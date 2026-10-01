@@ -58,11 +58,10 @@ type api struct {
 	eventSynchronize   *syscall.Proc
 	eventElapsedTime   *syscall.Proc
 
-	cublasCreate       *syscall.Proc
-	cublasDestroy      *syscall.Proc
-	cublasSetStream    *syscall.Proc
-	cublasSgemm        *syscall.Proc
-	cublasStridedBatch *syscall.Proc
+	cublasCreate    *syscall.Proc
+	cublasDestroy   *syscall.Proc
+	cublasSetStream *syscall.Proc
+	cublasSgemm     *syscall.Proc
 }
 
 var (
@@ -166,7 +165,6 @@ func load() (*api, error) {
 		}
 		blas, err := findProcs(cublas,
 			"cublasCreate_v2", "cublasDestroy_v2", "cublasSetStream_v2", "cublasSgemm_v2",
-			"cublasSgemmStridedBatched",
 		)
 		if err != nil {
 			loadErr = fmt.Errorf("%w: %v", ErrUnavailable, err)
@@ -181,7 +179,7 @@ func load() (*api, error) {
 			streamWaitEvent: runtime[14], eventCreate: runtime[15], eventDestroy: runtime[16],
 			eventRecord: runtime[17], eventSynchronize: runtime[18], eventElapsedTime: runtime[19],
 			cublasCreate: blas[0], cublasDestroy: blas[1], cublasSetStream: blas[2],
-			cublasSgemm: blas[3], cublasStridedBatch: blas[4],
+			cublasSgemm: blas[3],
 		}
 	})
 	return loaded, loadErr
@@ -624,73 +622,6 @@ func (b *Blas) SgemmRowMajorNT(m, n, k int, alpha float32, a uintptr, lda int, b
 		c, uintptr(int32(ldc)),
 	)
 	return blasError("cublasSgemm", status)
-}
-
-// SgemmStridedBatchedRowMajor computes c = alpha*a*b + beta*c for batchCount
-// row-major float32 matrix products a [m,k] (stride strideA), b [k,n] (stride
-// strideB) and c [m,n] (stride strideC). A zero stride repeats one operand
-// across the batch.
-func (b *Blas) SgemmStridedBatchedRowMajor(batchCount, m, n, k int, alpha float32, a uintptr, lda int, strideA int64, bPtr uintptr, ldb int, strideB int64, beta float32, c uintptr, ldc int, strideC int64) error {
-	aAPI, err := load()
-	if err != nil {
-		return err
-	}
-	status, _, _ := aAPI.cublasStridedBatch.Call(
-		b.handle,
-		0, 0, // CUBLAS_OP_N, CUBLAS_OP_N
-		uintptr(int32(n)), uintptr(int32(m)), uintptr(int32(k)),
-		uintptr(unsafe.Pointer(&alpha)),
-		bPtr, uintptr(int32(ldb)), uintptr(strideB),
-		a, uintptr(int32(lda)), uintptr(strideA),
-		uintptr(unsafe.Pointer(&beta)),
-		c, uintptr(int32(ldc)), uintptr(strideC),
-		uintptr(int32(batchCount)),
-	)
-	return blasError("cublasSgemmStridedBatched", status)
-}
-
-// SgemmStridedBatchedRowMajorNT computes c = alpha*a*b^T + beta*c for
-// batchCount row-major float32 matrix products a [m,k] (stride strideA), b
-// [n,k] (stride strideB) and c [m,n] (stride strideC).
-func (b *Blas) SgemmStridedBatchedRowMajorNT(batchCount, m, n, k int, alpha float32, a uintptr, lda int, strideA int64, bPtr uintptr, ldb int, strideB int64, beta float32, c uintptr, ldc int, strideC int64) error {
-	aAPI, err := load()
-	if err != nil {
-		return err
-	}
-	status, _, _ := aAPI.cublasStridedBatch.Call(
-		b.handle,
-		1, 0, // CUBLAS_OP_T on b, CUBLAS_OP_N on a
-		uintptr(int32(n)), uintptr(int32(m)), uintptr(int32(k)),
-		uintptr(unsafe.Pointer(&alpha)),
-		bPtr, uintptr(int32(ldb)), uintptr(strideB),
-		a, uintptr(int32(lda)), uintptr(strideA),
-		uintptr(unsafe.Pointer(&beta)),
-		c, uintptr(int32(ldc)), uintptr(strideC),
-		uintptr(int32(batchCount)),
-	)
-	return blasError("cublasSgemmStridedBatched", status)
-}
-
-// SgemmStridedBatchedRowMajorTransposeA computes c = alpha*a^T*b + beta*c for
-// batchCount row-major float32 matrix products a [k,m] (stride strideA), b
-// [k,n] (stride strideB) and c [m,n] (stride strideC).
-func (b *Blas) SgemmStridedBatchedRowMajorTransposeA(batchCount, m, n, k int, alpha float32, a uintptr, lda int, strideA int64, bPtr uintptr, ldb int, strideB int64, beta float32, c uintptr, ldc int, strideC int64) error {
-	aAPI, err := load()
-	if err != nil {
-		return err
-	}
-	status, _, _ := aAPI.cublasStridedBatch.Call(
-		b.handle,
-		0, 1, // CUBLAS_OP_N on b, CUBLAS_OP_T on a
-		uintptr(int32(n)), uintptr(int32(m)), uintptr(int32(k)),
-		uintptr(unsafe.Pointer(&alpha)),
-		bPtr, uintptr(int32(ldb)), uintptr(strideB),
-		a, uintptr(int32(lda)), uintptr(strideA),
-		uintptr(unsafe.Pointer(&beta)),
-		c, uintptr(int32(ldc)), uintptr(strideC),
-		uintptr(int32(batchCount)),
-	)
-	return blasError("cublasSgemmStridedBatched", status)
 }
 
 // SgemmRowMajorTransposeA computes c = alpha*a^T*b + beta*c for row-major

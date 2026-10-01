@@ -36,32 +36,6 @@ func benchBuffer(b *testing.B, count int) *Buffer {
 	return buffer
 }
 
-func BenchmarkSgemmStridedBatched(b *testing.B) {
-	benchSetup(b)
-	columnCount := benchChannels * benchKernel
-	columns := benchBuffer(b, benchBatch*columnCount*benchLength)
-	w := benchBuffer(b, benchOutChannels*columnCount)
-	out := benchBuffer(b, benchBatch*benchOutChannels*benchLength)
-	blas, err := NewBlas()
-	if err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() { blas.Destroy() })
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := blas.SgemmStridedBatchedRowMajor(benchBatch, benchOutChannels, benchLength, columnCount, 1,
-			w.Pointer(), columnCount, 0,
-			columns.Pointer(), benchLength, int64(columnCount*benchLength),
-			0,
-			out.Pointer(), benchLength, int64(benchOutChannels*benchLength)); err != nil {
-			b.Fatal(err)
-		}
-	}
-	if err := Synchronize(); err != nil {
-		b.Fatal(err)
-	}
-}
-
 func BenchmarkSgemmTransposeA(b *testing.B) {
 	benchSetup(b)
 	rows := benchBatch * benchLength

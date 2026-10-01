@@ -147,21 +147,6 @@ func (b *Blas) SgemmRowMajorTransposeA(m, n, k int, alpha float32, a uintptr, ld
 	return ErrUnavailable
 }
 
-// SgemmStridedBatchedRowMajor returns ErrUnavailable.
-func (b *Blas) SgemmStridedBatchedRowMajor(batchCount, m, n, k int, alpha float32, a uintptr, lda int, strideA int64, bPtr uintptr, ldb int, strideB int64, beta float32, c uintptr, ldc int, strideC int64) error {
-	return ErrUnavailable
-}
-
-// SgemmStridedBatchedRowMajorNT returns ErrUnavailable.
-func (b *Blas) SgemmStridedBatchedRowMajorNT(batchCount, m, n, k int, alpha float32, a uintptr, lda int, strideA int64, bPtr uintptr, ldb int, strideB int64, beta float32, c uintptr, ldc int, strideC int64) error {
-	return ErrUnavailable
-}
-
-// SgemmStridedBatchedRowMajorTransposeA returns ErrUnavailable.
-func (b *Blas) SgemmStridedBatchedRowMajorTransposeA(batchCount, m, n, k int, alpha float32, a uintptr, lda int, strideA int64, bPtr uintptr, ldb int, strideB int64, beta float32, c uintptr, ldc int, strideC int64) error {
-	return ErrUnavailable
-}
-
 // DeviceAttribute returns ErrUnavailable.
 func DeviceAttribute(attribute, device int) (int, error) { return 0, ErrUnavailable }
 

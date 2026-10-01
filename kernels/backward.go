@@ -1,10 +1,10 @@
 package kernels
 
 import (
-	"fmt"
-	"github.com/yh2237/gograd/cuda"
 	"sync"
 	"unsafe"
+
+	"github.com/yh2237/gograd/cuda"
 )
 
 const backwardKernelSource = `
@@ -33,20 +33,9 @@ extern "C" __global__ void column_sum(const float* x, float* out, int rows, int 
 	for (int r = begin; r < end; r++) sum += x[r * cols + c];
 	if (sum != 0.0f) atomicAdd(&out[c], sum);
 }
-extern "C" __global__ void conv_bias_grad(const float* dy, float* db, int batch, int outChannels, int length) {
-	// One thread per (batch, out) scans the time axis, then combines across
-	// batches with an atomic.
-	int index = blockIdx.x * blockDim.x + threadIdx.x;
-	if (index >= batch * outChannels) return;
-	int o = index % outChannels;
-	int b = index / outChannels;
-	float sum = 0.0f;
-	for (int t = 0; t < length; t++) sum += dy[(b * outChannels + o) * length + t];
-	if (sum != 0.0f) atomicAdd(&db[o], sum);
-}
 extern "C" __global__ void conv_weight_grad_partial(const float* x, const float* dy, float* partial, int batch, int channels, int length, int outChannels, int kernel, int dilation) {
-	// One thread per (batch, out, in, kernel) writes its own partial sum, so
-	// the pass needs no atomics; a second kernel reduces over the batch.
+	// Standalone fallback used when the forward columns are not available. One
+	// thread per (batch, out, in, kernel) writes its own partial sum.
 	int per = outChannels * channels * kernel;
 	int index = blockIdx.x * blockDim.x + threadIdx.x;
 	if (index >= batch * per) return;
@@ -70,20 +59,6 @@ extern "C" __global__ void sum_over_batch(const float* partial, float* out, int 
 	for (int b = 0; b < batch; b++) sum += partial[b * per + index];
 	out[index] += sum;
 }
-extern "C" __global__ void col2im1d(const float* col, float* dx, int batch, int channels, int length, int kernel, int dilation) {
-	int index = blockIdx.x * blockDim.x + threadIdx.x;
-	if (index >= batch * channels * length) return;
-	int t = index % length;
-	int c = (index / length) % channels;
-	int b = index / (channels * length);
-	float sum = 0.0f;
-	for (int k = 0; k < kernel; k++) {
-		int src = t + dilation - k * dilation;
-		if (src < 0 || src >= length) continue;
-		sum += col[(b * channels * kernel + c * kernel + k) * length + src];
-	}
-	dx[index] += sum;
-}
 `
 
 type backwardKernelSet struct {
@@ -91,15 +66,12 @@ type backwardKernelSet struct {
 	addInto        *cuda.Kernel
 	addPair        *cuda.Kernel
 	columnSum      *cuda.Kernel
-	convBiasGrad   *cuda.Kernel
 	convWeightPart *cuda.Kernel
 	sumOverBatch   *cuda.Kernel
-	col2im         *cuda.Kernel
 }
 
 var (
 	backwardProgramOnce sync.Once
-	backwardProgram     *cuda.Program
 	backwardSet         *backwardKernelSet
 	backwardErr         error
 )
@@ -117,10 +89,8 @@ func backwardKernels() (*backwardKernelSet, error) {
 			"add_into":                 &set.addInto,
 			"add_pair":                 &set.addPair,
 			"column_sum":               &set.columnSum,
-			"conv_bias_grad":           &set.convBiasGrad,
 			"conv_weight_grad_partial": &set.convWeightPart,
 			"sum_over_batch":           &set.sumOverBatch,
-			"col2im1d":                 &set.col2im,
 		} {
 			kernel, err := program.Function(name)
 			if err != nil {
@@ -129,7 +99,7 @@ func backwardKernels() (*backwardKernelSet, error) {
 			}
 			*target = kernel
 		}
-		backwardProgram, backwardSet = program, set
+		backwardSet = set
 	})
 	return backwardSet, backwardErr
 }
@@ -166,8 +136,7 @@ func AddInto(dst, src *cuda.Buffer, count int) error {
 	return set.addInto.Launch(elementGrid(count), [3]int{256, 1, 1}, 0, nil, args)
 }
 
-// AddPair writes dst = a + b elementwise. Unlike AddInto it needs no zeroed
-// destination, so it replaces a copy plus an accumulate.
+// AddPair writes dst = a + b elementwise.
 func AddPair(dst, a, b *cuda.Buffer, count int) error {
 	set, err := backwardKernels()
 	if err != nil {
@@ -199,20 +168,9 @@ func ColumnSum(x, out *cuda.Buffer, rows, cols int) error {
 	return set.columnSum.Launch(elementGrid(cols*chunks), [3]int{256, 1, 1}, 0, nil, args)
 }
 
-// ConvBiasGrad accumulates sum of dy into db[outChannels].
-func ConvBiasGrad(dy, db *cuda.Buffer, batch, outChannels, length int) error {
-	set, err := backwardKernels()
-	if err != nil {
-		return err
-	}
-	dyAddr, dbAddr := dy.Pointer(), db.Pointer()
-	args := int32Args(int32(batch), int32(outChannels), int32(length))
-	args = append([]unsafe.Pointer{unsafe.Pointer(&dyAddr), unsafe.Pointer(&dbAddr)}, args...)
-	return set.convBiasGrad.Launch(elementGrid(batch*outChannels), [3]int{256, 1, 1}, 0, nil, args)
-}
-
-// ConvWeightGrad accumulates the convolution weight gradient. A first pass
-// writes one partial sum per batch without atomics, and a second reduces them.
+// ConvWeightGrad accumulates the convolution weight gradient for channel-major
+// x [batch,channels,length] and dy [batch,outChannels,length]. A first pass
+// writes one partial sum per batch without atomics and a second reduces them.
 func ConvWeightGrad(x, dy, dw *cuda.Buffer, batch, channels, length, outChannels, kernel, dilation int) error {
 	set, err := backwardKernels()
 	if err != nil {
@@ -235,63 +193,4 @@ func ConvWeightGrad(x, dy, dw *cuda.Buffer, batch, channels, length, outChannels
 	sumArgs := int32Args(int32(batch), int32(per))
 	sumArgs = append([]unsafe.Pointer{unsafe.Pointer(&partialAddr2), unsafe.Pointer(&dwAddr)}, sumArgs...)
 	return set.sumOverBatch.Launch(elementGrid(per), [3]int{256, 1, 1}, 0, nil, sumArgs)
-}
-
-// ConvWeightGradGemm accumulates the convolution weight gradient from the
-// columns gathered by the forward pass: dw += sum_b dy[b]*columns[b]^T.
-func ConvWeightGradGemm(blas *cuda.Blas, dy, columns, dw *cuda.Buffer, batch, channels, length, outChannels, kernel int) error {
-	set, err := backwardKernels()
-	if err != nil {
-		return err
-	}
-	if blas == nil {
-		return fmt.Errorf("cuda: ConvWeightGradGemm requires a cuBLAS handle")
-	}
-	columnCount := channels * kernel
-	perBatch, err := cuda.Alloc(batch * outChannels * columnCount * 4)
-	if err != nil {
-		return err
-	}
-	defer perBatch.Free()
-	if err := blas.SgemmStridedBatchedRowMajorNT(batch, outChannels, columnCount, length, 1,
-		dy.Pointer(), length, int64(outChannels*length),
-		columns.Pointer(), length, int64(columnCount*length),
-		0,
-		perBatch.Pointer(), columnCount, int64(outChannels*columnCount)); err != nil {
-		return err
-	}
-	partialAddr, dwAddr := perBatch.Pointer(), dw.Pointer()
-	sumArgs := int32Args(int32(batch), int32(outChannels*columnCount))
-	sumArgs = append([]unsafe.Pointer{unsafe.Pointer(&partialAddr), unsafe.Pointer(&dwAddr)}, sumArgs...)
-	return set.sumOverBatch.Launch(elementGrid(outChannels*columnCount), [3]int{256, 1, 1}, 0, nil, sumArgs)
-}
-
-// ConvInputGrad accumulates the convolution gradient with respect to its input.
-// It forms the per-patch gradient dCol = W^T*dY with one strided-batched GEMM
-// and scatters it with col2im, instead of reading dY once per output.
-func ConvInputGrad(blas *cuda.Blas, dy, weight, dx *cuda.Buffer, batch, channels, length, outChannels, kernel, dilation int) error {
-	set, err := backwardKernels()
-	if err != nil {
-		return err
-	}
-	if blas == nil {
-		return fmt.Errorf("cuda: ConvInputGrad requires a cuBLAS handle")
-	}
-	columnCount := channels * kernel
-	columns, err := cuda.Alloc(batch * columnCount * length * 4)
-	if err != nil {
-		return err
-	}
-	defer columns.Free()
-	if err := blas.SgemmStridedBatchedRowMajorTransposeA(batch, columnCount, length, outChannels, 1,
-		weight.Pointer(), columnCount, 0,
-		dy.Pointer(), length, int64(outChannels*length),
-		0,
-		columns.Pointer(), length, int64(columnCount*length)); err != nil {
-		return err
-	}
-	colAddr, dxAddr := columns.Pointer(), dx.Pointer()
-	args := int32Args(int32(batch), int32(channels), int32(length), int32(kernel), int32(dilation))
-	args = append([]unsafe.Pointer{unsafe.Pointer(&colAddr), unsafe.Pointer(&dxAddr)}, args...)
-	return set.col2im.Launch(elementGrid(batch*channels*length), [3]int{256, 1, 1}, 0, nil, args)
 }

@@ -89,9 +89,8 @@ func DownloadFloat32(buffer *cuda.Buffer, count int) ([]float32, error) {
 }
 
 type layerCache struct {
-	inputChannelMajor *cuda.Buffer // transpose of the layer input [batch,hidden,time]
-	outputActivation  *cuda.Buffer // activation after the residual tanh [batch,time,hidden]
-	columns           *cuda.Buffer // im2col of the layer input [batch,hidden*3,time]
+	outputActivation *cuda.Buffer // activation after the residual tanh [batch,time,hidden]
+	columns          *cuda.Buffer // im2col of the layer input [hidden*3, batch*time]
 }
 
 // Cache holds the activations saved by a forward pass for backpropagation.
@@ -223,32 +222,25 @@ func (m *Model) forwardFrom(cache *Cache, input *cuda.Buffer) error {
 
 	for index := range m.Layers {
 		layer := &m.Layers[index]
-		channelMajor, err := cache.alloc(batch * hidden * time)
+		columns, err := cache.alloc(hidden * 3 * batch * time)
 		if err != nil {
 			return err
 		}
-		if err := kernels.Transpose12(state, channelMajor, batch, time, hidden); err != nil {
-			return err
-		}
-		convolved, err := cache.alloc(batch * hidden * time)
+		convolved, err := cache.alloc(hidden * batch * time)
 		if err != nil {
 			return err
 		}
-		columns, err := cache.alloc(batch * hidden * 3 * time)
-		if err != nil {
-			return err
-		}
-		if err := kernels.Conv1dForwardTo(blas, channelMajor, layer.Weight, layer.Bias, convolved, columns, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
+		if err := kernels.Conv1dForwardTo(blas, state, layer.Weight, convolved, columns, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
 			return err
 		}
 		next, err := cache.alloc(batch * time * hidden)
 		if err != nil {
 			return err
 		}
-		if err := kernels.TransposeAddTanh(convolved, state, next, batch, hidden, time); err != nil {
+		if err := kernels.TransposeAddTanh(convolved, state, layer.Bias, next, batch, hidden, time); err != nil {
 			return err
 		}
-		cache.layers = append(cache.layers, layerCache{inputChannelMajor: channelMajor, outputActivation: next, columns: columns})
+		cache.layers = append(cache.layers, layerCache{outputActivation: next, columns: columns})
 		state = next
 	}
 
@@ -390,13 +382,11 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 			return fail(err)
 		}
 
-		// dZ is already the gradient of the transposed convolution output, so
-		// transpose it directly instead of copying into another buffer.
-		dConvChannel, err := grads.alloc(batch * hidden * time)
+		dConv, err := grads.alloc(hidden * batch * time)
 		if err != nil {
 			return fail(err)
 		}
-		if err := kernels.Transpose12(dZ, dConvChannel, batch, time, hidden); err != nil {
+		if err := kernels.ToHBT(dZ, dConv, batch, hidden, time); err != nil {
 			return fail(err)
 		}
 		weightGrad, err := grads.zeroAlloc(hidden * hidden * 3)
@@ -408,24 +398,17 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 			return fail(err)
 		}
 		grads.Layers[index] = GradientLayer{Weight: weightGrad, Bias: biasGrad}
-		if err := kernels.ConvWeightGradGemm(blas, dConvChannel, cacheLayer.columns, weightGrad, batch, hidden, time, hidden, 3); err != nil {
+		if err := kernels.ConvWeightGradGemm(blas, dConv, cacheLayer.columns, weightGrad, batch, hidden, time, hidden, 3); err != nil {
 			return fail(err)
 		}
-		if err := kernels.ConvBiasGrad(dConvChannel, biasGrad, batch, hidden, time); err != nil {
+		if err := kernels.RowSum(dConv, biasGrad, hidden, batch*time); err != nil {
 			return fail(err)
 		}
-		dInputChannel, err := grads.zeroAlloc(batch * hidden * time)
+		dInputTime, err := grads.zeroAlloc(rows * hidden)
 		if err != nil {
 			return fail(err)
 		}
-		if err := kernels.ConvInputGrad(blas, dConvChannel, layer.Weight, dInputChannel, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
-			return fail(err)
-		}
-		dInputTime, err := grads.alloc(batch * time * hidden)
-		if err != nil {
-			return fail(err)
-		}
-		if err := kernels.Transpose12(dInputChannel, dInputTime, batch, hidden, time); err != nil {
+		if err := kernels.ConvInputGrad(blas, dConv, layer.Weight, dInputTime, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
 			return fail(err)
 		}
 		dAPrev, err := grads.alloc(rows * hidden)

@@ -189,22 +189,24 @@ func TestTranspose12(t *testing.T) {
 	}
 }
 
-func referenceConv1d(x, weight, bias []float32, batch, channels, length, outChannels, kernel, dilation int) []float32 {
-	out := make([]float32, batch*outChannels*length)
-	for b := 0; b < batch; b++ {
-		for o := 0; o < outChannels; o++ {
+// referenceConv1dTimeMajor returns y[o, b*length+t] for time-major
+// x [batch,length,channels] without bias.
+func referenceConv1dTimeMajor(x, weight []float32, batch, channels, length, outChannels, kernel, dilation int) []float32 {
+	out := make([]float32, outChannels*batch*length)
+	for o := 0; o < outChannels; o++ {
+		for b := 0; b < batch; b++ {
 			for t := 0; t < length; t++ {
-				sum := bias[o]
+				sum := float32(0)
 				for c := 0; c < channels; c++ {
 					for k := 0; k < kernel; k++ {
 						source := t - dilation + k*dilation
 						if source < 0 || source >= length {
 							continue
 						}
-						sum += weight[(o*channels+c)*kernel+k] * x[(b*channels+c)*length+source]
+						sum += weight[(o*channels+c)*kernel+k] * x[(b*length+source)*channels+c]
 					}
 				}
-				out[(b*outChannels+o)*length+t] = sum
+				out[o*batch*length+b*length+t] = sum
 			}
 		}
 	}
@@ -221,7 +223,7 @@ func TestConv1dForward(t *testing.T) {
 		t.Fatal(err)
 	}
 	const batch, channels, length, outChannels, kernel, dilation = 2, 3, 8, 4, 3, 2
-	x := make([]float32, batch*channels*length)
+	x := make([]float32, batch*length*channels)
 	for i := range x {
 		x[i] = float32(math.Sin(float64(i) * 0.7))
 	}
@@ -229,33 +231,35 @@ func TestConv1dForward(t *testing.T) {
 	for i := range weight {
 		weight[i] = float32(math.Cos(float64(i) * 0.3))
 	}
-	bias := []float32{0.1, -0.2, 0.3, 0.05}
-	want := referenceConv1d(x, weight, bias, batch, channels, length, outChannels, kernel, dilation)
+	want := referenceConv1dTimeMajor(x, weight, batch, channels, length, outChannels, kernel, dilation)
 
 	deviceX := upload(t, x)
 	deviceWeight := upload(t, weight)
-	deviceBias := upload(t, bias)
-	deviceOut, err := cuda.Alloc(batch * outChannels * length * 4)
+	columns, err := cuda.Alloc(channels * kernel * batch * length * 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv, err := cuda.Alloc(outChannels * batch * length * 4)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer deviceX.Free()
 	defer deviceWeight.Free()
-	defer deviceBias.Free()
-	defer deviceOut.Free()
+	defer columns.Free()
+	defer conv.Free()
 
 	blas, err := cuda.NewBlas()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer blas.Destroy()
-	if err := Conv1dForward(blas, deviceX, deviceWeight, deviceBias, deviceOut, batch, channels, length, outChannels, kernel, dilation); err != nil {
+	if err := Conv1dForwardTo(blas, deviceX, deviceWeight, conv, columns, batch, channels, length, outChannels, kernel, dilation); err != nil {
 		t.Fatal(err)
 	}
 	if err := cuda.Synchronize(); err != nil {
 		t.Fatal(err)
 	}
-	got := download(t, deviceOut, len(want))
+	got := download(t, conv, len(want))
 	for i := range want {
 		if math.Abs(float64(got[i]-want[i])) > 1e-4*math.Max(1, math.Abs(float64(want[i]))) {
 			t.Fatalf("conv[%d]: got %v want %v", i, got[i], want[i])

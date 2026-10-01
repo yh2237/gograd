@@ -40,10 +40,10 @@ func benchBuffer(b *testing.B, count int) *cuda.Buffer {
 
 func BenchmarkConv1dForward(b *testing.B) {
 	benchSetup(b)
-	x := benchBuffer(b, benchBatch*benchChannels*benchLength)
+	x := benchBuffer(b, benchBatch*benchLength*benchChannels)
 	w := benchBuffer(b, benchOutChannels*benchChannels*benchKernel)
-	bias := benchBuffer(b, benchOutChannels)
-	out := benchBuffer(b, benchBatch*benchOutChannels*benchLength)
+	columns := benchBuffer(b, benchChannels*benchKernel*benchBatch*benchLength)
+	conv := benchBuffer(b, benchOutChannels*benchBatch*benchLength)
 	blas, err := cuda.NewBlas()
 	if err != nil {
 		b.Fatal(err)
@@ -51,7 +51,7 @@ func BenchmarkConv1dForward(b *testing.B) {
 	b.Cleanup(func() { blas.Destroy() })
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := Conv1dForward(blas, x, w, bias, out, benchBatch, benchChannels, benchLength, benchOutChannels, benchKernel, benchDilation); err != nil {
+		if err := Conv1dForwardTo(blas, x, w, conv, columns, benchBatch, benchChannels, benchLength, benchOutChannels, benchKernel, benchDilation); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -78,9 +78,9 @@ func BenchmarkConvWeightGrad(b *testing.B) {
 
 func BenchmarkConvInputGrad(b *testing.B) {
 	benchSetup(b)
-	dy := benchBuffer(b, benchBatch*benchOutChannels*benchLength)
+	dy := benchBuffer(b, benchOutChannels*benchBatch*benchLength)
 	w := benchBuffer(b, benchOutChannels*benchChannels*benchKernel)
-	dx := benchBuffer(b, benchBatch*benchChannels*benchLength)
+	dx := benchBuffer(b, benchBatch*benchLength*benchChannels)
 	blas, err := cuda.NewBlas()
 	if err != nil {
 		b.Fatal(err)
@@ -89,6 +89,21 @@ func BenchmarkConvInputGrad(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if err := ConvInputGrad(blas, dy, w, dx, benchBatch, benchChannels, benchLength, benchOutChannels, benchKernel, benchDilation); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := cuda.Synchronize(); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func BenchmarkToHBT(b *testing.B) {
+	benchSetup(b)
+	in := benchBuffer(b, benchBatch*benchLength*benchChannels)
+	out := benchBuffer(b, benchChannels*benchBatch*benchLength)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := ToHBT(in, out, benchBatch, benchChannels, benchLength); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -146,13 +161,13 @@ func BenchmarkAddTanh(b *testing.B) {
 	}
 }
 
-func BenchmarkConvBiasGrad(b *testing.B) {
+func BenchmarkRowSum(b *testing.B) {
 	benchSetup(b)
-	dy := benchBuffer(b, benchBatch*benchOutChannels*benchLength)
+	dy := benchBuffer(b, benchOutChannels*benchBatch*benchLength)
 	db := benchBuffer(b, benchOutChannels)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := ConvBiasGrad(dy, db, benchBatch, benchOutChannels, benchLength); err != nil {
+		if err := RowSum(dy, db, benchOutChannels, benchBatch*benchLength); err != nil {
 			b.Fatal(err)
 		}
 	}
