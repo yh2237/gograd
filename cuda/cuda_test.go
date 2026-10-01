@@ -197,6 +197,80 @@ func TestKernelTanh(t *testing.T) {
 	}
 }
 
+func referenceConv1d(x, weight, bias []float32, batch, channels, length, outChannels, kernel, dilation int) []float32 {
+	out := make([]float32, batch*outChannels*length)
+	for b := 0; b < batch; b++ {
+		for o := 0; o < outChannels; o++ {
+			for t := 0; t < length; t++ {
+				sum := bias[o]
+				for c := 0; c < channels; c++ {
+					for k := 0; k < kernel; k++ {
+						source := t - dilation + k*dilation
+						if source < 0 || source >= length {
+							continue
+						}
+						sum += weight[(o*channels+c)*kernel+k] * x[(b*channels+c)*length+source]
+					}
+				}
+				out[(b*outChannels+o)*length+t] = sum
+			}
+		}
+	}
+	return out
+}
+
+func TestConv1dForward(t *testing.T) {
+	if !Available() {
+		t.Skip("cuda unavailable:", loadErrorText())
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := SetDevice(0); err != nil {
+		t.Fatal(err)
+	}
+	const batch, channels, length, outChannels, kernel, dilation = 2, 3, 8, 4, 3, 2
+	x := make([]float32, batch*channels*length)
+	for i := range x {
+		x[i] = float32(math.Sin(float64(i) * 0.7))
+	}
+	weight := make([]float32, outChannels*channels*kernel)
+	for i := range weight {
+		weight[i] = float32(math.Cos(float64(i) * 0.3))
+	}
+	bias := []float32{0.1, -0.2, 0.3, 0.05}
+	want := referenceConv1d(x, weight, bias, batch, channels, length, outChannels, kernel, dilation)
+
+	deviceX := upload(t, x)
+	deviceWeight := upload(t, weight)
+	deviceBias := upload(t, bias)
+	deviceOut, err := Alloc(batch * outChannels * length * 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer deviceX.Free()
+	defer deviceWeight.Free()
+	defer deviceBias.Free()
+	defer deviceOut.Free()
+
+	blas, err := NewBlas()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blas.Destroy()
+	if err := Conv1dForward(blas, deviceX, deviceWeight, deviceBias, deviceOut, batch, channels, length, outChannels, kernel, dilation); err != nil {
+		t.Fatal(err)
+	}
+	if err := Synchronize(); err != nil {
+		t.Fatal(err)
+	}
+	got := download(t, deviceOut, len(want))
+	for i := range want {
+		if math.Abs(float64(got[i]-want[i])) > 1e-4*math.Max(1, math.Abs(float64(want[i]))) {
+			t.Fatalf("conv[%d]: got %v want %v", i, got[i], want[i])
+		}
+	}
+}
+
 func loadErrorText() string {
 	if _, err := DeviceCount(); err != nil {
 		return err.Error()

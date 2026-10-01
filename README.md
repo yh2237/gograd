@@ -18,10 +18,10 @@ operations the TCN and its loss need:
 The `cuda` package binds the CUDA runtime, cuBLAS and NVRTC DLLs on Windows
 through the system loader, so no cgo or C compiler is needed. It provides device
 queries, device buffers with explicit `Free`, streams, events, a row-major
-`SgemmRowMajor` wrapper, and NVRTC-compiled kernels loaded through the CUDA
-driver. On other platforms every call reports `ErrUnavailable`. The GPU package
-is not yet wired into the engine; training still runs on the CPU reference
-path.
+`SgemmRowMajor` wrapper, an im2col + SGEMM `Conv1dForward`, and NVRTC-compiled
+kernels loaded through the CUDA driver. On other platforms every call reports
+`ErrUnavailable`. The GPU package is not yet wired into the engine; training
+still runs on the CPU reference path.
 
 ## Verification
 

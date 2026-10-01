@@ -116,6 +116,18 @@ func DeviceAttribute(attribute, device int) (int, error) { return 0, ErrUnavaila
 // Kernel is a compiled device function.
 type Kernel struct{ module, function uintptr }
 
+// Program is a compiled module.
+type Program struct{ module uintptr }
+
+// Compile returns ErrUnavailable.
+func Compile(source string) (*Program, error) { return nil, ErrUnavailable }
+
+// Function returns ErrUnavailable.
+func (p *Program) Function(name string) (*Kernel, error) { return nil, ErrUnavailable }
+
+// Close returns ErrUnavailable.
+func (p *Program) Close() error { return ErrUnavailable }
+
 // LoadKernel returns ErrUnavailable.
 func LoadKernel(source, name string) (*Kernel, error) { return nil, ErrUnavailable }
 

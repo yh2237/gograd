@@ -95,34 +95,67 @@ func cStringBytes(text string) []byte {
 type Kernel struct {
 	module   uintptr
 	function uintptr
+	owned    bool
 }
 
-// LoadKernel compiles source with NVRTC for the current device and resolves
-// the named __global__ function.
-func LoadKernel(source, name string) (*Kernel, error) {
-	a, err := loadKernelAPI()
+// Program is a compiled module that can resolve several functions.
+type Program struct {
+	module uintptr
+}
+
+// Compile builds an NVRTC program for the current device and loads it. The
+// module stays loaded until Close.
+func Compile(source string) (*Program, error) {
+	module, err := compileModule(source)
 	if err != nil {
 		return nil, err
+	}
+	return &Program{module: module}, nil
+}
+
+// Function resolves a __global__ function from the program.
+func (p *Program) Function(name string) (*Kernel, error) {
+	return moduleFunction(p.module, name)
+}
+
+// Close unloads the module.
+func (p *Program) Close() error {
+	if p.module == 0 {
+		return nil
+	}
+	a, err := loadKernelAPI()
+	if err != nil {
+		return err
+	}
+	code, _, _ := a.moduleUnload.Call(p.module)
+	p.module = 0
+	return driverError("cuModuleUnload", code)
+}
+
+func compileModule(source string) (uintptr, error) {
+	a, err := loadKernelAPI()
+	if err != nil {
+		return 0, err
 	}
 	if err := SetDevice(0); err == nil {
 		_ = initializeContext()
 	}
 	device, err := CurrentDevice()
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	major, err := DeviceAttribute(75, device)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	minor, err := DeviceAttribute(76, device)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	architecture := fmt.Sprintf("--gpu-architecture=compute_%d%d", major, minor)
 
 	sourceBytes := cStringBytes(source)
-	nameBytes := cStringBytes(name)
+	nameBytes := cStringBytes("gograd_kernel")
 	var program uintptr
 	create, _, _ := a.createProgram.Call(
 		uintptr(unsafe.Pointer(&program)),
@@ -131,7 +164,7 @@ func LoadKernel(source, name string) (*Kernel, error) {
 		0, 0, 0,
 	)
 	if create != 0 {
-		return nil, &Error{Op: "nvrtcCreateProgram", Code: int(create)}
+		return 0, &Error{Op: "nvrtcCreateProgram", Code: int(create)}
 	}
 	defer func() {
 		a.destroyProgram.Call(uintptr(unsafe.Pointer(&program)))
@@ -147,29 +180,57 @@ func LoadKernel(source, name string) (*Kernel, error) {
 	compile, _, _ := a.compileProgram.Call(program, uintptr(len(optionPtrs)), uintptr(unsafe.Pointer(&optionPtrs[0])))
 	runtime.KeepAlive(optionBytes)
 	if compile != 0 {
-		return nil, &Error{Op: "nvrtcCompileProgram", Code: int(compile), Message: programLog(a, program)}
+		return 0, &Error{Op: "nvrtcCompileProgram", Code: int(compile), Message: programLog(a, program)}
 	}
 
 	var size uintptr
 	if code, _, _ := a.getPTXSize.Call(program, uintptr(unsafe.Pointer(&size))); code != 0 {
-		return nil, &Error{Op: "nvrtcGetPTXSize", Code: int(code)}
+		return 0, &Error{Op: "nvrtcGetPTXSize", Code: int(code)}
 	}
 	ptx := make([]byte, size)
 	if code, _, _ := a.getPTX.Call(program, uintptr(unsafe.Pointer(&ptx[0]))); code != 0 {
-		return nil, &Error{Op: "nvrtcGetPTX", Code: int(code)}
+		return 0, &Error{Op: "nvrtcGetPTX", Code: int(code)}
 	}
 
 	var module uintptr
 	if code, _, _ := a.moduleLoadData.Call(uintptr(unsafe.Pointer(&module)), uintptr(unsafe.Pointer(&ptx[0]))); code != 0 {
-		return nil, &Error{Op: "cuModuleLoadData", Code: int(code)}
+		return 0, &Error{Op: "cuModuleLoadData", Code: int(code)}
 	}
+	return module, nil
+}
+
+func moduleFunction(module uintptr, name string) (*Kernel, error) {
+	a, err := loadKernelAPI()
+	if err != nil {
+		return nil, err
+	}
+	nameBytes := cStringBytes(name)
 	var function uintptr
-	getFunction, _, _ := a.moduleGetFunction.Call(uintptr(unsafe.Pointer(&function)), module, uintptr(unsafe.Pointer(&nameBytes[0])))
-	if getFunction != 0 {
-		a.moduleUnload.Call(module)
-		return nil, &Error{Op: "cuModuleGetFunction", Code: int(getFunction)}
+	code, _, _ := a.moduleGetFunction.Call(uintptr(unsafe.Pointer(&function)), module, uintptr(unsafe.Pointer(&nameBytes[0])))
+	if code != 0 {
+		return nil, &Error{Op: "cuModuleGetFunction", Code: int(code)}
 	}
 	return &Kernel{module: module, function: function}, nil
+}
+
+// LoadKernel compiles source with NVRTC for the current device and resolves
+// the named __global__ function. The returned kernel owns the module and
+// unloads it on Close.
+func LoadKernel(source, name string) (*Kernel, error) {
+	module, err := compileModule(source)
+	if err != nil {
+		return nil, err
+	}
+	kernel, err := moduleFunction(module, name)
+	if err != nil {
+		a, _ := loadKernelAPI()
+		if a != nil {
+			a.moduleUnload.Call(module)
+		}
+		return nil, err
+	}
+	kernel.owned = true
+	return kernel, nil
 }
 
 func programLog(a *kernelAPI, program uintptr) string {
@@ -210,12 +271,17 @@ func (k *Kernel) Launch(grid, block [3]int, sharedMemory int, stream *Stream, ar
 	return driverError("cuLaunchKernel", code)
 }
 
-// Close unloads the module.
+// Close unloads the module when the kernel owns it. Kernels obtained from a
+// Program share that program's module and are released by Program.Close.
 func (k *Kernel) Close() error {
+	if !k.owned {
+		return nil
+	}
 	a, err := loadKernelAPI()
 	if err != nil {
 		return err
 	}
+	k.owned = false
 	code, _, _ := a.moduleUnload.Call(k.module)
 	k.module = 0
 	k.function = 0
