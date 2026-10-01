@@ -291,7 +291,14 @@ type Buffer struct {
 	freed   bool
 }
 
-// Alloc reserves size bytes on the current device.
+var (
+	poolMu    sync.Mutex
+	poolTable = map[int][]uintptr{}
+)
+
+// Alloc reserves size bytes on the current device. Freed buffers of the same
+// size are reused from an internal pool, which avoids the cost of repeated
+// cudaMalloc/cudaFree pairs.
 func Alloc(size int) (*Buffer, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("cuda: negative allocation size %d", size)
@@ -300,6 +307,15 @@ func Alloc(size int) (*Buffer, error) {
 	if err != nil {
 		return nil, err
 	}
+	poolMu.Lock()
+	list := poolTable[size]
+	if len(list) > 0 {
+		pointer := list[len(list)-1]
+		poolTable[size] = list[:len(list)-1]
+		poolMu.Unlock()
+		return &Buffer{pointer: pointer, size: size}, nil
+	}
+	poolMu.Unlock()
 	var pointer uintptr
 	code, _, _ := a.malloc.Call(uintptr(unsafe.Pointer(&pointer)), uintptr(size))
 	if err := runtimeError("cudaMalloc", code); err != nil {
@@ -308,19 +324,38 @@ func Alloc(size int) (*Buffer, error) {
 	return &Buffer{pointer: pointer, size: size}, nil
 }
 
-// Free releases the device allocation. It is safe to call more than once.
+// Free returns the allocation to the internal pool. It is safe to call more
+// than once. Use ReleasePool to release pooled memory to the driver.
 func (b *Buffer) Free() error {
 	if b == nil || b.freed {
 		return nil
 	}
+	b.freed = true
+	poolMu.Lock()
+	poolTable[b.size] = append(poolTable[b.size], b.pointer)
+	poolMu.Unlock()
+	b.pointer = 0
+	return nil
+}
+
+// ReleasePool frees every buffer currently held by the internal pool.
+func ReleasePool() error {
 	a, err := load()
 	if err != nil {
 		return err
 	}
-	code, _, _ := a.free.Call(b.pointer)
-	b.freed = true
-	b.pointer = 0
-	return runtimeError("cudaFree", code)
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	for _, list := range poolTable {
+		for _, pointer := range list {
+			code, _, _ := a.free.Call(pointer)
+			if err := runtimeError("cudaFree", code); err != nil {
+				return err
+			}
+		}
+	}
+	poolTable = map[int][]uintptr{}
+	return nil
 }
 
 // Pointer returns the raw device address.

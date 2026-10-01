@@ -19,7 +19,9 @@ The `cuda` package binds the CUDA runtime, cuBLAS and NVRTC DLLs on Windows
 through the system loader, so no cgo or C compiler is needed. It provides device
 queries, device buffers with explicit `Free`, streams, events, a row-major
 `SgemmRowMajor` wrapper, an im2col + SGEMM `Conv1dForward`, and NVRTC-compiled
-kernels loaded through the CUDA driver. On other platforms every call reports
+kernels loaded through the CUDA driver. Freed buffers are reused from an
+internal size pool, which cuts cudaMalloc/cudaFree traffic; `ReleasePool`
+returns that memory to the driver. On other platforms every call reports
 `ErrUnavailable`.
 
 The `gputcn` package runs the TCN forward and backward passes on the GPU in

@@ -51,6 +51,9 @@ func Alloc(size int) (*Buffer, error) { return nil, ErrUnavailable }
 // Free returns ErrUnavailable.
 func (b *Buffer) Free() error { return ErrUnavailable }
 
+// ReleasePool returns nil on this platform.
+func ReleasePool() error { return nil }
+
 // Pointer returns the raw device address.
 func (b *Buffer) Pointer() uintptr { return 0 }
 
