@@ -25,6 +25,11 @@ internal size pool, which cuts cudaMalloc/cudaFree traffic; `ReleasePool`
 returns that memory to the driver. On other platforms every call reports
 `ErrUnavailable`.
 
+The `tensor` and `nn` packages are the general path: a shape-aware GPU tensor,
+modules with explicit forward and backward, a shared AdamW optimizer and MSE
+loss. A small MLP trains on synthetic data through them, and the TCN-specific
+`gputcn` package stays as the specialized path.
+
 The `gputcn` package runs the TCN forward and backward passes on the GPU in
 float32. The forward output matches the PyTorch float64 reference to about
 5e-08 and the parameter gradients to about 1e-05. The loss and AdamW, including
@@ -84,6 +89,8 @@ go test ./cuda/
 - `export.go` — runtime JSON layout
 - `cuda/` — CUDA runtime, cuBLAS and NVRTC binding, streams and graph capture
 - `kernels/` — custom GPU kernels (activation, convolution, loss, AdamW) on top of `cuda`
+- `tensor/` — shape-aware float32 GPU tensor
+- `nn/` — modules, AdamW optimizer and MSE loss built on `tensor` and `kernels`
 - `gputcn/` — GPU float32 TCN forward, backward and AdamW
 - `cmd/tcn-train` — synthetic CPU training example
 - `cmd/gputcn-train` — synthetic GPU training example with timings
