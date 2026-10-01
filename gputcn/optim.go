@@ -2,6 +2,7 @@ package gputcn
 
 import (
 	"math"
+	"runtime"
 
 	"github.com/yh2237/gograd/cuda"
 )
@@ -86,6 +87,11 @@ func (s *AdamState) ensure(params []*cuda.Buffer) error {
 // update on the device. The moment buffers live in state and are created on
 // the first call.
 func (m *Model) ApplyAdamW(grads *Gradients, state *AdamState, learningRate, weightDecay, maxNorm float64) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := cuda.SetDevice(0); err != nil {
+		return err
+	}
 	params := m.Parameters()
 	gradientBuffers := grads.gradientBuffers()
 	if len(params) != len(gradientBuffers) {
@@ -115,7 +121,7 @@ func (m *Model) ApplyAdamW(grads *Gradients, state *AdamState, learningRate, wei
 			return err
 		}
 	}
-	return cuda.Synchronize()
+	return nil
 }
 
 var errParameterMismatch = &cuda.Error{Op: "ApplyAdamW", Code: -1, Message: "parameter and gradient counts differ"}

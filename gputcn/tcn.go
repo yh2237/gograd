@@ -28,6 +28,22 @@ type Model struct {
 	InputBias    *cuda.Buffer // [hidden]
 	OutputWeight *cuda.Buffer // [1,hidden]
 	OutputBias   *cuda.Buffer // [1]
+
+	blas *cuda.Blas
+}
+
+// blasHandle returns a cached cuBLAS handle. Creating a handle is comparatively
+// expensive, so it is reused across forward and backward calls.
+func (m *Model) blasHandle() (*cuda.Blas, error) {
+	if m.blas != nil {
+		return m.blas, nil
+	}
+	blas, err := cuda.NewBlas()
+	if err != nil {
+		return nil, err
+	}
+	m.blas = blas
+	return blas, nil
 }
 
 // Close releases every device parameter.
@@ -40,6 +56,10 @@ func (m *Model) Close() {
 	m.InputBias.Free()
 	m.OutputWeight.Free()
 	m.OutputBias.Free()
+	if m.blas != nil {
+		m.blas.Destroy()
+		m.blas = nil
+	}
 }
 
 // UploadFloat32 copies a host slice into a new device buffer.
@@ -122,11 +142,10 @@ func (m *Model) ForwardCached(x []float32, batch, time int) (*Cache, error) {
 	if err := cuda.SetDevice(0); err != nil {
 		return nil, err
 	}
-	blas, err := cuda.NewBlas()
+	blas, err := m.blasHandle()
 	if err != nil {
 		return nil, err
 	}
-	defer blas.Destroy()
 
 	cache := &Cache{rows: batch * time, batch: batch, time: time}
 	fail := func(err error) (*Cache, error) {
@@ -194,9 +213,8 @@ func (m *Model) ForwardCached(x []float32, batch, time int) (*Cache, error) {
 	if err := cuda.AddBiasColumns(output, m.OutputBias, rows, 1); err != nil {
 		return fail(err)
 	}
-	if err := cuda.Synchronize(); err != nil {
-		return fail(err)
-	}
+	// Work stays queued on the stream; later kernels and the final copy are
+	// ordered after it, so an explicit device sync here would only stall.
 	cache.output = output
 	return cache, nil
 }
@@ -267,11 +285,10 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 	if err := cuda.SetDevice(0); err != nil {
 		return nil, err
 	}
-	blas, err := cuda.NewBlas()
+	blas, err := m.blasHandle()
 	if err != nil {
 		return nil, err
 	}
-	defer blas.Destroy()
 
 	rows := cache.rows
 	batch, time := cache.batch, cache.time
@@ -393,9 +410,6 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 		return fail(err)
 	}
 	if err := cuda.ColumnSum(dZ1, inputBias, rows, hidden); err != nil {
-		return fail(err)
-	}
-	if err := cuda.Synchronize(); err != nil {
 		return fail(err)
 	}
 	return grads, nil
