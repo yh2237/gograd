@@ -56,10 +56,11 @@ type api struct {
 	eventRecord        *syscall.Proc
 	eventSynchronize   *syscall.Proc
 
-	cublasCreate    *syscall.Proc
-	cublasDestroy   *syscall.Proc
-	cublasSetStream *syscall.Proc
-	cublasSgemm     *syscall.Proc
+	cublasCreate       *syscall.Proc
+	cublasDestroy      *syscall.Proc
+	cublasSetStream    *syscall.Proc
+	cublasSgemm        *syscall.Proc
+	cublasStridedBatch *syscall.Proc
 }
 
 var (
@@ -140,6 +141,7 @@ func load() (*api, error) {
 		}
 		blas, err := findProcs(cublas,
 			"cublasCreate_v2", "cublasDestroy_v2", "cublasSetStream_v2", "cublasSgemm_v2",
+			"cublasSgemmStridedBatched",
 		)
 		if err != nil {
 			loadErr = fmt.Errorf("%w: %v", ErrUnavailable, err)
@@ -153,7 +155,8 @@ func load() (*api, error) {
 			streamCreate: runtime[10], streamDestroy: runtime[11], streamSynchronize: runtime[12],
 			streamWaitEvent: runtime[13], eventCreate: runtime[14], eventDestroy: runtime[15],
 			eventRecord: runtime[16], eventSynchronize: runtime[17],
-			cublasCreate: blas[0], cublasDestroy: blas[1], cublasSetStream: blas[2], cublasSgemm: blas[3],
+			cublasCreate: blas[0], cublasDestroy: blas[1], cublasSetStream: blas[2],
+			cublasSgemm: blas[3], cublasStridedBatch: blas[4],
 		}
 	})
 	return loaded, loadErr
@@ -528,6 +531,29 @@ func (b *Blas) SgemmRowMajorNT(m, n, k int, alpha float32, a uintptr, lda int, b
 		c, uintptr(int32(ldc)),
 	)
 	return blasError("cublasSgemm", status)
+}
+
+// SgemmStridedBatchedRowMajor computes c = alpha*a*b + beta*c for batchCount
+// row-major float32 matrix products a [m,k] (stride strideA), b [k,n] (stride
+// strideB) and c [m,n] (stride strideC). A zero stride repeats one operand
+// across the batch.
+func (b *Blas) SgemmStridedBatchedRowMajor(batchCount, m, n, k int, alpha float32, a uintptr, lda int, strideA int64, bPtr uintptr, ldb int, strideB int64, beta float32, c uintptr, ldc int, strideC int64) error {
+	aAPI, err := load()
+	if err != nil {
+		return err
+	}
+	status, _, _ := aAPI.cublasStridedBatch.Call(
+		b.handle,
+		0, 0, // CUBLAS_OP_N, CUBLAS_OP_N
+		uintptr(int32(n)), uintptr(int32(m)), uintptr(int32(k)),
+		uintptr(unsafe.Pointer(&alpha)),
+		bPtr, uintptr(int32(ldb)), uintptr(strideB),
+		a, uintptr(int32(lda)), uintptr(strideA),
+		uintptr(unsafe.Pointer(&beta)),
+		c, uintptr(int32(ldc)), uintptr(strideC),
+		uintptr(int32(batchCount)),
+	)
+	return blasError("cublasSgemmStridedBatched", status)
 }
 
 // SgemmRowMajor computes c = alpha*a*b + beta*c for row-major float32 matrices

@@ -7,23 +7,25 @@ import (
 )
 
 const convKernelSource = `
-extern "C" __global__ void im2col1d(const float* x, float* col, int channels, int length, int kernel, int dilation) {
+extern "C" __global__ void im2col1d_batched(const float* x, float* col, int batch, int channels, int length, int kernel, int dilation) {
 	int index = blockIdx.x * blockDim.x + threadIdx.x;
-	int total = channels * kernel * length;
-	if (index >= total) return;
+	int per = channels * kernel * length;
+	if (index >= batch * per) return;
 	int t = index % length;
-	int ck = index / length;
+	int ck = (index / length) % (channels * kernel);
+	int b = index / per;
 	int k = ck % kernel;
 	int c = ck / kernel;
 	int src = t - dilation + k * dilation;
 	float value = 0.0f;
-	if (src >= 0 && src < length) value = x[c * length + src];
+	if (src >= 0 && src < length) value = x[(b * channels + c) * length + src];
 	col[index] = value;
 }
-extern "C" __global__ void add_bias_row(float* y, const float* bias, int outChannels, int length) {
+extern "C" __global__ void add_bias_batched(float* y, const float* bias, int batch, int outChannels, int length) {
 	int index = blockIdx.x * blockDim.x + threadIdx.x;
-	if (index >= outChannels * length) return;
-	int o = index / length;
+	int total = batch * outChannels * length;
+	if (index >= total) return;
+	int o = (index / length) % outChannels;
 	y[index] += bias[o];
 }
 `
@@ -43,12 +45,12 @@ func convKernels() (*Kernel, *Kernel, error) {
 			convProgramErr = err
 			return
 		}
-		im2col, err := program.Function("im2col1d")
+		im2col, err := program.Function("im2col1d_batched")
 		if err != nil {
 			convProgramErr = err
 			return
 		}
-		bias, err := program.Function("add_bias_row")
+		bias, err := program.Function("add_bias_batched")
 		if err != nil {
 			convProgramErr = err
 			return
@@ -61,8 +63,8 @@ func convKernels() (*Kernel, *Kernel, error) {
 // Conv1dForward computes a symmetric, dilated same-length convolution for
 // row-major float32 tensors: x [batch,channels,length], weight
 // [outChannels,channels,kernel], bias [outChannels], output
-// [batch,outChannels,length]. Each batch collects its patches with an im2col
-// kernel and multiplies them with cuBLAS.
+// [batch,outChannels,length]. One im2col kernel collects all batches, a
+// strided-batched cuBLAS GEMM multiplies them, and one kernel adds the bias.
 func Conv1dForward(blas *Blas, x, weight, bias, output *Buffer, batch, channels, length, outChannels, kernel, dilation int) error {
 	im2col, addBias, err := convKernels()
 	if err != nil {
@@ -74,36 +76,31 @@ func Conv1dForward(blas *Blas, x, weight, bias, output *Buffer, batch, channels,
 	if blas == nil {
 		return fmt.Errorf("cuda: Conv1dForward requires a cuBLAS handle")
 	}
-	columns, err := Alloc(channels * kernel * length * 4)
+	columnCount := channels * kernel
+	columns, err := Alloc(batch * columnCount * length * 4)
 	if err != nil {
 		return err
 	}
 	defer columns.Free()
 
-	columnCount := channels * kernel
-	im2colGrid := [3]int{(columnCount*length + 255) / 256, 1, 1}
-	biasGrid := [3]int{(outChannels*length + 255) / 256, 1, 1}
-	for b := 0; b < batch; b++ {
-		xOffset := x.Pointer() + uintptr(b*channels*length*4)
-		yOffset := output.Pointer() + uintptr(b*outChannels*length*4)
-		xAddr, colAddr := xOffset, columns.Pointer()
-		c, t, k, d := int32(channels), int32(length), int32(kernel), int32(dilation)
-		im2colArgs := []unsafe.Pointer{
-			unsafe.Pointer(&xAddr), unsafe.Pointer(&colAddr),
-			unsafe.Pointer(&c), unsafe.Pointer(&t), unsafe.Pointer(&k), unsafe.Pointer(&d),
-		}
-		if err := im2col.Launch(im2colGrid, [3]int{256, 1, 1}, 0, nil, im2colArgs); err != nil {
-			return err
-		}
-		if err := blas.SgemmRowMajor(outChannels, length, columnCount, 1, weight.Pointer(), columnCount, columns.Pointer(), length, 0, yOffset, length); err != nil {
-			return err
-		}
-		biasAddr := bias.Pointer()
-		o, l := int32(outChannels), int32(length)
-		biasArgs := []unsafe.Pointer{unsafe.Pointer(&yOffset), unsafe.Pointer(&biasAddr), unsafe.Pointer(&o), unsafe.Pointer(&l)}
-		if err := addBias.Launch(biasGrid, [3]int{256, 1, 1}, 0, nil, biasArgs); err != nil {
-			return err
-		}
+	xAddr, colAddr := x.Pointer(), columns.Pointer()
+	b, c, t, k, d := int32(batch), int32(channels), int32(length), int32(kernel), int32(dilation)
+	im2colArgs := []unsafe.Pointer{
+		unsafe.Pointer(&xAddr), unsafe.Pointer(&colAddr),
+		unsafe.Pointer(&b), unsafe.Pointer(&c), unsafe.Pointer(&t), unsafe.Pointer(&k), unsafe.Pointer(&d),
 	}
-	return nil
+	if err := im2col.Launch(elementGrid(batch*columnCount*length), [3]int{256, 1, 1}, 0, nil, im2colArgs); err != nil {
+		return err
+	}
+	if err := blas.SgemmStridedBatchedRowMajor(batch, outChannels, length, columnCount, 1,
+		weight.Pointer(), columnCount, 0,
+		columns.Pointer(), length, int64(columnCount*length),
+		0,
+		output.Pointer(), length, int64(outChannels*length)); err != nil {
+		return err
+	}
+	yAddr, biasAddr := output.Pointer(), bias.Pointer()
+	o, l := int32(outChannels), int32(length)
+	biasArgs := []unsafe.Pointer{unsafe.Pointer(&yAddr), unsafe.Pointer(&biasAddr), unsafe.Pointer(&b), unsafe.Pointer(&o), unsafe.Pointer(&l)}
+	return addBias.Launch(elementGrid(batch*outChannels*length), [3]int{256, 1, 1}, 0, nil, biasArgs)
 }
