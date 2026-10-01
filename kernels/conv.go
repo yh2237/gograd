@@ -13,13 +13,16 @@ import (
 // column, which removes the per-utterance loop and all layout transposes.
 const convKernelSource = `
 extern "C" __global__ void im2col1d_batched(const float* x, float* col, int batch, int channels, int length, int kernel, int dilation) {
+	// col is [batch*length, channels*kernel]; x is [batch,length,channels].
+	// Consecutive threads walk the channel-tap axis, so both the read of x and
+	// the write of col are contiguous.
 	int index = blockIdx.x * blockDim.x + threadIdx.x;
 	int per = channels * kernel;
-	if (index >= batch * per * length) return;
-	int t = index % length;
-	int tmp = index / length;
-	int b = tmp % batch;
-	int ck = tmp / batch;
+	if (index >= batch * length * per) return;
+	int ck = index % per;
+	int bt = index / per;
+	int t = bt % length;
+	int b = bt / length;
 	int k = ck % kernel;
 	int c = ck / kernel;
 	int src = t - dilation + k * dilation;
@@ -60,7 +63,7 @@ extern "C" __global__ void row_sum(const float* x, float* out, int rows, int col
 	if (sum != 0.0f) atomicAdd(&out[r], sum);
 }
 extern "C" __global__ void col2im1d(const float* col, float* dx, int batch, int channels, int length, int kernel, int dilation) {
-	// col is [channels*kernel, batch*length]; dx is [batch,length,channels].
+	// col is [batch*length, channels*kernel]; dx is [batch,length,channels].
 	int index = blockIdx.x * blockDim.x + threadIdx.x;
 	if (index >= batch * length * channels) return;
 	int c = index % channels;
@@ -68,10 +71,12 @@ extern "C" __global__ void col2im1d(const float* col, float* dx, int batch, int 
 	int t = bt % length;
 	int b = bt / length;
 	float sum = 0.0f;
+	int ck = c * kernel;
+	int stride = channels * kernel;
 	for (int k = 0; k < kernel; k++) {
 		int src = t + dilation - k * dilation;
 		if (src < 0 || src >= length) continue;
-		sum += col[((c * kernel + k) * batch + b) * length + src];
+		sum += col[(b * length + src) * stride + ck + k];
 	}
 	dx[index] += sum;
 }
@@ -209,8 +214,8 @@ func Conv1dForwardTo(blas *cuda.Blas, x, weight, conv, columns *cuda.Buffer, bat
 		return err
 	}
 	columnCount := channels * kernel
-	return blas.SgemmRowMajor(outChannels, batch*length, columnCount, 1,
-		weight.Pointer(), columnCount, columns.Pointer(), batch*length, 0, conv.Pointer(), batch*length)
+	return blas.SgemmRowMajorNT(outChannels, batch*length, columnCount, 1,
+		weight.Pointer(), columnCount, columns.Pointer(), columnCount, 0, conv.Pointer(), batch*length)
 }
 
 // ConvWeightGradGemm accumulates the convolution weight gradient from the
@@ -221,8 +226,8 @@ func ConvWeightGradGemm(blas *cuda.Blas, dy, columns, dw *cuda.Buffer, batch, ch
 		return fmt.Errorf("cuda: ConvWeightGradGemm requires a cuBLAS handle")
 	}
 	columnCount := channels * kernel
-	return blas.SgemmRowMajorNT(outChannels, columnCount, batch*length, 1,
-		dy.Pointer(), batch*length, columns.Pointer(), batch*length, 0, dw.Pointer(), columnCount)
+	return blas.SgemmRowMajor(outChannels, columnCount, batch*length, 1,
+		dy.Pointer(), batch*length, columns.Pointer(), columnCount, 0, dw.Pointer(), columnCount)
 }
 
 // ConvInputGrad accumulates the input gradient from dy [outChannels,
@@ -237,8 +242,8 @@ func ConvInputGrad(blas *cuda.Blas, dy, weight, dx *cuda.Buffer, batch, channels
 		return err
 	}
 	defer columns.Free()
-	if err := blas.SgemmRowMajorTransposeA(columnCount, batch*length, outChannels, 1,
-		weight.Pointer(), columnCount, dy.Pointer(), batch*length, 0, columns.Pointer(), batch*length); err != nil {
+	if err := blas.SgemmRowMajorTransposeA(batch*length, columnCount, outChannels, 1,
+		dy.Pointer(), batch*length, weight.Pointer(), columnCount, 0, columns.Pointer(), columnCount); err != nil {
 		return err
 	}
 	return Col2im(columns, dx, batch, channels, length, kernel, dilation)
