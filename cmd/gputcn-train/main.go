@@ -100,6 +100,7 @@ func main() {
 	seed := flag.Int64("seed", 1, "random seed")
 	out := flag.String("out", "out/gputcn-synthetic.json", "output model JSON")
 	graphMode := flag.Bool("graph", false, "capture the step in a CUDA graph and replay it")
+	profileSteps := flag.Int("profile", 0, "measure GPU time per phase for N steps with CUDA events and exit")
 	flag.Parse()
 
 	if !cuda.Available() {
@@ -179,6 +180,95 @@ func main() {
 
 	stepsCount := float64(*steps)
 	initial := 0.0
+
+	if *profileSteps > 0 {
+		runStep := func() error {
+			cache, err := model.ForwardCached(input, *batch, length)
+			if err != nil {
+				return err
+			}
+			if err := lossBuffer.Memset(0, 4); err != nil {
+				cache.Close()
+				return err
+			}
+			if err := kernels.SequenceLossGrad(cache.Output(), targetBuffer, maskBuffer, gradientBuffer, lossBuffer,
+				*batch, length, totalValid, totalPairs, options.Bounded, options.LowCents, options.HighCents, options.DeltaWeight); err != nil {
+				cache.Close()
+				return err
+			}
+			grads, err := model.Backward(cache, gradientBuffer)
+			cache.Close()
+			if err != nil {
+				return err
+			}
+			err = model.ApplyAdamW(grads, state, *learningRate, 1e-5, 1.0)
+			grads.Close()
+			return err
+		}
+		for i := 0; i < 3; i++ {
+			if err := runStep(); err != nil {
+				fmt.Fprintln(os.Stderr, "warmup:", err)
+				os.Exit(1)
+			}
+		}
+		if err := cuda.Synchronize(); err != nil {
+			fmt.Fprintln(os.Stderr, "sync:", err)
+			os.Exit(1)
+		}
+		events := make([]*cuda.Event, 5)
+		for i := range events {
+			event, err := cuda.NewEvent(true)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "event:", err)
+				os.Exit(1)
+			}
+			events[i] = event
+			defer event.Destroy()
+		}
+		var forwardMS, lossMS, backwardMS, optimMS float64
+		for step := 0; step < *profileSteps; step++ {
+			events[0].Record(nil)
+			cache, err := model.ForwardCached(input, *batch, length)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "forward:", err)
+				os.Exit(1)
+			}
+			events[1].Record(nil)
+			lossBuffer.Memset(0, 4)
+			if err := kernels.SequenceLossGrad(cache.Output(), targetBuffer, maskBuffer, gradientBuffer, lossBuffer,
+				*batch, length, totalValid, totalPairs, options.Bounded, options.LowCents, options.HighCents, options.DeltaWeight); err != nil {
+				fmt.Fprintln(os.Stderr, "loss:", err)
+				os.Exit(1)
+			}
+			events[2].Record(nil)
+			grads, err := model.Backward(cache, gradientBuffer)
+			cache.Close()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "backward:", err)
+				os.Exit(1)
+			}
+			events[3].Record(nil)
+			model.ApplyAdamW(grads, state, *learningRate, 1e-5, 1.0)
+			grads.Close()
+			events[4].Record(nil)
+			if err := cuda.Synchronize(); err != nil {
+				fmt.Fprintln(os.Stderr, "sync:", err)
+				os.Exit(1)
+			}
+			f, _ := cuda.ElapsedTime(events[0], events[1])
+			l, _ := cuda.ElapsedTime(events[1], events[2])
+			b, _ := cuda.ElapsedTime(events[2], events[3])
+			o, _ := cuda.ElapsedTime(events[3], events[4])
+			forwardMS += float64(f)
+			lossMS += float64(l)
+			backwardMS += float64(b)
+			optimMS += float64(o)
+		}
+		n := float64(*profileSteps)
+		fmt.Printf("GPU time per step: forward %.3fms, loss %.3fms, backward %.3fms, adamw %.3fms, total %.3fms\n",
+			forwardMS/n, lossMS/n, backwardMS/n, optimMS/n, (forwardMS+lossMS+backwardMS+optimMS)/n)
+		return
+	}
 
 	if *graphMode {
 		inputBuffer, err := upload(input)

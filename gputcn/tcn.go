@@ -91,6 +91,7 @@ func DownloadFloat32(buffer *cuda.Buffer, count int) ([]float32, error) {
 type layerCache struct {
 	inputChannelMajor *cuda.Buffer // transpose of the layer input [batch,hidden,time]
 	outputActivation  *cuda.Buffer // activation after the residual tanh [batch,time,hidden]
+	columns           *cuda.Buffer // im2col of the layer input [batch,hidden*3,time]
 }
 
 // Cache holds the activations saved by a forward pass for backpropagation.
@@ -233,7 +234,11 @@ func (m *Model) forwardFrom(cache *Cache, input *cuda.Buffer) error {
 		if err != nil {
 			return err
 		}
-		if err := kernels.Conv1dForward(blas, channelMajor, layer.Weight, layer.Bias, convolved, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
+		columns, err := cache.alloc(batch * hidden * 3 * time)
+		if err != nil {
+			return err
+		}
+		if err := kernels.Conv1dForwardTo(blas, channelMajor, layer.Weight, layer.Bias, convolved, columns, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
 			return err
 		}
 		next, err := cache.alloc(batch * time * hidden)
@@ -243,7 +248,7 @@ func (m *Model) forwardFrom(cache *Cache, input *cuda.Buffer) error {
 		if err := kernels.TransposeAddTanh(convolved, state, next, batch, hidden, time); err != nil {
 			return err
 		}
-		cache.layers = append(cache.layers, layerCache{inputChannelMajor: channelMajor, outputActivation: next})
+		cache.layers = append(cache.layers, layerCache{inputChannelMajor: channelMajor, outputActivation: next, columns: columns})
 		state = next
 	}
 
@@ -403,7 +408,7 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 			return fail(err)
 		}
 		grads.Layers[index] = GradientLayer{Weight: weightGrad, Bias: biasGrad}
-		if err := kernels.ConvWeightGrad(cacheLayer.inputChannelMajor, dConvChannel, weightGrad, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
+		if err := kernels.ConvWeightGradGemm(blas, dConvChannel, cacheLayer.columns, weightGrad, batch, hidden, time, hidden, 3); err != nil {
 			return fail(err)
 		}
 		if err := kernels.ConvBiasGrad(dConvChannel, biasGrad, batch, hidden, time); err != nil {

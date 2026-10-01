@@ -61,13 +61,36 @@ func convKernels() (*cuda.Kernel, *cuda.Kernel, error) {
 	return im2colKernel, biasKernel, convProgramErr
 }
 
+// Im2col gathers symmetric dilated patches from x [batch,channels,length] into
+// col [batch,channels*kernel,length].
+func Im2col(x, col *cuda.Buffer, batch, channels, length, kernel, dilation int) error {
+	im2col, _, err := convKernels()
+	if err != nil {
+		return err
+	}
+	xAddr, colAddr := x.Pointer(), col.Pointer()
+	b, c, t, k, d := int32(batch), int32(channels), int32(length), int32(kernel), int32(dilation)
+	args := []unsafe.Pointer{
+		unsafe.Pointer(&xAddr), unsafe.Pointer(&colAddr),
+		unsafe.Pointer(&b), unsafe.Pointer(&c), unsafe.Pointer(&t), unsafe.Pointer(&k), unsafe.Pointer(&d),
+	}
+	return im2col.Launch(elementGrid(batch*channels*kernel*length), [3]int{256, 1, 1}, 0, nil, args)
+}
+
 // Conv1dForward computes a symmetric, dilated same-length convolution for
 // row-major float32 tensors: x [batch,channels,length], weight
 // [outChannels,channels,kernel], bias [outChannels], output
 // [batch,outChannels,length]. One im2col kernel collects all batches, a
 // strided-batched cuBLAS GEMM multiplies them, and one kernel adds the bias.
 func Conv1dForward(blas *cuda.Blas, x, weight, bias, output *cuda.Buffer, batch, channels, length, outChannels, kernel, dilation int) error {
-	im2col, addBias, err := convKernels()
+	return Conv1dForwardTo(blas, x, weight, bias, output, nil, batch, channels, length, outChannels, kernel, dilation)
+}
+
+// Conv1dForwardTo is Conv1dForward with an optional preallocated columns buffer.
+// When columns is not nil the im2col result is kept there, so the weight
+// gradient can reuse it instead of gathering patches again.
+func Conv1dForwardTo(blas *cuda.Blas, x, weight, bias, output, columns *cuda.Buffer, batch, channels, length, outChannels, kernel, dilation int) error {
+	_, addBias, err := convKernels()
 	if err != nil {
 		return err
 	}
@@ -78,19 +101,15 @@ func Conv1dForward(blas *cuda.Blas, x, weight, bias, output *cuda.Buffer, batch,
 		return fmt.Errorf("cuda: Conv1dForward requires a cuBLAS handle")
 	}
 	columnCount := channels * kernel
-	columns, err := cuda.Alloc(batch * columnCount * length * 4)
-	if err != nil {
-		return err
+	if columns == nil {
+		columns, err = cuda.Alloc(batch * columnCount * length * 4)
+		if err != nil {
+			return err
+		}
+		defer columns.Free()
 	}
-	defer columns.Free()
 
-	xAddr, colAddr := x.Pointer(), columns.Pointer()
-	b, c, t, k, d := int32(batch), int32(channels), int32(length), int32(kernel), int32(dilation)
-	im2colArgs := []unsafe.Pointer{
-		unsafe.Pointer(&xAddr), unsafe.Pointer(&colAddr),
-		unsafe.Pointer(&b), unsafe.Pointer(&c), unsafe.Pointer(&t), unsafe.Pointer(&k), unsafe.Pointer(&d),
-	}
-	if err := im2col.Launch(elementGrid(batch*columnCount*length), [3]int{256, 1, 1}, 0, nil, im2colArgs); err != nil {
+	if err := Im2col(x, columns, batch, channels, length, kernel, dilation); err != nil {
 		return err
 	}
 	if err := blas.SgemmStridedBatchedRowMajor(batch, outChannels, length, columnCount, 1,
@@ -101,7 +120,7 @@ func Conv1dForward(blas *cuda.Blas, x, weight, bias, output *cuda.Buffer, batch,
 		return err
 	}
 	yAddr, biasAddr := output.Pointer(), bias.Pointer()
-	o, l := int32(outChannels), int32(length)
+	b, o, l := int32(batch), int32(outChannels), int32(length)
 	biasArgs := []unsafe.Pointer{unsafe.Pointer(&yAddr), unsafe.Pointer(&biasAddr), unsafe.Pointer(&b), unsafe.Pointer(&o), unsafe.Pointer(&l)}
 	return addBias.Launch(elementGrid(batch*outChannels*length), [3]int{256, 1, 1}, 0, nil, biasArgs)
 }

@@ -114,6 +114,9 @@ func (e *Event) Record(stream *Stream) error { return ErrUnavailable }
 // Synchronize returns ErrUnavailable.
 func (e *Event) Synchronize() error { return ErrUnavailable }
 
+// ElapsedTime returns ErrUnavailable.
+func ElapsedTime(start, end *Event) (float32, error) { return 0, ErrUnavailable }
+
 // Destroy returns ErrUnavailable.
 func (e *Event) Destroy() error { return ErrUnavailable }
 
@@ -146,6 +149,11 @@ func (b *Blas) SgemmRowMajorTransposeA(m, n, k int, alpha float32, a uintptr, ld
 
 // SgemmStridedBatchedRowMajor returns ErrUnavailable.
 func (b *Blas) SgemmStridedBatchedRowMajor(batchCount, m, n, k int, alpha float32, a uintptr, lda int, strideA int64, bPtr uintptr, ldb int, strideB int64, beta float32, c uintptr, ldc int, strideC int64) error {
+	return ErrUnavailable
+}
+
+// SgemmStridedBatchedRowMajorNT returns ErrUnavailable.
+func (b *Blas) SgemmStridedBatchedRowMajorNT(batchCount, m, n, k int, alpha float32, a uintptr, lda int, strideA int64, bPtr uintptr, ldb int, strideB int64, beta float32, c uintptr, ldc int, strideC int64) error {
 	return ErrUnavailable
 }
 
