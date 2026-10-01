@@ -68,6 +68,18 @@ Passing `-graph` captures the whole step with `cuda.Capture` and replays it, and
 `-profile N` reports GPU time per phase using CUDA events. Both are
 demonstrations of the engine, not real training recipes.
 
+`gputcn-fit` trains on a prepared dataset (frame features, targets and mask)
+instead of the synthetic corpus:
+
+```
+go run ./cmd/gputcn-fit -write-synthetic out/prepared.json
+go run ./cmd/gputcn-fit -dataset out/prepared.json -epochs 30
+```
+
+The dataset is JSON with `feature_names` and records that store sparse features
+as `rows`, `cols` and `vals`, plus `targets` (cents) and a `mask`. Records are
+split into train and validation by a hash of the id.
+
 To regenerate the PyTorch fixture (requires `torch`):
 
 ```
@@ -95,6 +107,7 @@ go test ./cuda/
 - `gputcn/` — GPU float32 TCN forward, backward and AdamW
 - `cmd/tcn-train` — synthetic CPU training example
 - `cmd/gputcn-train` — synthetic GPU training example with timings
+- `cmd/gputcn-fit` — trains on a prepared dataset
 - `tools/gen_fixture.py` — PyTorch fixture generator
 - `testdata/` — committed fixtures
 

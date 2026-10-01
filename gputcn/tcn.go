@@ -6,6 +6,8 @@ package gputcn
 
 import (
 	"fmt"
+	"math"
+	"math/rand"
 	"runtime"
 	"unsafe"
 
@@ -31,6 +33,52 @@ type Model struct {
 	OutputBias   *cuda.Buffer // [1]
 
 	blas *cuda.Blas
+}
+
+// NewFrameIntonationTCN builds a model with uniformly initialized parameters
+// and returns it. The RNG is local, so runs are reproducible.
+func NewFrameIntonationTCN(inputs, hidden int, dilations []int, seed int64) (*Model, error) {
+	rng := rand.New(rand.NewSource(seed))
+	uniform := func(count, fanIn int) (*cuda.Buffer, error) {
+		values := make([]float32, count)
+		bound := float32(1 / math.Sqrt(float64(fanIn)))
+		for i := range values {
+			values[i] = (rng.Float32()*2 - 1) * bound
+		}
+		return UploadFloat32(values)
+	}
+	model := &Model{Inputs: inputs, Hidden: hidden}
+	var err error
+	if model.InputWeight, err = uniform(hidden*inputs, inputs); err != nil {
+		return nil, err
+	}
+	if model.InputBias, err = uniform(hidden, inputs); err != nil {
+		model.Close()
+		return nil, err
+	}
+	for _, dilation := range dilations {
+		weight, err := uniform(hidden*hidden*3, hidden*3)
+		if err != nil {
+			model.Close()
+			return nil, err
+		}
+		bias, err := uniform(hidden, hidden*3)
+		if err != nil {
+			weight.Free()
+			model.Close()
+			return nil, err
+		}
+		model.Layers = append(model.Layers, Layer{Weight: weight, Bias: bias, Dilation: dilation})
+	}
+	if model.OutputWeight, err = uniform(hidden, hidden); err != nil {
+		model.Close()
+		return nil, err
+	}
+	if model.OutputBias, err = uniform(1, hidden); err != nil {
+		model.Close()
+		return nil, err
+	}
+	return model, nil
 }
 
 // blasHandle returns a cached cuBLAS handle. Creating a handle is comparatively
