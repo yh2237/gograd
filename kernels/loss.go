@@ -1,6 +1,7 @@
-package cuda
+package kernels
 
 import (
+	"github.com/yh2237/gograd/cuda"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -184,14 +185,14 @@ const sequenceLossBlock = 256
 
 var (
 	lossProgramOnce sync.Once
-	lossProgram     *Program
-	lossKernel      *Kernel
+	lossProgram     *cuda.Program
+	lossKernel      *cuda.Kernel
 	lossProgramErr  error
 )
 
-func lossKernels() (*Kernel, error) {
+func lossKernels() (*cuda.Kernel, error) {
 	lossProgramOnce.Do(func() {
-		program, err := Compile(sequenceLossSource)
+		program, err := cuda.Compile(sequenceLossSource)
 		if err != nil {
 			lossProgramErr = err
 			return
@@ -211,11 +212,11 @@ func lossKernels() (*Kernel, error) {
 // totalPairs are the batch-wide masked-element and adjacent-pair counts the
 // reference loss divides by. loss is a one-element buffer and gradient has
 // rows*time floats.
-func SequenceLossGrad(predicted, target, mask, gradient, loss *Buffer, rows, time, totalValid, totalPairs int, bounded bool, low, high, deltaWeight float64) error {
+func SequenceLossGrad(predicted, target, mask, gradient, loss *cuda.Buffer, rows, time, totalValid, totalPairs int, bounded bool, low, high, deltaWeight float64) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	if !InCapture() {
-		_ = SetDevice(0)
+	if !cuda.InCapture() {
+		_ = cuda.SetDevice(0)
 	}
 	kernel, err := lossKernels()
 	if err != nil {

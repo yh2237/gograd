@@ -1,6 +1,7 @@
-package cuda
+package kernels
 
 import (
+	"github.com/yh2237/gograd/cuda"
 	"sync"
 	"unsafe"
 )
@@ -28,27 +29,27 @@ extern "C" __global__ void adamw_update(float* p, const float* g, float* m, floa
 `
 
 type optimKernelSet struct {
-	sumSquares *Kernel
-	sqrtScalar *Kernel
-	adamw      *Kernel
+	sumSquares *cuda.Kernel
+	sqrtScalar *cuda.Kernel
+	adamw      *cuda.Kernel
 }
 
 var (
 	optimProgramOnce sync.Once
-	optimProgram     *Program
+	optimProgram     *cuda.Program
 	optimSet         *optimKernelSet
 	optimErr         error
 )
 
 func optimKernels() (*optimKernelSet, error) {
 	optimProgramOnce.Do(func() {
-		program, err := Compile(optimKernelSource)
+		program, err := cuda.Compile(optimKernelSource)
 		if err != nil {
 			optimErr = err
 			return
 		}
 		set := &optimKernelSet{}
-		for name, target := range map[string]**Kernel{
+		for name, target := range map[string]**cuda.Kernel{
 			"sum_squares":  &set.sumSquares,
 			"sqrt_scalar":  &set.sqrtScalar,
 			"adamw_update": &set.adamw,
@@ -66,7 +67,7 @@ func optimKernels() (*optimKernelSet, error) {
 }
 
 // SumSquares accumulates the sum of x[i]^2 into acc[0].
-func SumSquares(x, acc *Buffer, count int) error {
+func SumSquares(x, acc *cuda.Buffer, count int) error {
 	set, err := optimKernels()
 	if err != nil {
 		return err
@@ -78,7 +79,7 @@ func SumSquares(x, acc *Buffer, count int) error {
 }
 
 // SqrtScalar replaces x[0] with its square root.
-func SqrtScalar(x *Buffer) error {
+func SqrtScalar(x *cuda.Buffer) error {
 	set, err := optimKernels()
 	if err != nil {
 		return err
@@ -90,7 +91,7 @@ func SqrtScalar(x *Buffer) error {
 
 // AdamWUpdate applies one AdamW step to p from g, updating the moment buffers
 // m and v and clipping the gradient by the global norm in norm[0].
-func AdamWUpdate(p, g, m, v, norm *Buffer, count int, beta1, beta2, stepSize, biasCorrection2, weightDecay, eps, maxNorm float32) error {
+func AdamWUpdate(p, g, m, v, norm *cuda.Buffer, count int, beta1, beta2, stepSize, biasCorrection2, weightDecay, eps, maxNorm float32) error {
 	set, err := optimKernels()
 	if err != nil {
 		return err

@@ -10,6 +10,7 @@ import (
 	"unsafe"
 
 	"github.com/yh2237/gograd/cuda"
+	"github.com/yh2237/gograd/kernels"
 )
 
 // Layer is one dilated residual convolution.
@@ -214,7 +215,7 @@ func (m *Model) forwardFrom(cache *Cache, input *cuda.Buffer) error {
 	if err := blas.SgemmRowMajorNT(rows, hidden, m.Inputs, 1, input.Pointer(), m.Inputs, m.InputWeight.Pointer(), m.Inputs, 0, state.Pointer(), hidden); err != nil {
 		return err
 	}
-	if err := cuda.BiasColumnsTanh(state, m.InputBias, rows, hidden); err != nil {
+	if err := kernels.BiasColumnsTanh(state, m.InputBias, rows, hidden); err != nil {
 		return err
 	}
 	cache.inputActivation = state
@@ -225,21 +226,21 @@ func (m *Model) forwardFrom(cache *Cache, input *cuda.Buffer) error {
 		if err != nil {
 			return err
 		}
-		if err := cuda.Transpose12(state, channelMajor, batch, time, hidden); err != nil {
+		if err := kernels.Transpose12(state, channelMajor, batch, time, hidden); err != nil {
 			return err
 		}
 		convolved, err := cache.alloc(batch * hidden * time)
 		if err != nil {
 			return err
 		}
-		if err := cuda.Conv1dForward(blas, channelMajor, layer.Weight, layer.Bias, convolved, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
+		if err := kernels.Conv1dForward(blas, channelMajor, layer.Weight, layer.Bias, convolved, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
 			return err
 		}
 		next, err := cache.alloc(batch * time * hidden)
 		if err != nil {
 			return err
 		}
-		if err := cuda.TransposeAddTanh(convolved, state, next, batch, hidden, time); err != nil {
+		if err := kernels.TransposeAddTanh(convolved, state, next, batch, hidden, time); err != nil {
 			return err
 		}
 		cache.layers = append(cache.layers, layerCache{inputChannelMajor: channelMajor, outputActivation: next})
@@ -253,7 +254,7 @@ func (m *Model) forwardFrom(cache *Cache, input *cuda.Buffer) error {
 	if err := blas.SgemmRowMajorNT(rows, 1, hidden, 1, state.Pointer(), hidden, m.OutputWeight.Pointer(), hidden, 0, output.Pointer(), 1); err != nil {
 		return err
 	}
-	if err := cuda.AddBiasColumns(output, m.OutputBias, rows, 1); err != nil {
+	if err := kernels.AddBiasColumns(output, m.OutputBias, rows, 1); err != nil {
 		return err
 	}
 	// Work stays queued on the stream; later kernels and the final copy are
@@ -360,7 +361,7 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 	if err := blas.SgemmRowMajorTransposeA(1, hidden, rows, 1, dy.Pointer(), 1, lastActivation.Pointer(), hidden, 0, outputWeight.Pointer(), hidden); err != nil {
 		return fail(err)
 	}
-	if err := cuda.ColumnSum(dy, outputBias, rows, 1); err != nil {
+	if err := kernels.ColumnSum(dy, outputBias, rows, 1); err != nil {
 		return fail(err)
 	}
 
@@ -380,7 +381,7 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 		if err != nil {
 			return fail(err)
 		}
-		if err := cuda.TanhBackward(cacheLayer.outputActivation, dA, dZ, rows*hidden); err != nil {
+		if err := kernels.TanhBackward(cacheLayer.outputActivation, dA, dZ, rows*hidden); err != nil {
 			return fail(err)
 		}
 
@@ -390,7 +391,7 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 		if err != nil {
 			return fail(err)
 		}
-		if err := cuda.Transpose12(dZ, dConvChannel, batch, time, hidden); err != nil {
+		if err := kernels.Transpose12(dZ, dConvChannel, batch, time, hidden); err != nil {
 			return fail(err)
 		}
 		weightGrad, err := grads.zeroAlloc(hidden * hidden * 3)
@@ -402,31 +403,31 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 			return fail(err)
 		}
 		grads.Layers[index] = GradientLayer{Weight: weightGrad, Bias: biasGrad}
-		if err := cuda.ConvWeightGrad(cacheLayer.inputChannelMajor, dConvChannel, weightGrad, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
+		if err := kernels.ConvWeightGrad(cacheLayer.inputChannelMajor, dConvChannel, weightGrad, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
 			return fail(err)
 		}
-		if err := cuda.ConvBiasGrad(dConvChannel, biasGrad, batch, hidden, time); err != nil {
+		if err := kernels.ConvBiasGrad(dConvChannel, biasGrad, batch, hidden, time); err != nil {
 			return fail(err)
 		}
 		dInputChannel, err := grads.zeroAlloc(batch * hidden * time)
 		if err != nil {
 			return fail(err)
 		}
-		if err := cuda.ConvInputGrad(blas, dConvChannel, layer.Weight, dInputChannel, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
+		if err := kernels.ConvInputGrad(blas, dConvChannel, layer.Weight, dInputChannel, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
 			return fail(err)
 		}
 		dInputTime, err := grads.alloc(batch * time * hidden)
 		if err != nil {
 			return fail(err)
 		}
-		if err := cuda.Transpose12(dInputChannel, dInputTime, batch, hidden, time); err != nil {
+		if err := kernels.Transpose12(dInputChannel, dInputTime, batch, hidden, time); err != nil {
 			return fail(err)
 		}
 		dAPrev, err := grads.alloc(rows * hidden)
 		if err != nil {
 			return fail(err)
 		}
-		if err := cuda.AddPair(dAPrev, dZ, dInputTime, rows*hidden); err != nil {
+		if err := kernels.AddPair(dAPrev, dZ, dInputTime, rows*hidden); err != nil {
 			return fail(err)
 		}
 		dA = dAPrev
@@ -436,7 +437,7 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 	if err != nil {
 		return fail(err)
 	}
-	if err := cuda.TanhBackward(cache.inputActivation, dA, dZ1, rows*hidden); err != nil {
+	if err := kernels.TanhBackward(cache.inputActivation, dA, dZ1, rows*hidden); err != nil {
 		return fail(err)
 	}
 	inputWeight, err := grads.alloc(hidden * m.Inputs)
@@ -452,7 +453,7 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 	if err := blas.SgemmRowMajorTransposeA(hidden, m.Inputs, rows, 1, dZ1.Pointer(), hidden, cache.input.Pointer(), m.Inputs, 0, inputWeight.Pointer(), m.Inputs); err != nil {
 		return fail(err)
 	}
-	if err := cuda.ColumnSum(dZ1, inputBias, rows, hidden); err != nil {
+	if err := kernels.ColumnSum(dZ1, inputBias, rows, hidden); err != nil {
 		return fail(err)
 	}
 	return grads, nil

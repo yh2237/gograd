@@ -1,6 +1,7 @@
-package cuda
+package kernels
 
 import (
+	"github.com/yh2237/gograd/cuda"
 	"sync"
 	"unsafe"
 )
@@ -43,29 +44,29 @@ extern "C" __global__ void transpose_add_tanh(const float* conv, const float* st
 `
 
 type opsKernelSet struct {
-	addTanh          *Kernel
-	biasTanh         *Kernel
-	biasColumn       *Kernel
-	transpose        *Kernel
-	transposeAddTanh *Kernel
+	addTanh          *cuda.Kernel
+	biasTanh         *cuda.Kernel
+	biasColumn       *cuda.Kernel
+	transpose        *cuda.Kernel
+	transposeAddTanh *cuda.Kernel
 }
 
 var (
 	opsProgramOnce sync.Once
-	opsProgram     *Program
+	opsProgram     *cuda.Program
 	opsSet         *opsKernelSet
 	opsProgramErr  error
 )
 
 func opsKernels() (*opsKernelSet, error) {
 	opsProgramOnce.Do(func() {
-		program, err := Compile(opsKernelSource)
+		program, err := cuda.Compile(opsKernelSource)
 		if err != nil {
 			opsProgramErr = err
 			return
 		}
 		set := &opsKernelSet{}
-		for name, target := range map[string]**Kernel{
+		for name, target := range map[string]**cuda.Kernel{
 			"add_tanh":           &set.addTanh,
 			"bias_columns_tanh":  &set.biasTanh,
 			"add_bias_columns":   &set.biasColumn,
@@ -89,7 +90,7 @@ func elementGrid(count int) [3]int {
 }
 
 // AddTanh writes tanh(a+b) elementwise for equal-length buffers.
-func AddTanh(a, b, out *Buffer, count int) error {
+func AddTanh(a, b, out *cuda.Buffer, count int) error {
 	set, err := opsKernels()
 	if err != nil {
 		return err
@@ -102,7 +103,7 @@ func AddTanh(a, b, out *Buffer, count int) error {
 
 // BiasColumnsTanh adds a per-column bias and applies tanh to a [rows,cols]
 // row-major matrix.
-func BiasColumnsTanh(y, bias *Buffer, rows, cols int) error {
+func BiasColumnsTanh(y, bias *cuda.Buffer, rows, cols int) error {
 	set, err := opsKernels()
 	if err != nil {
 		return err
@@ -114,7 +115,7 @@ func BiasColumnsTanh(y, bias *Buffer, rows, cols int) error {
 }
 
 // AddBiasColumns adds a per-column bias to a [rows,cols] row-major matrix.
-func AddBiasColumns(y, bias *Buffer, rows, cols int) error {
+func AddBiasColumns(y, bias *cuda.Buffer, rows, cols int) error {
 	set, err := opsKernels()
 	if err != nil {
 		return err
@@ -127,7 +128,7 @@ func AddBiasColumns(y, bias *Buffer, rows, cols int) error {
 
 // TransposeAddTanh writes tanh(state + transpose(conv)), where conv is
 // [batch,channels,length] and state and out are [batch,length,channels].
-func TransposeAddTanh(conv, state, out *Buffer, batch, channels, length int) error {
+func TransposeAddTanh(conv, state, out *cuda.Buffer, batch, channels, length int) error {
 	set, err := opsKernels()
 	if err != nil {
 		return err
@@ -140,7 +141,7 @@ func TransposeAddTanh(conv, state, out *Buffer, batch, channels, length int) err
 }
 
 // Transpose12 swaps the last two dimensions of a contiguous [d0,d1,d2] tensor.
-func Transpose12(x, out *Buffer, d0, d1, d2 int) error {
+func Transpose12(x, out *cuda.Buffer, d0, d1, d2 int) error {
 	set, err := opsKernels()
 	if err != nil {
 		return err

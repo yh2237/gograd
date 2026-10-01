@@ -1,7 +1,8 @@
-package cuda
+package kernels
 
 import (
 	"fmt"
+	"github.com/yh2237/gograd/cuda"
 	"sync"
 	"unsafe"
 )
@@ -32,15 +33,15 @@ extern "C" __global__ void add_bias_batched(float* y, const float* bias, int bat
 
 var (
 	convProgramOnce sync.Once
-	convProgram     *Program
-	im2colKernel    *Kernel
-	biasKernel      *Kernel
+	convProgram     *cuda.Program
+	im2colKernel    *cuda.Kernel
+	biasKernel      *cuda.Kernel
 	convProgramErr  error
 )
 
-func convKernels() (*Kernel, *Kernel, error) {
+func convKernels() (*cuda.Kernel, *cuda.Kernel, error) {
 	convProgramOnce.Do(func() {
-		program, err := Compile(convKernelSource)
+		program, err := cuda.Compile(convKernelSource)
 		if err != nil {
 			convProgramErr = err
 			return
@@ -65,7 +66,7 @@ func convKernels() (*Kernel, *Kernel, error) {
 // [outChannels,channels,kernel], bias [outChannels], output
 // [batch,outChannels,length]. One im2col kernel collects all batches, a
 // strided-batched cuBLAS GEMM multiplies them, and one kernel adds the bias.
-func Conv1dForward(blas *Blas, x, weight, bias, output *Buffer, batch, channels, length, outChannels, kernel, dilation int) error {
+func Conv1dForward(blas *cuda.Blas, x, weight, bias, output *cuda.Buffer, batch, channels, length, outChannels, kernel, dilation int) error {
 	im2col, addBias, err := convKernels()
 	if err != nil {
 		return err
@@ -77,7 +78,7 @@ func Conv1dForward(blas *Blas, x, weight, bias, output *Buffer, batch, channels,
 		return fmt.Errorf("cuda: Conv1dForward requires a cuBLAS handle")
 	}
 	columnCount := channels * kernel
-	columns, err := Alloc(batch * columnCount * length * 4)
+	columns, err := cuda.Alloc(batch * columnCount * length * 4)
 	if err != nil {
 		return err
 	}

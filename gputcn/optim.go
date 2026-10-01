@@ -5,6 +5,7 @@ import (
 	"runtime"
 
 	"github.com/yh2237/gograd/cuda"
+	"github.com/yh2237/gograd/kernels"
 )
 
 // Parameters lists the device parameters in a stable order.
@@ -104,11 +105,11 @@ func (m *Model) ApplyAdamW(grads *Gradients, state *AdamState, learningRate, wei
 		return err
 	}
 	for _, gradient := range gradientBuffers {
-		if err := cuda.SumSquares(gradient, state.norm, gradient.Size()/4); err != nil {
+		if err := kernels.SumSquares(gradient, state.norm, gradient.Size()/4); err != nil {
 			return err
 		}
 	}
-	if err := cuda.SqrtScalar(state.norm); err != nil {
+	if err := kernels.SqrtScalar(state.norm); err != nil {
 		return err
 	}
 	state.step++
@@ -116,7 +117,7 @@ func (m *Model) ApplyAdamW(grads *Gradients, state *AdamState, learningRate, wei
 	biasCorrection2 := 1 - math.Pow(0.999, float64(state.step))
 	stepSize := float32(learningRate / biasCorrection1)
 	for i, param := range params {
-		if err := cuda.AdamWUpdate(param, gradientBuffers[i], state.m[i], state.v[i], state.norm, param.Size()/4,
+		if err := kernels.AdamWUpdate(param, gradientBuffers[i], state.m[i], state.v[i], state.norm, param.Size()/4,
 			0.9, 0.999, stepSize, float32(biasCorrection2), float32(learningRate*weightDecay), 1e-8, float32(maxNorm)); err != nil {
 			return err
 		}

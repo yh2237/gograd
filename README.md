@@ -82,7 +82,8 @@ go test ./cuda/
 - `model.go` — `FrameIntonationTCN`
 - `optim.go` — AdamW and gradient clipping
 - `export.go` — runtime JSON layout
-- `cuda/` — CUDA runtime, cuBLAS and NVRTC binding
+- `cuda/` — CUDA runtime, cuBLAS and NVRTC binding, streams and graph capture
+- `kernels/` — custom GPU kernels (activation, convolution, loss, AdamW) on top of `cuda`
 - `gputcn/` — GPU float32 TCN forward, backward and AdamW
 - `cmd/tcn-train` — synthetic CPU training example
 - `cmd/gputcn-train` — synthetic GPU training example with timings

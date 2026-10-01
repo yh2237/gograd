@@ -15,6 +15,7 @@ import (
 
 	"github.com/yh2237/gograd/cuda"
 	"github.com/yh2237/gograd/gputcn"
+	"github.com/yh2237/gograd/kernels"
 )
 
 func syntheticData(rng *rand.Rand, count, inputs, maxTime int) ([][]float32, [][]float64, [][]bool) {
@@ -195,7 +196,7 @@ func main() {
 				cache.Close()
 				return err
 			}
-			if err := cuda.SequenceLossGrad(cache.Output(), targetBuffer, maskBuffer, gradientBuffer, lossBuffer,
+			if err := kernels.SequenceLossGrad(cache.Output(), targetBuffer, maskBuffer, gradientBuffer, lossBuffer,
 				*batch, length, totalValid, totalPairs, options.Bounded, options.LowCents, options.HighCents, options.DeltaWeight); err != nil {
 				cache.Close()
 				return err
@@ -284,7 +285,7 @@ func main() {
 				fmt.Fprintln(os.Stderr, "loss reset:", err)
 				os.Exit(1)
 			}
-			if err := cuda.SequenceLossGrad(cache.Output(), targetBuffer, maskBuffer, gradientBuffer, lossBuffer,
+			if err := kernels.SequenceLossGrad(cache.Output(), targetBuffer, maskBuffer, gradientBuffer, lossBuffer,
 				*batch, length, totalValid, totalPairs, options.Bounded, options.LowCents, options.HighCents, options.DeltaWeight); err != nil {
 				fmt.Fprintln(os.Stderr, "loss:", err)
 				os.Exit(1)

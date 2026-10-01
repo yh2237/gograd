@@ -1,7 +1,8 @@
-package cuda
+package kernels
 
 import (
 	"fmt"
+	"github.com/yh2237/gograd/cuda"
 	"sync"
 	"unsafe"
 )
@@ -79,31 +80,31 @@ extern "C" __global__ void col2im1d(const float* col, float* dx, int batch, int 
 `
 
 type backwardKernelSet struct {
-	tanhBackward   *Kernel
-	addInto        *Kernel
-	addPair        *Kernel
-	columnSum      *Kernel
-	convBiasGrad   *Kernel
-	convWeightGrad *Kernel
-	col2im         *Kernel
+	tanhBackward   *cuda.Kernel
+	addInto        *cuda.Kernel
+	addPair        *cuda.Kernel
+	columnSum      *cuda.Kernel
+	convBiasGrad   *cuda.Kernel
+	convWeightGrad *cuda.Kernel
+	col2im         *cuda.Kernel
 }
 
 var (
 	backwardProgramOnce sync.Once
-	backwardProgram     *Program
+	backwardProgram     *cuda.Program
 	backwardSet         *backwardKernelSet
 	backwardErr         error
 )
 
 func backwardKernels() (*backwardKernelSet, error) {
 	backwardProgramOnce.Do(func() {
-		program, err := Compile(backwardKernelSource)
+		program, err := cuda.Compile(backwardKernelSource)
 		if err != nil {
 			backwardErr = err
 			return
 		}
 		set := &backwardKernelSet{}
-		for name, target := range map[string]**Kernel{
+		for name, target := range map[string]**cuda.Kernel{
 			"tanh_backward":    &set.tanhBackward,
 			"add_into":         &set.addInto,
 			"add_pair":         &set.addPair,
@@ -133,7 +134,7 @@ func int32Args(values ...int32) []unsafe.Pointer {
 }
 
 // TanhBackward accumulates dout*(1-a^2) into din.
-func TanhBackward(a, dout, din *Buffer, count int) error {
+func TanhBackward(a, dout, din *cuda.Buffer, count int) error {
 	set, err := backwardKernels()
 	if err != nil {
 		return err
@@ -145,7 +146,7 @@ func TanhBackward(a, dout, din *Buffer, count int) error {
 }
 
 // AddInto accumulates src into dst elementwise.
-func AddInto(dst, src *Buffer, count int) error {
+func AddInto(dst, src *cuda.Buffer, count int) error {
 	set, err := backwardKernels()
 	if err != nil {
 		return err
@@ -158,7 +159,7 @@ func AddInto(dst, src *Buffer, count int) error {
 
 // AddPair writes dst = a + b elementwise. Unlike AddInto it needs no zeroed
 // destination, so it replaces a copy plus an accumulate.
-func AddPair(dst, a, b *Buffer, count int) error {
+func AddPair(dst, a, b *cuda.Buffer, count int) error {
 	set, err := backwardKernels()
 	if err != nil {
 		return err
@@ -171,7 +172,7 @@ func AddPair(dst, a, b *Buffer, count int) error {
 
 // ColumnSum accumulates out[c] += sum_r x[r,c] for a [rows,cols] matrix. out
 // must be zero before the call.
-func ColumnSum(x, out *Buffer, rows, cols int) error {
+func ColumnSum(x, out *cuda.Buffer, rows, cols int) error {
 	set, err := backwardKernels()
 	if err != nil {
 		return err
@@ -190,7 +191,7 @@ func ColumnSum(x, out *Buffer, rows, cols int) error {
 }
 
 // ConvBiasGrad accumulates sum of dy into db[outChannels].
-func ConvBiasGrad(dy, db *Buffer, batch, outChannels, length int) error {
+func ConvBiasGrad(dy, db *cuda.Buffer, batch, outChannels, length int) error {
 	set, err := backwardKernels()
 	if err != nil {
 		return err
@@ -202,7 +203,7 @@ func ConvBiasGrad(dy, db *Buffer, batch, outChannels, length int) error {
 }
 
 // ConvWeightGrad accumulates the convolution weight gradient.
-func ConvWeightGrad(x, dy, dw *Buffer, batch, channels, length, outChannels, kernel, dilation int) error {
+func ConvWeightGrad(x, dy, dw *cuda.Buffer, batch, channels, length, outChannels, kernel, dilation int) error {
 	set, err := backwardKernels()
 	if err != nil {
 		return err
@@ -216,7 +217,7 @@ func ConvWeightGrad(x, dy, dw *Buffer, batch, channels, length, outChannels, ker
 // ConvInputGrad accumulates the convolution gradient with respect to its input.
 // It forms the per-patch gradient dCol = W^T*dY with one strided-batched GEMM
 // and scatters it with col2im, instead of reading dY once per output.
-func ConvInputGrad(blas *Blas, dy, weight, dx *Buffer, batch, channels, length, outChannels, kernel, dilation int) error {
+func ConvInputGrad(blas *cuda.Blas, dy, weight, dx *cuda.Buffer, batch, channels, length, outChannels, kernel, dilation int) error {
 	set, err := backwardKernels()
 	if err != nil {
 		return err
@@ -225,7 +226,7 @@ func ConvInputGrad(blas *Blas, dy, weight, dx *Buffer, batch, channels, length, 
 		return fmt.Errorf("cuda: ConvInputGrad requires a cuBLAS handle")
 	}
 	columnCount := channels * kernel
-	columns, err := Alloc(batch * columnCount * length * 4)
+	columns, err := cuda.Alloc(batch * columnCount * length * 4)
 	if err != nil {
 		return err
 	}

@@ -7,6 +7,7 @@ import (
 
 	"github.com/yh2237/gograd"
 	"github.com/yh2237/gograd/cuda"
+	"github.com/yh2237/gograd/kernels"
 )
 
 func countMasked(mask [][]bool) (int, int) {
@@ -85,7 +86,7 @@ func TestSequenceLossGradGPU(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := cuda.SequenceLossGrad(predictedBuffer, targetBuffer, maskBuffer, gradientBuffer, lossBuffer, rows, time, valid, pairs, true, -250, 250, 0.35); err != nil {
+	if err := kernels.SequenceLossGrad(predictedBuffer, targetBuffer, maskBuffer, gradientBuffer, lossBuffer, rows, time, valid, pairs, true, -250, 250, 0.35); err != nil {
 		t.Fatal(err)
 	}
 	if err := cuda.Synchronize(); err != nil {
@@ -143,7 +144,7 @@ func TestSequenceLossGradGPUSimple(t *testing.T) {
 	if err := lossBuffer.Memset(0, 4); err != nil {
 		t.Fatal(err)
 	}
-	if err := cuda.SequenceLossGrad(predictedBuffer, targetBuffer, maskBuffer, gradientBuffer, lossBuffer, rows, time, 4, 3, false, 0, 0, 0); err != nil {
+	if err := kernels.SequenceLossGrad(predictedBuffer, targetBuffer, maskBuffer, gradientBuffer, lossBuffer, rows, time, 4, 3, false, 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := cuda.Synchronize(); err != nil {
