@@ -170,7 +170,7 @@ func RowSum(x, out *cuda.Buffer, rows, cols int) error {
 	}
 	chunks := 1
 	if cols > 1 {
-		chunks = 64
+		chunks = 256
 		if chunks > cols {
 			chunks = cols
 		}
