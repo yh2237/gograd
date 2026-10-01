@@ -129,6 +129,52 @@ func main() {
 	state := gputcn.NewAdamState()
 	rows := *batch * length
 
+	targetF32 := make([]float32, rows)
+	for i, value := range target {
+		targetF32[i] = float32(value)
+	}
+	targetBuffer, err := upload(targetF32)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "upload target:", err)
+		os.Exit(1)
+	}
+	defer targetBuffer.Free()
+	maskBytes := make([]byte, rows)
+	totalValid, totalPairs := 0, 0
+	for r := 0; r < *batch; r++ {
+		for c := 0; c < length; c++ {
+			if maskBatch[r][c] {
+				maskBytes[r*length+c] = 1
+				totalValid++
+			}
+			if c > 0 && maskBatch[r][c-1] && maskBatch[r][c] {
+				totalPairs++
+			}
+		}
+	}
+	maskBuffer, err := cuda.Alloc(rows)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "alloc mask:", err)
+		os.Exit(1)
+	}
+	defer maskBuffer.Free()
+	if err := maskBuffer.CopyFromHost(maskBytes); err != nil {
+		fmt.Fprintln(os.Stderr, "upload mask:", err)
+		os.Exit(1)
+	}
+	gradientBuffer, err := cuda.Alloc(rows * 4)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "alloc gradient:", err)
+		os.Exit(1)
+	}
+	defer gradientBuffer.Free()
+	lossBuffer, err := cuda.Alloc(4)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "alloc loss:", err)
+		os.Exit(1)
+	}
+	defer lossBuffer.Free()
+
 	var forwardTime, lossTime, backwardTime, optimTime time.Duration
 	initial := 0.0
 	for step := 0; step < *steps; step++ {
@@ -141,26 +187,28 @@ func main() {
 		forwardTime += time.Since(start)
 
 		start = time.Now()
-		predicted, err := gputcn.DownloadFloat32(cache.Output(), rows)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "download:", err)
+		if err := lossBuffer.Memset(0, 4); err != nil {
+			fmt.Fprintln(os.Stderr, "loss reset:", err)
 			os.Exit(1)
 		}
-		loss, gradient := gputcn.LossGrad(predicted, target, maskBatch, options)
+		if err := cuda.SequenceLossGrad(cache.Output(), targetBuffer, maskBuffer, gradientBuffer, lossBuffer,
+			*batch, length, totalValid, totalPairs, options.Bounded, options.LowCents, options.HighCents, options.DeltaWeight); err != nil {
+			fmt.Fprintln(os.Stderr, "loss:", err)
+			os.Exit(1)
+		}
+		lossValues, err := gputcn.DownloadFloat32(lossBuffer, 1)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "loss download:", err)
+			os.Exit(1)
+		}
 		lossTime += time.Since(start)
 		if step == 0 {
-			initial = loss
+			initial = float64(lossValues[0])
 		}
 
 		start = time.Now()
-		dy, err := upload(gradient)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "upload:", err)
-			os.Exit(1)
-		}
-		grads, err := model.Backward(cache, dy)
+		grads, err := model.Backward(cache, gradientBuffer)
 		cache.Close()
-		dy.Free()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "backward:", err)
 			os.Exit(1)
@@ -176,7 +224,7 @@ func main() {
 		grads.Close()
 
 		if step%20 == 0 || step == *steps-1 {
-			fmt.Printf("step %3d/%d: loss=%.4f\n", step, *steps, loss)
+			fmt.Printf("step %3d/%d: loss=%.4f\n", step, *steps, lossValues[0])
 		}
 	}
 

@@ -26,10 +26,11 @@ returns that memory to the driver. On other platforms every call reports
 
 The `gputcn` package runs the TCN forward and backward passes on the GPU in
 float32. The forward output matches the PyTorch float64 reference to about
-5e-08 and the parameter gradients to about 1e-05. AdamW, including the global
-norm clip, runs on the GPU; the loss runs in Go on the host through `LossGrad`,
-which mirrors the CPU `SequenceLoss`. A GPU training loop reduces the synthetic
-loss while the heavy linear algebra stays on the GPU.
+5e-08 and the parameter gradients to about 1e-05. The loss and AdamW, including
+the global norm clip, run on the GPU. `SequenceLossGrad` reproduces the CPU
+`SequenceLoss` (per-row median centering, clamped target, Smooth L1 and the
+delta term) with one block per row, and is checked against `LossGrad`. A GPU
+training loop reduces the synthetic loss.
 
 ## Verification
 
