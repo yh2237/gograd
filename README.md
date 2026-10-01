@@ -64,8 +64,9 @@ go test ./gputcn/ -run XXX -bench .
 `tcn-train` fits a tiny synthetic corpus on the CPU and writes
 `out/synthetic-tcn.json`. `gputcn-train` does the same with the GPU forward and
 backward passes, prints per-phase timings, and writes `out/gputcn-synthetic.json`.
-Passing `-graph` captures the whole step with `cuda.Capture` and replays it.
-Both are demonstrations of the engine, not real training recipes.
+Passing `-graph` captures the whole step with `cuda.Capture` and replays it, and
+`-profile N` reports GPU time per phase using CUDA events. Both are
+demonstrations of the engine, not real training recipes.
 
 To regenerate the PyTorch fixture (requires `torch`):
 
