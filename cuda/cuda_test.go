@@ -393,6 +393,84 @@ func TestConv1dForward(t *testing.T) {
 	}
 }
 
+func TestGraphCapture(t *testing.T) {
+	if !Available() {
+		t.Skip("cuda unavailable:", loadErrorText())
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := SetDevice(0); err != nil {
+		t.Fatal(err)
+	}
+	const n = 1024
+	aHost := make([]float32, n)
+	bHost := make([]float32, n)
+	for i := 0; i < n; i++ {
+		aHost[i] = 1
+		bHost[i] = 2
+	}
+	a := upload(t, aHost)
+	b := upload(t, bHost)
+	out := upload(t, make([]float32, n))
+	defer a.Free()
+	defer b.Free()
+	defer out.Free()
+
+	stream, err := NewStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Destroy()
+	if err := AddPair(out, a, b, n); err != nil {
+		t.Fatal(err)
+	}
+	if err := Synchronize(); err != nil {
+		t.Fatal(err)
+	}
+
+	graph, err := Capture(stream, func() error {
+		return AddPair(out, a, b, n)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+
+	if err := graph.Launch(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Synchronize(); err != nil {
+		t.Fatal(err)
+	}
+	got := download(t, out, n)
+	for i := range got {
+		if got[i] != 3 {
+			t.Fatalf("replay[%d]: got %v want 3", i, got[i])
+		}
+	}
+
+	// The graph reads the buffers at replay time, so changing an input shows up
+	// on the next launch.
+	for i := 0; i < n; i++ {
+		aHost[i] = 5
+	}
+	if err := a.CopyFromHost(floatsToBytes(aHost)); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Launch(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Synchronize(); err != nil {
+		t.Fatal(err)
+	}
+	got = download(t, out, n)
+	for i := range got {
+		if got[i] != 7 {
+			t.Fatalf("replay after update[%d]: got %v want 7", i, got[i])
+		}
+	}
+}
+
 func loadErrorText() string {
 	if _, err := DeviceCount(); err != nil {
 		return err.Error()

@@ -29,6 +29,13 @@ type kernelAPI struct {
 	moduleGetFunction *syscall.Proc
 	moduleUnload      *syscall.Proc
 	launchKernel      *syscall.Proc
+
+	streamBeginCapture *syscall.Proc
+	streamEndCapture   *syscall.Proc
+	graphInstantiate   *syscall.Proc
+	graphLaunch        *syscall.Proc
+	graphExecDestroy   *syscall.Proc
+	graphDestroy       *syscall.Proc
 }
 
 var (
@@ -73,6 +80,18 @@ func loadKernelAPI() (*kernelAPI, error) {
 			kernelErr = fmt.Errorf("%w: %v", ErrUnavailable, err)
 			return
 		}
+		graphProcs, err := findProcsAny(driver, [][]string{
+			{"cuStreamBeginCapture_v2", "cuStreamBeginCapture"},
+			{"cuStreamEndCapture"},
+			{"cuGraphInstantiateWithFlags", "cuGraphInstantiate"},
+			{"cuGraphLaunch"},
+			{"cuGraphExecDestroy"},
+			{"cuGraphDestroy"},
+		})
+		if err != nil {
+			kernelErr = fmt.Errorf("%w: %v", ErrUnavailable, err)
+			return
+		}
 		kernelInst = &kernelAPI{
 			nvrtc: nvrtc, driver: driver,
 			createProgram: nvrtcProcs[0], compileProgram: nvrtcProcs[1],
@@ -80,6 +99,9 @@ func loadKernelAPI() (*kernelAPI, error) {
 			getLogSize: nvrtcProcs[4], getLog: nvrtcProcs[5], destroyProgram: nvrtcProcs[6],
 			moduleLoadData: driverProcs[0], moduleGetFunction: driverProcs[1],
 			moduleUnload: driverProcs[2], launchKernel: driverProcs[3],
+			streamBeginCapture: graphProcs[0], streamEndCapture: graphProcs[1],
+			graphInstantiate: graphProcs[2], graphLaunch: graphProcs[3],
+			graphExecDestroy: graphProcs[4], graphDestroy: graphProcs[5],
 		}
 	})
 	return kernelInst, kernelErr
@@ -253,7 +275,7 @@ func (k *Kernel) Launch(grid, block [3]int, sharedMemory int, stream *Stream, ar
 	if err != nil {
 		return err
 	}
-	var streamHandle uintptr
+	streamHandle := currentStream
 	if stream != nil {
 		streamHandle = stream.handle
 	}

@@ -54,6 +54,21 @@ func (b *Buffer) Free() error { return ErrUnavailable }
 // ReleasePool returns nil on this platform.
 func ReleasePool() error { return nil }
 
+// SetCurrentStream does nothing on this platform.
+func SetCurrentStream(s *Stream) {}
+
+// Graph is a captured sequence of GPU work.
+type Graph struct{ exec uintptr }
+
+// Capture returns ErrUnavailable.
+func Capture(stream *Stream, fn func() error) (*Graph, error) { return nil, ErrUnavailable }
+
+// Launch returns ErrUnavailable.
+func (g *Graph) Launch() error { return ErrUnavailable }
+
+// Close returns ErrUnavailable.
+func (g *Graph) Close() error { return ErrUnavailable }
+
 // Pointer returns the raw device address.
 func (b *Buffer) Pointer() uintptr { return 0 }
 

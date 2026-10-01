@@ -104,6 +104,29 @@ func findProcs(dll *syscall.DLL, names ...string) ([]*syscall.Proc, error) {
 	return procs, nil
 }
 
+// findProcsAny resolves each entry to the first available of its alternative
+// symbol names, which handles APIs that changed suffix across CUDA versions.
+func findProcsAny(dll *syscall.DLL, alternatives [][]string) ([]*syscall.Proc, error) {
+	procs := make([]*syscall.Proc, len(alternatives))
+	for i, names := range alternatives {
+		var found *syscall.Proc
+		var lastErr error
+		for _, name := range names {
+			proc, err := dll.FindProc(name)
+			if err == nil {
+				found = proc
+				break
+			}
+			lastErr = err
+		}
+		if found == nil {
+			return nil, lastErr
+		}
+		procs[i] = found
+	}
+	return procs, nil
+}
+
 func load() (*api, error) {
 	loadOnce.Do(func() {
 		runtimeNames := libraryCandidates("cudart64_13.dll")
