@@ -22,10 +22,11 @@ queries, device buffers with explicit `Free`, streams, events, a row-major
 kernels loaded through the CUDA driver. On other platforms every call reports
 `ErrUnavailable`.
 
-The `gputcn` package runs the TCN forward pass on the GPU in float32. Its output
-matches the PyTorch float64 reference to about 5e-08. Backpropagation, the loss
-and the optimizer are not implemented on the GPU yet, so GPU training is not
-available.
+The `gputcn` package runs the TCN forward and backward passes on the GPU in
+float32. The forward output matches the PyTorch float64 reference to about
+5e-08 and the parameter gradients to about 1e-05. The loss uses the CPU engine
+on the host and AdamW runs in Go on the host, so a GPU training loop reduces the
+synthetic loss while the heavy linear algebra stays on the GPU.
 
 ## Verification
 
@@ -72,14 +73,15 @@ go test ./cuda/
 - `optim.go` — AdamW and gradient clipping
 - `export.go` — runtime JSON layout
 - `cuda/` — CUDA runtime, cuBLAS and NVRTC binding
-- `gputcn/` — GPU float32 TCN forward pass
+- `gputcn/` — GPU float32 TCN forward, backward and AdamW
 - `cmd/tcn-train` — synthetic training example
 - `tools/gen_fixture.py` — PyTorch fixture generator
 - `testdata/` — committed fixtures
 
 ## Not present in this code
 
-GPU execution inside the engine, float32 training, AMP, arbitrary
+A general GPU tensor type integrated with the autograd engine; the GPU path is
+specific to the TCN. Also absent: float32 training on the CPU, AMP, arbitrary
 strides/broadcasting, additional models, and loading other frameworks'
 checkpoints.
 
