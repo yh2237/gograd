@@ -89,7 +89,7 @@ func (s *AdamState) ensure(params []*cuda.Buffer) error {
 func (m *Model) ApplyAdamW(grads *Gradients, state *AdamState, learningRate, weightDecay, maxNorm float64) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	if err := cuda.SetDevice(0); err != nil {
+	if err := m.ensureDevice(); err != nil {
 		return err
 	}
 	params := m.Parameters()

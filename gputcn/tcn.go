@@ -135,44 +135,87 @@ func (c *Cache) zeroAlloc(count int) (*cuda.Buffer, error) {
 	return buffer, nil
 }
 
-// ForwardCached runs the model and keeps the activations needed for Backward.
+// ensureDevice makes the CUDA context current unless a capture is in progress,
+// which forbids setting the device.
+func (m *Model) ensureDevice() error {
+	if cuda.InCapture() {
+		return nil
+	}
+	return cuda.SetDevice(0)
+}
+
+// SetStream binds the cached cuBLAS handle to a stream, as graph capture
+// requires.
+func (m *Model) SetStream(stream *cuda.Stream) error {
+	blas, err := m.blasHandle()
+	if err != nil {
+		return err
+	}
+	return blas.SetStream(stream)
+}
+
+// ForwardCached runs the model on x and keeps the activations for Backward.
 func (m *Model) ForwardCached(x []float32, batch, time int) (*Cache, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	if err := cuda.SetDevice(0); err != nil {
+	if err := m.ensureDevice(); err != nil {
 		return nil, err
 	}
-	blas, err := m.blasHandle()
-	if err != nil {
-		return nil, err
-	}
-
 	cache := &Cache{rows: batch * time, batch: batch, time: time}
-	fail := func(err error) (*Cache, error) {
+	input, err := cache.alloc(cache.rows * m.Inputs)
+	if err != nil {
 		cache.Close()
 		return nil, err
 	}
-	rows := cache.rows
-	hidden := m.Hidden
+	if err := input.CopyFromHost(floatsToBytes(x)); err != nil {
+		cache.Close()
+		return nil, err
+	}
+	if err := m.forwardFrom(cache, input); err != nil {
+		cache.Close()
+		return nil, err
+	}
+	return cache, nil
+}
 
-	input, err := cache.alloc(rows * m.Inputs)
+// ForwardCachedDevice is ForwardCached with a caller-owned input buffer, so a
+// captured graph can read an input the host updates between launches.
+func (m *Model) ForwardCachedDevice(input *cuda.Buffer, batch, time int) (*Cache, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := m.ensureDevice(); err != nil {
+		return nil, err
+	}
+	cache := &Cache{rows: batch * time, batch: batch, time: time}
+	if input.Size() < cache.rows*m.Inputs*4 {
+		return nil, fmt.Errorf("gputcn: input buffer is too small")
+	}
+	if err := m.forwardFrom(cache, input); err != nil {
+		cache.Close()
+		return nil, err
+	}
+	return cache, nil
+}
+
+func (m *Model) forwardFrom(cache *Cache, input *cuda.Buffer) error {
+	blas, err := m.blasHandle()
 	if err != nil {
-		return fail(err)
+		return err
 	}
 	cache.input = input
-	if err := input.CopyFromHost(floatsToBytes(x)); err != nil {
-		return fail(err)
-	}
+	rows := cache.rows
+	hidden := m.Hidden
+	batch, time := cache.batch, cache.time
 
 	state, err := cache.alloc(rows * hidden)
 	if err != nil {
-		return fail(err)
+		return err
 	}
 	if err := blas.SgemmRowMajorNT(rows, hidden, m.Inputs, 1, input.Pointer(), m.Inputs, m.InputWeight.Pointer(), m.Inputs, 0, state.Pointer(), hidden); err != nil {
-		return fail(err)
+		return err
 	}
 	if err := cuda.BiasColumnsTanh(state, m.InputBias, rows, hidden); err != nil {
-		return fail(err)
+		return err
 	}
 	cache.inputActivation = state
 
@@ -180,24 +223,24 @@ func (m *Model) ForwardCached(x []float32, batch, time int) (*Cache, error) {
 		layer := &m.Layers[index]
 		channelMajor, err := cache.alloc(batch * hidden * time)
 		if err != nil {
-			return fail(err)
+			return err
 		}
 		if err := cuda.Transpose12(state, channelMajor, batch, time, hidden); err != nil {
-			return fail(err)
+			return err
 		}
 		convolved, err := cache.alloc(batch * hidden * time)
 		if err != nil {
-			return fail(err)
+			return err
 		}
 		if err := cuda.Conv1dForward(blas, channelMajor, layer.Weight, layer.Bias, convolved, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
-			return fail(err)
+			return err
 		}
 		next, err := cache.alloc(batch * time * hidden)
 		if err != nil {
-			return fail(err)
+			return err
 		}
 		if err := cuda.TransposeAddTanh(convolved, state, next, batch, hidden, time); err != nil {
-			return fail(err)
+			return err
 		}
 		cache.layers = append(cache.layers, layerCache{inputChannelMajor: channelMajor, outputActivation: next})
 		state = next
@@ -205,18 +248,18 @@ func (m *Model) ForwardCached(x []float32, batch, time int) (*Cache, error) {
 
 	output, err := cache.alloc(rows)
 	if err != nil {
-		return fail(err)
+		return err
 	}
 	if err := blas.SgemmRowMajorNT(rows, 1, hidden, 1, state.Pointer(), hidden, m.OutputWeight.Pointer(), hidden, 0, output.Pointer(), 1); err != nil {
-		return fail(err)
+		return err
 	}
 	if err := cuda.AddBiasColumns(output, m.OutputBias, rows, 1); err != nil {
-		return fail(err)
+		return err
 	}
 	// Work stays queued on the stream; later kernels and the final copy are
 	// ordered after it, so an explicit device sync here would only stall.
 	cache.output = output
-	return cache, nil
+	return nil
 }
 
 // Forward is a convenience wrapper that returns the output and frees the cache.
@@ -282,7 +325,7 @@ func (g *Gradients) zeroAlloc(count int) (*cuda.Buffer, error) {
 func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	if err := cuda.SetDevice(0); err != nil {
+	if err := m.ensureDevice(); err != nil {
 		return nil, err
 	}
 	blas, err := m.blasHandle()

@@ -47,6 +47,7 @@ type api struct {
 	free               *syscall.Proc
 	memcpy             *syscall.Proc
 	memset             *syscall.Proc
+	memsetAsync        *syscall.Proc
 	streamCreate       *syscall.Proc
 	streamDestroy      *syscall.Proc
 	streamSynchronize  *syscall.Proc
@@ -153,7 +154,7 @@ func load() (*api, error) {
 		runtime, err := findProcs(cudart,
 			"cudaGetDeviceCount", "cudaGetDevice", "cudaSetDevice",
 			"cudaDeviceSynchronize", "cudaGetLastError", "cudaDeviceGetAttribute",
-			"cudaMalloc", "cudaFree", "cudaMemcpy", "cudaMemset",
+			"cudaMalloc", "cudaFree", "cudaMemcpy", "cudaMemset", "cudaMemsetAsync",
 			"cudaStreamCreate", "cudaStreamDestroy", "cudaStreamSynchronize",
 			"cudaStreamWaitEvent", "cudaEventCreate", "cudaEventDestroy",
 			"cudaEventRecord", "cudaEventSynchronize",
@@ -174,10 +175,10 @@ func load() (*api, error) {
 			cudart: cudart, cublas: cublas,
 			getDeviceCount: runtime[0], getDevice: runtime[1], setDevice: runtime[2],
 			deviceSynchronize: runtime[3], getLastError: runtime[4], getDeviceAttribute: runtime[5],
-			malloc: runtime[6], free: runtime[7], memcpy: runtime[8], memset: runtime[9],
-			streamCreate: runtime[10], streamDestroy: runtime[11], streamSynchronize: runtime[12],
-			streamWaitEvent: runtime[13], eventCreate: runtime[14], eventDestroy: runtime[15],
-			eventRecord: runtime[16], eventSynchronize: runtime[17],
+			malloc: runtime[6], free: runtime[7], memcpy: runtime[8], memset: runtime[9], memsetAsync: runtime[10],
+			streamCreate: runtime[11], streamDestroy: runtime[12], streamSynchronize: runtime[13],
+			streamWaitEvent: runtime[14], eventCreate: runtime[15], eventDestroy: runtime[16],
+			eventRecord: runtime[17], eventSynchronize: runtime[18],
 			cublasCreate: blas[0], cublasDestroy: blas[1], cublasSetStream: blas[2],
 			cublasSgemm: blas[3], cublasStridedBatch: blas[4],
 		}
@@ -420,7 +421,8 @@ func (b *Buffer) copy(kind int, data []byte, offset int) error {
 	return runtimeError("cudaMemcpy", code)
 }
 
-// Memset fills the first size bytes with a byte value.
+// Memset fills the first size bytes with a byte value on the current stream.
+// It uses the asynchronous form so it is also valid during graph capture.
 func (b *Buffer) Memset(value byte, size int) error {
 	if size < 0 || size > b.size {
 		return fmt.Errorf("cuda: memset size %d exceeds buffer size %d", size, b.size)
@@ -429,8 +431,22 @@ func (b *Buffer) Memset(value byte, size int) error {
 	if err != nil {
 		return err
 	}
-	code, _, _ := a.memset.Call(b.pointer, uintptr(value), uintptr(size))
-	return runtimeError("cudaMemset", code)
+	code, _, _ := a.memsetAsync.Call(b.pointer, uintptr(value), uintptr(size), currentStream)
+	return runtimeError("cudaMemsetAsync", code)
+}
+
+// MemsetAsync fills the first size bytes with a byte value on the current
+// stream without blocking the host. It is safe to use during graph capture.
+func (b *Buffer) MemsetAsync(value byte, size int) error {
+	if size < 0 || size > b.size {
+		return fmt.Errorf("cuda: memset size %d exceeds buffer size %d", size, b.size)
+	}
+	a, err := load()
+	if err != nil {
+		return err
+	}
+	code, _, _ := a.memsetAsync.Call(b.pointer, uintptr(value), uintptr(size), currentStream)
+	return runtimeError("cudaMemsetAsync", code)
 }
 
 // Stream is a non-default CUDA stream.

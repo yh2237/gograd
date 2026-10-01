@@ -11,6 +11,13 @@ import (
 // given one. Graph capture routes all work through a single stream this way.
 var currentStream uintptr
 
+// capturing reports whether a graph capture is in progress. Callers must avoid
+// driver calls that capture forbids, such as setting the device.
+var capturing bool
+
+// InCapture reports whether a graph capture is in progress.
+func InCapture() bool { return capturing }
+
 // SetCurrentStream routes kernel launches that do not name a stream to s. Pass
 // nil to use the default stream.
 func SetCurrentStream(s *Stream) {
@@ -39,7 +46,11 @@ func Capture(stream *Stream, fn func() error) (*Graph, error) {
 	}
 	previous := currentStream
 	currentStream = stream.handle
-	defer func() { currentStream = previous }()
+	capturing = true
+	defer func() {
+		currentStream = previous
+		capturing = false
+	}()
 	a, err := loadKernelAPI()
 	if err != nil {
 		return nil, err

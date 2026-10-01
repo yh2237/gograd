@@ -19,7 +19,8 @@ The `cuda` package binds the CUDA runtime, cuBLAS and NVRTC DLLs on Windows
 through the system loader, so no cgo or C compiler is needed. It provides device
 queries, device buffers with explicit `Free`, streams, events, a row-major
 `SgemmRowMajor` wrapper, an im2col + SGEMM `Conv1dForward`, and NVRTC-compiled
-kernels loaded through the CUDA driver. Freed buffers are reused from an
+kernels loaded through the CUDA driver. It can capture a sequence of work into
+a `Graph` and replay it with one launch. Freed buffers are reused from an
 internal size pool, which cuts cudaMalloc/cudaFree traffic; `ReleasePool`
 returns that memory to the driver. On other platforms every call reports
 `ErrUnavailable`.
@@ -58,6 +59,7 @@ go test ./gputcn/ -run XXX -bench .
 `tcn-train` fits a tiny synthetic corpus on the CPU and writes
 `out/synthetic-tcn.json`. `gputcn-train` does the same with the GPU forward and
 backward passes, prints per-phase timings, and writes `out/gputcn-synthetic.json`.
+Passing `-graph` captures the whole step with `cuda.Capture` and replays it.
 Both are demonstrations of the engine, not real training recipes.
 
 To regenerate the PyTorch fixture (requires `torch`):

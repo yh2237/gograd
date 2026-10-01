@@ -57,6 +57,9 @@ func ReleasePool() error { return nil }
 // SetCurrentStream does nothing on this platform.
 func SetCurrentStream(s *Stream) {}
 
+// InCapture always reports false on this platform.
+func InCapture() bool { return false }
+
 // Graph is a captured sequence of GPU work.
 type Graph struct{ exec uintptr }
 
@@ -83,6 +86,9 @@ func (b *Buffer) CopyToHost(data []byte) error { return ErrUnavailable }
 
 // Memset returns ErrUnavailable.
 func (b *Buffer) Memset(value byte, size int) error { return ErrUnavailable }
+
+// MemsetAsync returns ErrUnavailable.
+func (b *Buffer) MemsetAsync(value byte, size int) error { return ErrUnavailable }
 
 // Stream is a CUDA stream.
 type Stream struct{ handle uintptr }

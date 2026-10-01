@@ -214,7 +214,9 @@ func lossKernels() (*Kernel, error) {
 func SequenceLossGrad(predicted, target, mask, gradient, loss *Buffer, rows, time, totalValid, totalPairs int, bounded bool, low, high, deltaWeight float64) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	_ = SetDevice(0)
+	if !InCapture() {
+		_ = SetDevice(0)
+	}
 	kernel, err := lossKernels()
 	if err != nil {
 		return err
