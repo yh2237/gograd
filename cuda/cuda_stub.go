@@ -110,6 +110,11 @@ func (b *Blas) SgemmRowMajor(m, n, k int, alpha float32, a uintptr, lda int, bPt
 	return ErrUnavailable
 }
 
+// SgemmRowMajorNT returns ErrUnavailable.
+func (b *Blas) SgemmRowMajorNT(m, n, k int, alpha float32, a uintptr, lda int, bPtr uintptr, ldb int, beta float32, c uintptr, ldc int) error {
+	return ErrUnavailable
+}
+
 // DeviceAttribute returns ErrUnavailable.
 func DeviceAttribute(attribute, device int) (int, error) { return 0, ErrUnavailable }
 

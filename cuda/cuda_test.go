@@ -197,6 +197,87 @@ func TestKernelTanh(t *testing.T) {
 	}
 }
 
+func TestSgemmRowMajorNT(t *testing.T) {
+	if !Available() {
+		t.Skip("cuda unavailable:", loadErrorText())
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := SetDevice(0); err != nil {
+		t.Fatal(err)
+	}
+	a := []float32{1, 2, 3, 4, 5, 6}    // 2x3
+	b := []float32{7, 8, 9, 10, 11, 12} // 2x3
+	want := []float32{
+		a[0]*b[0] + a[1]*b[1] + a[2]*b[2], a[0]*b[3] + a[1]*b[4] + a[2]*b[5],
+		a[3]*b[0] + a[4]*b[1] + a[5]*b[2], a[3]*b[3] + a[4]*b[4] + a[5]*b[5],
+	}
+	deviceA := upload(t, a)
+	deviceB := upload(t, b)
+	deviceC := upload(t, make([]float32, 4))
+	defer deviceA.Free()
+	defer deviceB.Free()
+	defer deviceC.Free()
+	blas, err := NewBlas()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blas.Destroy()
+	if err := blas.SgemmRowMajorNT(2, 2, 3, 1, deviceA.Pointer(), 3, deviceB.Pointer(), 3, 0, deviceC.Pointer(), 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := Synchronize(); err != nil {
+		t.Fatal(err)
+	}
+	got := download(t, deviceC, 4)
+	for i := range want {
+		if math.Abs(float64(got[i]-want[i])) > 1e-5 {
+			t.Errorf("gemm-nt[%d]: got %v want %v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestTranspose12(t *testing.T) {
+	if !Available() {
+		t.Skip("cuda unavailable:", loadErrorText())
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := SetDevice(0); err != nil {
+		t.Fatal(err)
+	}
+	// [2,3,2] -> [2,2,3]
+	d0, d1, d2 := 2, 3, 2
+	input := make([]float32, d0*d1*d2)
+	for i := range input {
+		input[i] = float32(i)
+	}
+	want := make([]float32, len(input))
+	for b := 0; b < d0; b++ {
+		for j := 0; j < d2; j++ {
+			for k := 0; k < d1; k++ {
+				want[(b*d2+j)*d1+k] = input[(b*d1+k)*d2+j]
+			}
+		}
+	}
+	deviceIn := upload(t, input)
+	deviceOut := upload(t, make([]float32, len(input)))
+	defer deviceIn.Free()
+	defer deviceOut.Free()
+	if err := Transpose12(deviceIn, deviceOut, d0, d1, d2); err != nil {
+		t.Fatal(err)
+	}
+	if err := Synchronize(); err != nil {
+		t.Fatal(err)
+	}
+	got := download(t, deviceOut, len(input))
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("transpose[%d]: got %v want %v", i, got[i], want[i])
+		}
+	}
+}
+
 func referenceConv1d(x, weight, bias []float32, batch, channels, length, outChannels, kernel, dilation int) []float32 {
 	out := make([]float32, batch*outChannels*length)
 	for b := 0; b < batch; b++ {

@@ -20,8 +20,12 @@ through the system loader, so no cgo or C compiler is needed. It provides device
 queries, device buffers with explicit `Free`, streams, events, a row-major
 `SgemmRowMajor` wrapper, an im2col + SGEMM `Conv1dForward`, and NVRTC-compiled
 kernels loaded through the CUDA driver. On other platforms every call reports
-`ErrUnavailable`. The GPU package is not yet wired into the engine; training
-still runs on the CPU reference path.
+`ErrUnavailable`.
+
+The `gputcn` package runs the TCN forward pass on the GPU in float32. Its output
+matches the PyTorch float64 reference to about 5e-08. Backpropagation, the loss
+and the optimizer are not implemented on the GPU yet, so GPU training is not
+available.
 
 ## Verification
 
@@ -67,7 +71,8 @@ go test ./cuda/
 - `model.go` — `FrameIntonationTCN`
 - `optim.go` — AdamW and gradient clipping
 - `export.go` — runtime JSON layout
-- `cuda/` — CUDA runtime and cuBLAS binding
+- `cuda/` — CUDA runtime, cuBLAS and NVRTC binding
+- `gputcn/` — GPU float32 TCN forward pass
 - `cmd/tcn-train` — synthetic training example
 - `tools/gen_fixture.py` — PyTorch fixture generator
 - `testdata/` — committed fixtures

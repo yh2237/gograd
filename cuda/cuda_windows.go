@@ -507,6 +507,29 @@ func (b *Blas) Destroy() error {
 	return blasError("cublasDestroy", status)
 }
 
+// SgemmRowMajorNT computes c = alpha*a*b^T + beta*c for row-major float32
+// matrices a [m,k], b [n,k] and c [m,n]. Leading dimensions must be at least
+// the corresponding row width.
+func (b *Blas) SgemmRowMajorNT(m, n, k int, alpha float32, a uintptr, lda int, bPtr uintptr, ldb int, beta float32, c uintptr, ldc int) error {
+	aAPI, err := load()
+	if err != nil {
+		return err
+	}
+	// Column-major cublasSgemm with the weight operand transposed produces the
+	// row-major product a * b^T.
+	status, _, _ := aAPI.cublasSgemm.Call(
+		b.handle,
+		1, 0, // CUBLAS_OP_T, CUBLAS_OP_N
+		uintptr(int32(n)), uintptr(int32(m)), uintptr(int32(k)),
+		uintptr(unsafe.Pointer(&alpha)),
+		bPtr, uintptr(int32(ldb)),
+		a, uintptr(int32(lda)),
+		uintptr(unsafe.Pointer(&beta)),
+		c, uintptr(int32(ldc)),
+	)
+	return blasError("cublasSgemm", status)
+}
+
 // SgemmRowMajor computes c = alpha*a*b + beta*c for row-major float32 matrices
 // a [m,k], b [k,n] and c [m,n]. Leading dimensions must be at least the
 // corresponding row width.
