@@ -2,10 +2,10 @@ package cuda
 
 import (
 	"math"
+	"runtime"
+	"testing"
 	"unsafe"
 )
-
-import "testing"
 
 func floatsToBytes(values []float32) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(&values[0])), len(values)*4)
@@ -89,6 +89,110 @@ func TestSgemmRowMajor(t *testing.T) {
 	for i := range want {
 		if math.Abs(float64(got[i]-want[i])) > 1e-5*math.Max(1, math.Abs(float64(want[i]))) {
 			t.Errorf("sgemm[%d]: got %v want %v", i, got[i], want[i])
+		}
+	}
+}
+
+const testKernelSource = `
+extern "C" __global__ void vec_add(const float* a, const float* b, float* out, int n) {
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < n) out[i] = a[i] + b[i];
+}
+extern "C" __global__ void apply_tanh(const float* x, float* out, int n) {
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < n) out[i] = tanhf(x[i]);
+}
+`
+
+func launchUnary(t *testing.T, kernel *Kernel, input *Buffer, n int) *Buffer {
+	t.Helper()
+	output, err := Alloc(n * 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputAddress := input.Pointer()
+	outputAddress := output.Pointer()
+	size := int32(n)
+	args := []unsafe.Pointer{unsafe.Pointer(&inputAddress), unsafe.Pointer(&outputAddress), unsafe.Pointer(&size)}
+	grid := [3]int{(n + 255) / 256, 1, 1}
+	if err := kernel.Launch(grid, [3]int{256, 1, 1}, 0, nil, args); err != nil {
+		t.Fatal(err)
+	}
+	if err := Synchronize(); err != nil {
+		t.Fatal(err)
+	}
+	return output
+}
+
+func TestKernelVectorAdd(t *testing.T) {
+	if !Available() {
+		t.Skip("cuda unavailable:", loadErrorText())
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := SetDevice(0); err != nil {
+		t.Fatal(err)
+	}
+	kernel, err := LoadKernel(testKernelSource, "vec_add")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kernel.Close()
+
+	a := []float32{1, 2, 3, 4, 5}
+	b := []float32{10, 20, 30, 40, 50}
+	deviceA := upload(t, a)
+	deviceB := upload(t, b)
+	output, err := Alloc(len(a) * 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer deviceA.Free()
+	defer deviceB.Free()
+	defer output.Free()
+
+	aAddr, bAddr, outAddr := deviceA.Pointer(), deviceB.Pointer(), output.Pointer()
+	size := int32(len(a))
+	args := []unsafe.Pointer{unsafe.Pointer(&aAddr), unsafe.Pointer(&bAddr), unsafe.Pointer(&outAddr), unsafe.Pointer(&size)}
+	if err := kernel.Launch([3]int{1, 1, 1}, [3]int{256, 1, 1}, 0, nil, args); err != nil {
+		t.Fatal(err)
+	}
+	if err := Synchronize(); err != nil {
+		t.Fatal(err)
+	}
+	got := download(t, output, len(a))
+	for i := range a {
+		if got[i] != a[i]+b[i] {
+			t.Errorf("add[%d]: got %v want %v", i, got[i], a[i]+b[i])
+		}
+	}
+}
+
+func TestKernelTanh(t *testing.T) {
+	if !Available() {
+		t.Skip("cuda unavailable:", loadErrorText())
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := SetDevice(0); err != nil {
+		t.Fatal(err)
+	}
+	kernel, err := LoadKernel(testKernelSource, "apply_tanh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kernel.Close()
+
+	input := []float32{-2, -0.5, 0, 0.5, 2}
+	deviceInput := upload(t, input)
+	defer deviceInput.Free()
+	output := launchUnary(t, kernel, deviceInput, len(input))
+	defer output.Free()
+	got := download(t, output, len(input))
+	for i := range input {
+		want := float32(math.Tanh(float64(input[i])))
+		if math.Abs(float64(got[i]-want)) > 1e-6 {
+			t.Errorf("tanh[%d]: got %v want %v", i, got[i], want)
 		}
 	}
 }

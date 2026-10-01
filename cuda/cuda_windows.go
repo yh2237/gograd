@@ -37,23 +37,24 @@ type api struct {
 	cudart *syscall.DLL
 	cublas *syscall.DLL
 
-	getDeviceCount    *syscall.Proc
-	getDevice         *syscall.Proc
-	setDevice         *syscall.Proc
-	deviceSynchronize *syscall.Proc
-	getLastError      *syscall.Proc
-	malloc            *syscall.Proc
-	free              *syscall.Proc
-	memcpy            *syscall.Proc
-	memset            *syscall.Proc
-	streamCreate      *syscall.Proc
-	streamDestroy     *syscall.Proc
-	streamSynchronize *syscall.Proc
-	streamWaitEvent   *syscall.Proc
-	eventCreate       *syscall.Proc
-	eventDestroy      *syscall.Proc
-	eventRecord       *syscall.Proc
-	eventSynchronize  *syscall.Proc
+	getDeviceCount     *syscall.Proc
+	getDevice          *syscall.Proc
+	setDevice          *syscall.Proc
+	deviceSynchronize  *syscall.Proc
+	getLastError       *syscall.Proc
+	getDeviceAttribute *syscall.Proc
+	malloc             *syscall.Proc
+	free               *syscall.Proc
+	memcpy             *syscall.Proc
+	memset             *syscall.Proc
+	streamCreate       *syscall.Proc
+	streamDestroy      *syscall.Proc
+	streamSynchronize  *syscall.Proc
+	streamWaitEvent    *syscall.Proc
+	eventCreate        *syscall.Proc
+	eventDestroy       *syscall.Proc
+	eventRecord        *syscall.Proc
+	eventSynchronize   *syscall.Proc
 
 	cublasCreate    *syscall.Proc
 	cublasDestroy   *syscall.Proc
@@ -127,7 +128,7 @@ func load() (*api, error) {
 
 		runtime, err := findProcs(cudart,
 			"cudaGetDeviceCount", "cudaGetDevice", "cudaSetDevice",
-			"cudaDeviceSynchronize", "cudaGetLastError",
+			"cudaDeviceSynchronize", "cudaGetLastError", "cudaDeviceGetAttribute",
 			"cudaMalloc", "cudaFree", "cudaMemcpy", "cudaMemset",
 			"cudaStreamCreate", "cudaStreamDestroy", "cudaStreamSynchronize",
 			"cudaStreamWaitEvent", "cudaEventCreate", "cudaEventDestroy",
@@ -147,11 +148,11 @@ func load() (*api, error) {
 		loaded = &api{
 			cudart: cudart, cublas: cublas,
 			getDeviceCount: runtime[0], getDevice: runtime[1], setDevice: runtime[2],
-			deviceSynchronize: runtime[3], getLastError: runtime[4],
-			malloc: runtime[5], free: runtime[6], memcpy: runtime[7], memset: runtime[8],
-			streamCreate: runtime[9], streamDestroy: runtime[10], streamSynchronize: runtime[11],
-			streamWaitEvent: runtime[12], eventCreate: runtime[13], eventDestroy: runtime[14],
-			eventRecord: runtime[15], eventSynchronize: runtime[16],
+			deviceSynchronize: runtime[3], getLastError: runtime[4], getDeviceAttribute: runtime[5],
+			malloc: runtime[6], free: runtime[7], memcpy: runtime[8], memset: runtime[9],
+			streamCreate: runtime[10], streamDestroy: runtime[11], streamSynchronize: runtime[12],
+			streamWaitEvent: runtime[13], eventCreate: runtime[14], eventDestroy: runtime[15],
+			eventRecord: runtime[16], eventSynchronize: runtime[17],
 			cublasCreate: blas[0], cublasDestroy: blas[1], cublasSetStream: blas[2], cublasSgemm: blas[3],
 		}
 	})
@@ -230,6 +231,32 @@ func CurrentDevice() (int, error) {
 		return 0, err
 	}
 	return int(device), nil
+}
+
+// DeviceAttribute returns an integer device attribute. Attribute 75 is the
+// compute capability major version and 76 is the minor version.
+func DeviceAttribute(attribute, device int) (int, error) {
+	a, err := load()
+	if err != nil {
+		return 0, err
+	}
+	var value int32
+	code, _, _ := a.getDeviceAttribute.Call(uintptr(unsafe.Pointer(&value)), uintptr(int32(attribute)), uintptr(int32(device)))
+	if err := runtimeError("cudaDeviceGetAttribute", code); err != nil {
+		return 0, err
+	}
+	return int(value), nil
+}
+
+// initializeContext creates the primary context on the current device via the
+// documented cudaFree(0) idiom.
+func initializeContext() error {
+	a, err := load()
+	if err != nil {
+		return err
+	}
+	code, _, _ := a.free.Call(0)
+	return runtimeError("cudaFree", code)
 }
 
 // Synchronize blocks until all preceding work on the current device finishes

@@ -4,7 +4,10 @@
 // platforms the API exists but every call reports ErrUnavailable.
 package cuda
 
-import "errors"
+import (
+	"errors"
+	"unsafe"
+)
 
 // ErrUnavailable reports that this platform has no CUDA binding.
 var ErrUnavailable = errors.New("cuda: runtime binding is Windows-only")
@@ -106,3 +109,20 @@ func (b *Blas) Destroy() error { return ErrUnavailable }
 func (b *Blas) SgemmRowMajor(m, n, k int, alpha float32, a uintptr, lda int, bPtr uintptr, ldb int, beta float32, c uintptr, ldc int) error {
 	return ErrUnavailable
 }
+
+// DeviceAttribute returns ErrUnavailable.
+func DeviceAttribute(attribute, device int) (int, error) { return 0, ErrUnavailable }
+
+// Kernel is a compiled device function.
+type Kernel struct{ module, function uintptr }
+
+// LoadKernel returns ErrUnavailable.
+func LoadKernel(source, name string) (*Kernel, error) { return nil, ErrUnavailable }
+
+// Launch returns ErrUnavailable.
+func (k *Kernel) Launch(grid, block [3]int, sharedMemory int, stream *Stream, args []unsafe.Pointer) error {
+	return ErrUnavailable
+}
+
+// Close returns ErrUnavailable.
+func (k *Kernel) Close() error { return ErrUnavailable }
