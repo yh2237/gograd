@@ -245,12 +245,20 @@ func (g *Gradients) Close() {
 	g.buffers = nil
 }
 
-func (g *Gradients) zeroAlloc(count int) (*cuda.Buffer, error) {
+func (g *Gradients) alloc(count int) (*cuda.Buffer, error) {
 	buffer, err := cuda.Alloc(count * 4)
 	if err != nil {
 		return nil, err
 	}
 	g.buffers = append(g.buffers, buffer)
+	return buffer, nil
+}
+
+func (g *Gradients) zeroAlloc(count int) (*cuda.Buffer, error) {
+	buffer, err := g.alloc(count)
+	if err != nil {
+		return nil, err
+	}
 	if err := buffer.Memset(0, buffer.Size()); err != nil {
 		buffer.Free()
 		return nil, err
@@ -286,7 +294,7 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 	if len(cache.layers) > 0 {
 		lastActivation = cache.layers[len(cache.layers)-1].outputActivation
 	}
-	outputWeight, err := grads.zeroAlloc(hidden)
+	outputWeight, err := grads.alloc(hidden)
 	if err != nil {
 		return fail(err)
 	}
@@ -303,7 +311,7 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 		return fail(err)
 	}
 
-	dA, err := grads.zeroAlloc(rows * hidden)
+	dA, err := grads.alloc(rows * hidden)
 	if err != nil {
 		return fail(err)
 	}
@@ -323,18 +331,13 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 			return fail(err)
 		}
 
-		dConvTime, err := grads.zeroAlloc(batch * time * hidden)
+		// dZ is already the gradient of the transposed convolution output, so
+		// transpose it directly instead of copying into another buffer.
+		dConvChannel, err := grads.alloc(batch * hidden * time)
 		if err != nil {
 			return fail(err)
 		}
-		if err := cuda.AddInto(dConvTime, dZ, rows*hidden); err != nil {
-			return fail(err)
-		}
-		dConvChannel, err := grads.zeroAlloc(batch * hidden * time)
-		if err != nil {
-			return fail(err)
-		}
-		if err := cuda.Transpose12(dConvTime, dConvChannel, batch, time, hidden); err != nil {
+		if err := cuda.Transpose12(dZ, dConvChannel, batch, time, hidden); err != nil {
 			return fail(err)
 		}
 		weightGrad, err := grads.zeroAlloc(hidden * hidden * 3)
@@ -359,21 +362,18 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 		if err := cuda.ConvInputGrad(dConvChannel, layer.Weight, dInputChannel, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
 			return fail(err)
 		}
-		dInputTime, err := grads.zeroAlloc(batch * time * hidden)
+		dInputTime, err := grads.alloc(batch * time * hidden)
 		if err != nil {
 			return fail(err)
 		}
 		if err := cuda.Transpose12(dInputChannel, dInputTime, batch, hidden, time); err != nil {
 			return fail(err)
 		}
-		dAPrev, err := grads.zeroAlloc(rows * hidden)
+		dAPrev, err := grads.alloc(rows * hidden)
 		if err != nil {
 			return fail(err)
 		}
-		if err := cuda.AddInto(dAPrev, dZ, rows*hidden); err != nil {
-			return fail(err)
-		}
-		if err := cuda.AddInto(dAPrev, dInputTime, rows*hidden); err != nil {
+		if err := cuda.AddPair(dAPrev, dZ, dInputTime, rows*hidden); err != nil {
 			return fail(err)
 		}
 		dA = dAPrev
@@ -386,7 +386,7 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 	if err := cuda.TanhBackward(cache.inputActivation, dA, dZ1, rows*hidden); err != nil {
 		return fail(err)
 	}
-	inputWeight, err := grads.zeroAlloc(hidden * m.Inputs)
+	inputWeight, err := grads.alloc(hidden * m.Inputs)
 	if err != nil {
 		return fail(err)
 	}

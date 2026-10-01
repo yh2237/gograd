@@ -14,6 +14,10 @@ extern "C" __global__ void add_into(float* dst, const float* src, int n) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i < n) dst[i] += src[i];
 }
+extern "C" __global__ void add_pair(float* dst, const float* a, const float* b, int n) {
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < n) dst[i] = a[i] + b[i];
+}
 extern "C" __global__ void column_sum(const float* x, float* out, int rows, int cols, int chunks) {
 	// Each thread sums a contiguous row range for one column and adds it with
 	// an atomic, so wide reductions still fill the grid.
@@ -78,6 +82,7 @@ extern "C" __global__ void conv_input_grad(const float* dy, const float* w, floa
 type backwardKernelSet struct {
 	tanhBackward   *Kernel
 	addInto        *Kernel
+	addPair        *Kernel
 	columnSum      *Kernel
 	convBiasGrad   *Kernel
 	convWeightGrad *Kernel
@@ -102,6 +107,7 @@ func backwardKernels() (*backwardKernelSet, error) {
 		for name, target := range map[string]**Kernel{
 			"tanh_backward":    &set.tanhBackward,
 			"add_into":         &set.addInto,
+			"add_pair":         &set.addPair,
 			"column_sum":       &set.columnSum,
 			"conv_bias_grad":   &set.convBiasGrad,
 			"conv_weight_grad": &set.convWeightGrad,
@@ -149,6 +155,19 @@ func AddInto(dst, src *Buffer, count int) error {
 	n := int32(count)
 	args := []unsafe.Pointer{unsafe.Pointer(&dstAddr), unsafe.Pointer(&srcAddr), unsafe.Pointer(&n)}
 	return set.addInto.Launch(elementGrid(count), [3]int{256, 1, 1}, 0, nil, args)
+}
+
+// AddPair writes dst = a + b elementwise. Unlike AddInto it needs no zeroed
+// destination, so it replaces a copy plus an accumulate.
+func AddPair(dst, a, b *Buffer, count int) error {
+	set, err := backwardKernels()
+	if err != nil {
+		return err
+	}
+	dstAddr, aAddr, bAddr := dst.Pointer(), a.Pointer(), b.Pointer()
+	n := int32(count)
+	args := []unsafe.Pointer{unsafe.Pointer(&dstAddr), unsafe.Pointer(&aAddr), unsafe.Pointer(&bAddr), unsafe.Pointer(&n)}
+	return set.addPair.Launch(elementGrid(count), [3]int{256, 1, 1}, 0, nil, args)
 }
 
 // ColumnSum accumulates out[c] += sum_r x[r,c] for a [rows,cols] matrix. out
