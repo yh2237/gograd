@@ -4,7 +4,6 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/yh2237/gograd"
 	"github.com/yh2237/gograd/cuda"
 )
 
@@ -89,7 +88,7 @@ func BenchmarkTrainStep(b *testing.B) {
 	model, input, target, mask, _ := benchmarkSetup(b)
 	defer model.Close()
 	length := len(input) / (benchBatch * benchInputs)
-	options := gograd.SequenceLossOptions{LowCents: -250, HighCents: 250, Bounded: true, TargetScale: 1, DeltaWeight: 0.35}
+	options := LossOptions{LowCents: -250, HighCents: 250, Bounded: true, TargetScale: 1, DeltaWeight: 0.35}
 	state := NewAdamState()
 	warmup, err := model.ForwardCached(input, benchBatch, length)
 	if err != nil {
@@ -116,11 +115,8 @@ func BenchmarkTrainStep(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		predictedTensor := gograd.NewTensor([]int{benchBatch, length}, toFloat64(predicted))
-		targetTensor := gograd.NewTensor([]int{benchBatch, length}, flatten2D(target))
-		loss := gograd.SequenceLoss(predictedTensor, targetTensor, mask, options)
-		loss.Backward()
-		dy, err := UploadFloat32(toFloat32(predictedTensor.Grad))
+		_, gradient := LossGrad(predicted, flatten2D(target), mask, options)
+		dy, err := UploadFloat32(gradient)
 		if err != nil {
 			b.Fatal(err)
 		}

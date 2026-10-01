@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/yh2237/gograd"
 	"github.com/yh2237/gograd/cuda"
 	"github.com/yh2237/gograd/gputcn"
 )
@@ -126,7 +125,7 @@ func main() {
 		})
 	}
 
-	options := gograd.SequenceLossOptions{LowCents: -250, HighCents: 250, Bounded: true, TargetScale: 1, DeltaWeight: 0.35}
+	options := gputcn.LossOptions{LowCents: -250, HighCents: 250, Bounded: true, TargetScale: 1, DeltaWeight: 0.35}
 	state := gputcn.NewAdamState()
 	rows := *batch * length
 
@@ -147,17 +146,14 @@ func main() {
 			fmt.Fprintln(os.Stderr, "download:", err)
 			os.Exit(1)
 		}
-		predictedTensor := gograd.NewTensor([]int{*batch, length}, toFloat64(predicted))
-		targetTensor := gograd.NewTensor([]int{*batch, length}, target)
-		loss := gograd.SequenceLoss(predictedTensor, targetTensor, maskBatch, options)
-		loss.Backward()
+		loss, gradient := gputcn.LossGrad(predicted, target, maskBatch, options)
 		lossTime += time.Since(start)
 		if step == 0 {
-			initial = loss.Data[0]
+			initial = loss
 		}
 
 		start = time.Now()
-		dy, err := upload(toFloat32(predictedTensor.Grad))
+		dy, err := upload(gradient)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "upload:", err)
 			os.Exit(1)
@@ -180,7 +176,7 @@ func main() {
 		grads.Close()
 
 		if step%20 == 0 || step == *steps-1 {
-			fmt.Printf("step %3d/%d: loss=%.4f\n", step, *steps, loss.Data[0])
+			fmt.Printf("step %3d/%d: loss=%.4f\n", step, *steps, loss)
 		}
 	}
 
@@ -233,20 +229,4 @@ func mustUpload(rng *rand.Rand, count int, scale float64) *cuda.Buffer {
 		panic(err)
 	}
 	return buffer
-}
-
-func toFloat64(values []float32) []float64 {
-	result := make([]float64, len(values))
-	for i, value := range values {
-		result[i] = float64(value)
-	}
-	return result
-}
-
-func toFloat32(values []float64) []float32 {
-	result := make([]float32, len(values))
-	for i, value := range values {
-		result[i] = float32(value)
-	}
-	return result
 }

@@ -5,7 +5,6 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/yh2237/gograd"
 	"github.com/yh2237/gograd/cuda"
 )
 
@@ -106,7 +105,7 @@ func TestTrainingReducesLoss(t *testing.T) {
 		})
 	}
 
-	options := gograd.SequenceLossOptions{LowCents: -250, HighCents: 250, Bounded: true, TargetScale: 1, DeltaWeight: 0.35}
+	options := LossOptions{LowCents: -250, HighCents: 250, Bounded: true, TargetScale: 1, DeltaWeight: 0.35}
 	state := NewAdamState()
 
 	evaluate := func() float64 {
@@ -122,9 +121,8 @@ func TestTrainingReducesLoss(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		predictedTensor := gograd.NewTensor([]int{count, length}, toFloat64(predicted))
-		targetTensor := gograd.NewTensor([]int{count, length}, flatten2D(target))
-		return gograd.SequenceLoss(predictedTensor, targetTensor, maskBatch, options).Data[0]
+		loss, _ := LossGrad(predicted, flatten2D(target), maskBatch, options)
+		return loss
 	}
 
 	initial := evaluate()
@@ -140,11 +138,8 @@ func TestTrainingReducesLoss(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		predictedTensor := gograd.NewTensor([]int{count, length}, toFloat64(predicted))
-		targetTensor := gograd.NewTensor([]int{count, length}, flatten2D(target))
-		loss := gograd.SequenceLoss(predictedTensor, targetTensor, maskBatch, options)
-		loss.Backward()
-		dy := mustUpload(t, toFloat32(predictedTensor.Grad))
+		_, gradient := LossGrad(predicted, flatten2D(target), maskBatch, options)
+		dy := mustUpload(t, gradient)
 		grads, err := model.Backward(cache, dy)
 		cache.Close()
 		dy.Free()
