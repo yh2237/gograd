@@ -412,7 +412,7 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 		if err != nil {
 			return fail(err)
 		}
-		if err := cuda.ConvInputGrad(dConvChannel, layer.Weight, dInputChannel, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
+		if err := cuda.ConvInputGrad(blas, dConvChannel, layer.Weight, dInputChannel, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
 			return fail(err)
 		}
 		dInputTime, err := grads.alloc(batch * time * hidden)

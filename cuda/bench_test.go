@@ -105,9 +105,14 @@ func BenchmarkConvInputGrad(b *testing.B) {
 	dy := benchBuffer(b, benchBatch*benchOutChannels*benchLength)
 	w := benchBuffer(b, benchOutChannels*benchChannels*benchKernel)
 	dx := benchBuffer(b, benchBatch*benchChannels*benchLength)
+	blas, err := NewBlas()
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { blas.Destroy() })
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := ConvInputGrad(dy, w, dx, benchBatch, benchChannels, benchLength, benchOutChannels, benchKernel, benchDilation); err != nil {
+		if err := ConvInputGrad(blas, dy, w, dx, benchBatch, benchChannels, benchLength, benchOutChannels, benchKernel, benchDilation); err != nil {
 			b.Fatal(err)
 		}
 	}

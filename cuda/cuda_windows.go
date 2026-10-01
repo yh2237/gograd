@@ -630,6 +630,28 @@ func (b *Blas) SgemmStridedBatchedRowMajor(batchCount, m, n, k int, alpha float3
 	return blasError("cublasSgemmStridedBatched", status)
 }
 
+// SgemmStridedBatchedRowMajorTransposeA computes c = alpha*a^T*b + beta*c for
+// batchCount row-major float32 matrix products a [k,m] (stride strideA), b
+// [k,n] (stride strideB) and c [m,n] (stride strideC).
+func (b *Blas) SgemmStridedBatchedRowMajorTransposeA(batchCount, m, n, k int, alpha float32, a uintptr, lda int, strideA int64, bPtr uintptr, ldb int, strideB int64, beta float32, c uintptr, ldc int, strideC int64) error {
+	aAPI, err := load()
+	if err != nil {
+		return err
+	}
+	status, _, _ := aAPI.cublasStridedBatch.Call(
+		b.handle,
+		0, 1, // CUBLAS_OP_N on b, CUBLAS_OP_T on a
+		uintptr(int32(n)), uintptr(int32(m)), uintptr(int32(k)),
+		uintptr(unsafe.Pointer(&alpha)),
+		bPtr, uintptr(int32(ldb)), uintptr(strideB),
+		a, uintptr(int32(lda)), uintptr(strideA),
+		uintptr(unsafe.Pointer(&beta)),
+		c, uintptr(int32(ldc)), uintptr(strideC),
+		uintptr(int32(batchCount)),
+	)
+	return blasError("cublasSgemmStridedBatched", status)
+}
+
 // SgemmRowMajorTransposeA computes c = alpha*a^T*b + beta*c for row-major
 // float32 matrices a [k,m], b [k,n] and c [m,n]. Leading dimensions must be at
 // least the corresponding row width.

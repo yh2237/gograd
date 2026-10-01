@@ -1,6 +1,7 @@
 package cuda
 
 import (
+	"fmt"
 	"sync"
 	"unsafe"
 )
@@ -61,20 +62,18 @@ extern "C" __global__ void conv_weight_grad(const float* x, const float* dy, flo
 	}
 	if (sum != 0.0f) atomicAdd(&dw[ock], sum);
 }
-extern "C" __global__ void conv_input_grad(const float* dy, const float* w, float* dx, int batch, int channels, int length, int outChannels, int kernel, int dilation) {
+extern "C" __global__ void col2im1d(const float* col, float* dx, int batch, int channels, int length, int kernel, int dilation) {
 	int index = blockIdx.x * blockDim.x + threadIdx.x;
-	int total = batch * channels * length;
-	if (index >= total) return;
+	if (index >= batch * channels * length) return;
 	int t = index % length;
 	int c = (index / length) % channels;
 	int b = index / (channels * length);
 	float sum = 0.0f;
-	for (int o = 0; o < outChannels; o++)
-		for (int k = 0; k < kernel; k++) {
-			int dst = t + dilation - k * dilation;
-			if (dst < 0 || dst >= length) continue;
-			sum += dy[(b * outChannels + o) * length + dst] * w[(o * channels + c) * kernel + k];
-		}
+	for (int k = 0; k < kernel; k++) {
+		int src = t + dilation - k * dilation;
+		if (src < 0 || src >= length) continue;
+		sum += col[(b * channels * kernel + c * kernel + k) * length + src];
+	}
 	dx[index] += sum;
 }
 `
@@ -86,7 +85,7 @@ type backwardKernelSet struct {
 	columnSum      *Kernel
 	convBiasGrad   *Kernel
 	convWeightGrad *Kernel
-	convInputGrad  *Kernel
+	col2im         *Kernel
 }
 
 var (
@@ -111,7 +110,7 @@ func backwardKernels() (*backwardKernelSet, error) {
 			"column_sum":       &set.columnSum,
 			"conv_bias_grad":   &set.convBiasGrad,
 			"conv_weight_grad": &set.convWeightGrad,
-			"conv_input_grad":  &set.convInputGrad,
+			"col2im1d":         &set.col2im,
 		} {
 			kernel, err := program.Function(name)
 			if err != nil {
@@ -215,13 +214,31 @@ func ConvWeightGrad(x, dy, dw *Buffer, batch, channels, length, outChannels, ker
 }
 
 // ConvInputGrad accumulates the convolution gradient with respect to its input.
-func ConvInputGrad(dy, weight, dx *Buffer, batch, channels, length, outChannels, kernel, dilation int) error {
+// It forms the per-patch gradient dCol = W^T*dY with one strided-batched GEMM
+// and scatters it with col2im, instead of reading dY once per output.
+func ConvInputGrad(blas *Blas, dy, weight, dx *Buffer, batch, channels, length, outChannels, kernel, dilation int) error {
 	set, err := backwardKernels()
 	if err != nil {
 		return err
 	}
-	dyAddr, wAddr, dxAddr := dy.Pointer(), weight.Pointer(), dx.Pointer()
-	args := int32Args(int32(batch), int32(channels), int32(length), int32(outChannels), int32(kernel), int32(dilation))
-	args = append([]unsafe.Pointer{unsafe.Pointer(&dyAddr), unsafe.Pointer(&wAddr), unsafe.Pointer(&dxAddr)}, args...)
-	return set.convInputGrad.Launch(elementGrid(batch*channels*length), [3]int{256, 1, 1}, 0, nil, args)
+	if blas == nil {
+		return fmt.Errorf("cuda: ConvInputGrad requires a cuBLAS handle")
+	}
+	columnCount := channels * kernel
+	columns, err := Alloc(batch * columnCount * length * 4)
+	if err != nil {
+		return err
+	}
+	defer columns.Free()
+	if err := blas.SgemmStridedBatchedRowMajorTransposeA(batch, columnCount, length, outChannels, 1,
+		weight.Pointer(), columnCount, 0,
+		dy.Pointer(), length, int64(outChannels*length),
+		0,
+		columns.Pointer(), length, int64(columnCount*length)); err != nil {
+		return err
+	}
+	colAddr, dxAddr := columns.Pointer(), dx.Pointer()
+	args := int32Args(int32(batch), int32(channels), int32(length), int32(kernel), int32(dilation))
+	args = append([]unsafe.Pointer{unsafe.Pointer(&colAddr), unsafe.Pointer(&dxAddr)}, args...)
+	return set.col2im.Launch(elementGrid(batch*channels*length), [3]int{256, 1, 1}, 0, nil, args)
 }
