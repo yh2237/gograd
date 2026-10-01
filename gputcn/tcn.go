@@ -296,7 +296,7 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 		return fail(err)
 	}
 	grads.OutputBias = outputBias
-	if err := cuda.OuterSum(dy, lastActivation, outputWeight, rows, 1, hidden); err != nil {
+	if err := blas.SgemmRowMajorTransposeA(1, hidden, rows, 1, dy.Pointer(), 1, lastActivation.Pointer(), hidden, 0, outputWeight.Pointer(), hidden); err != nil {
 		return fail(err)
 	}
 	if err := cuda.ColumnSum(dy, outputBias, rows, 1); err != nil {
@@ -396,7 +396,7 @@ func (m *Model) Backward(cache *Cache, dy *cuda.Buffer) (*Gradients, error) {
 		return fail(err)
 	}
 	grads.InputBias = inputBias
-	if err := cuda.OuterSum(dZ1, cache.input, inputWeight, rows, hidden, m.Inputs); err != nil {
+	if err := blas.SgemmRowMajorTransposeA(hidden, m.Inputs, rows, 1, dZ1.Pointer(), hidden, cache.input.Pointer(), m.Inputs, 0, inputWeight.Pointer(), m.Inputs); err != nil {
 		return fail(err)
 	}
 	if err := cuda.ColumnSum(dZ1, inputBias, rows, hidden); err != nil {

@@ -237,6 +237,47 @@ func TestSgemmRowMajorNT(t *testing.T) {
 	}
 }
 
+func TestSgemmRowMajorTransposeA(t *testing.T) {
+	if !Available() {
+		t.Skip("cuda unavailable:", loadErrorText())
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := SetDevice(0); err != nil {
+		t.Fatal(err)
+	}
+	a := []float32{1, 2, 3, 4, 5, 6} // 2x3, treated as a^T [3,2]
+	bb := []float32{7, 8, 9, 10}     // 2x2
+	want := []float32{
+		a[0]*bb[0] + a[3]*bb[2], a[0]*bb[1] + a[3]*bb[3],
+		a[1]*bb[0] + a[4]*bb[2], a[1]*bb[1] + a[4]*bb[3],
+		a[2]*bb[0] + a[5]*bb[2], a[2]*bb[1] + a[5]*bb[3],
+	}
+	deviceA := upload(t, a)
+	deviceB := upload(t, bb)
+	deviceC := upload(t, make([]float32, 6))
+	defer deviceA.Free()
+	defer deviceB.Free()
+	defer deviceC.Free()
+	blas, err := NewBlas()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blas.Destroy()
+	if err := blas.SgemmRowMajorTransposeA(3, 2, 2, 1, deviceA.Pointer(), 3, deviceB.Pointer(), 2, 0, deviceC.Pointer(), 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := Synchronize(); err != nil {
+		t.Fatal(err)
+	}
+	got := download(t, deviceC, 6)
+	for i := range want {
+		if math.Abs(float64(got[i]-want[i])) > 1e-5 {
+			t.Errorf("gemm-ta[%d]: got %v want %v", i, got[i], want[i])
+		}
+	}
+}
+
 func TestTranspose12(t *testing.T) {
 	if !Available() {
 		t.Skip("cuda unavailable:", loadErrorText())

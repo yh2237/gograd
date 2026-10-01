@@ -118,6 +118,11 @@ func (b *Blas) SgemmRowMajorNT(m, n, k int, alpha float32, a uintptr, lda int, b
 	return ErrUnavailable
 }
 
+// SgemmRowMajorTransposeA returns ErrUnavailable.
+func (b *Blas) SgemmRowMajorTransposeA(m, n, k int, alpha float32, a uintptr, lda int, bPtr uintptr, ldb int, beta float32, c uintptr, ldc int) error {
+	return ErrUnavailable
+}
+
 // SgemmStridedBatchedRowMajor returns ErrUnavailable.
 func (b *Blas) SgemmStridedBatchedRowMajor(batchCount, m, n, k int, alpha float32, a uintptr, lda int, strideA int64, bPtr uintptr, ldb int, strideB int64, beta float32, c uintptr, ldc int, strideC int64) error {
 	return ErrUnavailable

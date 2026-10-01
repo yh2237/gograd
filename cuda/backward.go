@@ -21,15 +21,6 @@ extern "C" __global__ void column_sum(const float* x, float* out, int rows, int 
 	for (int r = 0; r < rows; r++) sum += x[r * cols + c];
 	out[c] = sum;
 }
-extern "C" __global__ void outer_sum(const float* a, const float* b, float* out, int rows, int colsA, int colsB) {
-	int index = blockIdx.x * blockDim.x + threadIdx.x;
-	if (index >= colsA * colsB) return;
-	int cb = index % colsB;
-	int ca = index / colsB;
-	float sum = 0.0f;
-	for (int r = 0; r < rows; r++) sum += a[r * colsA + ca] * b[r * colsB + cb];
-	out[index] += sum;
-}
 extern "C" __global__ void conv_bias_grad(const float* dy, float* db, int batch, int outChannels, int length) {
 	int o = blockIdx.x * blockDim.x + threadIdx.x;
 	if (o >= outChannels) return;
@@ -40,19 +31,23 @@ extern "C" __global__ void conv_bias_grad(const float* dy, float* db, int batch,
 	db[o] += sum;
 }
 extern "C" __global__ void conv_weight_grad(const float* x, const float* dy, float* dw, int batch, int channels, int length, int outChannels, int kernel, int dilation) {
+	// One thread per (batch, out, in, kernel) keeps the grid large and lets each
+	// thread scan only the time axis before an atomic add.
+	int per = outChannels * channels * kernel;
 	int index = blockIdx.x * blockDim.x + threadIdx.x;
-	if (index >= outChannels * channels * kernel) return;
-	int k = index % kernel;
-	int c = (index / kernel) % channels;
-	int o = index / (kernel * channels);
+	if (index >= batch * per) return;
+	int ock = index % per;
+	int b = index / per;
+	int k = ock % kernel;
+	int c = (ock / kernel) % channels;
+	int o = ock / (kernel * channels);
 	float sum = 0.0f;
-	for (int b = 0; b < batch; b++)
-		for (int t = 0; t < length; t++) {
-			int src = t - dilation + k * dilation;
-			if (src < 0 || src >= length) continue;
-			sum += dy[(b * outChannels + o) * length + t] * x[(b * channels + c) * length + src];
-		}
-	dw[index] += sum;
+	for (int t = 0; t < length; t++) {
+		int src = t - dilation + k * dilation;
+		if (src < 0 || src >= length) continue;
+		sum += dy[(b * outChannels + o) * length + t] * x[(b * channels + c) * length + src];
+	}
+	if (sum != 0.0f) atomicAdd(&dw[ock], sum);
 }
 extern "C" __global__ void conv_input_grad(const float* dy, const float* w, float* dx, int batch, int channels, int length, int outChannels, int kernel, int dilation) {
 	int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -76,7 +71,6 @@ type backwardKernelSet struct {
 	tanhBackward   *Kernel
 	addInto        *Kernel
 	columnSum      *Kernel
-	outerSum       *Kernel
 	convBiasGrad   *Kernel
 	convWeightGrad *Kernel
 	convInputGrad  *Kernel
@@ -101,7 +95,6 @@ func backwardKernels() (*backwardKernelSet, error) {
 			"tanh_backward":    &set.tanhBackward,
 			"add_into":         &set.addInto,
 			"column_sum":       &set.columnSum,
-			"outer_sum":        &set.outerSum,
 			"conv_bias_grad":   &set.convBiasGrad,
 			"conv_weight_grad": &set.convWeightGrad,
 			"conv_input_grad":  &set.convInputGrad,
@@ -162,18 +155,6 @@ func ColumnSum(x, out *Buffer, rows, cols int) error {
 	return set.columnSum.Launch(elementGrid(cols), [3]int{256, 1, 1}, 0, nil, args)
 }
 
-// OuterSum accumulates out[ca,cb] += sum_r a[r,ca]*b[r,cb].
-func OuterSum(a, b, out *Buffer, rows, colsA, colsB int) error {
-	set, err := backwardKernels()
-	if err != nil {
-		return err
-	}
-	aAddr, bAddr, outAddr := a.Pointer(), b.Pointer(), out.Pointer()
-	args := int32Args(int32(rows), int32(colsA), int32(colsB))
-	args = append([]unsafe.Pointer{unsafe.Pointer(&aAddr), unsafe.Pointer(&bAddr), unsafe.Pointer(&outAddr)}, args...)
-	return set.outerSum.Launch(elementGrid(colsA*colsB), [3]int{256, 1, 1}, 0, nil, args)
-}
-
 // ConvBiasGrad accumulates sum of dy into db[outChannels].
 func ConvBiasGrad(dy, db *Buffer, batch, outChannels, length int) error {
 	set, err := backwardKernels()
@@ -195,7 +176,7 @@ func ConvWeightGrad(x, dy, dw *Buffer, batch, channels, length, outChannels, ker
 	xAddr, dyAddr, dwAddr := x.Pointer(), dy.Pointer(), dw.Pointer()
 	args := int32Args(int32(batch), int32(channels), int32(length), int32(outChannels), int32(kernel), int32(dilation))
 	args = append([]unsafe.Pointer{unsafe.Pointer(&xAddr), unsafe.Pointer(&dyAddr), unsafe.Pointer(&dwAddr)}, args...)
-	return set.convWeightGrad.Launch(elementGrid(outChannels*channels*kernel), [3]int{256, 1, 1}, 0, nil, args)
+	return set.convWeightGrad.Launch(elementGrid(batch*outChannels*channels*kernel), [3]int{256, 1, 1}, 0, nil, args)
 }
 
 // ConvInputGrad accumulates the convolution gradient with respect to its input.
