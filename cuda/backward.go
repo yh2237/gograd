@@ -14,21 +14,29 @@ extern "C" __global__ void add_into(float* dst, const float* src, int n) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i < n) dst[i] += src[i];
 }
-extern "C" __global__ void column_sum(const float* x, float* out, int rows, int cols) {
-	int c = blockIdx.x * blockDim.x + threadIdx.x;
-	if (c >= cols) return;
+extern "C" __global__ void column_sum(const float* x, float* out, int rows, int cols, int chunks) {
+	// Each thread sums a contiguous row range for one column and adds it with
+	// an atomic, so wide reductions still fill the grid.
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+	if (index >= cols * chunks) return;
+	int chunk = index % chunks;
+	int c = index / chunks;
+	int begin = (rows * chunk) / chunks;
+	int end = (rows * (chunk + 1)) / chunks;
 	float sum = 0.0f;
-	for (int r = 0; r < rows; r++) sum += x[r * cols + c];
-	out[c] = sum;
+	for (int r = begin; r < end; r++) sum += x[r * cols + c];
+	if (sum != 0.0f) atomicAdd(&out[c], sum);
 }
 extern "C" __global__ void conv_bias_grad(const float* dy, float* db, int batch, int outChannels, int length) {
-	int o = blockIdx.x * blockDim.x + threadIdx.x;
-	if (o >= outChannels) return;
+	// One thread per (batch, out) scans the time axis, then combines across
+	// batches with an atomic.
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+	if (index >= batch * outChannels) return;
+	int o = index % outChannels;
+	int b = index / outChannels;
 	float sum = 0.0f;
-	for (int b = 0; b < batch; b++)
-		for (int t = 0; t < length; t++)
-			sum += dy[(b * outChannels + o) * length + t];
-	db[o] += sum;
+	for (int t = 0; t < length; t++) sum += dy[(b * outChannels + o) * length + t];
+	if (sum != 0.0f) atomicAdd(&db[o], sum);
 }
 extern "C" __global__ void conv_weight_grad(const float* x, const float* dy, float* dw, int batch, int channels, int length, int outChannels, int kernel, int dilation) {
 	// One thread per (batch, out, in, kernel) keeps the grid large and lets each
@@ -143,16 +151,24 @@ func AddInto(dst, src *Buffer, count int) error {
 	return set.addInto.Launch(elementGrid(count), [3]int{256, 1, 1}, 0, nil, args)
 }
 
-// ColumnSum writes out[c] = sum_r x[r,c] for a [rows,cols] matrix.
+// ColumnSum accumulates out[c] += sum_r x[r,c] for a [rows,cols] matrix. out
+// must be zero before the call.
 func ColumnSum(x, out *Buffer, rows, cols int) error {
 	set, err := backwardKernels()
 	if err != nil {
 		return err
 	}
+	chunks := 1
+	if rows > 1 {
+		chunks = 64
+		if chunks > rows {
+			chunks = rows
+		}
+	}
 	xAddr, outAddr := x.Pointer(), out.Pointer()
-	args := int32Args(int32(rows), int32(cols))
+	args := int32Args(int32(rows), int32(cols), int32(chunks))
 	args = append([]unsafe.Pointer{unsafe.Pointer(&xAddr), unsafe.Pointer(&outAddr)}, args...)
-	return set.columnSum.Launch(elementGrid(cols), [3]int{256, 1, 1}, 0, nil, args)
+	return set.columnSum.Launch(elementGrid(cols*chunks), [3]int{256, 1, 1}, 0, nil, args)
 }
 
 // ConvBiasGrad accumulates sum of dy into db[outChannels].
@@ -164,7 +180,7 @@ func ConvBiasGrad(dy, db *Buffer, batch, outChannels, length int) error {
 	dyAddr, dbAddr := dy.Pointer(), db.Pointer()
 	args := int32Args(int32(batch), int32(outChannels), int32(length))
 	args = append([]unsafe.Pointer{unsafe.Pointer(&dyAddr), unsafe.Pointer(&dbAddr)}, args...)
-	return set.convBiasGrad.Launch(elementGrid(outChannels), [3]int{256, 1, 1}, 0, nil, args)
+	return set.convBiasGrad.Launch(elementGrid(batch*outChannels), [3]int{256, 1, 1}, 0, nil, args)
 }
 
 // ConvWeightGrad accumulates the convolution weight gradient.

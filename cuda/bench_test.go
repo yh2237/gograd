@@ -68,6 +68,92 @@ func BenchmarkConvInputGrad(b *testing.B) {
 	}
 }
 
+func BenchmarkTranspose12(b *testing.B) {
+	benchSetup(b)
+	d0, d1, d2 := benchBatch, benchLength, benchChannels
+	input := benchBuffer(b, d0*d1*d2)
+	output := benchBuffer(b, d0*d1*d2)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := Transpose12(input, output, d0, d1, d2); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := Synchronize(); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func BenchmarkAddInto(b *testing.B) {
+	benchSetup(b)
+	count := benchBatch * benchLength * benchChannels
+	dst := benchBuffer(b, count)
+	src := benchBuffer(b, count)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := AddInto(dst, src, count); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := Synchronize(); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func BenchmarkAddTanh(b *testing.B) {
+	benchSetup(b)
+	count := benchBatch * benchLength * benchChannels
+	a := benchBuffer(b, count)
+	bb := benchBuffer(b, count)
+	out := benchBuffer(b, count)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := AddTanh(a, bb, out, count); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := Synchronize(); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func BenchmarkConvBiasGrad(b *testing.B) {
+	benchSetup(b)
+	dy := benchBuffer(b, benchBatch*benchOutChannels*benchLength)
+	db := benchBuffer(b, benchOutChannels)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := ConvBiasGrad(dy, db, benchBatch, benchOutChannels, benchLength); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := Synchronize(); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func BenchmarkSgemmTransposeA(b *testing.B) {
+	benchSetup(b)
+	rows := benchBatch * benchLength
+	a := benchBuffer(b, rows*benchChannels)
+	bb := benchBuffer(b, rows*benchChannels)
+	c := benchBuffer(b, benchChannels*benchChannels)
+	blas, err := NewBlas()
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { blas.Destroy() })
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := blas.SgemmRowMajorTransposeA(benchChannels, benchChannels, rows, 1, a.Pointer(), benchChannels, bb.Pointer(), benchChannels, 0, c.Pointer(), benchChannels); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := Synchronize(); err != nil {
+		b.Fatal(err)
+	}
+}
+
 func BenchmarkTanhBackward(b *testing.B) {
 	benchSetup(b)
 	rows := benchBatch * benchLength
