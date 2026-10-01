@@ -29,6 +29,7 @@ type kernelAPI struct {
 	moduleGetFunction *syscall.Proc
 	moduleUnload      *syscall.Proc
 	launchKernel      *syscall.Proc
+	ctxGetCurrent     *syscall.Proc
 }
 
 var (
@@ -67,7 +68,7 @@ func loadKernelAPI() (*kernelAPI, error) {
 			return
 		}
 		driverProcs, err := findProcs(driver,
-			"cuModuleLoadData", "cuModuleGetFunction", "cuModuleUnload", "cuLaunchKernel",
+			"cuModuleLoadData", "cuModuleGetFunction", "cuModuleUnload", "cuLaunchKernel", "cuCtxGetCurrent",
 		)
 		if err != nil {
 			kernelErr = fmt.Errorf("%w: %v", ErrUnavailable, err)
@@ -79,7 +80,7 @@ func loadKernelAPI() (*kernelAPI, error) {
 			getPTXSize: nvrtcProcs[2], getPTX: nvrtcProcs[3],
 			getLogSize: nvrtcProcs[4], getLog: nvrtcProcs[5], destroyProgram: nvrtcProcs[6],
 			moduleLoadData: driverProcs[0], moduleGetFunction: driverProcs[1],
-			moduleUnload: driverProcs[2], launchKernel: driverProcs[3],
+			moduleUnload: driverProcs[2], launchKernel: driverProcs[3], ctxGetCurrent: driverProcs[4],
 		}
 	})
 	return kernelInst, kernelErr
@@ -252,6 +253,15 @@ func (k *Kernel) Launch(grid, block [3]int, sharedMemory int, stream *Stream, ar
 	a, err := loadKernelAPI()
 	if err != nil {
 		return err
+	}
+	// The driver launches on the calling thread's current context. If the
+	// goroutine moved to a thread that has none, establish the primary context
+	// here so the launch does not fail with an invalid-context error.
+	var context uintptr
+	a.ctxGetCurrent.Call(uintptr(unsafe.Pointer(&context)))
+	if context == 0 {
+		_ = SetDevice(0)
+		_ = initializeContext()
 	}
 	var streamHandle uintptr
 	if stream != nil {
