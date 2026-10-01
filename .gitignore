@@ -1,0 +1,6 @@
+/out/
+/testdata/generated/
+*.exe
+*.test
+*.out
+*.prof
