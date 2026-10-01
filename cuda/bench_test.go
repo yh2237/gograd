@@ -36,6 +36,54 @@ func benchBuffer(b *testing.B, count int) *Buffer {
 	return buffer
 }
 
+func BenchmarkConv1dForward(b *testing.B) {
+	benchSetup(b)
+	x := benchBuffer(b, benchBatch*benchChannels*benchLength)
+	w := benchBuffer(b, benchOutChannels*benchChannels*benchKernel)
+	bias := benchBuffer(b, benchOutChannels)
+	out := benchBuffer(b, benchBatch*benchOutChannels*benchLength)
+	blas, err := NewBlas()
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { blas.Destroy() })
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := Conv1dForward(blas, x, w, bias, out, benchBatch, benchChannels, benchLength, benchOutChannels, benchKernel, benchDilation); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := Synchronize(); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func BenchmarkSgemmStridedBatched(b *testing.B) {
+	benchSetup(b)
+	columnCount := benchChannels * benchKernel
+	columns := benchBuffer(b, benchBatch*columnCount*benchLength)
+	w := benchBuffer(b, benchOutChannels*columnCount)
+	out := benchBuffer(b, benchBatch*benchOutChannels*benchLength)
+	blas, err := NewBlas()
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { blas.Destroy() })
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := blas.SgemmStridedBatchedRowMajor(benchBatch, benchOutChannels, benchLength, columnCount, 1,
+			w.Pointer(), columnCount, 0,
+			columns.Pointer(), benchLength, int64(columnCount*benchLength),
+			0,
+			out.Pointer(), benchLength, int64(benchOutChannels*benchLength)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := Synchronize(); err != nil {
+		b.Fatal(err)
+	}
+}
+
 func BenchmarkConvWeightGrad(b *testing.B) {
 	benchSetup(b)
 	x := benchBuffer(b, benchBatch*benchChannels*benchLength)
