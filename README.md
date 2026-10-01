@@ -47,10 +47,14 @@ baseline:
 go test ./...
 go vet ./...
 go run ./cmd/tcn-train
+go run ./cmd/gputcn-train
+go test ./gputcn/ -run XXX -bench .
 ```
 
-`tcn-train` fits a tiny synthetic corpus and writes `out/synthetic-tcn.json`. It
-is a demonstration of the engine, not a real training recipe.
+`tcn-train` fits a tiny synthetic corpus on the CPU and writes
+`out/synthetic-tcn.json`. `gputcn-train` does the same with the GPU forward and
+backward passes, prints per-phase timings, and writes `out/gputcn-synthetic.json`.
+Both are demonstrations of the engine, not real training recipes.
 
 To regenerate the PyTorch fixture (requires `torch`):
 
@@ -74,7 +78,8 @@ go test ./cuda/
 - `export.go` — runtime JSON layout
 - `cuda/` — CUDA runtime, cuBLAS and NVRTC binding
 - `gputcn/` — GPU float32 TCN forward, backward and AdamW
-- `cmd/tcn-train` — synthetic training example
+- `cmd/tcn-train` — synthetic CPU training example
+- `cmd/gputcn-train` — synthetic GPU training example with timings
 - `tools/gen_fixture.py` — PyTorch fixture generator
 - `testdata/` — committed fixtures
 
