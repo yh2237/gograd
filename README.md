@@ -1,12 +1,12 @@
 # gograd
 
 A small reverse-mode autograd library and a frame-level intonation TCN, written
-in Go. All computation is CPU float64.
+in Go. The engine computes in CPU float64.
 
 ## Status
 
-This repository contains the CPU reference implementation in float64. It covers
-exactly the operations the TCN and its loss need:
+The engine is a CPU reference implementation in float64. It covers exactly the
+operations the TCN and its loss need:
 
 - `Linear`, `tanh`, elementwise add/sub/scale, `clamp`
 - symmetric zero-padded dilated `Conv1d` (kernel 3, per-layer dilation)
@@ -15,7 +15,11 @@ exactly the operations the TCN and its loss need:
 - AdamW with decoupled weight decay and global gradient-norm clipping
 - export of the `frame_pitch` JSON consumed by the Go runtime
 
-There is no GPU backend.
+The `cuda` package binds the CUDA runtime and cuBLAS DLLs on Windows through the
+system loader, so no cgo or C compiler is needed. It provides device queries,
+device buffers, streams, events and a row-major `SgemmRowMajor` wrapper. On
+other platforms every call reports `ErrUnavailable`. The GPU package is not yet
+wired into the engine; training still runs on the CPU reference path.
 
 ## Verification
 
@@ -47,20 +51,30 @@ To regenerate the PyTorch fixture (requires `torch`):
 python tools/gen_fixture.py
 ```
 
+The `cuda` tests run only when the CUDA runtime and cuBLAS DLLs are loadable.
+On Windows, put the CUDA `bin\x64` directory on `PATH`, for example:
+
+```
+$env:PATH = "$env:CUDA_PATH\bin\x64;$env:PATH"
+go test ./cuda/
+```
+
 ## Layout
 
 - `tensor.go`, `ops.go`, `conv.go`, `loss.go` — the autograd engine
 - `model.go` — `FrameIntonationTCN`
 - `optim.go` — AdamW and gradient clipping
 - `export.go` — runtime JSON layout
+- `cuda/` — CUDA runtime and cuBLAS binding
 - `cmd/tcn-train` — synthetic training example
 - `tools/gen_fixture.py` — PyTorch fixture generator
 - `testdata/` — committed fixtures
 
 ## Not present in this code
 
-GPU execution, float32 training, AMP, arbitrary strides/broadcasting, additional
-models, and loading other frameworks' checkpoints.
+GPU execution inside the engine, float32 training, AMP, arbitrary
+strides/broadcasting, additional models, and loading other frameworks'
+checkpoints.
 
 ## License
 
