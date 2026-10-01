@@ -173,18 +173,11 @@ func (m *Model) ForwardCached(x []float32, batch, time int) (*Cache, error) {
 		if err := cuda.Conv1dForward(blas, channelMajor, layer.Weight, layer.Bias, convolved, batch, hidden, time, hidden, 3, layer.Dilation); err != nil {
 			return fail(err)
 		}
-		convolvedTime, err := cache.alloc(batch * time * hidden)
-		if err != nil {
-			return fail(err)
-		}
-		if err := cuda.Transpose12(convolved, convolvedTime, batch, hidden, time); err != nil {
-			return fail(err)
-		}
 		next, err := cache.alloc(batch * time * hidden)
 		if err != nil {
 			return fail(err)
 		}
-		if err := cuda.AddTanh(state, convolvedTime, next, rows*hidden); err != nil {
+		if err := cuda.TransposeAddTanh(convolved, state, next, batch, hidden, time); err != nil {
 			return fail(err)
 		}
 		cache.layers = append(cache.layers, layerCache{inputChannelMajor: channelMajor, outputActivation: next})

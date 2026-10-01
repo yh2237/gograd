@@ -29,13 +29,25 @@ extern "C" __global__ void transpose12(const float* x, float* out, int d0, int d
 	int b = rest / d2;
 	out[index] = x[b * d1 * d2 + k * d2 + j];
 }
+extern "C" __global__ void transpose_add_tanh(const float* conv, const float* state, float* out, int batch, int channels, int length) {
+	// conv is [batch,channels,length] and state/out are [batch,length,channels].
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+	if (index >= batch * channels * length) return;
+	int c = index % channels;
+	int rest = index / channels;
+	int t = rest % length;
+	int b = rest / length;
+	float value = state[(b * length + t) * channels + c] + conv[(b * channels + c) * length + t];
+	out[(b * length + t) * channels + c] = tanhf(value);
+}
 `
 
 type opsKernelSet struct {
-	addTanh    *Kernel
-	biasTanh   *Kernel
-	biasColumn *Kernel
-	transpose  *Kernel
+	addTanh          *Kernel
+	biasTanh         *Kernel
+	biasColumn       *Kernel
+	transpose        *Kernel
+	transposeAddTanh *Kernel
 }
 
 var (
@@ -54,10 +66,11 @@ func opsKernels() (*opsKernelSet, error) {
 		}
 		set := &opsKernelSet{}
 		for name, target := range map[string]**Kernel{
-			"add_tanh":          &set.addTanh,
-			"bias_columns_tanh": &set.biasTanh,
-			"add_bias_columns":  &set.biasColumn,
-			"transpose12":       &set.transpose,
+			"add_tanh":           &set.addTanh,
+			"bias_columns_tanh":  &set.biasTanh,
+			"add_bias_columns":   &set.biasColumn,
+			"transpose12":        &set.transpose,
+			"transpose_add_tanh": &set.transposeAddTanh,
 		} {
 			kernel, err := program.Function(name)
 			if err != nil {
@@ -110,6 +123,20 @@ func AddBiasColumns(y, bias *Buffer, rows, cols int) error {
 	yAddr, biasAddr := y.Pointer(), bias.Pointer()
 	args := []unsafe.Pointer{unsafe.Pointer(&yAddr), unsafe.Pointer(&biasAddr), unsafe.Pointer(&r), unsafe.Pointer(&c)}
 	return set.biasColumn.Launch(elementGrid(rows*cols), [3]int{256, 1, 1}, 0, nil, args)
+}
+
+// TransposeAddTanh writes tanh(state + transpose(conv)), where conv is
+// [batch,channels,length] and state and out are [batch,length,channels].
+func TransposeAddTanh(conv, state, out *Buffer, batch, channels, length int) error {
+	set, err := opsKernels()
+	if err != nil {
+		return err
+	}
+	b, c, l := int32(batch), int32(channels), int32(length)
+	convAddr, stateAddr, outAddr := conv.Pointer(), state.Pointer(), out.Pointer()
+	args := []unsafe.Pointer{unsafe.Pointer(&convAddr), unsafe.Pointer(&stateAddr), unsafe.Pointer(&outAddr),
+		unsafe.Pointer(&b), unsafe.Pointer(&c), unsafe.Pointer(&l)}
+	return set.transposeAddTanh.Launch(elementGrid(batch*channels*length), [3]int{256, 1, 1}, 0, nil, args)
 }
 
 // Transpose12 swaps the last two dimensions of a contiguous [d0,d1,d2] tensor.
