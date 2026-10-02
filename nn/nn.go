@@ -288,6 +288,11 @@ func (s *Sequential) Backward(blas *cuda.Blas, grad *tensor.Tensor) (*tensor.Ten
 // CloseActivations releases the tensors saved by the last forward pass. Call it
 // after Backward.
 func (s *Sequential) CloseActivations() {
+	for _, m := range s.Modules {
+		if c, ok := m.(interface{ CloseActivations() }); ok {
+			c.CloseActivations()
+		}
+	}
 	for _, t := range s.saved {
 		t.Close()
 	}
