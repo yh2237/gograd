@@ -7,6 +7,19 @@ import (
 )
 
 const opsKernelSource = `
+extern "C" __global__ void activation(const float* x, const float* grad, float* out, int n, int kind, float slope, int backward) {
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	float v = x[i], y;
+	if (kind == 0) y = backward ? (v > 0.0f ? 1.0f : 0.0f) : fmaxf(v, 0.0f);
+	else if (kind == 1) y = backward ? (v > 0.0f ? 1.0f : slope) : (v > 0.0f ? v : slope * v);
+	else {
+		float u = 0.7978845608028654f * (v + 0.044715f * v * v * v);
+		float th = tanhf(u);
+		y = backward ? 0.5f * (1.0f + th) + 0.5f * v * (1.0f - th * th) * 0.7978845608028654f * (1.0f + 3.0f * 0.044715f * v * v) : 0.5f * v * (1.0f + th);
+	}
+	out[i] = backward ? grad[i] * y : y;
+}
 extern "C" __global__ void add_tanh(const float* a, const float* b, float* out, int n) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i < n) out[i] = tanhf(a[i] + b[i]);
@@ -42,6 +55,7 @@ type opsKernelSet struct {
 	biasColumn *cuda.Kernel
 	transpose  *cuda.Kernel
 	tanh       *cuda.Kernel
+	activation *cuda.Kernel
 }
 
 var (
@@ -65,6 +79,7 @@ func opsKernels() (*opsKernelSet, error) {
 			"add_bias_columns":  &set.biasColumn,
 			"transpose12":       &set.transpose,
 			"tanh_array":        &set.tanh,
+			"activation":        &set.activation,
 		} {
 			kernel, err := program.Function(name)
 			if err != nil {
@@ -76,6 +91,25 @@ func opsKernels() (*opsKernelSet, error) {
 		opsProgram, opsSet = program, set
 	})
 	return opsSet, opsProgramErr
+}
+
+// Activation applies ReLU (0), LeakyReLU (1), or GELU (2), or their derivatives.
+func Activation(x, grad, out *cuda.Buffer, count, kind int, slope float32, backward bool) error {
+	set, err := opsKernels()
+	if err != nil {
+		return err
+	}
+	xAddr, outAddr := x.Pointer(), out.Pointer()
+	var gradAddr uintptr
+	if grad != nil {
+		gradAddr = grad.Pointer()
+	}
+	n, k, b := int32(count), int32(kind), int32(0)
+	if backward {
+		b = 1
+	}
+	args := []unsafe.Pointer{unsafe.Pointer(&xAddr), unsafe.Pointer(&gradAddr), unsafe.Pointer(&outAddr), unsafe.Pointer(&n), unsafe.Pointer(&k), unsafe.Pointer(&slope), unsafe.Pointer(&b)}
+	return set.activation.Launch(elementGrid(count), [3]int{256, 1, 1}, 0, nil, args)
 }
 
 func elementGrid(count int) [3]int {

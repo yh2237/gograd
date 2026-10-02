@@ -194,6 +194,99 @@ func TestAllActivationsDeviceParity(t *testing.T) {
 	}
 }
 
+func TestWideConvAndMaskedLossDeviceParity(t *testing.T) {
+	if !cuda.Available() {
+		t.Skip("CUDA unavailable")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := cuda.SetDevice(0); err != nil {
+		t.Fatal(err)
+	}
+	blas, err := cuda.NewBlas()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blas.Destroy()
+	xv := make([]float32, 2*7*3)
+	for i := range xv {
+		xv[i] = float32(math.Sin(float64(i) * .31))
+	}
+	up := make([]float32, 2*7*4)
+	for i := range up {
+		up[i] = float32(math.Cos(float64(i) * .23))
+	}
+	var outputs, inputs, weights [2][]float32
+	var cpuL1Loss, cpuMSELoss float64
+	var cpuL1Grad, cpuMSEGrad []float32
+	for index, device := range []tensor.Device{tensor.CPU, tensor.CUDA} {
+		conv, err := NewConv1dOn(device, 3, 4, 5, 2, rand.New(rand.NewSource(9)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		x := tensorOn(t, device, []int{2, 7, 3}, xv)
+		g := tensorOn(t, device, []int{2, 7, 4}, up)
+		y, err := conv.Forward(blas, x)
+		if err != nil {
+			t.Fatal(err)
+		}
+		outputs[index] = host(t, y)
+		conv.ZeroGrad()
+		dx, err := conv.Backward(blas, g)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inputs[index] = host(t, dx)
+		weights[index] = host(t, conv.Gradients()[0])
+		for _, l1 := range []bool{false, true} {
+			target := tensorOn(t, device, []int{2, 7, 4}, up)
+			mask := []float32{1, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 1}
+			cw := []float32{1, .5, 2, 0}
+			var loss float64
+			var lg *tensor.Tensor
+			if l1 {
+				loss, lg, err = MaskedL1(y, target, mask, cw)
+			} else {
+				loss, lg, err = MaskedWeightedMSE(y, target, mask, cw)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if index == 0 {
+				if l1 {
+					cpuL1Loss = loss
+					cpuL1Grad = host(t, lg)
+				} else {
+					cpuMSELoss = loss
+					cpuMSEGrad = host(t, lg)
+				}
+			} else {
+				if l1 {
+					if math.Abs(loss-cpuL1Loss) > 1e-5 {
+						t.Fatalf("L1 loss %g vs %g", loss, cpuL1Loss)
+					}
+					closeEnough(t, "L1 gradient", host(t, lg), cpuL1Grad, 1e-6)
+				} else {
+					if math.Abs(loss-cpuMSELoss) > 1e-5 {
+						t.Fatalf("MSE loss %g vs %g", loss, cpuMSELoss)
+					}
+					closeEnough(t, "MSE gradient", host(t, lg), cpuMSEGrad, 1e-6)
+				}
+			}
+			lg.Close()
+			target.Close()
+		}
+		dx.Close()
+		y.Close()
+		g.Close()
+		x.Close()
+		conv.Close()
+	}
+	closeEnough(t, "conv forward", outputs[1], outputs[0], 1e-5)
+	closeEnough(t, "conv input gradient", inputs[1], inputs[0], 1e-5)
+	closeEnough(t, "conv weight gradient", weights[1], weights[0], 1e-5)
+}
+
 type fixture struct {
 	Input, Target, Mask, Channels, Forward []float32
 	Loss                                   float64

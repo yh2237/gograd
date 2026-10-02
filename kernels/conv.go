@@ -25,7 +25,7 @@ extern "C" __global__ void im2col1d_batched(const float* x, float* col, int batc
 	int b = bt / length;
 	int k = ck % kernel;
 	int c = ck / kernel;
-	int src = t - dilation + k * dilation;
+	int src = t - (kernel / 2) * dilation + k * dilation;
 	float value = 0.0f;
 	if (src >= 0 && src < length) value = x[(b * length + src) * channels + c];
 	col[index] = value;
@@ -74,7 +74,7 @@ extern "C" __global__ void col2im1d(const float* col, float* dx, int batch, int 
 	int ck = c * kernel;
 	int stride = channels * kernel;
 	for (int k = 0; k < kernel; k++) {
-		int src = t + dilation - k * dilation;
+		int src = t + (kernel / 2) * dilation - k * dilation;
 		if (src < 0 || src >= length) continue;
 		sum += col[(b * length + src) * stride + ck + k];
 	}

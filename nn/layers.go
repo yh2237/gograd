@@ -3,6 +3,7 @@ package nn
 import (
 	"fmt"
 	"github.com/yh2237/gograd/cuda"
+	"github.com/yh2237/gograd/kernels"
 	"github.com/yh2237/gograd/tensor"
 	"math"
 	"math/rand"
@@ -26,6 +27,7 @@ type Conv1d struct {
 	In, Out, Kernel, Dilation int
 	input                     *tensor.Tensor
 	columns                   []float32
+	deviceColumns             *tensor.Tensor
 }
 
 func NewConv1d(in, out, kernel, dilation int, rng *rand.Rand) (*Conv1d, error) {
@@ -72,13 +74,16 @@ func (c *Conv1d) Close() {
 		t.Close()
 	}
 }
-func (c *Conv1d) Forward(_ *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, error) {
+func (c *Conv1d) Forward(blas *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, error) {
 	s := x.Shape()
 	if len(s) != 3 || s[2] != c.In || x.Device() != c.Weight.Device() {
 		return nil, fmt.Errorf("nn: Conv1d expects [batch,time,%d] on %s, got %v", c.In, c.Weight.Device(), s)
 	}
 	b, t := s[0], s[1]
 	rows, k := b*t, c.In*c.Kernel
+	if x.Device() == tensor.CUDA {
+		return c.forwardCUDA(blas, x, b, t, rows, k)
+	}
 	xv, err := values(x)
 	if err != nil {
 		return nil, err
@@ -123,7 +128,7 @@ func (c *Conv1d) Forward(_ *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, error)
 	c.columns = cols
 	return output(x.Device(), []int{b, t, c.Out}, y)
 }
-func (c *Conv1d) Backward(_ *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor, error) {
+func (c *Conv1d) Backward(blas *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor, error) {
 	if c.input == nil {
 		return nil, fmt.Errorf("nn: Conv1d backward before forward")
 	}
@@ -132,6 +137,9 @@ func (c *Conv1d) Backward(_ *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor, er
 	rows, k := b*t, c.In*c.Kernel
 	if gs := grad.Shape(); len(gs) != 3 || gs[0] != b || gs[1] != t || gs[2] != c.Out {
 		return nil, fmt.Errorf("nn: Conv1d gradient shape mismatch")
+	}
+	if grad.Device() == tensor.CUDA {
+		return c.backwardCUDA(blas, grad, s, b, t, rows, k)
 	}
 	gv, err := values(grad)
 	if err != nil {
@@ -196,6 +204,64 @@ func (c *Conv1d) Backward(_ *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor, er
 	return output(grad.Device(), s, dx)
 }
 
+func (c *Conv1d) forwardCUDA(blas *cuda.Blas, x *tensor.Tensor, b, t, rows, k int) (*tensor.Tensor, error) {
+	cols, err := tensor.NewOn(tensor.CUDA, rows, k)
+	if err != nil {
+		return nil, err
+	}
+	y, err := tensor.NewOn(tensor.CUDA, b, t, c.Out)
+	if err != nil {
+		cols.Close()
+		return nil, err
+	}
+	if err = kernels.Im2col(x.Buffer(), cols.Buffer(), b, c.In, t, c.Kernel, c.Dilation); err == nil {
+		err = blas.SgemmRowMajorNT(rows, c.Out, k, 1, cols.Buffer().Pointer(), k, c.Weight.Buffer().Pointer(), k, 0, y.Buffer().Pointer(), c.Out)
+	}
+	if err == nil {
+		err = kernels.AddBiasColumns(y.Buffer(), c.Bias.Buffer(), rows, c.Out)
+	}
+	if err != nil {
+		cols.Close()
+		y.Close()
+		return nil, err
+	}
+	if c.deviceColumns != nil {
+		c.deviceColumns.Close()
+	}
+	c.deviceColumns, c.input = cols, x
+	return y, nil
+}
+
+func (c *Conv1d) backwardCUDA(blas *cuda.Blas, grad *tensor.Tensor, shape []int, b, t, rows, k int) (*tensor.Tensor, error) {
+	dx, err := tensor.ZerosOn(tensor.CUDA, shape...)
+	if err != nil {
+		return nil, err
+	}
+	dcols, err := tensor.NewOn(tensor.CUDA, rows, k)
+	if err != nil {
+		dx.Close()
+		return nil, err
+	}
+	defer dcols.Close()
+	err = blas.SgemmRowMajorTransposeA(c.Out, k, rows, 1, grad.Buffer().Pointer(), c.Out, c.deviceColumns.Buffer().Pointer(), k, 0, c.gradWeight.Buffer().Pointer(), k)
+	if err == nil {
+		err = kernels.ColumnSum(grad.Buffer(), c.gradBias.Buffer(), rows, c.Out)
+	}
+	if err == nil {
+		err = blas.SgemmRowMajor(rows, k, c.Out, 1, grad.Buffer().Pointer(), c.Out, c.Weight.Buffer().Pointer(), k, 0, dcols.Buffer().Pointer(), k)
+	}
+	if err == nil {
+		err = kernels.Col2im(dcols.Buffer(), dx.Buffer(), b, c.In, t, c.Kernel, c.Dilation)
+	}
+	if err != nil {
+		dx.Close()
+		return nil, err
+	}
+	c.deviceColumns.Close()
+	c.deviceColumns = nil
+	return dx, nil
+}
+
 // ReLU, LeakyReLU and GELU are elementwise trainable-graph modules.
 type ReLU struct{ activation }
 type LeakyReLU struct {
@@ -255,6 +321,9 @@ func activationBackward(a *activation, g *tensor.Tensor, f func(float32) float32
 	return output(g.Device(), g.Shape(), dx)
 }
 func (a *ReLU) Forward(_ *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, error) {
+	if x.Device() == tensor.CUDA {
+		return activationCUDA(&a.activation, x, nil, 0, 0)
+	}
 	return activationForward(&a.activation, x, func(v float32) float32 {
 		if v > 0 {
 			return v
@@ -263,6 +332,9 @@ func (a *ReLU) Forward(_ *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, error) {
 	})
 }
 func (a *ReLU) Backward(_ *cuda.Blas, g *tensor.Tensor) (*tensor.Tensor, error) {
+	if g.Device() == tensor.CUDA {
+		return activationCUDA(&a.activation, a.input, g, 0, 0)
+	}
 	return activationBackward(&a.activation, g, func(v float32) float32 {
 		if v > 0 {
 			return 1
@@ -271,6 +343,9 @@ func (a *ReLU) Backward(_ *cuda.Blas, g *tensor.Tensor) (*tensor.Tensor, error) 
 	})
 }
 func (a *LeakyReLU) Forward(_ *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, error) {
+	if x.Device() == tensor.CUDA {
+		return activationCUDA(&a.activation, x, nil, 1, a.Slope)
+	}
 	return activationForward(&a.activation, x, func(v float32) float32 {
 		if v > 0 {
 			return v
@@ -279,6 +354,9 @@ func (a *LeakyReLU) Forward(_ *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, err
 	})
 }
 func (a *LeakyReLU) Backward(_ *cuda.Blas, g *tensor.Tensor) (*tensor.Tensor, error) {
+	if g.Device() == tensor.CUDA {
+		return activationCUDA(&a.activation, a.input, g, 1, a.Slope)
+	}
 	return activationBackward(&a.activation, g, func(v float32) float32 {
 		if v > 0 {
 			return 1
@@ -287,10 +365,37 @@ func (a *LeakyReLU) Backward(_ *cuda.Blas, g *tensor.Tensor) (*tensor.Tensor, er
 	})
 }
 func (a *GELU) Forward(_ *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, error) {
+	if x.Device() == tensor.CUDA {
+		return activationCUDA(&a.activation, x, nil, 2, 0)
+	}
 	return activationForward(&a.activation, x, gelu)
 }
 func (a *GELU) Backward(_ *cuda.Blas, g *tensor.Tensor) (*tensor.Tensor, error) {
+	if g.Device() == tensor.CUDA {
+		return activationCUDA(&a.activation, a.input, g, 2, 0)
+	}
 	return activationBackward(&a.activation, g, geluPrime)
+}
+
+func activationCUDA(a *activation, x, grad *tensor.Tensor, kind int, slope float32) (*tensor.Tensor, error) {
+	if x == nil {
+		return nil, fmt.Errorf("nn: activation backward before forward")
+	}
+	y, err := tensor.NewOn(tensor.CUDA, x.Shape()...)
+	if err != nil {
+		return nil, err
+	}
+	var gb *cuda.Buffer
+	if grad != nil {
+		gb = grad.Buffer()
+	} else {
+		a.input = x
+	}
+	if err = kernels.Activation(x.Buffer(), gb, y.Buffer(), x.Numel(), kind, slope, grad != nil); err != nil {
+		y.Close()
+		return nil, err
+	}
+	return y, nil
 }
 
 // Residual computes x + F(x), requiring equal input and output shapes.
@@ -312,6 +417,17 @@ func (r *Residual) Forward(blas *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, e
 	if y.Numel() != x.Numel() {
 		return nil, fmt.Errorf("nn: residual shape mismatch")
 	}
+	if x.Device() == tensor.CUDA {
+		sum, err := tensor.NewOn(tensor.CUDA, x.Shape()...)
+		if err != nil {
+			return nil, err
+		}
+		if err = kernels.AddPair(sum.Buffer(), x.Buffer(), y.Buffer(), x.Numel()); err != nil {
+			sum.Close()
+			return nil, err
+		}
+		return sum, nil
+	}
 	xv, err := values(x)
 	if err != nil {
 		return nil, err
@@ -330,6 +446,9 @@ func (r *Residual) Backward(blas *cuda.Blas, g *tensor.Tensor) (*tensor.Tensor, 
 	dx, err := r.Inner.Backward(blas, g)
 	if err != nil {
 		return nil, err
+	}
+	if dx.Device() == tensor.CUDA {
+		return dx, kernels.AddInto(dx.Buffer(), g.Buffer(), dx.Numel())
 	}
 	dv, err := values(dx)
 	if err != nil {
