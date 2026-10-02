@@ -37,27 +37,32 @@ type Linear struct {
 
 // NewLinear creates a Linear with PyTorch-like uniform initialization.
 func NewLinear(in, out int, rng *rand.Rand) (*Linear, error) {
+	return NewLinearOn(tensor.CUDA, in, out, rng)
+}
+
+// NewLinearOn creates a Linear on device.
+func NewLinearOn(device tensor.Device, in, out int, rng *rand.Rand) (*Linear, error) {
 	weight := make([]float32, out*in)
 	bound := 1 / math.Sqrt(float64(in))
 	for i := range weight {
 		weight[i] = float32((rng.Float64()*2 - 1) * bound)
 	}
-	w, err := tensor.FromHost([]int{out, in}, weight)
+	w, err := tensor.FromHostOn(device, []int{out, in}, weight)
 	if err != nil {
 		return nil, err
 	}
-	b, err := tensor.FromHost([]int{out}, make([]float32, out))
+	b, err := tensor.FromHostOn(device, []int{out}, make([]float32, out))
 	if err != nil {
 		w.Close()
 		return nil, err
 	}
-	gw, err := tensor.Zeros(out, in)
+	gw, err := tensor.ZerosOn(device, out, in)
 	if err != nil {
 		w.Close()
 		b.Close()
 		return nil, err
 	}
-	gb, err := tensor.Zeros(out)
+	gb, err := tensor.ZerosOn(device, out)
 	if err != nil {
 		w.Close()
 		b.Close()
@@ -90,21 +95,38 @@ func (l *Linear) Close() {
 // Forward computes y = x*W^T + b.
 func (l *Linear) Forward(blas *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, error) {
 	shape := x.Shape()
-	if len(shape) != 2 || shape[1] != l.in {
+	if (len(shape) != 2 && len(shape) != 3) || shape[len(shape)-1] != l.in || x.Device() != l.Weight.Device() {
 		return nil, fmt.Errorf("nn: Linear expects [rows,%d], got %v", l.in, shape)
 	}
-	rows := shape[0]
-	y, err := tensor.New(rows, l.out)
+	rows := x.Numel() / l.in
+	outShape := append([]int(nil), shape...)
+	outShape[len(outShape)-1] = l.out
+	y, err := tensor.NewOn(x.Device(), outShape...)
 	if err != nil {
 		return nil, err
 	}
-	if err := blas.SgemmRowMajorNT(rows, l.out, l.in, 1, x.Buffer().Pointer(), l.in, l.Weight.Buffer().Pointer(), l.in, 0, y.Buffer().Pointer(), l.out); err != nil {
+	if x.Device() == tensor.CPU {
+		w := make([]float32, l.in*l.out)
+		for o := 0; o < l.out; o++ {
+			for i := 0; i < l.in; i++ {
+				w[i*l.out+o] = l.Weight.Data()[o*l.in+i]
+			}
+		}
+		tensor.SGEMM(y.Data(), x.Data(), w, rows, l.out, l.in)
+		for r := 0; r < rows; r++ {
+			for o := 0; o < l.out; o++ {
+				y.Data()[r*l.out+o] += l.Bias.Data()[o]
+			}
+		}
+	} else if err := blas.SgemmRowMajorNT(rows, l.out, l.in, 1, x.Buffer().Pointer(), l.in, l.Weight.Buffer().Pointer(), l.in, 0, y.Buffer().Pointer(), l.out); err != nil {
 		y.Close()
 		return nil, err
 	}
-	if err := kernels.AddBiasColumns(y.Buffer(), l.Bias.Buffer(), rows, l.out); err != nil {
-		y.Close()
-		return nil, err
+	if x.Device() == tensor.CUDA {
+		if err := kernels.AddBiasColumns(y.Buffer(), l.Bias.Buffer(), rows, l.out); err != nil {
+			y.Close()
+			return nil, err
+		}
 	}
 	l.input = x
 	l.rows = rows
@@ -113,9 +135,24 @@ func (l *Linear) Forward(blas *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, err
 
 // Backward accumulates dW and db and returns dX.
 func (l *Linear) Backward(blas *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor, error) {
-	dx, err := tensor.New(l.rows, l.in)
+	shape := l.input.Shape()
+	dx, err := tensor.NewOn(grad.Device(), shape...)
 	if err != nil {
 		return nil, err
+	}
+	if grad.Device() == tensor.CPU {
+		tensor.SGEMM(dx.Data(), grad.Data(), l.Weight.Data(), l.rows, l.in, l.out)
+		// dW = dY^T X; parameter gradients accumulate until ZeroGrad.
+		for r := 0; r < l.rows; r++ {
+			for o := 0; o < l.out; o++ {
+				g := grad.Data()[r*l.out+o]
+				l.gradBias.Data()[o] += g
+				for i := 0; i < l.in; i++ {
+					l.gradWeight.Data()[o*l.in+i] += g * l.input.Data()[r*l.in+i]
+				}
+			}
+		}
+		return dx, nil
 	}
 	if err := blas.SgemmRowMajor(l.rows, l.in, l.out, 1, grad.Buffer().Pointer(), l.out, l.Weight.Buffer().Pointer(), l.in, 0, dx.Buffer().Pointer(), l.in); err != nil {
 		dx.Close()
@@ -148,11 +185,15 @@ func (t *Tanh) ZeroGrad() {}
 
 // Forward computes tanh(x).
 func (t *Tanh) Forward(blas *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, error) {
-	out, err := tensor.New(x.Shape()...)
+	out, err := tensor.NewOn(x.Device(), x.Shape()...)
 	if err != nil {
 		return nil, err
 	}
-	if err := kernels.Tanh(x.Buffer(), out.Buffer(), x.Numel()); err != nil {
+	if x.Device() == tensor.CPU {
+		for i, v := range x.Data() {
+			out.Data()[i] = float32(math.Tanh(float64(v)))
+		}
+	} else if err := kernels.Tanh(x.Buffer(), out.Buffer(), x.Numel()); err != nil {
 		out.Close()
 		return nil, err
 	}
@@ -162,11 +203,15 @@ func (t *Tanh) Forward(blas *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, error
 
 // Backward returns dX = grad * (1 - out^2).
 func (t *Tanh) Backward(blas *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor, error) {
-	dx, err := tensor.Zeros(grad.Shape()...)
+	dx, err := tensor.ZerosOn(grad.Device(), grad.Shape()...)
 	if err != nil {
 		return nil, err
 	}
-	if err := kernels.TanhBackward(t.output.Buffer(), grad.Buffer(), dx.Buffer(), grad.Numel()); err != nil {
+	if grad.Device() == tensor.CPU {
+		for i, v := range t.output.Data() {
+			dx.Data()[i] = grad.Data()[i] * (1 - v*v)
+		}
+	} else if err := kernels.TanhBackward(t.output.Buffer(), grad.Buffer(), dx.Buffer(), grad.Numel()); err != nil {
 		dx.Close()
 		return nil, err
 	}
@@ -280,19 +325,23 @@ func NewAdamW(params, grads []*tensor.Tensor, learningRate, weightDecay, maxNorm
 	if len(params) != len(grads) {
 		return nil, fmt.Errorf("nn: parameter and gradient counts differ")
 	}
-	norm, err := tensor.Zeros(1)
+	device := tensor.CUDA
+	if len(params) > 0 {
+		device = params[0].Device()
+	}
+	norm, err := tensor.ZerosOn(device, 1)
 	if err != nil {
 		return nil, err
 	}
 	o := &AdamW{params: params, grads: grads, norm: norm,
 		learningRate: learningRate, weightDecay: weightDecay, maxNorm: maxNorm}
 	for _, p := range params {
-		m, err := tensor.Zeros(p.Shape()...)
+		m, err := tensor.ZerosOn(device, p.Shape()...)
 		if err != nil {
 			o.Close()
 			return nil, err
 		}
-		v, err := tensor.Zeros(p.Shape()...)
+		v, err := tensor.ZerosOn(device, p.Shape()...)
 		if err != nil {
 			o.Close()
 			return nil, err
@@ -305,6 +354,33 @@ func NewAdamW(params, grads []*tensor.Tensor, learningRate, weightDecay, maxNorm
 
 // Step clips the global gradient norm and applies one AdamW update.
 func (o *AdamW) Step() error {
+	if o.norm.Device() == tensor.CPU {
+		var sum float64
+		for _, g := range o.grads {
+			for _, v := range g.Data() {
+				sum += float64(v) * float64(v)
+			}
+		}
+		norm := math.Sqrt(sum)
+		scale := 1.0
+		if o.maxNorm > 0 && norm > o.maxNorm {
+			scale = o.maxNorm / norm
+		}
+		o.step++
+		bc1 := 1 - math.Pow(.9, float64(o.step))
+		bc2 := 1 - math.Pow(.999, float64(o.step))
+		for i, p := range o.params {
+			for j := range p.Data() {
+				g := float32(float64(o.grads[i].Data()[j]) * scale)
+				m := .9*o.m[i].Data()[j] + .1*g
+				v := .999*o.v[i].Data()[j] + .001*g*g
+				o.m[i].Data()[j] = m
+				o.v[i].Data()[j] = v
+				p.Data()[j] = p.Data()[j]*(1-float32(o.learningRate*o.weightDecay)) - float32(o.learningRate)*float32(float64(m)/bc1)/(float32(math.Sqrt(float64(v)/bc2))+1e-8)
+			}
+		}
+		return nil
+	}
 	if err := o.norm.Zero(); err != nil {
 		return err
 	}
