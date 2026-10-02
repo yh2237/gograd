@@ -37,8 +37,10 @@ optional channel weights. Each divides by the sum of element weights, and
 returns a loss and output gradient. AdamW clips the global gradient norm and
 uses decoupled weight decay on either device.
 
-The new CUDA Conv1d, activations and masked losses currently transfer data
-through host memory; the specialized `gputcn` GPU kernels remain available.
+General CUDA Conv1d uses im2col/col2im kernels and cuBLAS for both passes.
+Activations, residual additions, masked losses, and AdamW run on the device.
+The trainer keeps fixed loss weights on the device and downloads only the
+requested scalar loss during each step.
 
 The `gputcn` package runs the TCN forward and backward passes on the GPU in
 float32. The forward output matches the PyTorch float64 reference to about
@@ -73,6 +75,7 @@ go vet ./...
 go run ./cmd/tcn-train
 go run ./cmd/gputcn-train
 go run ./cmd/nn-conv-train -device cpu -hidden 128 -kernel 5 -steps 3
+go run ./cmd/nn-conv-train -device cpu -hidden 128 -kernel 5 -steps 5 -cpuprofile cpu.pprof
 go test ./tensor -run '^$' -bench 'Benchmark(SGEMM|NaiveSGEMM)$' -benchtime=1x -cpu=12
 go test ./gputcn/ -run XXX -bench .
 ```
@@ -86,7 +89,9 @@ demonstrations of the engine, not real training recipes.
 
 `nn-conv-train` trains a six-block residual Conv1d network on padded synthetic
 sequences (input 74, output 72, dilations 1,2,4,1,2,4), prints full training
-step times, and accepts `-device cuda` when CUDA is available.
+step times, and accepts `-device cuda` when CUDA is available. It defaults to
+masked L1 loss; `-loss mse` selects masked MSE. Set `GOMAXPROCS=12` for the
+12-thread benchmark and use `-cpuprofile` to write a Go CPU profile.
 
 `gputcn-fit` trains on a prepared dataset (frame features, targets and mask)
 instead of the synthetic corpus:
@@ -151,9 +156,8 @@ are `[batch,time,channels]` and zero same-padding extends by
 ## Not present in this code
 
 The general float32 path uses explicit module backward passes rather than an
-arbitrary autograd graph. AMP, arbitrary strides/broadcasting, loading other
-frameworks' checkpoints, and device-native kernels for all general CUDA ops
-are not present.
+arbitrary autograd graph. AMP, arbitrary strides/broadcasting, and loading
+other frameworks' checkpoints are not present.
 
 ## License
 

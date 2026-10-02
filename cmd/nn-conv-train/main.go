@@ -10,7 +10,9 @@ import (
 	"github.com/yh2237/gograd/tensor"
 	"math"
 	"math/rand"
+	"os"
 	"runtime"
+	"runtime/pprof"
 	"time"
 )
 
@@ -21,7 +23,20 @@ func main() {
 	batch := flag.Int("batch", 32, "batch size")
 	frames := flag.Int("time", 100, "padded frames")
 	steps := flag.Int("steps", 3, "training steps")
+	profile := flag.String("cpuprofile", "", "write CPU profile")
+	lossKind := flag.String("loss", "l1", "l1 or mse")
 	flag.Parse()
+	if *profile != "" {
+		f, err := os.Create(*profile)
+		if err != nil {
+			panic(err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			panic(err)
+		}
+		defer pprof.StopCPUProfile()
+	}
 	device := tensor.Device(*deviceFlag)
 	if device != tensor.CPU && device != tensor.CUDA {
 		panic("invalid device")
@@ -95,6 +110,14 @@ func main() {
 		panic(e)
 	}
 	defer target.Close()
+	if *lossKind != "l1" && *lossKind != "mse" {
+		panic("invalid loss")
+	}
+	lossOp, e := nn.NewMaskedLoss(device, mask, nil, 72, *lossKind == "l1")
+	if e != nil {
+		panic(e)
+	}
+	defer lossOp.Close()
 	for step := 0; step < *steps; step++ {
 		start := time.Now()
 		model.ZeroGrad()
@@ -102,7 +125,9 @@ func main() {
 		if e != nil {
 			panic(e)
 		}
-		loss, g, e := nn.MaskedWeightedMSE(y, target, mask, nil)
+		var loss float64
+		var g *tensor.Tensor
+		loss, g, e = lossOp.Forward(y, target)
 		if e != nil {
 			panic(e)
 		}
