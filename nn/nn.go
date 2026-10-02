@@ -106,13 +106,7 @@ func (l *Linear) Forward(blas *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, err
 		return nil, err
 	}
 	if x.Device() == tensor.CPU {
-		w := make([]float32, l.in*l.out)
-		for o := 0; o < l.out; o++ {
-			for i := 0; i < l.in; i++ {
-				w[i*l.out+o] = l.Weight.Data()[o*l.in+i]
-			}
-		}
-		tensor.SGEMM(y.Data(), x.Data(), w, rows, l.out, l.in)
+		tensor.SGEMMOp(y.Data(), x.Data(), l.Weight.Data(), rows, l.out, l.in, false, true)
 		for r := 0; r < rows; r++ {
 			for o := 0; o < l.out; o++ {
 				y.Data()[r*l.out+o] += l.Bias.Data()[o]

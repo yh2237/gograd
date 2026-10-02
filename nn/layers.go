@@ -111,14 +111,8 @@ func (c *Conv1d) Forward(blas *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, err
 			}
 		}
 	}
-	wt := make([]float32, k*c.Out)
-	for o := 0; o < c.Out; o++ {
-		for j := 0; j < k; j++ {
-			wt[j*c.Out+o] = wv[o*k+j]
-		}
-	}
 	y := make([]float32, rows*c.Out)
-	tensor.SGEMM(y, cols, wt, rows, c.Out, k)
+	tensor.SGEMMOp(y, cols, wv, rows, c.Out, k, false, true)
 	for r := 0; r < rows; r++ {
 		for o := 0; o < c.Out; o++ {
 			y[r*c.Out+o] += bias[o]
@@ -157,15 +151,8 @@ func (c *Conv1d) Backward(blas *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor,
 	if err != nil {
 		return nil, err
 	}
-	// Transpose columns and multiply to form all parameter gradients.
-	ct := make([]float32, k*rows)
-	for r := 0; r < rows; r++ {
-		for j := 0; j < k; j++ {
-			ct[j*rows+r] = c.columns[r*k+j]
-		}
-	}
 	dw := make([]float32, k*c.Out)
-	tensor.SGEMM(dw, ct, gv, k, c.Out, rows)
+	tensor.SGEMMOp(dw, c.columns, gv, k, c.Out, rows, true, false)
 	for o := 0; o < c.Out; o++ {
 		for j := 0; j < k; j++ {
 			gw[o*k+j] += dw[j*c.Out+o]
