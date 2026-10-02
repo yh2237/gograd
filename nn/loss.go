@@ -19,7 +19,8 @@ func MaskedL1(pred, target *tensor.Tensor, frameWeight, channelWeight []float32)
 }
 func maskedLoss(pred, target *tensor.Tensor, fw, cw []float32, l1 bool) (float64, *tensor.Tensor, error) {
 	s := pred.Shape()
-	if len(s) != 3 || target.Numel() != pred.Numel() || len(fw) != s[0]*s[1] || (cw != nil && len(cw) != s[2]) {
+	ts := target.Shape()
+	if len(s) != 3 || len(ts) != 3 || ts[0] != s[0] || ts[1] != s[1] || ts[2] != s[2] || target.Device() != pred.Device() || len(fw) != s[0]*s[1] || (cw != nil && len(cw) != s[2]) {
 		return 0, nil, fmt.Errorf("nn: masked loss shape mismatch")
 	}
 	p, err := values(pred)

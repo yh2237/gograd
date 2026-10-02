@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/yh2237/gograd/tensor"
 	"io"
+	"reflect"
 )
 
 // LayerConfig describes a layer for an independent inference reader. Layers
@@ -113,9 +114,12 @@ func Load(r io.Reader, model Module) (*Checkpoint, error) {
 	if c.Version != 1 {
 		return nil, fmt.Errorf("nn: unsupported checkpoint version %d", c.Version)
 	}
-	_, expected, err := describe(model, "model")
+	configs, expected, err := describe(model, "model")
 	if err != nil {
 		return nil, err
+	}
+	if !reflect.DeepEqual(configs, c.Layers) {
+		return nil, fmt.Errorf("nn: checkpoint layer configuration mismatch")
 	}
 	if len(expected) != len(c.Parameters) {
 		return nil, fmt.Errorf("nn: parameter count mismatch")

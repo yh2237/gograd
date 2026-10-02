@@ -147,6 +147,53 @@ func TestMaskedLossGradients(t *testing.T) {
 	}
 }
 
+func TestAllActivationsDeviceParity(t *testing.T) {
+	if !cuda.Available() {
+		t.Skip("CUDA unavailable")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if e := cuda.SetDevice(0); e != nil {
+		t.Fatal(e)
+	}
+	v := []float32{-.8, -.2, .3, .9}
+	up := []float32{.2, -.5, .3, .7}
+	for name, makeModule := range map[string]func() Module{
+		"relu": func() Module { return &ReLU{} }, "leaky_relu": func() Module { return &LeakyReLU{Slope: .15} }, "gelu": func() Module { return &GELU{} }, "tanh": func() Module { return &Tanh{} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			if e := cuda.SetDevice(0); e != nil {
+				t.Fatal(e)
+			}
+			outputs := make([][]float32, 2)
+			grads := make([][]float32, 2)
+			for i, device := range []tensor.Device{tensor.CPU, tensor.CUDA} {
+				m := makeModule()
+				x := tensorOn(t, device, []int{1, 2, 2}, v)
+				g := tensorOn(t, device, []int{1, 2, 2}, up)
+				y, e := m.Forward(nil, x)
+				if e != nil {
+					t.Fatal(e)
+				}
+				outputs[i] = host(t, y)
+				dx, e := m.Backward(nil, g)
+				if e != nil {
+					t.Fatal(e)
+				}
+				grads[i] = host(t, dx)
+				x.Close()
+				g.Close()
+				y.Close()
+				dx.Close()
+			}
+			closeEnough(t, "forward", outputs[1], outputs[0], 2e-6)
+			closeEnough(t, "backward", grads[1], grads[0], 2e-6)
+		})
+	}
+}
+
 type fixture struct {
 	Input, Target, Mask, Channels, Forward []float32
 	Loss                                   float64
@@ -236,9 +283,12 @@ func TestTorchConvParity(t *testing.T) {
 			if e = Save(&b, model); e != nil {
 				t.Fatal(e)
 			}
+			first := host(t, model.Parameters()[0])
+			model.Parameters()[0].Zero()
 			if _, e = Load(&b, model); e != nil {
 				t.Fatal(e)
 			}
+			closeEnough(t, "checkpoint roundtrip", host(t, model.Parameters()[0]), first, 0)
 		})
 	}
 }
