@@ -17,6 +17,10 @@ func blas() *cuda.Blas {
 	}
 	return blasHandle
 }
+
+// SetBLASStream routes autograd's cuBLAS handle during CUDA graph capture.
+// Passing nil restores the default stream.
+func SetBLASStream(stream *cuda.Stream) error { return blas().SetStream(stream) }
 func gpuMatMul(a, b *Tensor, s []int, m, n, k int, batch []int) *Tensor {
 	out := mustAlloc(numel(s))
 	ab := a.Shape[:len(a.Shape)-2]

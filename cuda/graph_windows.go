@@ -30,8 +30,9 @@ func SetCurrentStream(s *Stream) {
 
 // Graph is a captured sequence of GPU work that replays with one launch.
 type Graph struct {
-	exec   uintptr
-	stream *Stream
+	exec     uintptr
+	stream   *Stream
+	reserved map[uintptr]int
 }
 
 // Capture records the GPU work that fn enqueues on stream into a graph. fn must
@@ -47,9 +48,15 @@ func Capture(stream *Stream, fn func() error) (*Graph, error) {
 	previous := currentStream
 	currentStream = stream.handle
 	capturing = true
+	poolMu.Lock()
+	captureTouched = map[uintptr]int{}
+	poolMu.Unlock()
 	defer func() {
 		currentStream = previous
 		capturing = false
+		poolMu.Lock()
+		captureTouched = nil
+		poolMu.Unlock()
 	}()
 	a, err := loadKernelAPI()
 	if err != nil {
@@ -80,7 +87,21 @@ func Capture(stream *Stream, fn func() error) (*Graph, error) {
 		return nil, driverError("cuGraphInstantiate", code)
 	}
 	a.graphDestroy.Call(graph)
-	return &Graph{exec: exec, stream: stream}, nil
+	reserved := map[uintptr]int{}
+	poolMu.Lock()
+	for size, list := range poolTable {
+		kept := list[:0]
+		for _, pointer := range list {
+			if _, used := captureTouched[pointer]; used {
+				reserved[pointer] = size
+			} else {
+				kept = append(kept, pointer)
+			}
+		}
+		poolTable[size] = kept
+	}
+	poolMu.Unlock()
+	return &Graph{exec: exec, stream: stream, reserved: reserved}, nil
 }
 
 // Launch replays the graph.
@@ -104,7 +125,16 @@ func (g *Graph) Close() error {
 	if err != nil {
 		return err
 	}
+	if err := g.stream.Synchronize(); err != nil {
+		return err
+	}
 	code, _, _ := a.graphExecDestroy.Call(g.exec)
 	g.exec = 0
+	poolMu.Lock()
+	for pointer, size := range g.reserved {
+		poolTable[size] = append(poolTable[size], pointer)
+	}
+	g.reserved = nil
+	poolMu.Unlock()
 	return driverError("cuGraphExecDestroy", code)
 }

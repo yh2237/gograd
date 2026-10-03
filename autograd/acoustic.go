@@ -12,6 +12,45 @@ type Acoustic struct {
 	Hidden, Speakers, Outputs, Blocks int
 	Dilations                         []int
 	Device                            tensor.Device
+	phoneIndices, speakerIndices      *IndexBuffer
+}
+
+// SetCUDAIndices uploads fixed batch indices once for repeated forward calls.
+func (m *Acoustic) SetCUDAIndices(ids, speaker []int) error {
+	if m.Device != tensor.CUDA {
+		return fmt.Errorf("autograd: CUDA indices require CUDA model")
+	}
+	for _, id := range ids {
+		if id < 0 || id >= 46 {
+			return fmt.Errorf("autograd: phone index %d", id)
+		}
+	}
+	for _, id := range speaker {
+		if id < 0 || id >= m.Speakers {
+			return fmt.Errorf("autograd: speaker index %d", id)
+		}
+	}
+	phone, e := NewIndexBuffer(ids)
+	if e != nil {
+		return e
+	}
+	spk, e := NewIndexBuffer(speaker)
+	if e != nil {
+		phone.Close()
+		return e
+	}
+	m.ClearCUDAIndices()
+	m.phoneIndices, m.speakerIndices = phone, spk
+	return nil
+}
+func (m *Acoustic) ClearCUDAIndices() {
+	if m.phoneIndices != nil {
+		m.phoneIndices.Close()
+	}
+	if m.speakerIndices != nil {
+		m.speakerIndices.Close()
+	}
+	m.phoneIndices, m.speakerIndices = nil, nil
 }
 
 func NewAcoustic(hidden, speakers, outputs int, dilations []int, device tensor.Device) (*Acoustic, error) {
@@ -67,8 +106,17 @@ func (m *Acoustic) Forward(ids []int, cont *Tensor, speaker []int) *Tensor {
 		panic("autograd: acoustic inputs")
 	}
 	b, t := s[0], s[1]
-	phone := Reshape(Embedding(m.Param("phone.weight"), ids, []int{b, t, 3}), b, t, 192)
-	spk := Embedding(m.Param("speaker.weight"), speaker, []int{b})
+	var phone, spk *Tensor
+	if m.phoneIndices != nil {
+		if m.phoneIndices.Count != len(ids) || m.speakerIndices.Count != len(speaker) {
+			panic("autograd: cached index count")
+		}
+		phone = Reshape(EmbeddingFromIndexBuffer(m.Param("phone.weight"), m.phoneIndices, []int{b, t, 3}, -1), b, t, 192)
+		spk = EmbeddingFromIndexBuffer(m.Param("speaker.weight"), m.speakerIndices, []int{b}, -1)
+	} else {
+		phone = Reshape(Embedding(m.Param("phone.weight"), ids, []int{b, t, 3}), b, t, 192)
+		spk = Embedding(m.Param("speaker.weight"), speaker, []int{b})
+	}
 	expanded := Add(Reshape(spk, b, 1, 64), mustZeros([]int{b, t, 64}, m.Device))
 	x := Concat(2, phone, expanded, cont)
 	h := Conv1dGEMM(x, m.Param("inp.weight"), m.Param("inp.bias"), 1)

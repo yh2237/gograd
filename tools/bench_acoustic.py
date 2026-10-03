@@ -7,6 +7,7 @@ from gen_acoustic_fixture import Acoustic
 p = argparse.ArgumentParser()
 p.add_argument("--device", choices=("cpu", "cuda"), required=True)
 p.add_argument("--threads", type=int, default=12)
+p.add_argument("--graph", action="store_true", help="capture and replay a fixed-shape CUDA step")
 a = p.parse_args()
 torch.set_num_threads(a.threads)
 torch.manual_seed(733)
@@ -17,12 +18,15 @@ cont = torch.randn(24, 400, 4, device=device)
 speakers = torch.randint(0, 102, (24,), device=device)
 target = torch.randn(24, 400, 88, device=device)
 target[:, -10:] = torch.nan
-opt = torch.optim.AdamW(model.parameters(), lr=.001, weight_decay=.0001)
+valid = ~torch.isnan(target[..., 0])
+safe_target = torch.nan_to_num(target)
+denominator = valid.sum() * target.shape[-1]
+opt = torch.optim.AdamW(model.parameters(), lr=.001, weight_decay=.0001, capturable=a.graph)
 
 def step():
-    opt.zero_grad(set_to_none=True)
+    opt.zero_grad(set_to_none=not a.graph)
     pred = model(ids, cont, speakers)
-    loss = (pred - torch.nan_to_num(target)).abs()[~torch.isnan(target[..., 0])].mean()
+    loss = ((pred - safe_target).abs() * valid.unsqueeze(-1)).sum() / denominator
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     opt.step()
@@ -34,3 +38,19 @@ step()
 start = time.perf_counter()
 loss = step()
 print(f"torch {a.device}: {(time.perf_counter()-start)*1000:.3f} ms loss {loss:.6f}", flush=True)
+if a.graph:
+    if device.type != "cuda":
+        raise ValueError("graph capture requires CUDA")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        opt.zero_grad(set_to_none=False)
+        pred = model(ids, cont, speakers)
+        static_loss = ((pred - safe_target).abs() * valid.unsqueeze(-1)).sum() / denominator
+        static_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+    start = time.perf_counter()
+    graph.replay()
+    torch.cuda.synchronize()
+    loss = static_loss.item()
+    print(f"torch cuda graph replay: {(time.perf_counter()-start)*1000:.3f} ms loss {loss:.6f}", flush=True)

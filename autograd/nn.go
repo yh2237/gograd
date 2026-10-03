@@ -5,6 +5,7 @@ import (
 	"github.com/yh2237/gograd/kernels"
 	"github.com/yh2237/gograd/tensor"
 	"math"
+	"unsafe"
 )
 
 var lastNormGPU *cuda.Buffer
@@ -23,6 +24,7 @@ func GradientNormToHost() float32 {
 
 // Conv1d uses [batch,time,channels] and [out,in,kernel] weights.
 func Conv1d(x, w, b *Tensor, dilation int) *Tensor {
+	x, w, b = x.Contiguous(), w.Contiguous(), b.Contiguous()
 	if x.Device == tensor.CUDA {
 		return Conv1dGEMM(x, w, b, dilation)
 	}
@@ -85,6 +87,7 @@ func Conv1d(x, w, b *Tensor, dilation int) *Tensor {
 func GroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
 	same(x, w)
 	same(x, b)
+	x, w, b = x.Contiguous(), w.Contiguous(), b.Contiguous()
 	s := x.Shape
 	if len(s) != 3 || groups < 1 || s[2]%groups != 0 || w.Numel() != s[2] || b.Numel() != s[2] {
 		panic("autograd: groupnorm shape")
@@ -207,7 +210,42 @@ type AdamW struct {
 	M, V                               [][]float32
 	mGPU, vGPU                         []*cuda.Buffer
 	unityGPU                           *cuda.Buffer
+	graphStep                          *cuda.Buffer
 	StepCount                          int
+}
+
+// PrepareGraph initializes a device step counter before capturing AdamW.
+// Captured replays advance this counter and recompute bias correction.
+func (o *AdamW) PrepareGraph() error {
+	if len(o.Params) == 0 || o.Params[0].Value.Device != tensor.CUDA {
+		return cuda.ErrUnavailable
+	}
+	if o.graphStep == nil {
+		o.graphStep = mustAlloc(1)
+	}
+	step := int32(o.StepCount)
+	return o.graphStep.CopyFromHost(unsafe.Slice((*byte)(unsafe.Pointer(&step)), 4))
+}
+func (o *AdamW) GraphStepCount() (int, error) {
+	if o.graphStep == nil {
+		return 0, cuda.ErrUnavailable
+	}
+	var step int32
+	if e := o.graphStep.CopyToHost(unsafe.Slice((*byte)(unsafe.Pointer(&step)), 4)); e != nil {
+		return 0, e
+	}
+	return int(step), nil
+}
+
+// SyncGraphStepCount restores the host counter before switching from graph
+// replay back to eager AdamW updates. It reads one scalar from the device.
+func (o *AdamW) SyncGraphStepCount() error {
+	step, e := o.GraphStepCount()
+	if e != nil {
+		return e
+	}
+	o.StepCount = step
+	return nil
 }
 
 func NewAdamW(params []Parameter, lr, decay float32) *AdamW {
@@ -232,6 +270,22 @@ func NewAdamW(params []Parameter, lr, decay float32) *AdamW {
 }
 func (o *AdamW) Step() {
 	o.StepCount++
+	if cuda.InCapture() {
+		if o.graphStep == nil {
+			panic("autograd: call AdamW.PrepareGraph before capture")
+		}
+		step := ptr(o.graphStep)
+		launch("graph_adam_inc", 1, unsafe.Pointer(&step))
+		for i, p := range o.Params {
+			if p.Value.gradBuf == nil {
+				continue
+			}
+			pp, gp, mp, vp := ptr(p.Value.buf), ptr(p.Value.gradBuf), ptr(o.mGPU[i]), ptr(o.vGPU[i])
+			n := int32(p.Value.Numel())
+			launch("graph_adamw", int(n), unsafe.Pointer(&pp), unsafe.Pointer(&gp), unsafe.Pointer(&mp), unsafe.Pointer(&vp), unsafe.Pointer(&step), unsafe.Pointer(&n), unsafe.Pointer(&o.Beta1), unsafe.Pointer(&o.Beta2), unsafe.Pointer(&o.LR), unsafe.Pointer(&o.WeightDecay), unsafe.Pointer(&o.Eps))
+		}
+		return
+	}
 	bc1 := float32(1 - math.Pow(float64(o.Beta1), float64(o.StepCount)))
 	bc2 := float32(1 - math.Pow(float64(o.Beta2), float64(o.StepCount)))
 	if len(o.Params) > 0 && o.Params[0].Value.Device == tensor.CUDA {

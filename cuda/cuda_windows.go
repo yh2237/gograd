@@ -315,8 +315,9 @@ type Buffer struct {
 }
 
 var (
-	poolMu    sync.Mutex
-	poolTable = map[int][]uintptr{}
+	poolMu         sync.Mutex
+	poolTable      = map[int][]uintptr{}
+	captureTouched map[uintptr]int
 )
 
 // Alloc reserves size bytes on the current device. Freed buffers of the same
@@ -335,6 +336,9 @@ func Alloc(size int) (*Buffer, error) {
 	if len(list) > 0 {
 		pointer := list[len(list)-1]
 		poolTable[size] = list[:len(list)-1]
+		if capturing && captureTouched != nil {
+			captureTouched[pointer] = size
+		}
 		poolMu.Unlock()
 		return &Buffer{pointer: pointer, size: size}, nil
 	}
@@ -343,6 +347,13 @@ func Alloc(size int) (*Buffer, error) {
 	code, _, _ := a.malloc.Call(uintptr(unsafe.Pointer(&pointer)), uintptr(size))
 	if err := runtimeError("cudaMalloc", code); err != nil {
 		return nil, err
+	}
+	if capturing {
+		poolMu.Lock()
+		if captureTouched != nil {
+			captureTouched[pointer] = size
+		}
+		poolMu.Unlock()
 	}
 	return &Buffer{pointer: pointer, size: size}, nil
 }
@@ -355,6 +366,9 @@ func (b *Buffer) Free() error {
 	}
 	b.freed = true
 	poolMu.Lock()
+	if capturing && captureTouched != nil {
+		captureTouched[b.pointer] = b.size
+	}
 	poolTable[b.size] = append(poolTable[b.size], b.pointer)
 	poolMu.Unlock()
 	b.pointer = 0
@@ -586,7 +600,11 @@ func (b *Blas) SetStream(stream *Stream) error {
 	if err != nil {
 		return err
 	}
-	status, _, _ := a.cublasSetStream.Call(b.handle, stream.handle)
+	handle := uintptr(0)
+	if stream != nil {
+		handle = stream.handle
+	}
+	status, _, _ := a.cublasSetStream.Call(b.handle, handle)
 	return blasError("cublasSetStream", status)
 }
 

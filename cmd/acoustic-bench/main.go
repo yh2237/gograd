@@ -19,6 +19,7 @@ func main() {
 	warmup := flag.Int("warmup", 0, "untimed steps before measurement")
 	profile := flag.String("cpuprofile", "", "CPU profile path")
 	gpuProfile := flag.Bool("gpu-profile", false, "synchronize and report CUDA operator timings")
+	graph := flag.Bool("graph", false, "capture and time one fixed-shape CUDA training-step replay")
 	flag.Parse()
 	if *profile != "" {
 		f, e := os.Create(*profile)
@@ -90,6 +91,15 @@ func main() {
 		panic(e)
 	}
 	opt := autograd.NewAdamW(m.Params, .001, .0001)
+	if *graph {
+		if device != tensor.CUDA {
+			panic("graph capture requires CUDA")
+		}
+		if e := m.SetCUDAIndices(ids, spk); e != nil {
+			panic(e)
+		}
+		defer m.ClearCUDAIndices()
+	}
 	syncDevice := func() {
 		if device == tensor.CUDA {
 			if e := cuda.Synchronize(); e != nil {
@@ -141,6 +151,58 @@ func main() {
 				}
 			}
 		}
+	}
+	if *graph {
+		if e := opt.PrepareGraph(); e != nil {
+			panic(e)
+		}
+		stream, e := cuda.NewStream()
+		if e != nil {
+			panic(e)
+		}
+		defer stream.Destroy()
+		if e := autograd.SetBLASStream(stream); e != nil {
+			panic(e)
+		}
+		defer autograd.SetBLASStream(nil)
+		var capturedLoss *autograd.Tensor
+		captured, e := cuda.Capture(stream, func() error {
+			opt.ZeroGrad()
+			pred := m.Forward(ids, cont, spk)
+			loss := autograd.MaskedLoss(pred, target, false)
+			loss.RetainGrad()
+			capturedLoss = loss
+			if e := loss.Backward(); e != nil {
+				return e
+			}
+			autograd.ClipGradNorm(m.Params, 1)
+			opt.Step()
+			loss.ReleaseGraph()
+			return nil
+		})
+		if e != nil {
+			fmt.Printf("gograd cuda graph capture failed: %v\n", e)
+			return
+		}
+		defer captured.Close()
+		start := time.Now()
+		if e := captured.Launch(); e != nil {
+			panic(e)
+		}
+		if e := stream.Synchronize(); e != nil {
+			panic(e)
+		}
+		lossValue, e := capturedLoss.ToHost()
+		if e != nil {
+			panic(e)
+		}
+		elapsed := time.Since(start)
+		stepCount, e := opt.GraphStepCount()
+		if e != nil {
+			panic(e)
+		}
+		fmt.Printf("gograd cuda graph replay: %.3f ms (device AdamW step %d, loss %.6f)\n", float64(elapsed.Microseconds())/1000, stepCount, lossValue[0])
+		capturedLoss.Close()
 	}
 }
 func float32NaN() float32 { return float32(math.NaN()) }
