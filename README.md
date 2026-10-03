@@ -34,6 +34,12 @@ An elementwise op registry pairs CPU rules and CUDA kernels. Pre-norm
 `TransformerEncoderLayer` and batch-first `MultiheadAttention` compose these
 ops. `Module` supports named state and F32 safetensors files compatible with
 PyTorch exports.
+CUDA batched matmul uses one strided cuBLAS call for regular and broadcast
+batches. Attention combines batched GEMMs with fused masked softmax kernels;
+layer norm and the encoder feed-forward bias/GELU/residual use fused kernels.
+Warp softmax handles arbitrary axes. An optional `-bf16` benchmark mode
+converts GEMM operands on device and uses tensor-core cuBLAS GEMMEx with FP32
+accumulation, gradients, and master weights. The default remains FP32.
 `autograd.Acoustic` composes the reference acoustic model and is checked
 against a PyTorch training-step fixture on CPU and CUDA. CUDA tensors and
 gradients now live in device buffers; graph operators use cuBLAS and NVRTC
@@ -114,7 +120,9 @@ go run ./cmd/acoustic-bench -device cuda -warmup 2 -graph
 python tools/bench_acoustic.py --device cuda --threads 12
 python tools/bench_acoustic.py --device cuda --threads 12 --graph
 go run ./cmd/transformer-bench -device cuda -warmup 1
+go run ./cmd/transformer-bench -device cuda -warmup 2 -graph -bf16
 python tools/bench_transformer.py --device cuda --threads 12 --warmup 1
+python tools/bench_transformer.py --device cuda --warmup 2 --graph --bf16
 ```
 
 `tcn-train` fits a tiny synthetic corpus on the CPU and writes
@@ -133,22 +141,31 @@ masked L1 loss; `-loss mse` selects masked MSE. Set `GOMAXPROCS=12` for the
 Single warmed full-step measurements on the RTX 3060 Ti and 12 CPU threads
 (`GOMAXPROCS=12` for Go):
 
-| Model and runtime | CPU | CUDA eager | CUDA graph replay |
-| --- | ---: | ---: | ---: |
-| Acoustic, PyTorch | 2,582 ms | 58.2 ms | 55.1 ms |
-| Acoustic, gograd before this round | 5,416 ms | 78.2 ms | not available |
-| Acoustic, gograd now | 6,561 ms | 79.8 ms | 79.8 ms |
-| Transformer, PyTorch | 1,044 ms | 24.6 ms | not measured |
-| Transformer, gograd | 3,997 ms | 89.9 ms | not implemented |
+| Model and runtime | CPU FP32 | CUDA FP32 eager | CUDA FP32 graph | CUDA BF16 eager | CUDA BF16 graph |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Acoustic, PyTorch | 1,931 ms | 60.9 ms | 53.8 ms | 49.3 ms | 44.1 ms |
+| Acoustic, gograd | 4,193 ms | 84.3 ms | 80.8 ms | 70.1 ms | 68.6 ms |
+| Transformer, PyTorch | 477 ms | 23.5 ms | 24.0 ms | 13.1 ms | 12.3 ms |
+| Transformer, gograd | 2,388 ms | 28.7 ms | 28.3 ms | 27.3 ms | 25.8 ms |
 
 Acoustic is hidden 384, batch 24, 400 frames, 10 blocks. Transformer is four
 pre-norm layers with model width 256, four heads, feed-forward width 1024,
 batch 16, sequence 256. Steps include forward, backward, global-norm clip,
 and AdamW. Acoustic graph replay includes a scalar loss readback; its device
 step counter updates AdamW bias correction each launch. These are individual
-runs, so small differences should not be treated as speedup estimates. The
+runs, so small differences should not be treated as speedup estimates. BF16
+values use PyTorch autocast and gograd's GEMM-only autocast respectively, so
+their scope differs. The
 implementations use different seeded random values and are comparable by
 architecture and dimensions, not identical loss values.
+
+The transformer CUDA FP32 step is 1.22x PyTorch; BF16 is 2.08x PyTorch eager.
+The transformer CPU step is 5.00x PyTorch and remains the largest performance
+gap. The Acoustic CUDA graph records a roughly 1 ms launch submission and
+80 ms device wait, so host launch overhead is small. A profiled transformer
+step records 24 strided GEMM calls each for forward, input gradient, and
+weight gradient, compared with 896 individual calls in the prior round.
+Profiling adds synchronization and should not be compared to the table.
 
 `gputcn-fit` trains on a prepared dataset (frame features, targets and mask)
 instead of the synthetic corpus:
