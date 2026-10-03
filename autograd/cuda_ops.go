@@ -12,6 +12,30 @@ func mustAlloc(n int) *cuda.Buffer {
 	}
 	return b
 }
+func viewMeta(shape, stride []int) ([6]int32, [6]int32) {
+	if len(shape) > 6 {
+		panic("autograd: CUDA view rank > 6")
+	}
+	s := [6]int32{1, 1, 1, 1, 1, 1}
+	var st [6]int32
+	for i, d := range shape {
+		s[6-len(shape)+i] = int32(d)
+		st[6-len(shape)+i] = int32(stride[i])
+	}
+	return s, st
+}
+func gpuViewGather(src, dst *cuda.Buffer, shape, stride []int, offset int) {
+	s, st := viewMeta(shape, stride)
+	n, o := int32(numel(shape)), int32(offset)
+	a, b := ptr(src), ptr(dst)
+	launch("view_gather", int(n), unsafe.Pointer(&a), unsafe.Pointer(&b), unsafe.Pointer(&n), unsafe.Pointer(&s), unsafe.Pointer(&st), unsafe.Pointer(&o))
+}
+func gpuViewScatter(src, dst *cuda.Buffer, shape, stride []int, offset int) {
+	s, st := viewMeta(shape, stride)
+	n, o := int32(numel(shape)), int32(offset)
+	a, b := ptr(src), ptr(dst)
+	launch("view_scatter", int(n), unsafe.Pointer(&a), unsafe.Pointer(&b), unsafe.Pointer(&n), unsafe.Pointer(&s), unsafe.Pointer(&st), unsafe.Pointer(&o))
+}
 func gpuScalar(a *Tensor, value float32, op int) *Tensor {
 	n := int32(a.Numel())
 	out := mustAlloc(int(n))
@@ -39,6 +63,9 @@ func aligned3(shape []int) [3]int32 {
 }
 func gpuBinary(a, b *Tensor, op int) *Tensor {
 	s := bshape(a.Shape, b.Shape)
+	if len(s) > 3 {
+		return gpuBinaryND(a, b, s, op)
+	}
 	out := mustAlloc(numel(s))
 	ad, bd := aligned3(a.Shape), aligned3(b.Shape)
 	od := aligned3(s)
@@ -51,6 +78,30 @@ func gpuBinary(a, b *Tensor, op int) *Tensor {
 		ag, bg := ptr(a.ensureGradGPU()), ptr(b.ensureGradGPU())
 		gp := ptr(g)
 		launch("binary_b", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&bp), unsafe.Pointer(&gp), unsafe.Pointer(&ag), unsafe.Pointer(&bg), unsafe.Pointer(&n), unsafe.Pointer(&d1), unsafe.Pointer(&d2), unsafe.Pointer(&ad[0]), unsafe.Pointer(&ad[1]), unsafe.Pointer(&ad[2]), unsafe.Pointer(&bd[0]), unsafe.Pointer(&bd[1]), unsafe.Pointer(&bd[2]), unsafe.Pointer(&ao))
+	})
+}
+func gpuBinaryND(a, b *Tensor, s []int, op int) *Tensor {
+	broadcastStride := func(t *Tensor) []int {
+		st := make([]int, len(s))
+		for i := range s {
+			j := i - len(s) + len(t.Shape)
+			if j >= 0 && t.Shape[j] != 1 {
+				st[i] = t.Strides[j]
+			}
+		}
+		return st
+	}
+	shape, _ := viewMeta(s, strides(s))
+	_, as := viewMeta(s, broadcastStride(a))
+	_, bs := viewMeta(s, broadcastStride(b))
+	n, kind := int32(numel(s)), int32(op)
+	out := mustAlloc(int(n))
+	ap, bp, yp := ptr(a.buf), ptr(b.buf), ptr(out)
+	launch("binary_nd_f", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&bp), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&shape), unsafe.Pointer(&as), unsafe.Pointer(&bs), unsafe.Pointer(&kind))
+	return resultGPU(out, s, []*Tensor{a, b}, func(g *cuda.Buffer) {
+		ag, bg := ptr(a.ensureGradGPU()), ptr(b.ensureGradGPU())
+		gp := ptr(g)
+		launch("binary_nd_b", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&bp), unsafe.Pointer(&gp), unsafe.Pointer(&ag), unsafe.Pointer(&bg), unsafe.Pointer(&n), unsafe.Pointer(&shape), unsafe.Pointer(&as), unsafe.Pointer(&bs), unsafe.Pointer(&kind))
 	})
 }
 func gpuUnary(a *Tensor, op int) *Tensor {
@@ -124,9 +175,7 @@ func gpuSlice(a *Tensor, axis, start, end int, s []int) *Tensor {
 		launch("slice_b", n, unsafe.Pointer(&gp), unsafe.Pointer(&da), unsafe.Pointer(&nn), unsafe.Pointer(&width), unsafe.Pointer(&begin), unsafe.Pointer(&full), unsafe.Pointer(&inner))
 	})
 }
-func gpuEmbedding(w *Tensor, ids []int, shape []int) *Tensor {
-	dim := w.Shape[1]
-	s := append(append([]int(nil), shape...), dim)
+func gpuEmbedding(w *Tensor, ids []int, shape []int, padding int) *Tensor {
 	id32 := make([]int32, len(ids))
 	for i, v := range ids {
 		id32[i] = int32(v)
@@ -135,26 +184,32 @@ func gpuEmbedding(w *Tensor, ids []int, shape []int) *Tensor {
 	if e := idBuf.CopyFromHost(unsafe.Slice((*byte)(unsafe.Pointer(&id32[0])), len(ids)*4)); e != nil {
 		panic(e)
 	}
-	n := int32(len(ids) * dim)
+	return gpuEmbeddingBuffer(w, idBuf, shape, padding, true)
+}
+func gpuEmbeddingBuffer(w *Tensor, idBuf *cuda.Buffer, shape []int, padding int, own bool) *Tensor {
+	dim := w.Shape[1]
+	s := append(append([]int(nil), shape...), dim)
+	n := int32(numel(shape) * dim)
 	out := mustAlloc(int(n))
 	wp, ip, yp := ptr(w.buf), ptr(idBuf), ptr(out)
-	d := int32(dim)
+	d, pad := int32(dim), int32(padding)
 	launch("embedding_f", int(n), unsafe.Pointer(&wp), unsafe.Pointer(&ip), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&d))
 	r := resultGPU(out, s, []*Tensor{w}, func(g *cuda.Buffer) {
-		defer idBuf.Free()
 		dw := ptr(w.ensureGradGPU())
 		if dw == 0 {
 			return
 		}
 		gp := ptr(g)
-		launch("embedding_b", int(n), unsafe.Pointer(&gp), unsafe.Pointer(&ip), unsafe.Pointer(&dw), unsafe.Pointer(&n), unsafe.Pointer(&d))
+		launch("embedding_b", int(n), unsafe.Pointer(&gp), unsafe.Pointer(&ip), unsafe.Pointer(&dw), unsafe.Pointer(&n), unsafe.Pointer(&d), unsafe.Pointer(&pad))
 	})
-	r.aux = []*cuda.Buffer{idBuf}
+	if own {
+		r.aux = []*cuda.Buffer{idBuf}
+	}
 	return r
 }
 func gpuReduce(a *Tensor, s []int, selected []bool, mean bool) *Tensor {
 	if len(a.Shape) > 3 {
-		panic("autograd: CUDA reduction rank > 3")
+		return gpuReduceND(a, s, selected, mean)
 	}
 	out := mustAlloc(numel(s))
 	if e := out.Memset(0, out.Size()); e != nil {
@@ -184,6 +239,37 @@ func gpuReduce(a *Tensor, s []int, selected []bool, mean bool) *Tensor {
 		}
 		gp := ptr(g)
 		launch("reduce_b", int(n), unsafe.Pointer(&gp), unsafe.Pointer(&dx), unsafe.Pointer(&n), unsafe.Pointer(&d1), unsafe.Pointer(&d2), unsafe.Pointer(&rs[0]), unsafe.Pointer(&rs[1]), unsafe.Pointer(&rs[2]), unsafe.Pointer(&scale))
+	})
+}
+func gpuReduceND(a *Tensor, s []int, selected []bool, mean bool) *Tensor {
+	mapStride := make([]int, len(a.Shape))
+	outStride := strides(s)
+	next := 0
+	for i := range a.Shape {
+		if !selected[i] {
+			mapStride[i] = outStride[next]
+			next++
+		}
+	}
+	shape, mapped := viewMeta(a.Shape, mapStride)
+	n := int32(a.Numel())
+	scale := float32(1)
+	if mean {
+		scale /= float32(a.Numel() / numel(s))
+	}
+	out := mustAlloc(numel(s))
+	if err := out.Memset(0, out.Size()); err != nil {
+		panic(err)
+	}
+	ap, yp := ptr(a.buf), ptr(out)
+	launch("reduce_nd_f", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&shape), unsafe.Pointer(&mapped), unsafe.Pointer(&scale))
+	return resultGPU(out, s, []*Tensor{a}, func(g *cuda.Buffer) {
+		dx := ptr(a.ensureGradGPU())
+		if dx == 0 {
+			return
+		}
+		gp := ptr(g)
+		launch("reduce_nd_b", int(n), unsafe.Pointer(&gp), unsafe.Pointer(&dx), unsafe.Pointer(&n), unsafe.Pointer(&shape), unsafe.Pointer(&mapped), unsafe.Pointer(&scale))
 	})
 }
 func gpuGroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {

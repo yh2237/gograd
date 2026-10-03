@@ -1,7 +1,6 @@
 package autograd
 
 import (
-	"github.com/yh2237/gograd/cuda"
 	"github.com/yh2237/gograd/tensor"
 	"math"
 	"runtime"
@@ -12,17 +11,8 @@ func Reshape(a *Tensor, s ...int) *Tensor {
 	if numel(s) != a.Numel() {
 		panic("autograd: reshape size")
 	}
-	if a.Device == tensor.CUDA {
-		req := a.RequiresGrad && recording
-		return &Tensor{Shape: append([]int(nil), s...), Strides: strides(s), DType: Float32, Device: tensor.CUDA, buf: a.buf, RequiresGrad: req, parents: []*Tensor{a}, backwardGPU: func(g *cuda.Buffer) {
-			if da := a.ensureGradGPU(); da != nil {
-				addDevice(da, g, a.Numel())
-			}
-		}}
-	}
-	r := result(a.Data, append([]int(nil), s...), []*Tensor{a}, func(g []float32) { a.addGrad(g) })
-	r.ownsData = false
-	return r
+	a = a.Contiguous()
+	return makeView(a, s, strides(s), 0)
 }
 func Permute(a *Tensor, axes ...int) *Tensor {
 	n := len(a.Shape)
@@ -38,27 +28,12 @@ func Permute(a *Tensor, axes ...int) *Tensor {
 		seen[x] = true
 		s[i] = a.Shape[x]
 	}
-	if a.Device == tensor.CUDA {
-		return gpuPermute(a, axes, s)
+	a = a.Contiguous()
+	st := make([]int, len(axes))
+	for i, axis := range axes {
+		st[i] = a.Strides[axis]
 	}
-	v := cpuAlloc(len(a.Data))
-	mapping := make([]int, len(v))
-	os := strides(s)
-	for i := range v {
-		j := 0
-		for k, ax := range axes {
-			j += (i / os[k] % s[k]) * a.Strides[ax]
-		}
-		mapping[i] = j
-		v[i] = a.Data[j]
-	}
-	return result(v, s, []*Tensor{a}, func(g []float32) {
-		dx := make([]float32, len(v))
-		for i, j := range mapping {
-			dx[j] += g[i]
-		}
-		a.addGrad(dx)
-	})
+	return makeView(a, s, st, 0)
 }
 func Transpose(a *Tensor, i, j int) *Tensor {
 	axes := make([]int, len(a.Shape))
@@ -71,6 +46,7 @@ func Transpose(a *Tensor, i, j int) *Tensor {
 func Sum(a *Tensor, axes ...int) *Tensor  { return reduce(a, false, axes...) }
 func Mean(a *Tensor, axes ...int) *Tensor { return reduce(a, true, axes...) }
 func reduce(a *Tensor, mean bool, axes ...int) *Tensor {
+	a = a.Contiguous()
 	selected := make([]bool, len(a.Shape))
 	for _, ax := range axes {
 		if ax < 0 {
@@ -171,6 +147,9 @@ func Concat(axis int, inputs ...*Tensor) *Tensor {
 		}
 		s[axis] += x.Shape[axis]
 	}
+	for i, x := range inputs {
+		inputs[i] = x.Contiguous()
+	}
 	if inputs[0].Device == tensor.CUDA {
 		out := inputs[0]
 		for _, p := range inputs[1:] {
@@ -216,33 +195,12 @@ func Slice(a *Tensor, axis, start, end int) *Tensor {
 	}
 	s := append([]int(nil), a.Shape...)
 	s[axis] = end - start
-	if a.Device == tensor.CUDA {
-		return gpuSlice(a, axis, start, end, s)
-	}
-	v := cpuAlloc(numel(s))
-	mapping := make([]int, len(v))
-	for i := range v {
-		j := 0
-		for k := range s {
-			c := i / strides(s)[k] % s[k]
-			if k == axis {
-				c += start
-			}
-			j += c * a.Strides[k]
-		}
-		mapping[i] = j
-		v[i] = a.Data[j]
-	}
-	return result(v, s, []*Tensor{a}, func(g []float32) {
-		dx := make([]float32, len(a.Data))
-		for i, j := range mapping {
-			dx[j] += g[i]
-		}
-		a.addGrad(dx)
-	})
+	a = a.Contiguous()
+	return makeView(a, s, a.Strides, start*a.Strides[axis])
 }
 func MatMul(a, b *Tensor) *Tensor {
 	same(a, b)
+	a, b = a.Contiguous(), b.Contiguous()
 	if len(a.Shape) < 2 || len(b.Shape) < 2 {
 		panic("autograd: matmul rank")
 	}
@@ -260,39 +218,45 @@ func MatMul(a, b *Tensor) *Tensor {
 	for z := 0; z < numel(batch); z++ {
 		ai := bindex(z, batch, a.Shape[:len(a.Shape)-2]) * m * k
 		bi := bindex(z, batch, b.Shape[:len(b.Shape)-2]) * k * n
-		for i := 0; i < m; i++ {
-			for j := 0; j < n; j++ {
-				var q float32
-				for t := 0; t < k; t++ {
-					q += a.Data[ai+i*k+t] * b.Data[bi+t*n+j]
-				}
-				v[(z*m+i)*n+j] = q
-			}
-		}
+		tensor.SGEMM(v[z*m*n:(z+1)*m*n], a.Data[ai:ai+m*k], b.Data[bi:bi+k*n], m, n, k)
 	}
 	return result(v, s, []*Tensor{a, b}, func(g []float32) {
-		da := make([]float32, len(a.Data))
-		db := make([]float32, len(b.Data))
+		da := cpuAlloc(len(a.Data))
+		db := cpuAlloc(len(b.Data))
+		tmpA, tmpB := cpuAlloc(m*k), cpuAlloc(k*n)
 		for z := 0; z < numel(batch); z++ {
 			ai := bindex(z, batch, a.Shape[:len(a.Shape)-2]) * m * k
 			bi := bindex(z, batch, b.Shape[:len(b.Shape)-2]) * k * n
-			for i := 0; i < m; i++ {
-				for j := 0; j < n; j++ {
-					q := g[(z*m+i)*n+j]
-					for t := 0; t < k; t++ {
-						da[ai+i*k+t] += q * b.Data[bi+t*n+j]
-						db[bi+t*n+j] += q * a.Data[ai+i*k+t]
-					}
-				}
+			gg := g[z*m*n : (z+1)*m*n]
+			tensor.SGEMMOp(tmpA, gg, b.Data[bi:bi+k*n], m, k, n, false, true)
+			tensor.SGEMMOp(tmpB, a.Data[ai:ai+m*k], gg, k, n, m, true, false)
+			for i, v := range tmpA {
+				da[ai+i] += v
+			}
+			for i, v := range tmpB {
+				db[bi+i] += v
 			}
 		}
 		a.addGrad(da)
 		b.addGrad(db)
+		cpuRelease(tmpA)
+		cpuRelease(tmpB)
+		cpuRelease(da)
+		cpuRelease(db)
 	})
 }
 func Embedding(weight *Tensor, ids []int, shape []int) *Tensor {
+	return EmbeddingWithPadding(weight, ids, shape, -1)
+}
+
+// EmbeddingWithPadding gathers rows and leaves the padding row's gradient zero.
+func EmbeddingWithPadding(weight *Tensor, ids []int, shape []int, paddingIdx int) *Tensor {
+	weight = weight.Contiguous()
 	if len(weight.Shape) != 2 || numel(shape) != len(ids) {
 		panic("autograd: embedding shape")
+	}
+	if paddingIdx < -1 || paddingIdx >= weight.Shape[0] {
+		panic("autograd: padding index")
 	}
 	dim := weight.Shape[1]
 	s := append(append([]int(nil), shape...), dim)
@@ -302,7 +266,7 @@ func Embedding(weight *Tensor, ids []int, shape []int) *Tensor {
 				panic("autograd: embedding index")
 			}
 		}
-		return gpuEmbedding(weight, ids, shape)
+		return gpuEmbedding(weight, ids, shape, paddingIdx)
 	}
 	v := cpuAlloc(len(ids) * dim)
 	for i, id := range ids {
@@ -314,6 +278,9 @@ func Embedding(weight *Tensor, ids []int, shape []int) *Tensor {
 	return result(v, s, []*Tensor{weight}, func(g []float32) {
 		dw := make([]float32, len(weight.Data))
 		for i, id := range ids {
+			if id == paddingIdx {
+				continue
+			}
 			for j := 0; j < dim; j++ {
 				dw[id*dim+j] += g[i*dim+j]
 			}
@@ -323,6 +290,7 @@ func Embedding(weight *Tensor, ids []int, shape []int) *Tensor {
 }
 func MaskedLoss(pred, target *Tensor, mse bool) *Tensor {
 	same(pred, target)
+	pred, target = pred.Contiguous(), target.Contiguous()
 	if len(pred.Shape) != 3 || numel(pred.Shape) != target.Numel() {
 		panic("autograd: loss shape")
 	}

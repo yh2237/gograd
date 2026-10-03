@@ -1,5 +1,4 @@
-// Package autograd implements a define-by-run float32 tensor graph. The CUDA
-// device currently uses host staging for operators without a device kernel.
+// Package autograd implements a define-by-run float32 tensor graph on CPU and CUDA.
 package autograd
 
 import (
@@ -15,6 +14,7 @@ import (
 type Tensor struct {
 	Data, Grad     []float32
 	Shape, Strides []int
+	Offset         int
 	DType          DType
 	Device         tensor.Device
 	buf            *cuda.Buffer
@@ -34,6 +34,12 @@ type DType string
 const Float32 DType = "float32"
 
 func (t *Tensor) IsContiguous() bool {
+	if t.Offset != 0 {
+		return false
+	}
+	if t.Device == tensor.CPU && len(t.Data) != t.Numel() {
+		return false
+	}
 	expected := strides(t.Shape)
 	if len(expected) != len(t.Strides) {
 		return false
@@ -139,6 +145,18 @@ func floatBytes(data []float32) []byte {
 }
 func (t *Tensor) Numel() int { return numel(t.Shape) }
 func (t *Tensor) ToHost() ([]float32, error) {
+	if !t.IsContiguous() {
+		c := t.Contiguous()
+		v, e := c.ToHost()
+		if c != t {
+			if c.Device == tensor.CUDA {
+				c.Close()
+			} else {
+				cpuRelease(c.Data)
+			}
+		}
+		return v, e
+	}
 	if t.Device == tensor.CPU {
 		return append([]float32(nil), t.Data...), nil
 	}
@@ -166,8 +184,17 @@ func (t *Tensor) CopyFrom(data []float32) error {
 		return errors.New("autograd: copy size mismatch")
 	}
 	if t.Device == tensor.CPU {
+		if !t.IsContiguous() {
+			for i, v := range data {
+				t.Data[storageIndex(i, t.Shape, t.Strides, t.Offset)] = v
+			}
+			return nil
+		}
 		copy(t.Data, data)
 		return nil
+	}
+	if !t.IsContiguous() {
+		return errors.New("autograd: CopyFrom requires a contiguous CUDA tensor")
 	}
 	return t.buf.CopyFromHost(floatBytes(data))
 }
@@ -275,7 +302,7 @@ func (t *Tensor) addGrad(g []float32) {
 		return
 	}
 	if t.Grad == nil {
-		t.Grad = make([]float32, len(t.Data))
+		t.Grad = make([]float32, t.Numel())
 	}
 	for i, v := range g {
 		t.Grad[i] += v
@@ -477,32 +504,16 @@ func binary(a, b *Tensor, f, da, db func(float32, float32) float32) *Tensor {
 	})
 }
 func Add(a, b *Tensor) *Tensor {
-	if a.Device == tensor.CUDA {
-		same(a, b)
-		return gpuBinary(a, b, 0)
-	}
-	return binary(a, b, func(x, y float32) float32 { return x + y }, func(x, y float32) float32 { return 1 }, func(x, y float32) float32 { return 1 })
+	return dispatchElementwise("add", a, b)
 }
 func Sub(a, b *Tensor) *Tensor {
-	if a.Device == tensor.CUDA {
-		same(a, b)
-		return gpuBinary(a, b, 1)
-	}
-	return binary(a, b, func(x, y float32) float32 { return x - y }, func(x, y float32) float32 { return 1 }, func(x, y float32) float32 { return -1 })
+	return dispatchElementwise("sub", a, b)
 }
 func Mul(a, b *Tensor) *Tensor {
-	if a.Device == tensor.CUDA {
-		same(a, b)
-		return gpuBinary(a, b, 2)
-	}
-	return binary(a, b, func(x, y float32) float32 { return x * y }, func(x, y float32) float32 { return y }, func(x, y float32) float32 { return x })
+	return dispatchElementwise("mul", a, b)
 }
 func Div(a, b *Tensor) *Tensor {
-	if a.Device == tensor.CUDA {
-		same(a, b)
-		return gpuBinary(a, b, 3)
-	}
-	return binary(a, b, func(x, y float32) float32 { return x / y }, func(x, y float32) float32 { return 1 / y }, func(x, y float32) float32 { return -x / (y * y) })
+	return dispatchElementwise("div", a, b)
 }
 func Scalar(a *Tensor, v float32) *Tensor {
 	b, _ := New([]float32{v}, []int{}, a.Device, false)
@@ -510,24 +521,28 @@ func Scalar(a *Tensor, v float32) *Tensor {
 	return b
 }
 func AddScalar(a *Tensor, v float32) *Tensor {
+	a = a.Contiguous()
 	if a.Device == tensor.CUDA {
 		return gpuScalar(a, v, 0)
 	}
 	return Add(a, Scalar(a, v))
 }
 func SubScalar(a *Tensor, v float32) *Tensor {
+	a = a.Contiguous()
 	if a.Device == tensor.CUDA {
 		return gpuScalar(a, v, 1)
 	}
 	return Sub(a, Scalar(a, v))
 }
 func MulScalar(a *Tensor, v float32) *Tensor {
+	a = a.Contiguous()
 	if a.Device == tensor.CUDA {
 		return gpuScalar(a, v, 2)
 	}
 	return Mul(a, Scalar(a, v))
 }
 func DivScalar(a *Tensor, v float32) *Tensor {
+	a = a.Contiguous()
 	if a.Device == tensor.CUDA {
 		return gpuScalar(a, v, 3)
 	}
@@ -548,18 +563,21 @@ func unary(a *Tensor, f, d func(float32) float32) *Tensor {
 	})
 }
 func Exp(a *Tensor) *Tensor {
+	a = a.Contiguous()
 	if a.Device == tensor.CUDA {
 		return gpuUnary(a, 0)
 	}
 	return unary(a, func(x float32) float32 { return float32(math.Exp(float64(x))) }, func(x float32) float32 { return float32(math.Exp(float64(x))) })
 }
 func Log(a *Tensor) *Tensor {
+	a = a.Contiguous()
 	if a.Device == tensor.CUDA {
 		return gpuUnary(a, 1)
 	}
 	return unary(a, func(x float32) float32 { return float32(math.Log(float64(x))) }, func(x float32) float32 { return 1 / x })
 }
 func Abs(a *Tensor) *Tensor {
+	a = a.Contiguous()
 	if a.Device == tensor.CUDA {
 		return gpuUnary(a, 2)
 	}
@@ -574,12 +592,14 @@ func Abs(a *Tensor) *Tensor {
 	})
 }
 func Tanh(a *Tensor) *Tensor {
+	a = a.Contiguous()
 	if a.Device == tensor.CUDA {
 		return gpuUnary(a, 3)
 	}
 	return unary(a, func(x float32) float32 { return float32(math.Tanh(float64(x))) }, func(x float32) float32 { v := float32(math.Tanh(float64(x))); return 1 - v*v })
 }
 func ReLU(a *Tensor) *Tensor {
+	a = a.Contiguous()
 	if a.Device == tensor.CUDA {
 		return gpuUnary(a, 4)
 	}
@@ -596,6 +616,7 @@ func ReLU(a *Tensor) *Tensor {
 	})
 }
 func GELU(a *Tensor, approx bool) *Tensor {
+	a = a.Contiguous()
 	if a.Device == tensor.CUDA {
 		if approx {
 			return gpuUnary(a, 6)

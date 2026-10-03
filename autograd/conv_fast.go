@@ -7,6 +7,7 @@ import "github.com/yh2237/gograd/tensor"
 func Conv1dGEMM(x, w, b *Tensor, dilation int) *Tensor {
 	same(x, w)
 	same(x, b)
+	x, w, b = x.Contiguous(), w.Contiguous(), b.Contiguous()
 	s := x.Shape
 	if len(s) != 3 || len(w.Shape) != 3 || w.Shape[1] != s[2] || b.Numel() != w.Shape[0] || w.Shape[2]%2 != 1 || dilation < 1 {
 		panic("autograd: conv1d shape")
