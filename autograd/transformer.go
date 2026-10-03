@@ -135,8 +135,12 @@ func (m *TransformerEncoderLayer) Forward(x, mask *Tensor, stepSeed uint32) *Ten
 	h = m.Attention.ForwardSeed(h, h, h, mask, stepSeed+3)
 	x = Add(x, Dropout(h, m.Dropout, stepSeed, m.Training))
 	h = LayerNorm(x, m.param("norm2.weight"), m.param("norm2.bias"), 1e-5)
-	h = GELU(Add(MatMul(h, Transpose(m.param("linear1.weight"), 0, 1)), m.param("linear1.bias")), false)
+	h = BiasGELU(MatMul(h, Transpose(m.param("linear1.weight"), 0, 1)), m.param("linear1.bias"))
 	h = Dropout(h, m.Dropout, stepSeed+1, m.Training)
-	h = Add(MatMul(h, Transpose(m.param("linear2.weight"), 0, 1)), m.param("linear2.bias"))
-	return Add(x, Dropout(h, m.Dropout, stepSeed+2, m.Training))
+	h = MatMul(h, Transpose(m.param("linear2.weight"), 0, 1))
+	if !m.Training || m.Dropout == 0 {
+		return BiasResidual(h, m.param("linear2.bias"), x)
+	}
+	h = Add(h, m.param("linear2.bias"))
+	return Add(x, Dropout(h, m.Dropout, stepSeed+2, true))
 }

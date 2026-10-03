@@ -146,6 +146,15 @@ func (b *Blas) SgemmRowMajorNT(m, n, k int, alpha float32, a uintptr, lda int, b
 func (b *Blas) SgemmRowMajorTransposeA(m, n, k int, alpha float32, a uintptr, lda int, bPtr uintptr, ldb int, beta float32, c uintptr, ldc int) error {
 	return ErrUnavailable
 }
+func (b *Blas) SgemmRowMajorStridedBatched(m, n, k int, transA, transB bool, alpha float32, a uintptr, strideA int64, bPtr uintptr, strideB int64, beta float32, c uintptr, strideC int64, batch int) error {
+	return ErrUnavailable
+}
+func (b *Blas) GemmRowMajorBF16(m, n, k int, transA, transB bool, alpha float32, a uintptr, bPtr uintptr, beta float32, c uintptr) error {
+	return ErrUnavailable
+}
+func (b *Blas) GemmRowMajorStridedBF16(m, n, k int, transA, transB bool, alpha float32, a uintptr, strideA int64, bPtr uintptr, strideB int64, beta float32, c uintptr, strideC int64, batch int) error {
+	return ErrUnavailable
+}
 
 // DeviceAttribute returns ErrUnavailable.
 func DeviceAttribute(attribute, device int) (int, error) { return 0, ErrUnavailable }

@@ -58,10 +58,13 @@ type api struct {
 	eventSynchronize   *syscall.Proc
 	eventElapsedTime   *syscall.Proc
 
-	cublasCreate    *syscall.Proc
-	cublasDestroy   *syscall.Proc
-	cublasSetStream *syscall.Proc
-	cublasSgemm     *syscall.Proc
+	cublasCreate               *syscall.Proc
+	cublasDestroy              *syscall.Proc
+	cublasSetStream            *syscall.Proc
+	cublasSgemm                *syscall.Proc
+	cublasSgemmStridedBatched  *syscall.Proc
+	cublasGemmEx               *syscall.Proc
+	cublasGemmStridedBatchedEx *syscall.Proc
 }
 
 var (
@@ -164,12 +167,14 @@ func load() (*api, error) {
 			return
 		}
 		blas, err := findProcs(cublas,
-			"cublasCreate_v2", "cublasDestroy_v2", "cublasSetStream_v2", "cublasSgemm_v2",
+			"cublasCreate_v2", "cublasDestroy_v2", "cublasSetStream_v2", "cublasSgemm_v2", "cublasSgemmStridedBatched",
 		)
 		if err != nil {
 			loadErr = fmt.Errorf("%w: %v", ErrUnavailable, err)
 			return
 		}
+		gemmEx, _ := cublas.FindProc("cublasGemmEx")
+		stridedEx, _ := cublas.FindProc("cublasGemmStridedBatchedEx")
 		loaded = &api{
 			cudart: cudart, cublas: cublas,
 			getDeviceCount: runtime[0], getDevice: runtime[1], setDevice: runtime[2],
@@ -179,7 +184,9 @@ func load() (*api, error) {
 			streamWaitEvent: runtime[14], eventCreate: runtime[15], eventDestroy: runtime[16],
 			eventRecord: runtime[17], eventSynchronize: runtime[18], eventElapsedTime: runtime[19],
 			cublasCreate: blas[0], cublasDestroy: blas[1], cublasSetStream: blas[2],
-			cublasSgemm: blas[3],
+			cublasSgemm:               blas[3],
+			cublasSgemmStridedBatched: blas[4],
+			cublasGemmEx:              gemmEx, cublasGemmStridedBatchedEx: stridedEx,
 		}
 	})
 	return loaded, loadErr
@@ -684,4 +691,76 @@ func (b *Blas) SgemmRowMajor(m, n, k int, alpha float32, a uintptr, lda int, bPt
 		c, uintptr(int32(ldc)),
 	)
 	return blasError("cublasSgemm", status)
+}
+
+// SgemmRowMajorStridedBatched computes a batch of row-major matrix products.
+// Strides count float32 elements; a zero stride broadcasts one matrix.
+func (b *Blas) SgemmRowMajorStridedBatched(m, n, k int, transA, transB bool, alpha float32, a uintptr, strideA int64, bPtr uintptr, strideB int64, beta float32, c uintptr, strideC int64, batch int) error {
+	api, err := load()
+	if err != nil {
+		return err
+	}
+	opB, opA := uintptr(0), uintptr(0)
+	lda, ldb := n, k
+	if transB {
+		opB = 1
+		lda = k
+	}
+	if transA {
+		opA = 1
+		ldb = m
+	}
+	status, _, _ := api.cublasSgemmStridedBatched.Call(
+		b.handle, opB, opA, uintptr(int32(n)), uintptr(int32(m)), uintptr(int32(k)),
+		uintptr(unsafe.Pointer(&alpha)), bPtr, uintptr(int32(lda)), uintptr(strideB),
+		a, uintptr(int32(ldb)), uintptr(strideA), uintptr(unsafe.Pointer(&beta)),
+		c, uintptr(int32(n)), uintptr(strideC), uintptr(int32(batch)),
+	)
+	return blasError("cublasSgemmStridedBatched", status)
+}
+
+// GemmRowMajorBF16 accepts BF16 A/B and writes FP32 C with FP32 accumulation.
+func (b *Blas) GemmRowMajorBF16(m, n, k int, transA, transB bool, alpha float32, a uintptr, bPtr uintptr, beta float32, c uintptr) error {
+	api, err := load()
+	if err != nil {
+		return err
+	}
+	if api.cublasGemmEx == nil {
+		return fmt.Errorf("cuda: cublasGemmEx unavailable")
+	}
+	opB, opA := uintptr(0), uintptr(0)
+	lda, ldb := n, k
+	if transB {
+		opB = 1
+		lda = k
+	}
+	if transA {
+		opA = 1
+		ldb = m
+	}
+	status, _, _ := api.cublasGemmEx.Call(b.handle, opB, opA, uintptr(int32(n)), uintptr(int32(m)), uintptr(int32(k)), uintptr(unsafe.Pointer(&alpha)), bPtr, 14, uintptr(int32(lda)), a, 14, uintptr(int32(ldb)), uintptr(unsafe.Pointer(&beta)), c, 0, uintptr(int32(n)), 68, uintptr(^uint(0)))
+	return blasError("cublasGemmEx", status)
+}
+
+// GemmRowMajorStridedBF16 applies the same computation to regular batches.
+func (b *Blas) GemmRowMajorStridedBF16(m, n, k int, transA, transB bool, alpha float32, a uintptr, strideA int64, bPtr uintptr, strideB int64, beta float32, c uintptr, strideC int64, batch int) error {
+	api, err := load()
+	if err != nil {
+		return err
+	}
+	if api.cublasGemmStridedBatchedEx == nil {
+		return fmt.Errorf("cuda: cublasGemmStridedBatchedEx unavailable")
+	}
+	opB, opA := uintptr(0), uintptr(0)
+	lda, ldb := n, k
+	if transB {
+		opB = 1
+		lda = k
+	}
+	if transA {
+		opA = 1
+		ldb = m
+	}
+	status, _, _ := api.cublasGemmStridedBatchedEx.Call(b.handle, opB, opA, uintptr(int32(n)), uintptr(int32(m)), uintptr(int32(k)), uintptr(unsafe.Pointer(&alpha)), bPtr, 14, uintptr(int32(lda)), uintptr(strideB), a, 14, uintptr(int32(ldb)), uintptr(strideA), uintptr(unsafe.Pointer(&beta)), c, 0, uintptr(int32(n)), uintptr(strideC), uintptr(int32(batch)), 68, uintptr(^uint(0)))
+	return blasError("cublasGemmStridedBatchedEx", status)
 }

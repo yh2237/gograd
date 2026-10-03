@@ -33,11 +33,11 @@ func softmax(a *Tensor, axis int, logmode bool) *Tensor {
 		if logmode {
 			mode = 1
 		}
-		launch("softmax_f", int(rows), unsafe.Pointer(&ap), unsafe.Pointer(&yp), unsafe.Pointer(&rows), unsafe.Pointer(&d), unsafe.Pointer(&in), unsafe.Pointer(&mode))
+		launch("softmax_f", int(rows)*32, unsafe.Pointer(&ap), unsafe.Pointer(&yp), unsafe.Pointer(&rows), unsafe.Pointer(&d), unsafe.Pointer(&in), unsafe.Pointer(&mode))
 		return resultGPU(out, a.Shape, []*Tensor{a}, func(g *cuda.Buffer) {
 			if dx := a.ensureGradGPU(); dx != nil {
 				gp, dp := ptr(g), ptr(dx)
-				launch("softmax_b", int(rows), unsafe.Pointer(&yp), unsafe.Pointer(&gp), unsafe.Pointer(&dp), unsafe.Pointer(&rows), unsafe.Pointer(&d), unsafe.Pointer(&in), unsafe.Pointer(&mode))
+				launch("softmax_b", int(rows)*32, unsafe.Pointer(&yp), unsafe.Pointer(&gp), unsafe.Pointer(&dp), unsafe.Pointer(&rows), unsafe.Pointer(&d), unsafe.Pointer(&in), unsafe.Pointer(&mode))
 			}
 		})
 	}
@@ -159,6 +159,9 @@ func attentionWithDropout(q, k, v, mask *Tensor, p float32, seed uint32, trainin
 	depth := q.Shape[len(q.Shape)-1]
 	if depth != k.Shape[len(k.Shape)-1] {
 		panic("autograd: attention depth")
+	}
+	if q.Device == tensor.CUDA && (!training || p == 0) && canFuseAttention(q, k, v, mask) {
+		return gpuAttention(q, k, v, mask)
 	}
 	scores := MulScalar(MatMul(q, Transpose(k, len(k.Shape)-2, len(k.Shape)-1)), 1/float32(math.Sqrt(float64(depth))))
 	if mask != nil {
