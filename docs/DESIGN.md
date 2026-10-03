@@ -3,17 +3,19 @@
 ## Contract and current slice
 
 `autograd` is a define-by-run float32 graph. A tensor has a logical shape,
-row-major strides, a device, data, an optional accumulated gradient, and a
-backward closure. The current implementation materializes contiguous results;
-transpose and permute copy data. Its CUDA mode validates CUDA availability but
-stages the new operators through host float32 arrays. This is a correctness
-slice, not a competitive GPU implementation. The existing `tensor` and `nn`
-packages retain their device-resident CUDA kernels.
+row-major strides, a device, data or a CUDA buffer, an optional accumulated
+gradient, and a backward closure. The current implementation materializes
+contiguous results; transpose and permute copy data. CUDA graph values,
+gradients, optimizer moments and clipped gradients remain in device buffers.
+Training uploads inputs and reads the scalar loss. Parity tests and explicit
+state export also read tensors back for inspection.
 
-The public design uses `Tensor{Shape, Strides, Device, Data, Grad}` for now.
-The eventual storage object will own CPU or CUDA memory separately from the
-view: shape, strides, offset and dtype. It will track sharing and release to
-per-device pools after the last consumer. Dtypes will start with float32,
+The public design uses `Tensor{Shape, Strides, DType, Device}` with CPU slices
+or CUDA buffers. `Backward` returns CUDA intermediates to the allocation
+pool; `ReleaseGraph` releases CPU intermediates for reuse and also frees
+unused CUDA inference graphs. Reshape shares storage. The eventual storage
+object will separate views from ownership and support offsets and arbitrary
+strides. Dtypes start with float32,
 then add float16 and bfloat16 compute with float32 accumulation and int64
 indices. Operators must reject mixed devices and unsupported dtype pairs.
 Non-contiguous views will be permitted once kernels accept strides; reshape
@@ -30,13 +32,17 @@ context when concurrent training is added: the present package-wide recording
 flag is not goroutine safe. In-place mutation after forward must eventually
 use version counters to reject stale saved tensors.
 
-An op registry should select a kernel by `(op, dtype, device, layout)`.
-Implementations share shape inference and gradient rules. CPU starts with
-pure Go and blocked SGEMM; CUDA should dispatch cuBLAS and NVRTC kernels via
-the existing DLL bindings. Host staging is only a temporary fallback and
-should be explicit in profiling. Use CUDA streams and event lifetime tracking
-before asynchronous frees. Pools should be bounded and keyed by device and
-size class; graph capture requires stable allocations.
+An op registry should eventually select a kernel by `(op, dtype, device,
+layout)`. Dispatch is currently direct. CPU uses blocked SGEMM with a
+runtime-selected AVX2/FMA microkernel and pure Go fallback; CPU elementwise
+ops and reductions use multiple cores, and size pools reuse buffers. CUDA
+Conv1d uses im2col/col2im plus cuBLAS SGEMM. NVRTC kernels implement
+elementwise broadcasting, shape transforms, embedding, reductions,
+normalization, masked losses and clipping. The CUDA driver context is tied to
+an OS thread, so callers hold `NewCUDAContext` through the training step.
+The graph currently uses one stream. Stream-aware lifetime tracking is needed
+before cross-stream frees or graph capture. Pools should eventually be
+bounded and keyed by device as well as size.
 
 Broadcasting aligns dimensions from the right. Each pair must match or one
 dimension must be 1. Backward sums over expanded dimensions. Matmul applies
@@ -55,8 +61,9 @@ reference. A zero-valid-element loss currently returns zero.
 
 `Acoustic` is the first graph-composed model. Its parameter names match the
 PyTorch reference, and the small fixture tests all of their gradients. The
-next `nn.Module` contract should expose ordered named parameters, buffers,
-children, `state_dict`, `load_state_dict`, train/eval and device/dtype moves.
+`Module` now registers ordered named parameters, buffers and children and
+provides `StateDict` and `LoadStateDict`. Train/eval and device/dtype moves
+remain.
 Parameters are graph leaves; nontrainable running statistics are buffers.
 Names are stable dotted paths and duplicate aliases are stored once.
 
@@ -77,20 +84,23 @@ atomically. Existing `nn` JSON checkpoints remain readable during migration.
 
 ## Migration and phases
 
-1. Add a device-resident storage abstraction, registry and CUDA kernels for
-   elementwise, reductions, normalization, embedding and graph Conv1d; reuse
-   `cuda`, `kernels`, `tensor.SGEMMOp` and cuBLAS. Make tape recording local to
-   an execution context. Port `nn.Linear` and `nn.Conv1d` to graph operators,
-   then make their explicit backward methods compatibility wrappers.
+1. Complete the device-resident storage abstraction and add an op registry.
+   The CUDA kernels for elementwise ops, reductions, normalization, embedding
+   and graph Conv1d are implemented. Make tape recording local to an execution
+   context. Port `nn.Linear` and `nn.Conv1d` to graph operators, then make
+   their explicit backward methods compatibility wrappers.
 2. Move `gputcn` layers and its sequence loss onto the same operators. Retain
    its optimized CUDA graph path as a compiled execution plan. Add module
    state dictionaries and safetensors read/write, followed by dataset loaders.
-3. Add LayerNorm, attention and transformer blocks, more indexing and
-   reduction ops, mixed precision and loss scaling. Capture the general path
-   with CUDA graphs and a reuse planner. Add CPU SIMD kernels selected at
-   runtime with pure Go fallbacks. Validate against PyTorch on each dtype and
-   shape family, and profile end-to-end steps before removing legacy paths.
+3. Add attention and transformer blocks, more indexing and reduction ops,
+   mixed precision and loss scaling. Capture the general path with CUDA
+   graphs and a reuse planner. Extend CPU SIMD beyond SGEMM while retaining
+   pure Go fallbacks. Validate against PyTorch on each dtype and shape family
+   before removing legacy paths.
 
-The present prototype does not meet the GPU performance objective. In
-particular, `Conv1dGEMM` and all normalization run on the host even when the
-tensor device is CUDA; there is no device-resident graph storage yet.
+At the real Acoustic shape, the warmed full step measured 78.2 ms on the RTX
+3060 Ti versus 53.0 ms for PyTorch CUDA; CPU measured 5.42 s versus 8.52 s
+for PyTorch. The op registry, tape-local recording and migration of `nn` and
+`gputcn` remain open. GPU event profiling shows convolution SGEMMs dominate
+the step. CUDA graph capture, mixed precision and a reusable execution plan
+are the next performance opportunities.

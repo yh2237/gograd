@@ -30,14 +30,18 @@ The new `autograd` package is a define-by-run float32 graph with broadcasting,
 batched matmul, reductions, layout transforms, embedding, Conv1d,
 normalization, activations, masked losses, clipping, AdamW, and OneCycle LR.
 `autograd.Acoustic` composes the reference acoustic model and is checked
-against a PyTorch training-step fixture on CPU and CUDA. Its CUDA mode is
-currently host staged, so this path is a correctness prototype. See
+against a PyTorch training-step fixture on CPU and CUDA. CUDA tensors and
+gradients now live in device buffers; graph operators use cuBLAS and NVRTC
+kernels, and clipping and AdamW stay on device. CUDA callers pin an OS thread
+with `autograd.NewCUDAContext` for the driver context. CPU Conv1d uses blocked
+SGEMM with an AVX2/FMA microkernel and a pure Go fallback. See
 [`docs/DESIGN.md`](docs/DESIGN.md) for the architecture and migration plan.
 
 The `tensor` and `nn` packages are the earlier general float32 path. Select
 `tensor.CPU` or `tensor.CUDA` at construction with `NewOn`, `FromHostOn`,
 `NewLinearOn`, and `NewConv1dOn`. The original constructors still select CUDA.
-CPU matrix multiplication uses pure-Go, multithreaded blocked SGEMM. Modules
+CPU matrix multiplication uses multithreaded blocked SGEMM with AVX2/FMA
+when available and a pure Go fallback. Modules
 support `[batch,time,channels]`: Linear, same-padded dilated Conv1d, ReLU,
 LeakyReLU, tanh-approximation GELU, Tanh, Sequential, and Residual. The two
 masked losses accept a `[batch,time]` frame weight (zero for padding) and
@@ -86,10 +90,11 @@ go vet ./...
 go run ./cmd/tcn-train
 go run ./cmd/gputcn-train
 go run ./cmd/nn-conv-train -device cpu -hidden 128 -kernel 5 -steps 3
-go run ./cmd/nn-conv-train -device cpu -hidden 128 -kernel 5 -steps 5 -cpuprofile cpu.pprof
+go run ./cmd/nn-conv-train -device cpu -hidden 128 -kernel 5 -steps 5 -cpuprofile "$env:TEMP/gograd-nn-cpu.pprof"
 go test ./tensor -run '^$' -bench 'Benchmark(SGEMM|NaiveSGEMM)$' -benchtime=1x -cpu=12
 go test ./gputcn/ -run XXX -bench .
 go run ./cmd/acoustic-bench -device cpu
+go run ./cmd/acoustic-bench -device cuda -warmup 1 -gpu-profile
 python tools/bench_acoustic.py --device cuda --threads 12
 ```
 
@@ -109,14 +114,19 @@ masked L1 loss; `-loss mse` selects masked MSE. Set `GOMAXPROCS=12` for the
 For the real-size Acoustic shape (hidden 384, batch 24, 400 frames, 102
 speakers, 88 outputs), one forward/backward/clip/AdamW step measured:
 
-| Runtime | CPU | CUDA-labelled path |
+| Runtime | CPU | CUDA |
 | --- | ---: | ---: |
-| PyTorch | 9,178 ms | 53.2 ms |
-| gograd `autograd` | 74,025 ms | 63,281 ms |
+| PyTorch (current measurement) | 8,523 ms | 53.0 ms |
+| gograd before this round | 74,025 ms | 63,281 ms (host staged) |
+| gograd after this round | 5,416 ms | 78.2 ms (device resident) |
 
-The gograd CUDA-labelled path currently computes through host arrays; this
-number does not represent device-resident GPU execution. PyTorch was timed
-after one warmup step with 12 CPU threads, while gograd used `GOMAXPROCS=12`.
+Both current measurements followed one warmup step, with 12 CPU threads or
+`GOMAXPROCS=12`. The gograd CUDA step measured forward 28.7 ms, backward
+46.8 ms, clipping 1.7 ms, and AdamW 1.0 ms. CUDA event profiling reported
+about 14.3/14.1/12.2 ms for the 12 convolution forward/input-gradient/
+weight-gradient SGEMMs, respectively. The instrumented run includes event
+overhead and is separate from the unprofiled step. The CPU profile's leading entries were
+AVX SGEMM (64% of samples) and broadcast indexing (16%).
 The implementations use different seeded random values and are comparable
 for architecture and dimensions, not identical loss values.
 
@@ -185,9 +195,12 @@ are `[batch,time,channels]` and zero same-padding extends by
 
 ## Not present in this code
 
-The new graph still uses contiguous float32 host data for its CUDA-labelled
-tensors. Device-resident graph operators, view strides, AMP, a module-wide
-state dictionary, safetensors loading, and data loading are not yet present.
+The new graph still materializes contiguous float32 results. General strides,
+mixed precision, safetensors loading, data loading, and CUDA graph capture for
+the autograd path are not yet present. The op dispatch is direct rather than
+a registry, and the recording flag is not goroutine local. CUDA broadcasting,
+permutation and reductions currently support ranks up to three. GPU inference
+callers should release unused graphs with `ReleaseGraph`.
 The older `nn` path still uses explicit module backward methods.
 
 ## License
