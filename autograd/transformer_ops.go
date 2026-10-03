@@ -187,7 +187,7 @@ func attentionWithDropout(q, k, v, mask *Tensor, p float32, seed uint32, trainin
 			}
 			return gpuFlashAttention(q, k, v, mask)
 		case "auto":
-			batchCount:=numel(q.Shape[:len(q.Shape)-2])
+			batchCount := numel(q.Shape[:len(q.Shape)-2])
 			if flashSupported && int64(batchCount)*int64(q.Shape[len(q.Shape)-2])*int64(k.Shape[len(k.Shape)-2])*12 >= 1<<30 {
 				return gpuFlashAttention(q, k, v, mask)
 			}

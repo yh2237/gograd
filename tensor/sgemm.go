@@ -7,6 +7,7 @@ import (
 )
 
 var sgemmPools sync.Map
+
 // The larger tile wins on both full-model median timings; set the environment
 // variable to 0 to retain the 4x8 fallback for diagnosis.
 var use8x8 = useAVX2FMA && os.Getenv("GOGRAD_SGEMM_8X8") != "0"
