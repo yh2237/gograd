@@ -1,0 +1,295 @@
+package autograd
+
+import "math"
+
+func Reshape(a *Tensor, s ...int) *Tensor {
+	if numel(s) != len(a.Data) {
+		panic("autograd: reshape size")
+	}
+	return result(a.Data, append([]int(nil), s...), []*Tensor{a}, func(g []float32) { a.addGrad(g) })
+}
+func Permute(a *Tensor, axes ...int) *Tensor {
+	n := len(a.Shape)
+	if len(axes) != n {
+		panic("autograd: permutation rank")
+	}
+	seen := make([]bool, n)
+	s := make([]int, n)
+	for i, x := range axes {
+		if x < 0 || x >= n || seen[x] {
+			panic("autograd: invalid permutation")
+		}
+		seen[x] = true
+		s[i] = a.Shape[x]
+	}
+	v := make([]float32, len(a.Data))
+	mapping := make([]int, len(v))
+	os := strides(s)
+	for i := range v {
+		j := 0
+		for k, ax := range axes {
+			j += (i / os[k] % s[k]) * a.Strides[ax]
+		}
+		mapping[i] = j
+		v[i] = a.Data[j]
+	}
+	return result(v, s, []*Tensor{a}, func(g []float32) {
+		dx := make([]float32, len(v))
+		for i, j := range mapping {
+			dx[j] += g[i]
+		}
+		a.addGrad(dx)
+	})
+}
+func Transpose(a *Tensor, i, j int) *Tensor {
+	axes := make([]int, len(a.Shape))
+	for k := range axes {
+		axes[k] = k
+	}
+	axes[i], axes[j] = axes[j], axes[i]
+	return Permute(a, axes...)
+}
+func Sum(a *Tensor, axes ...int) *Tensor  { return reduce(a, false, axes...) }
+func Mean(a *Tensor, axes ...int) *Tensor { return reduce(a, true, axes...) }
+func reduce(a *Tensor, mean bool, axes ...int) *Tensor {
+	selected := make([]bool, len(a.Shape))
+	for _, ax := range axes {
+		if ax < 0 {
+			ax += len(selected)
+		}
+		if ax < 0 || ax >= len(selected) || selected[ax] {
+			panic("autograd: invalid axis")
+		}
+		selected[ax] = true
+	}
+	s := []int{}
+	for i, d := range a.Shape {
+		if !selected[i] {
+			s = append(s, d)
+		}
+	}
+	v := make([]float32, numel(s))
+	mapping := make([]int, len(a.Data))
+	count := float32(len(a.Data) / len(v))
+	for i, x := range a.Data {
+		j := 0
+		shift := len(s) - 1
+		for k := len(a.Shape) - 1; k >= 0; k-- {
+			if !selected[k] {
+				j += (i / a.Strides[k] % a.Shape[k]) * strides(s)[shift]
+				shift--
+			}
+		}
+		mapping[i] = j
+		v[j] += x
+	}
+	if mean {
+		for i := range v {
+			v[i] /= count
+		}
+	}
+	return result(v, s, []*Tensor{a}, func(g []float32) {
+		dx := make([]float32, len(a.Data))
+		for i, j := range mapping {
+			dx[i] = g[j]
+			if mean {
+				dx[i] /= count
+			}
+		}
+		a.addGrad(dx)
+	})
+}
+func Concat(axis int, inputs ...*Tensor) *Tensor {
+	if len(inputs) == 0 {
+		panic("autograd: empty concat")
+	}
+	s := append([]int(nil), inputs[0].Shape...)
+	if axis < 0 {
+		axis += len(s)
+	}
+	s[axis] = 0
+	for _, x := range inputs {
+		same(inputs[0], x)
+		for i, d := range x.Shape {
+			if i != axis && d != s[i] {
+				panic("autograd: concat shape")
+			}
+		}
+		s[axis] += x.Shape[axis]
+	}
+	v := make([]float32, numel(s))
+	outer := numel(s[:axis])
+	inner := numel(s[axis+1:])
+	for o := 0; o < outer; o++ {
+		off := 0
+		for _, x := range inputs {
+			size := x.Shape[axis] * inner
+			copy(v[o*s[axis]*inner+off:], x.Data[o*size:(o+1)*size])
+			off += size
+		}
+	}
+	return result(v, s, inputs, func(g []float32) {
+		for _, x := range inputs {
+			dx := make([]float32, len(x.Data))
+			for o := 0; o < outer; o++ {
+				off := 0
+				for _, p := range inputs {
+					if p == x {
+						size := x.Shape[axis] * inner
+						copy(dx[o*size:(o+1)*size], g[o*s[axis]*inner+off:])
+						break
+					}
+					off += p.Shape[axis] * inner
+				}
+			}
+			x.addGrad(dx)
+		}
+	})
+}
+func Slice(a *Tensor, axis, start, end int) *Tensor {
+	if axis < 0 {
+		axis += len(a.Shape)
+	}
+	if axis < 0 || axis >= len(a.Shape) || start < 0 || end < start || end > a.Shape[axis] {
+		panic("autograd: slice bounds")
+	}
+	s := append([]int(nil), a.Shape...)
+	s[axis] = end - start
+	v := make([]float32, numel(s))
+	mapping := make([]int, len(v))
+	for i := range v {
+		j := 0
+		for k := range s {
+			c := i / strides(s)[k] % s[k]
+			if k == axis {
+				c += start
+			}
+			j += c * a.Strides[k]
+		}
+		mapping[i] = j
+		v[i] = a.Data[j]
+	}
+	return result(v, s, []*Tensor{a}, func(g []float32) {
+		dx := make([]float32, len(a.Data))
+		for i, j := range mapping {
+			dx[j] += g[i]
+		}
+		a.addGrad(dx)
+	})
+}
+func MatMul(a, b *Tensor) *Tensor {
+	same(a, b)
+	if len(a.Shape) < 2 || len(b.Shape) < 2 {
+		panic("autograd: matmul rank")
+	}
+	m, k := a.Shape[len(a.Shape)-2], a.Shape[len(a.Shape)-1]
+	if b.Shape[len(b.Shape)-2] != k {
+		panic("autograd: matmul inner dimension")
+	}
+	n := b.Shape[len(b.Shape)-1]
+	batch := bshape(a.Shape[:len(a.Shape)-2], b.Shape[:len(b.Shape)-2])
+	s := append(append([]int(nil), batch...), m, n)
+	v := make([]float32, numel(s))
+	for z := 0; z < numel(batch); z++ {
+		ai := bindex(z, batch, a.Shape[:len(a.Shape)-2]) * m * k
+		bi := bindex(z, batch, b.Shape[:len(b.Shape)-2]) * k * n
+		for i := 0; i < m; i++ {
+			for j := 0; j < n; j++ {
+				var q float32
+				for t := 0; t < k; t++ {
+					q += a.Data[ai+i*k+t] * b.Data[bi+t*n+j]
+				}
+				v[(z*m+i)*n+j] = q
+			}
+		}
+	}
+	return result(v, s, []*Tensor{a, b}, func(g []float32) {
+		da := make([]float32, len(a.Data))
+		db := make([]float32, len(b.Data))
+		for z := 0; z < numel(batch); z++ {
+			ai := bindex(z, batch, a.Shape[:len(a.Shape)-2]) * m * k
+			bi := bindex(z, batch, b.Shape[:len(b.Shape)-2]) * k * n
+			for i := 0; i < m; i++ {
+				for j := 0; j < n; j++ {
+					q := g[(z*m+i)*n+j]
+					for t := 0; t < k; t++ {
+						da[ai+i*k+t] += q * b.Data[bi+t*n+j]
+						db[bi+t*n+j] += q * a.Data[ai+i*k+t]
+					}
+				}
+			}
+		}
+		a.addGrad(da)
+		b.addGrad(db)
+	})
+}
+func Embedding(weight *Tensor, ids []int, shape []int) *Tensor {
+	if len(weight.Shape) != 2 || numel(shape) != len(ids) {
+		panic("autograd: embedding shape")
+	}
+	dim := weight.Shape[1]
+	s := append(append([]int(nil), shape...), dim)
+	v := make([]float32, len(ids)*dim)
+	for i, id := range ids {
+		if id < 0 || id >= weight.Shape[0] {
+			panic("autograd: embedding index")
+		}
+		copy(v[i*dim:], weight.Data[id*dim:(id+1)*dim])
+	}
+	return result(v, s, []*Tensor{weight}, func(g []float32) {
+		dw := make([]float32, len(weight.Data))
+		for i, id := range ids {
+			for j := 0; j < dim; j++ {
+				dw[id*dim+j] += g[i*dim+j]
+			}
+		}
+		weight.addGrad(dw)
+	})
+}
+func MaskedLoss(pred, target *Tensor, mse bool) *Tensor {
+	same(pred, target)
+	if len(pred.Shape) != 3 || numel(pred.Shape) != len(target.Data) {
+		panic("autograd: loss shape")
+	}
+	c := pred.Shape[2]
+	g := make([]float32, len(pred.Data))
+	var total float32
+	count := 0
+	for row := 0; row < len(g)/c; row++ {
+		if math.IsNaN(float64(target.Data[row*c])) {
+			continue
+		}
+		for j := 0; j < c; j++ {
+			targetValue := target.Data[row*c+j]
+			if math.IsNaN(float64(targetValue)) {
+				targetValue = 0
+			}
+			d := pred.Data[row*c+j] - targetValue
+			if mse {
+				total += d * d
+				g[row*c+j] = 2 * d
+			} else {
+				total += float32(math.Abs(float64(d)))
+				if d > 0 {
+					g[row*c+j] = 1
+				} else if d < 0 {
+					g[row*c+j] = -1
+				}
+			}
+			count++
+		}
+	}
+	if count > 0 {
+		total /= float32(count)
+		for i := range g {
+			g[i] /= float32(count)
+		}
+	}
+	return result([]float32{total}, []int{}, []*Tensor{pred}, func(up []float32) {
+		dx := make([]float32, len(g))
+		for i := range g {
+			dx[i] = g[i] * up[0]
+		}
+		pred.addGrad(dx)
+	})
+}
