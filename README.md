@@ -30,22 +30,29 @@ The `autograd` package is a define-by-run float32 graph with rank-six views,
 N-D broadcasting and reductions, batched matmul, embedding with padding,
 Conv1d, normalization, softmax, log-softmax, cross-entropy, deterministic
 dropout, scaled attention, masked losses, clipping, AdamW, and OneCycle LR.
-An elementwise op registry pairs CPU rules and CUDA kernels. Pre-norm
+The op registry lists the CPU and CUDA implementation for each public
+differentiable tensor operation and selects its device backend; a source-level
+test rejects an operation that bypasses dispatch. Pre-norm
 `TransformerEncoderLayer` and batch-first `MultiheadAttention` compose these
 ops. `Module` supports named state and F32 safetensors files compatible with
 PyTorch exports.
 CUDA batched matmul uses one strided cuBLAS call for regular and broadcast
-batches. Attention combines batched GEMMs with fused masked softmax kernels;
-layer norm and the encoder feed-forward bias/GELU/residual use fused kernels.
-Warp softmax handles arbitrary axes. An optional `-bf16` benchmark mode
-converts GEMM operands on device and uses tensor-core cuBLAS GEMMEx with FP32
-accumulation, gradients, and master weights. The default remains FP32.
+batches. Attention combines batched GEMMs with fused masked softmax kernels.
+An optional tiled CUDA path uses online softmax, recomputes scores in backward,
+and never stores a full score matrix; it supports an additive broadcast mask.
+The GEMM path remains the automatic choice when its scratch estimate is below
+1 GiB, because it is faster at the tested sequence lengths. CUDA layer norm
+and the encoder feed-forward bias/GELU/residual use fused kernels. Warp softmax
+handles arbitrary axes. Optional `-bf16` caches BF16 GEMM operands on device,
+carries BF16 shadows through views, and fuses BF16 output writes into pointwise
+kernels. GEMMEx uses FP32 accumulation; gradients and master weights remain
+FP32. The default remains FP32.
 `autograd.Acoustic` composes the reference acoustic model and is checked
 against a PyTorch training-step fixture on CPU and CUDA. CUDA tensors and
 gradients now live in device buffers; graph operators use cuBLAS and NVRTC
 kernels, and clipping and AdamW stay on device. CUDA callers pin an OS thread
 with `autograd.NewCUDAContext` for the driver context. CPU Conv1d uses blocked
-SGEMM with an AVX2/FMA microkernel and a pure Go fallback; batched matmul uses
+SGEMM with an AVX2/FMA 8x8 microkernel and a pure Go fallback; batched matmul uses
 the same implementation. The Acoustic step can be captured into a CUDA graph
 with fixed device indices and a device AdamW step counter. See
 [`docs/DESIGN.md`](docs/DESIGN.md) for the architecture and migration plan.
@@ -102,6 +109,12 @@ baseline:
   launches. A PyTorch-produced safetensors file loads in Go and round-trips
   back to PyTorch. A CUDA graph test compares two Acoustic replays with eager
   steps, including updated optimizer weights.
+- The registry inventory test checks every public differentiable operation
+  for a registry entry and a dispatch call. Removing one dispatch was verified
+  to make the test fail. Tiled attention checks masked output and gradients,
+  including sequence lengths 256, 1024 and 4096, against the materialized
+  CUDA path. CUDA residency tests assert device kernel launches; BF16 graph
+  tests check captured training steps.
 
 ## Commands
 
@@ -123,6 +136,8 @@ go run ./cmd/transformer-bench -device cuda -warmup 1
 go run ./cmd/transformer-bench -device cuda -warmup 2 -graph -bf16
 python tools/bench_transformer.py --device cuda --threads 12 --warmup 1
 python tools/bench_transformer.py --device cuda --warmup 2 --graph --bf16
+go run ./cmd/attention-bench -seq 4096 -algorithm materialized
+go run ./cmd/attention-bench -seq 4096 -algorithm flash
 ```
 
 `tcn-train` fits a tiny synthetic corpus on the CPU and writes
@@ -138,34 +153,49 @@ step times, and accepts `-device cuda` when CUDA is available. It defaults to
 masked L1 loss; `-loss mse` selects masked MSE. Set `GOMAXPROCS=12` for the
 12-thread benchmark and use `-cpuprofile` to write a Go CPU profile.
 
-Single warmed full-step measurements on the RTX 3060 Ti and 12 CPU threads
-(`GOMAXPROCS=12` for Go):
+Medians of three paired, warmed full training steps on the RTX 3060 Ti and
+12 CPU threads (`GOMAXPROCS=12` for Go, `torch.set_num_threads(12)`):
 
 | Model and runtime | CPU FP32 | CUDA FP32 eager | CUDA FP32 graph | CUDA BF16 eager | CUDA BF16 graph |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Acoustic, PyTorch | 1,931 ms | 60.9 ms | 53.8 ms | 49.3 ms | 44.1 ms |
-| Acoustic, gograd | 4,193 ms | 84.3 ms | 80.8 ms | 70.1 ms | 68.6 ms |
-| Transformer, PyTorch | 477 ms | 23.5 ms | 24.0 ms | 13.1 ms | 12.3 ms |
-| Transformer, gograd | 2,388 ms | 28.7 ms | 28.3 ms | 27.3 ms | 25.8 ms |
+| Acoustic, PyTorch | 2,506 ms | 58.5 ms | 53.7 ms | 47.1 ms | 42.6 ms |
+| Acoustic, gograd | 3,876 ms | 82.3 ms | 82.0 ms | 63.8 ms | 64.1 ms |
+| Transformer, PyTorch | 1,292 ms | 25.9 ms | 23.9 ms | 13.5 ms | 12.0 ms |
+| Transformer, gograd | 2,276 ms | 27.2 ms | 27.8 ms | 22.4 ms | 23.2 ms |
 
 Acoustic is hidden 384, batch 24, 400 frames, 10 blocks. Transformer is four
 pre-norm layers with model width 256, four heads, feed-forward width 1024,
 batch 16, sequence 256. Steps include forward, backward, global-norm clip,
 and AdamW. Acoustic graph replay includes a scalar loss readback; its device
-step counter updates AdamW bias correction each launch. These are individual
-runs, so small differences should not be treated as speedup estimates. BF16
-values use PyTorch autocast and gograd's GEMM-only autocast respectively, so
-their scope differs. The
+step counter updates AdamW bias correction each launch. CPU timings varied
+substantially during measurement, so these medians are more useful than a
+single step but should not be treated as stable throughput. BF16 values use
+PyTorch autocast and gograd's FP32-authoritative BF16 shadow path; their scope
+still differs. The
 implementations use different seeded random values and are comparable by
 architecture and dimensions, not identical loss values.
 
-The transformer CUDA FP32 step is 1.22x PyTorch; BF16 is 2.08x PyTorch eager.
-The transformer CPU step is 5.00x PyTorch and remains the largest performance
-gap. The Acoustic CUDA graph records a roughly 1 ms launch submission and
-80 ms device wait, so host launch overhead is small. A profiled transformer
-step records 24 strided GEMM calls each for forward, input gradient, and
-weight gradient, compared with 896 individual calls in the prior round.
-Profiling adds synchronization and should not be compared to the table.
+Transformer CPU is 1.76x PyTorch, meeting the 2.5x target; Acoustic CPU is
+1.55x, narrowly missing its 1.5x target. Transformer CUDA FP32 eager is
+1.05x PyTorch. BF16 eager is 1.66x PyTorch for the transformer and 1.35x for
+Acoustic. Graph replay is similar to eager for gograd; device work dominates
+the launch cost. Profiling adds synchronization and should not be compared
+to the table.
+
+CUDA event medians for a separate attention forward/backward benchmark
+(batch 1, four heads, head dimension 64; three runs):
+
+| Sequence | Materialized step | Tiled step | Materialized peak extra | Tiled peak extra |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 | 0.366 ms | 0.766 ms | 3.50 MiB | 1.01 MiB |
+| 1024 | 1.601 ms | 9.606 ms | 50.00 MiB | 4.03 MiB |
+| 4096 | 18.916 ms | 127.889 ms | 776.00 MiB | 16.12 MiB |
+
+Peak extra is the maximum live CUDA buffer increase above the input baseline,
+including loss and gradient buffers. Tiled attention trades speed for much
+lower scratch use at long sequences. Output and gradient parity against the
+materialized path passes at all three lengths; a separate test covers an
+additive broadcast mask and its gradient.
 
 `gputcn-fit` trains on a prepared dataset (frame features, targets and mask)
 instead of the synthetic corpus:
@@ -196,6 +226,10 @@ go test ./cuda/
 
 ## Layout
 
+- `autograd/cpu_binary.go`, `autograd/cuda_flash_attention.go`,
+  `autograd/cuda_autocast.go` — optimized CPU gradients, tiled attention,
+  and cached BF16 device buffers
+- `cmd/attention-bench` — CUDA attention time and live buffer comparison
 - `autograd/views.go`, `autograd/registry.go`, `autograd/transformer*.go`,
   `autograd/safetensors.go` — views, elementwise dispatch, transformer ops and modules, checkpoints
 - `cmd/transformer-bench`, `tools/bench_transformer.py` — four-layer encoder timings
@@ -237,13 +271,15 @@ are `[batch,time,channels]` and zero same-padding extends by
 
 ## Not present in this code
 
-The new graph still materializes contiguous float32 results. General strides,
-mixed precision, safetensors loading, data loading, and CUDA graph capture for
-the autograd path are not yet present. The op dispatch is direct rather than
-a registry, and the recording flag is not goroutine local. CUDA broadcasting,
-permutation and reductions currently support ranks up to three. GPU inference
-callers should release unused graphs with `ReleaseGraph`.
-The older `nn` path still uses explicit module backward methods.
+The graph still materializes many contiguous FP32 results. BF16 is optional
+and keeps FP32 authoritative storage; FP16, loss scaling, a dtype/layout keyed
+kernel registry, and data loading are not present. The registry selects CPU or
+CUDA implementations but does not yet support runtime kernel plugins. The
+recording flag and attention algorithm selection are process-wide. Tiled
+attention currently supports head dimensions up to 128 and is slower than the
+materialized GEMM path at the measured sequence lengths. GPU inference callers
+should release unused graphs with `ReleaseGraph`. The older `nn` path still
+uses explicit module backward methods.
 
 ## License
 
