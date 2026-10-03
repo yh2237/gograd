@@ -5,6 +5,20 @@ import (
 	"sync"
 )
 
+var sgemmPools sync.Map
+
+func sgemmBuffer(n int) []float32 {
+	p, _ := sgemmPools.LoadOrStore(n, &sync.Pool{})
+	if v := p.(*sync.Pool).Get(); v != nil {
+		return v.([]float32)[:n]
+	}
+	return make([]float32, n)
+}
+func releaseSGEMMBuffer(v []float32) {
+	p, _ := sgemmPools.LoadOrStore(len(v), &sync.Pool{})
+	p.(*sync.Pool).Put(v)
+}
+
 // SGEMM computes C = A*B for contiguous row-major matrices.
 func SGEMM(c, a, b []float32, m, n, k int) {
 	SGEMMOp(c, a, b, m, n, k, false, false)
@@ -30,7 +44,8 @@ func SGEMMOp(c, a, b []float32, m, n, k int, transA, transB bool) {
 	const kc = 256
 	const nr = 4
 	groups := (n + nr - 1) / nr
-	bp := make([]float32, groups*k*nr)
+	bp := sgemmBuffer(groups * k * nr)
+	defer releaseSGEMMBuffer(bp)
 	for g := 0; g < groups; g++ {
 		j := g * nr
 		width := min(n-j, nr)
@@ -53,7 +68,8 @@ func SGEMMOp(c, a, b []float32, m, n, k int, transA, transB bool) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ap := make([]float32, mc*kc)
+			ap := sgemmBuffer(mc * kc)
+			defer releaseSGEMMBuffer(ap)
 			for row := range jobs {
 				end := min(row+mc, m)
 				for depth := 0; depth < k; depth += kc {
@@ -79,7 +95,11 @@ func SGEMMOp(c, a, b []float32, m, n, k int, transA, transB bool) {
 							height := min(4, end-i)
 							aa := ap[(i-row)*kc:]
 							if height == 4 && width == 4 {
-								kernel4x4(c, aa, bb, i*n+j, n, nk, depth != 0)
+								if useAVX2FMA {
+									kernel4x4AVX(&c[i*n+j], &aa[0], &bb[0], n, nk, depth != 0)
+								} else {
+									kernel4x4(c, aa, bb, i*n+j, n, nk, depth != 0)
+								}
 							} else {
 								for r := 0; r < height; r++ {
 									for q := 0; q < width; q++ {
