@@ -18,6 +18,8 @@ type Tensor struct {
 	DType          DType
 	Device         tensor.Device
 	buf            *cuda.Buffer
+	bf16Buf        *cuda.Buffer
+	bf16Owner      bool
 	gradBuf        *cuda.Buffer
 	aux            []*cuda.Buffer
 	ownsBuffer     bool
@@ -196,10 +198,12 @@ func (t *Tensor) CopyFrom(data []float32) error {
 	if !t.IsContiguous() {
 		return errors.New("autograd: CopyFrom requires a contiguous CUDA tensor")
 	}
+	t.invalidateBF16()
 	return t.buf.CopyFromHost(floatBytes(data))
 }
 func (t *Tensor) Buffer() *cuda.Buffer { return t.buf }
 func (t *Tensor) Close() {
+	t.invalidateBF16()
 	for _, b := range t.aux {
 		b.Free()
 	}
@@ -551,6 +555,7 @@ func Div(a, b *Tensor) *Tensor {
 	return dispatchElementwise("div", a, b)
 }
 func Scalar(a *Tensor, v float32) *Tensor {
+	dispatchBackend("scalar", a.Device)
 	b, _ := New([]float32{v}, []int{}, a.Device, false)
 	b.ephemeral = true
 	return b
@@ -591,28 +596,28 @@ func cpuScalar(a *Tensor, value float32, op int) *Tensor {
 }
 func AddScalar(a *Tensor, v float32) *Tensor {
 	a = a.Contiguous()
-	if a.Device == tensor.CUDA {
+	if dispatchBackend("add_scalar", a.Device) {
 		return gpuScalar(a, v, 0)
 	}
 	return cpuScalar(a, v, 0)
 }
 func SubScalar(a *Tensor, v float32) *Tensor {
 	a = a.Contiguous()
-	if a.Device == tensor.CUDA {
+	if dispatchBackend("sub_scalar", a.Device) {
 		return gpuScalar(a, v, 1)
 	}
 	return cpuScalar(a, v, 1)
 }
 func MulScalar(a *Tensor, v float32) *Tensor {
 	a = a.Contiguous()
-	if a.Device == tensor.CUDA {
+	if dispatchBackend("mul_scalar", a.Device) {
 		return gpuScalar(a, v, 2)
 	}
 	return cpuScalar(a, v, 2)
 }
 func DivScalar(a *Tensor, v float32) *Tensor {
 	a = a.Contiguous()
-	if a.Device == tensor.CUDA {
+	if dispatchBackend("div_scalar", a.Device) {
 		return gpuScalar(a, v, 3)
 	}
 	return cpuScalar(a, v, 3)
@@ -633,21 +638,21 @@ func unary(a *Tensor, f, d func(float32) float32) *Tensor {
 }
 func Exp(a *Tensor) *Tensor {
 	a = a.Contiguous()
-	if a.Device == tensor.CUDA {
+	if dispatchBackend("exp", a.Device) {
 		return gpuUnary(a, 0)
 	}
 	return unary(a, func(x float32) float32 { return float32(math.Exp(float64(x))) }, func(x float32) float32 { return float32(math.Exp(float64(x))) })
 }
 func Log(a *Tensor) *Tensor {
 	a = a.Contiguous()
-	if a.Device == tensor.CUDA {
+	if dispatchBackend("log", a.Device) {
 		return gpuUnary(a, 1)
 	}
 	return unary(a, func(x float32) float32 { return float32(math.Log(float64(x))) }, func(x float32) float32 { return 1 / x })
 }
 func Abs(a *Tensor) *Tensor {
 	a = a.Contiguous()
-	if a.Device == tensor.CUDA {
+	if dispatchBackend("abs", a.Device) {
 		return gpuUnary(a, 2)
 	}
 	return unary(a, func(x float32) float32 { return float32(math.Abs(float64(x))) }, func(x float32) float32 {
@@ -662,14 +667,14 @@ func Abs(a *Tensor) *Tensor {
 }
 func Tanh(a *Tensor) *Tensor {
 	a = a.Contiguous()
-	if a.Device == tensor.CUDA {
+	if dispatchBackend("tanh", a.Device) {
 		return gpuUnary(a, 3)
 	}
 	return unary(a, func(x float32) float32 { return float32(math.Tanh(float64(x))) }, func(x float32) float32 { v := float32(math.Tanh(float64(x))); return 1 - v*v })
 }
 func ReLU(a *Tensor) *Tensor {
 	a = a.Contiguous()
-	if a.Device == tensor.CUDA {
+	if dispatchBackend("relu", a.Device) {
 		return gpuUnary(a, 4)
 	}
 	return unary(a, func(x float32) float32 {
@@ -686,7 +691,7 @@ func ReLU(a *Tensor) *Tensor {
 }
 func GELU(a *Tensor, approx bool) *Tensor {
 	a = a.Contiguous()
-	if a.Device == tensor.CUDA {
+	if dispatchBackend("gelu", a.Device) {
 		if approx {
 			return gpuUnary(a, 6)
 		}

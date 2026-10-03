@@ -1,11 +1,15 @@
 package tensor
 
 import (
+	"os"
 	"runtime"
 	"sync"
 )
 
 var sgemmPools sync.Map
+// The larger tile wins on both full-model median timings; set the environment
+// variable to 0 to retain the 4x8 fallback for diagnosis.
+var use8x8 = useAVX2FMA && os.Getenv("GOGRAD_SGEMM_8X8") != "0"
 
 func sgemmBuffer(n int) []float32 {
 	p, _ := sgemmPools.LoadOrStore(n, &sync.Pool{})
@@ -49,8 +53,12 @@ func SGEMMOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 	}
 	const kc = 256
 	nr := 4
+	mr := 4
 	if useAVX2FMA {
 		nr = 8
+		if use8x8 {
+			mr = 8
+		}
 	}
 	groups := (n + nr - 1) / nr
 	bp := sgemmBuffer(groups * k * nr)
@@ -83,15 +91,15 @@ func SGEMMOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 				end := min(row+mc, m)
 				for depth := 0; depth < k; depth += kc {
 					nk := min(kc, k-depth)
-					for i := row; i < end; i += 4 {
-						height := min(4, end-i)
-						panel := ap[(i-row)*kc : (i-row+4)*kc]
+					for i := row; i < end; i += mr {
+						height := min(mr, end-i)
+						panel := ap[(i-row)*kc : (i-row+mr)*kc]
 						for d := 0; d < nk; d++ {
 							for r := 0; r < height; r++ {
 								if transA {
-									panel[d*4+r] = a[(depth+d)*m+i+r]
+									panel[d*mr+r] = a[(depth+d)*m+i+r]
 								} else {
-									panel[d*4+r] = a[(i+r)*k+depth+d]
+									panel[d*mr+r] = a[(i+r)*k+depth+d]
 								}
 							}
 						}
@@ -100,12 +108,16 @@ func SGEMMOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 						j := g * nr
 						width := min(n-j, nr)
 						bb := bp[g*k*nr+depth*nr:]
-						for i := row; i < end; i += 4 {
-							height := min(4, end-i)
+						for i := row; i < end; i += mr {
+							height := min(mr, end-i)
 							aa := ap[(i-row)*kc:]
-							if height == 4 && width == nr {
+							if height == mr && width == nr {
 								if useAVX2FMA {
-									kernel4x8AVX(&c[i*n+j], &aa[0], &bb[0], n, nk, depth != 0)
+									if use8x8 {
+										kernel8x8AVX(&c[i*n+j], &aa[0], &bb[0], n, nk, depth != 0)
+									} else {
+										kernel4x8AVX(&c[i*n+j], &aa[0], &bb[0], n, nk, depth != 0)
+									}
 								} else {
 									kernel4x4(c, aa, bb, i*n+j, n, nk, depth != 0)
 								}
@@ -117,7 +129,7 @@ func SGEMMOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 											sum = c[(i+r)*n+j+q]
 										}
 										for d := 0; d < nk; d++ {
-											sum += aa[d*4+r] * bb[d*nr+q]
+											sum += aa[d*mr+r] * bb[d*nr+q]
 										}
 										c[(i+r)*n+j+q] = sum
 									}

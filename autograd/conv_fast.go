@@ -5,6 +5,7 @@ import "github.com/yh2237/gograd/tensor"
 // Conv1dGEMM lowers convolution to contiguous matrix products. CUDA currently
 // stages these matrices on the host; the device kernel migration is pending.
 func Conv1dGEMM(x, w, b *Tensor, dilation int) *Tensor {
+	useCUDA := dispatchBackend("conv1d_gemm", x.Device)
 	same(x, w)
 	same(x, b)
 	x, w, b = x.Contiguous(), w.Contiguous(), b.Contiguous()
@@ -12,7 +13,7 @@ func Conv1dGEMM(x, w, b *Tensor, dilation int) *Tensor {
 	if len(s) != 3 || len(w.Shape) != 3 || w.Shape[1] != s[2] || b.Numel() != w.Shape[0] || w.Shape[2]%2 != 1 || dilation < 1 {
 		panic("autograd: conv1d shape")
 	}
-	if x.Device == tensor.CUDA {
+	if useCUDA {
 		return gpuConv1d(x, w, b, dilation)
 	}
 	bs, t, ci, co, k := s[0], s[1], s[2], w.Shape[0], w.Shape[2]

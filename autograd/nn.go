@@ -25,8 +25,9 @@ func GradientNormToHost() float32 {
 
 // Conv1d uses [batch,time,channels] and [out,in,kernel] weights.
 func Conv1d(x, w, b *Tensor, dilation int) *Tensor {
+	useCUDA := dispatchBackend("conv1d", x.Device)
 	x, w, b = x.Contiguous(), w.Contiguous(), b.Contiguous()
-	if x.Device == tensor.CUDA {
+	if useCUDA {
 		return Conv1dGEMM(x, w, b, dilation)
 	}
 	same(x, w)
@@ -86,6 +87,7 @@ func Conv1d(x, w, b *Tensor, dilation int) *Tensor {
 
 // GroupNorm normalizes each sample across its time and channels per group.
 func GroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
+	useCUDA := dispatchBackend("group_norm", x.Device)
 	same(x, w)
 	same(x, b)
 	x, w, b = x.Contiguous(), w.Contiguous(), b.Contiguous()
@@ -93,7 +95,7 @@ func GroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
 	if len(s) != 3 || groups < 1 || s[2]%groups != 0 || w.Numel() != s[2] || b.Numel() != s[2] {
 		panic("autograd: groupnorm shape")
 	}
-	if x.Device == tensor.CUDA {
+	if useCUDA {
 		return gpuGroupNorm(x, w, b, groups, eps)
 	}
 	bs, t, c := s[0], s[1], s[2]
@@ -167,6 +169,7 @@ func GroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
 
 // LayerNorm normalizes over the last dimension.
 func LayerNorm(x, w, b *Tensor, eps float32) *Tensor {
+	useCUDA := dispatchBackend("layer_norm", x.Device)
 	if len(x.Shape) < 1 {
 		panic("autograd: layernorm rank")
 	}
@@ -177,7 +180,7 @@ func LayerNorm(x, w, b *Tensor, eps float32) *Tensor {
 	if c < 1 || len(w.Shape) != 1 || len(b.Shape) != 1 || w.Numel() != c || b.Numel() != c {
 		panic("autograd: layernorm shape")
 	}
-	if x.Device == tensor.CUDA {
+	if useCUDA {
 		return gpuLayerNorm(x, w, b, eps)
 	}
 	rows := x.Numel() / c
@@ -363,6 +366,7 @@ func (o *AdamW) Step() {
 			if e := kernels.AdamWUpdate(p.Value.buf, p.Value.gradBuf, o.mGPU[n], o.vGPU[n], o.unityGPU, p.Value.Numel(), o.Beta1, o.Beta2, o.LR/bc1, bc2, o.LR*o.WeightDecay, o.Eps, math.MaxFloat32); e != nil {
 				panic(e)
 			}
+			p.Value.invalidateBF16()
 		}
 		return
 	}

@@ -8,6 +8,7 @@ import (
 )
 
 func Reshape(a *Tensor, s ...int) *Tensor {
+	dispatchBackend("reshape", a.Device)
 	if numel(s) != a.Numel() {
 		panic("autograd: reshape size")
 	}
@@ -15,6 +16,7 @@ func Reshape(a *Tensor, s ...int) *Tensor {
 	return makeView(a, s, strides(s), 0)
 }
 func Permute(a *Tensor, axes ...int) *Tensor {
+	dispatchBackend("permute", a.Device)
 	n := len(a.Shape)
 	if len(axes) != n {
 		panic("autograd: permutation rank")
@@ -36,6 +38,7 @@ func Permute(a *Tensor, axes ...int) *Tensor {
 	return makeView(a, s, st, 0)
 }
 func Transpose(a *Tensor, i, j int) *Tensor {
+	dispatchBackend("transpose", a.Device)
 	axes := make([]int, len(a.Shape))
 	for k := range axes {
 		axes[k] = k
@@ -43,9 +46,16 @@ func Transpose(a *Tensor, i, j int) *Tensor {
 	axes[i], axes[j] = axes[j], axes[i]
 	return Permute(a, axes...)
 }
-func Sum(a *Tensor, axes ...int) *Tensor  { return reduce(a, false, axes...) }
-func Mean(a *Tensor, axes ...int) *Tensor { return reduce(a, true, axes...) }
+func Sum(a *Tensor, axes ...int) *Tensor {
+	dispatchBackend("sum", a.Device)
+	return reduce(a, false, axes...)
+}
+func Mean(a *Tensor, axes ...int) *Tensor {
+	dispatchBackend("mean", a.Device)
+	return reduce(a, true, axes...)
+}
 func reduce(a *Tensor, mean bool, axes ...int) *Tensor {
+	useCUDA := dispatchBackend(map[bool]string{true: "mean", false: "sum"}[mean], a.Device)
 	a = a.Contiguous()
 	selected := make([]bool, len(a.Shape))
 	for _, ax := range axes {
@@ -63,7 +73,7 @@ func reduce(a *Tensor, mean bool, axes ...int) *Tensor {
 			s = append(s, d)
 		}
 	}
-	if a.Device == tensor.CUDA {
+	if useCUDA {
 		return gpuReduce(a, s, selected, mean)
 	}
 	v := cpuAlloc(numel(s))
@@ -150,7 +160,7 @@ func Concat(axis int, inputs ...*Tensor) *Tensor {
 	for i, x := range inputs {
 		inputs[i] = x.Contiguous()
 	}
-	if inputs[0].Device == tensor.CUDA {
+	if dispatchBackend("concat", inputs[0].Device) {
 		out := inputs[0]
 		for _, p := range inputs[1:] {
 			out = gpuConcat(axis, out, p)
@@ -187,6 +197,7 @@ func Concat(axis int, inputs ...*Tensor) *Tensor {
 	})
 }
 func Slice(a *Tensor, axis, start, end int) *Tensor {
+	dispatchBackend("slice", a.Device)
 	if axis < 0 {
 		axis += len(a.Shape)
 	}
@@ -224,6 +235,7 @@ func parallelBatches(count int, fn func(int)) {
 	wg.Wait()
 }
 func MatMul(a, b *Tensor) *Tensor {
+	useCUDA := dispatchBackend("matmul", a.Device)
 	same(a, b)
 	a, b = a.Contiguous(), b.Contiguous()
 	if len(a.Shape) < 2 || len(b.Shape) < 2 {
@@ -236,7 +248,7 @@ func MatMul(a, b *Tensor) *Tensor {
 	n := b.Shape[len(b.Shape)-1]
 	batch := bshape(a.Shape[:len(a.Shape)-2], b.Shape[:len(b.Shape)-2])
 	s := append(append([]int(nil), batch...), m, n)
-	if a.Device == tensor.CUDA {
+	if useCUDA {
 		return gpuMatMul(a, b, s, m, n, k, batch)
 	}
 	count := numel(batch)
@@ -301,11 +313,13 @@ func MatMul(a, b *Tensor) *Tensor {
 	})
 }
 func Embedding(weight *Tensor, ids []int, shape []int) *Tensor {
+	dispatchBackend("embedding", weight.Device)
 	return EmbeddingWithPadding(weight, ids, shape, -1)
 }
 
 // EmbeddingWithPadding gathers rows and leaves the padding row's gradient zero.
 func EmbeddingWithPadding(weight *Tensor, ids []int, shape []int, paddingIdx int) *Tensor {
+	useCUDA := dispatchBackend("embedding_padding", weight.Device)
 	weight = weight.Contiguous()
 	if len(weight.Shape) != 2 || numel(shape) != len(ids) {
 		panic("autograd: embedding shape")
@@ -315,7 +329,7 @@ func EmbeddingWithPadding(weight *Tensor, ids []int, shape []int, paddingIdx int
 	}
 	dim := weight.Shape[1]
 	s := append(append([]int(nil), shape...), dim)
-	if weight.Device == tensor.CUDA {
+	if useCUDA {
 		for _, id := range ids {
 			if id < 0 || id >= weight.Shape[0] {
 				panic("autograd: embedding index")
@@ -344,12 +358,13 @@ func EmbeddingWithPadding(weight *Tensor, ids []int, shape []int, paddingIdx int
 	})
 }
 func MaskedLoss(pred, target *Tensor, mse bool) *Tensor {
+	useCUDA := dispatchBackend("masked_loss", pred.Device)
 	same(pred, target)
 	pred, target = pred.Contiguous(), target.Contiguous()
 	if len(pred.Shape) != 3 || numel(pred.Shape) != target.Numel() {
 		panic("autograd: loss shape")
 	}
-	if pred.Device == tensor.CUDA {
+	if useCUDA {
 		return gpuMaskedLoss(pred, target, mse)
 	}
 	c := pred.Shape[2]

@@ -16,11 +16,55 @@ func storageIndex(flat int, shape, stride []int, offset int) int {
 	}
 	return j
 }
+
+// A common attention view swaps the last two axes of contiguous matrices.
+// Detect it once and copy tiles without per-element N-D division/modulo.
+func lastTwoTranspose(shape, stride []int, offset int) bool {
+	n := len(shape)
+	if n < 2 || offset != 0 || stride[n-2] != 1 || stride[n-1] != shape[n-2] {
+		return false
+	}
+	expected := shape[n-2] * shape[n-1]
+	for i := n - 3; i >= 0; i-- {
+		if stride[i] != expected {
+			return false
+		}
+		expected *= shape[i]
+	}
+	return true
+}
+
+func transposeViewCopy(dst, src []float32, shape []int, backward bool) {
+	n := len(shape)
+	rows, cols := shape[n-2], shape[n-1]
+	outer := numel(shape[:n-2])
+	tiles := (rows + 31) / 32
+	parallelFor(outer*tiles*cols, func(start, end int) {
+		// Split on (outer,row-tile,column), keeping each source span contiguous.
+		for task := start; task < end; task++ {
+			o := task / (tiles * cols)
+			rem := task % (tiles * cols)
+			r0, c := rem/cols*32, rem%cols
+			r1 := min(rows, r0+32)
+			base := o * rows * cols
+			for r := r0; r < r1; r++ {
+				if backward {
+					dst[base+c*rows+r] += src[base+r*cols+c]
+				} else {
+					dst[base+r*cols+c] = src[base+c*rows+r]
+				}
+			}
+		}
+	})
+}
 func makeView(a *Tensor, shape, stride []int, offset int) *Tensor {
 	if !a.IsContiguous() {
 		panic("autograd: view parent must be contiguous")
 	}
 	v := &Tensor{Data: a.Data, Shape: append([]int(nil), shape...), Strides: append([]int(nil), stride...), Offset: offset, DType: Float32, Device: a.Device, buf: a.buf, RequiresGrad: a.RequiresGrad && recording, parents: []*Tensor{a}}
+	if a.bf16Buf != nil {
+		v.bf16Buf = a.bf16Buf
+	}
 	identity := offset == 0
 	want := strides(shape)
 	for i := range want {
@@ -39,8 +83,12 @@ func makeView(a *Tensor, shape, stride []int, offset int) *Tensor {
 				return
 			}
 			dx := cpuAlloc(a.Numel())
-			for i, z := range g {
-				dx[storageIndex(i, v.Shape, v.Strides, v.Offset)] += z
+			if lastTwoTranspose(v.Shape, v.Strides, v.Offset) {
+				transposeViewCopy(dx, g, v.Shape, true)
+			} else {
+				for i, z := range g {
+					dx[storageIndex(i, v.Shape, v.Strides, v.Offset)] += z
+				}
 			}
 			a.addGrad(dx)
 			cpuRelease(dx)
@@ -62,28 +110,40 @@ func makeView(a *Tensor, shape, stride []int, offset int) *Tensor {
 // Contiguous materializes a view in row-major order. A contiguous tensor is
 // returned unchanged. Backward maps the copy's logical gradient to its view.
 func (t *Tensor) Contiguous() *Tensor {
+	useCUDA := dispatchBackend("contiguous", t.Device)
 	if t.IsContiguous() {
 		return t
 	}
 	n := t.Numel()
-	if t.Device == tensor.CPU {
+	if !useCUDA {
 		v := cpuAlloc(n)
-		for i := range v {
-			v[i] = t.Data[storageIndex(i, t.Shape, t.Strides, t.Offset)]
+		if lastTwoTranspose(t.Shape, t.Strides, t.Offset) {
+			transposeViewCopy(v, t.Data, t.Shape, false)
+		} else {
+			for i := range v {
+				v[i] = t.Data[storageIndex(i, t.Shape, t.Strides, t.Offset)]
+			}
 		}
 		return result(v, append([]int(nil), t.Shape...), []*Tensor{t}, func(g []float32) { t.addGrad(g) })
 	}
 	out := mustAlloc(n)
 	gpuViewGather(t.buf, out, t.Shape, t.Strides, t.Offset)
-	return resultGPU(out, append([]int(nil), t.Shape...), []*Tensor{t}, func(g *cuda.Buffer) {
+	res := resultGPU(out, append([]int(nil), t.Shape...), []*Tensor{t}, func(g *cuda.Buffer) {
 		if dst := t.ensureGradGPU(); dst != nil {
 			addDevice(dst, g, n)
 		}
 	})
+	if BF16Autocast && t.bf16Buf != nil {
+		res.bf16Buf = allocBF16(n)
+		res.bf16Owner = true
+		gpuViewGatherBF16(t.bf16Buf, res.bf16Buf, t.Shape, t.Strides, t.Offset)
+	}
+	return res
 }
 
 // Expand broadcasts singleton dimensions without copying storage.
 func Expand(a *Tensor, shape ...int) *Tensor {
+	dispatchBackend("expand", a.Device)
 	if len(shape) < len(a.Shape) || len(shape) > 6 {
 		panic("autograd: expand rank")
 	}

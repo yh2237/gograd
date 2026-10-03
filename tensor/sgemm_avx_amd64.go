@@ -5,5 +5,6 @@ package tensor
 func hasAVX2FMA() bool
 func kernel4x4AVX(c, a, b *float32, stride, k int, add bool)
 func kernel4x8AVX(c, a, b *float32, stride, k int, add bool)
+func kernel8x8AVX(c, a, b *float32, stride, k int, add bool)
 
 var useAVX2FMA = hasAVX2FMA()

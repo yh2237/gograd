@@ -5,7 +5,6 @@ import (
 	"unsafe"
 
 	"github.com/yh2237/gograd/cuda"
-	"github.com/yh2237/gograd/tensor"
 )
 
 func axisParts(shape []int, axis int) (int, int, int) {
@@ -18,15 +17,26 @@ func axisParts(shape []int, axis int) (int, int, int) {
 	return numel(shape[:axis]), shape[axis], numel(shape[axis+1:])
 }
 
-func Softmax(a *Tensor, axis int) *Tensor    { return softmax(a, axis, false) }
-func LogSoftmax(a *Tensor, axis int) *Tensor { return softmax(a, axis, true) }
+func Softmax(a *Tensor, axis int) *Tensor {
+	dispatchBackend("softmax", a.Device)
+	return softmax(a, axis, false)
+}
+func LogSoftmax(a *Tensor, axis int) *Tensor {
+	dispatchBackend("log_softmax", a.Device)
+	return softmax(a, axis, true)
+}
 func softmax(a *Tensor, axis int, logmode bool) *Tensor {
+	name := "softmax"
+	if logmode {
+		name = "log_softmax"
+	}
+	useCUDA := dispatchBackend(name, a.Device)
 	a = a.Contiguous()
 	outer, dim, inner := axisParts(a.Shape, axis)
 	if dim == 0 {
 		panic("autograd: softmax empty axis")
 	}
-	if a.Device == tensor.CUDA {
+	if useCUDA {
 		out := mustAlloc(a.Numel())
 		ap, yp := ptr(a.buf), ptr(out)
 		rows, d, in, mode := int32(outer*inner), int32(dim), int32(inner), int32(0)
@@ -96,6 +106,7 @@ func softmax(a *Tensor, axis int, logmode bool) *Tensor {
 // Dropout uses the same index/seed hash on CPU and CUDA. A fixed seed makes a
 // forward/backward pair reproducible without keeping a mask tensor.
 func Dropout(a *Tensor, p float32, seed uint32, training bool) *Tensor {
+	useCUDA := dispatchBackend("dropout", a.Device)
 	if !training || p == 0 {
 		return a
 	}
@@ -104,7 +115,7 @@ func Dropout(a *Tensor, p float32, seed uint32, training bool) *Tensor {
 	}
 	a = a.Contiguous()
 	cutoff := uint32(float64(p) * 4294967296.0)
-	if a.Device == tensor.CUDA {
+	if useCUDA {
 		n := int32(a.Numel())
 		out := mustAlloc(int(n))
 		ap, yp := ptr(a.buf), ptr(out)
@@ -149,10 +160,17 @@ func Dropout(a *Tensor, p float32, seed uint32, training bool) *Tensor {
 
 // ScaledDotProductAttention accepts [..., query, depth] and [..., key, depth].
 // The additive mask broadcasts over the attention score shape.
+// AttentionAlgorithm is "materialized", "flash", or "auto". Set it between
+// training steps; the choice is process-wide. Auto selects the tiled path only
+// when materialized score scratch would exceed roughly 1 GiB.
+var AttentionAlgorithm = "auto"
+
 func ScaledDotProductAttention(q, k, v, mask *Tensor) *Tensor {
+	dispatchBackend("attention", q.Device)
 	return attentionWithDropout(q, k, v, mask, 0, 0, false)
 }
 func attentionWithDropout(q, k, v, mask *Tensor, p float32, seed uint32, training bool) *Tensor {
+	useCUDA := dispatchBackend("attention", q.Device)
 	if len(q.Shape) < 2 || len(k.Shape) < 2 || len(v.Shape) < 2 {
 		panic("autograd: attention rank")
 	}
@@ -160,7 +178,23 @@ func attentionWithDropout(q, k, v, mask *Tensor, p float32, seed uint32, trainin
 	if depth != k.Shape[len(k.Shape)-1] {
 		panic("autograd: attention depth")
 	}
-	if q.Device == tensor.CUDA && (!training || p == 0) && canFuseAttention(q, k, v, mask) {
+	if useCUDA && (!training || p == 0) && canFuseAttention(q, k, v, mask) {
+		flashSupported := q.Shape[len(q.Shape)-1] <= 128 && v.Shape[len(v.Shape)-1] <= 128
+		switch AttentionAlgorithm {
+		case "flash":
+			if !flashSupported {
+				panic("autograd: flash attention head dimension exceeds 128")
+			}
+			return gpuFlashAttention(q, k, v, mask)
+		case "auto":
+			batchCount:=numel(q.Shape[:len(q.Shape)-2])
+			if flashSupported && int64(batchCount)*int64(q.Shape[len(q.Shape)-2])*int64(k.Shape[len(k.Shape)-2])*12 >= 1<<30 {
+				return gpuFlashAttention(q, k, v, mask)
+			}
+		case "materialized":
+		default:
+			panic("autograd: unknown attention algorithm")
+		}
 		return gpuAttention(q, k, v, mask)
 	}
 	scores := MulScalar(MatMul(q, Transpose(k, len(k.Shape)-2, len(k.Shape)-1)), 1/float32(math.Sqrt(float64(depth))))
@@ -174,6 +208,7 @@ func attentionWithDropout(q, k, v, mask *Tensor, p float32, seed uint32, trainin
 // CrossEntropy treats the final logits axis as classes and averages over
 // targets other than ignoreIndex. Targets are integer class IDs on the host.
 func CrossEntropy(logits *Tensor, targets []int, ignoreIndex int) *Tensor {
+	useCUDA := dispatchBackend("cross_entropy", logits.Device)
 	logits = logits.Contiguous()
 	if len(logits.Shape) < 1 {
 		panic("autograd: cross entropy rank")
@@ -191,7 +226,7 @@ func CrossEntropy(logits *Tensor, targets []int, ignoreIndex int) *Tensor {
 			panic("autograd: cross entropy target index")
 		}
 	}
-	if logits.Device == tensor.CUDA {
+	if useCUDA {
 		ids := make([]int32, rows)
 		for i, id := range targets {
 			ids[i] = int32(id)

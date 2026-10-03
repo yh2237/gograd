@@ -43,6 +43,7 @@ func (ids *IndexBuffer) Close() {
 	}
 }
 func EmbeddingFromIndexBuffer(weight *Tensor, ids *IndexBuffer, shape []int, paddingIdx int) *Tensor {
+	dispatchBackend("embedding_index_buffer", weight.Device)
 	if weight.Device != tensor.CUDA || ids == nil || ids.buffer == nil || len(weight.Shape) != 2 || numel(shape) != ids.Count {
 		panic("autograd: CUDA embedding indices shape")
 	}
