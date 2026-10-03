@@ -198,6 +198,31 @@ func Slice(a *Tensor, axis, start, end int) *Tensor {
 	a = a.Contiguous()
 	return makeView(a, s, a.Strides, start*a.Strides[axis])
 }
+func parallelBatches(count int, fn func(int)) {
+	workers := min(runtime.GOMAXPROCS(0), count)
+	if workers < 2 {
+		for z := 0; z < count; z++ {
+			fn(z)
+		}
+		return
+	}
+	jobs := make(chan int, count)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for z := range jobs {
+				fn(z)
+			}
+		}()
+	}
+	for z := 0; z < count; z++ {
+		jobs <- z
+	}
+	close(jobs)
+	wg.Wait()
+}
 func MatMul(a, b *Tensor) *Tensor {
 	same(a, b)
 	a, b = a.Contiguous(), b.Contiguous()
@@ -214,17 +239,47 @@ func MatMul(a, b *Tensor) *Tensor {
 	if a.Device == tensor.CUDA {
 		return gpuMatMul(a, b, s, m, n, k, batch)
 	}
+	count := numel(batch)
+	aBatch, bBatch := a.Shape[:len(a.Shape)-2], b.Shape[:len(b.Shape)-2]
+	flatLinear := count > 1 && numel(aBatch) == count && numel(bBatch) == 1
 	v := cpuAlloc(numel(s))
-	for z := 0; z < numel(batch); z++ {
-		ai := bindex(z, batch, a.Shape[:len(a.Shape)-2]) * m * k
-		bi := bindex(z, batch, b.Shape[:len(b.Shape)-2]) * k * n
-		tensor.SGEMM(v[z*m*n:(z+1)*m*n], a.Data[ai:ai+m*k], b.Data[bi:bi+k*n], m, n, k)
+	if flatLinear {
+		tensor.SGEMM(v, a.Data, b.Data, count*m, n, k)
+	} else {
+		parallelBatches(count, func(z int) {
+			ai := bindex(z, batch, aBatch) * m * k
+			bi := bindex(z, batch, bBatch) * k * n
+			tensor.SGEMMOpWorkers(v[z*m*n:(z+1)*m*n], a.Data[ai:ai+m*k], b.Data[bi:bi+k*n], m, n, k, false, false, 1)
+		})
 	}
 	return result(v, s, []*Tensor{a, b}, func(g []float32) {
 		da := cpuAlloc(len(a.Data))
 		db := cpuAlloc(len(b.Data))
+		if flatLinear {
+			tensor.SGEMMOp(da, g, b.Data, count*m, k, n, false, true)
+			tensor.SGEMMOp(db, a.Data, g, k, n, count*m, true, false)
+			a.addGrad(da)
+			b.addGrad(db)
+			cpuRelease(da)
+			cpuRelease(db)
+			return
+		}
+		if count > 1 && numel(aBatch) == count && numel(bBatch) == count {
+			parallelBatches(count, func(z int) {
+				ai := bindex(z, batch, aBatch) * m * k
+				bi := bindex(z, batch, bBatch) * k * n
+				gg := g[z*m*n : (z+1)*m*n]
+				tensor.SGEMMOpWorkers(da[ai:ai+m*k], gg, b.Data[bi:bi+k*n], m, k, n, false, true, 1)
+				tensor.SGEMMOpWorkers(db[bi:bi+k*n], a.Data[ai:ai+m*k], gg, k, n, m, true, false, 1)
+			})
+			a.addGrad(da)
+			b.addGrad(db)
+			cpuRelease(da)
+			cpuRelease(db)
+			return
+		}
 		tmpA, tmpB := cpuAlloc(m*k), cpuAlloc(k*n)
-		for z := 0; z < numel(batch); z++ {
+		for z := 0; z < count; z++ {
 			ai := bindex(z, batch, a.Shape[:len(a.Shape)-2]) * m * k
 			bi := bindex(z, batch, b.Shape[:len(b.Shape)-2]) * k * n
 			gg := g[z*m*n : (z+1)*m*n]

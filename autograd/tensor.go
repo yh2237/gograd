@@ -388,7 +388,7 @@ func bindex(flat int, out, src []int) int {
 	return j
 }
 
-type broadcastIndex struct{ d1, d2, s0, s1, s2 int }
+type broadcastIndex struct{ d1, d2, s0, s1, s2, kind int }
 
 func makeBroadcastIndex(out, src []int) broadcastIndex {
 	o := [3]int{1, 1, 1}
@@ -400,6 +400,31 @@ func makeBroadcastIndex(out, src []int) broadcastIndex {
 		v[3-len(src)+i] = x
 	}
 	q := broadcastIndex{d1: o[1], d2: o[2]}
+	if len(out) == len(src) {
+		equal := true
+		for i := range out {
+			if out[i] != src[i] {
+				equal = false
+				break
+			}
+		}
+		if equal {
+			q.kind = 1
+			return q
+		}
+	}
+	if numel(src) == 1 {
+		q.kind = 2
+		return q
+	}
+	if len(src) == 1 && src[0] == out[len(out)-1] {
+		q.kind = 3
+		return q
+	}
+	if len(out) == 3 && len(src) == 3 && src[0] == out[0] && src[1] == 1 && src[2] == out[2] {
+		q.kind = 4
+		return q
+	}
 	if v[0] != 1 {
 		q.s0 = v[1] * v[2]
 	}
@@ -412,6 +437,16 @@ func makeBroadcastIndex(out, src []int) broadcastIndex {
 	return q
 }
 func (q broadcastIndex) at(i int) int {
+	switch q.kind {
+	case 1:
+		return i
+	case 2:
+		return 0
+	case 3:
+		return i % q.d2
+	case 4:
+		return i/(q.d1*q.d2)*q.d2 + i%q.d2
+	}
 	return (i/(q.d1*q.d2))*q.s0 + (i/q.d2%q.d1)*q.s1 + (i%q.d2)*q.s2
 }
 func parallelFor(n int, fn func(int, int)) {
@@ -520,33 +555,67 @@ func Scalar(a *Tensor, v float32) *Tensor {
 	b.ephemeral = true
 	return b
 }
+func cpuScalar(a *Tensor, value float32, op int) *Tensor {
+	out := cpuAlloc(a.Numel())
+	parallelFor(len(out), func(start, end int) {
+		for i := start; i < end; i++ {
+			x := a.Data[i]
+			switch op {
+			case 0:
+				out[i] = x + value
+			case 1:
+				out[i] = x - value
+			case 2:
+				out[i] = x * value
+			case 3:
+				out[i] = x / value
+			}
+		}
+	})
+	return result(out, a.Shape, []*Tensor{a}, func(g []float32) {
+		dx := cpuAlloc(len(g))
+		scale := float32(1)
+		if op == 2 {
+			scale = value
+		} else if op == 3 {
+			scale = 1 / value
+		}
+		parallelFor(len(g), func(start, end int) {
+			for i := start; i < end; i++ {
+				dx[i] = g[i] * scale
+			}
+		})
+		a.addGrad(dx)
+		cpuRelease(dx)
+	})
+}
 func AddScalar(a *Tensor, v float32) *Tensor {
 	a = a.Contiguous()
 	if a.Device == tensor.CUDA {
 		return gpuScalar(a, v, 0)
 	}
-	return Add(a, Scalar(a, v))
+	return cpuScalar(a, v, 0)
 }
 func SubScalar(a *Tensor, v float32) *Tensor {
 	a = a.Contiguous()
 	if a.Device == tensor.CUDA {
 		return gpuScalar(a, v, 1)
 	}
-	return Sub(a, Scalar(a, v))
+	return cpuScalar(a, v, 1)
 }
 func MulScalar(a *Tensor, v float32) *Tensor {
 	a = a.Contiguous()
 	if a.Device == tensor.CUDA {
 		return gpuScalar(a, v, 2)
 	}
-	return Mul(a, Scalar(a, v))
+	return cpuScalar(a, v, 2)
 }
 func DivScalar(a *Tensor, v float32) *Tensor {
 	a = a.Contiguous()
 	if a.Device == tensor.CUDA {
 		return gpuScalar(a, v, 3)
 	}
-	return Div(a, Scalar(a, v))
+	return cpuScalar(a, v, 3)
 }
 func unary(a *Tensor, f, d func(float32) float32) *Tensor {
 	v := cpuAlloc(len(a.Data))

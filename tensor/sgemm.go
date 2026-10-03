@@ -27,6 +27,12 @@ func SGEMM(c, a, b []float32, m, n, k int) {
 // SGEMMOp computes C = op(A)*op(B), with row-major stored operands.
 // transA stores A as k-by-m; transB stores B as n-by-k.
 func SGEMMOp(c, a, b []float32, m, n, k int, transA, transB bool) {
+	SGEMMOpWorkers(c, a, b, m, n, k, transA, transB, runtime.GOMAXPROCS(0))
+}
+
+// SGEMMOpWorkers caps internal row parallelism, useful when independent batch
+// matrices are already processed by outer workers.
+func SGEMMOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWorkers int) {
 	if len(a) != m*k || len(b) != k*n || len(c) != m*n {
 		panic("tensor: SGEMM shape mismatch")
 	}
@@ -42,7 +48,10 @@ func SGEMMOp(c, a, b []float32, m, n, k int, transA, transB bool) {
 		mc = 16
 	}
 	const kc = 256
-	const nr = 4
+	nr := 4
+	if useAVX2FMA {
+		nr = 8
+	}
 	groups := (n + nr - 1) / nr
 	bp := sgemmBuffer(groups * k * nr)
 	defer releaseSGEMMBuffer(bp)
@@ -61,7 +70,7 @@ func SGEMMOp(c, a, b []float32, m, n, k int, transA, transB bool) {
 		}
 	}
 	tiles := (m + mc - 1) / mc
-	workers := min(runtime.GOMAXPROCS(0), tiles)
+	workers := min(max(1, maxWorkers), tiles)
 	jobs := make(chan int, tiles)
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
@@ -94,9 +103,9 @@ func SGEMMOp(c, a, b []float32, m, n, k int, transA, transB bool) {
 						for i := row; i < end; i += 4 {
 							height := min(4, end-i)
 							aa := ap[(i-row)*kc:]
-							if height == 4 && width == 4 {
+							if height == 4 && width == nr {
 								if useAVX2FMA {
-									kernel4x4AVX(&c[i*n+j], &aa[0], &bb[0], n, nk, depth != 0)
+									kernel4x8AVX(&c[i*n+j], &aa[0], &bb[0], n, nk, depth != 0)
 								} else {
 									kernel4x4(c, aa, bb, i*n+j, n, nk, depth != 0)
 								}
@@ -108,7 +117,7 @@ func SGEMMOp(c, a, b []float32, m, n, k int, transA, transB bool) {
 											sum = c[(i+r)*n+j+q]
 										}
 										for d := 0; d < nk; d++ {
-											sum += aa[d*4+r] * bb[d*4+q]
+											sum += aa[d*4+r] * bb[d*nr+q]
 										}
 										c[(i+r)*n+j+q] = sum
 									}

@@ -5,6 +5,7 @@ import (
 	"github.com/yh2237/gograd/kernels"
 	"github.com/yh2237/gograd/tensor"
 	"math"
+	"sync"
 	"unsafe"
 )
 
@@ -169,11 +170,77 @@ func LayerNorm(x, w, b *Tensor, eps float32) *Tensor {
 	if len(x.Shape) < 1 {
 		panic("autograd: layernorm rank")
 	}
-	s := x.Shape
-	c := s[len(s)-1]
-	flat := Reshape(x, x.Numel()/c, 1, c)
-	y := GroupNorm(flat, w, b, 1, eps)
-	return Reshape(y, s...)
+	same(x, w)
+	same(x, b)
+	x, w, b = x.Contiguous(), w.Contiguous(), b.Contiguous()
+	c := x.Shape[len(x.Shape)-1]
+	if c < 1 || len(w.Shape) != 1 || len(b.Shape) != 1 || w.Numel() != c || b.Numel() != c {
+		panic("autograd: layernorm shape")
+	}
+	if x.Device == tensor.CUDA {
+		return gpuLayerNorm(x, w, b, eps)
+	}
+	rows := x.Numel() / c
+	out, means, invs := cpuAlloc(x.Numel()), cpuAlloc(rows), cpuAlloc(rows)
+	parallelFor(rows, func(start, end int) {
+		for row := start; row < end; row++ {
+			base := row * c
+			var mean, varsum float32
+			for j := 0; j < c; j++ {
+				mean += x.Data[base+j]
+			}
+			mean /= float32(c)
+			for j := 0; j < c; j++ {
+				z := x.Data[base+j] - mean
+				varsum += z * z
+			}
+			inv := float32(1 / math.Sqrt(float64(varsum/float32(c)+eps)))
+			means[row], invs[row] = mean, inv
+			for j := 0; j < c; j++ {
+				out[base+j] = (x.Data[base+j]-mean)*inv*w.Data[j] + b.Data[j]
+			}
+		}
+	})
+	return result(out, x.Shape, []*Tensor{x, w, b}, func(g []float32) {
+		defer cpuRelease(means)
+		defer cpuRelease(invs)
+		dx, dw, db := cpuAlloc(x.Numel()), cpuAlloc(c), cpuAlloc(c)
+		var mu sync.Mutex
+		parallelFor(rows, func(start, end int) {
+			localW, localB := make([]float32, c), make([]float32, c)
+			for row := start; row < end; row++ {
+				base := row * c
+				mean, inv := means[row], invs[row]
+				var sg, sgn float32
+				for j := 0; j < c; j++ {
+					norm := (x.Data[base+j] - mean) * inv
+					z := g[base+j] * w.Data[j]
+					sg += z
+					sgn += z * norm
+					localW[j] += g[base+j] * norm
+					localB[j] += g[base+j]
+				}
+				sg /= float32(c)
+				sgn /= float32(c)
+				for j := 0; j < c; j++ {
+					norm := (x.Data[base+j] - mean) * inv
+					dx[base+j] = inv * (g[base+j]*w.Data[j] - sg - norm*sgn)
+				}
+			}
+			mu.Lock()
+			for j := 0; j < c; j++ {
+				dw[j] += localW[j]
+				db[j] += localB[j]
+			}
+			mu.Unlock()
+		})
+		x.addGrad(dx)
+		w.addGrad(dw)
+		b.addGrad(db)
+		cpuRelease(dx)
+		cpuRelease(dw)
+		cpuRelease(db)
+	})
 }
 
 type Parameter struct {
