@@ -89,5 +89,6 @@ func mustZeros(shape []int, device tensor.Device) *Tensor {
 	if e != nil {
 		panic(e)
 	}
+	v.ephemeral = true
 	return v
 }

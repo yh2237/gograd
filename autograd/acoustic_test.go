@@ -52,6 +52,15 @@ func closeValues(t *testing.T, name string, got, want []float32, tol float64) {
 	}
 }
 func testAcoustic(t *testing.T, device tensor.Device) {
+	if device == tensor.CUDA {
+		context, e := NewCUDAContext()
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer context.Close()
+		EnableGPUProfile(true)
+		defer EnableGPUProfile(false)
+	}
 	f := loadFixture(t)
 	m, e := NewAcoustic(4, 3, 5, []int{1, 2, 4, 8, 16, 1, 2, 4, 8, 16}, device)
 	if e != nil {
@@ -62,7 +71,9 @@ func testAcoustic(t *testing.T, device tensor.Device) {
 		if !ok {
 			t.Fatalf("missing %s", p.Name)
 		}
-		copy(p.Value.Data, ref.Data)
+		if e := p.Value.CopyFrom(ref.Data); e != nil {
+			t.Fatal(e)
+		}
 	}
 	cont, e := New(f.Cont, []int{2, 3, 4}, device, false)
 	if e != nil {
@@ -81,21 +92,51 @@ func testAcoustic(t *testing.T, device tensor.Device) {
 		t.Fatal(e)
 	}
 	pred := m.Forward(f.IDs, cont, f.Speaker)
-	closeValues(t, "pred", pred.Data, f.Pred, 3e-4)
+	if device == tensor.CUDA && (pred.Buffer() == nil || pred.Data != nil) {
+		t.Fatal("CUDA output is not device-resident")
+	}
+	predValues, e := pred.ToHost()
+	if e != nil {
+		t.Fatal(e)
+	}
+	closeValues(t, "pred", predValues, f.Pred, 3e-4)
 	loss := MaskedLoss(pred, tgt, false)
-	closeValues(t, "loss", loss.Data, []float32{f.Loss}, 3e-4)
+	lossValues, e := loss.ToHost()
+	if e != nil {
+		t.Fatal(e)
+	}
+	closeValues(t, "loss", lossValues, []float32{f.Loss}, 3e-4)
 	if e = loss.Backward(); e != nil {
 		t.Fatal(e)
 	}
 	for _, p := range m.Params {
-		closeValues(t, "grad "+p.Name, p.Value.Grad, f.Grads[p.Name], 5e-4)
+		grad, e := p.Value.GradToHost()
+		if e != nil {
+			t.Fatal(e)
+		}
+		closeValues(t, "grad "+p.Name, grad, f.Grads[p.Name], 5e-4)
 	}
 	norm := ClipGradNorm(m.Params, 1)
+	if device == tensor.CUDA {
+		norm = GradientNormToHost()
+	}
 	closeValues(t, "norm", []float32{norm}, []float32{f.Norm}, 5e-4)
 	opt := NewAdamW(m.Params, .001, .0001)
 	opt.Step()
 	for _, p := range m.Params {
-		closeValues(t, "step "+p.Name, p.Value.Data, f.After[p.Name], 5e-4)
+		values, e := p.Value.ToHost()
+		if e != nil {
+			t.Fatal(e)
+		}
+		closeValues(t, "step "+p.Name, values, f.After[p.Name], 5e-4)
+	}
+	if device == tensor.CUDA {
+		profile := GPUProfile()
+		for name, minCount := range map[string]int{"embedding_f": 2, "conv_forward_sgemm": 12, "group_f": 10, "binary_f": 10, "masked_f": 1, "global_norm_parts": 1, "scale_all_grads": 1} {
+			if profile[name].Count < minCount {
+				t.Fatalf("CUDA kernel %s launched %d times, need %d", name, profile[name].Count, minCount)
+			}
+		}
 	}
 }
 func TestAcousticCPU(t *testing.T) { testAcoustic(t, tensor.CPU) }

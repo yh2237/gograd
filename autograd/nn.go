@@ -1,9 +1,31 @@
 package autograd
 
-import "math"
+import (
+	"github.com/yh2237/gograd/cuda"
+	"github.com/yh2237/gograd/kernels"
+	"github.com/yh2237/gograd/tensor"
+	"math"
+)
+
+var lastNormGPU *cuda.Buffer
+
+// GradientNormToHost is a diagnostic readback for tests and profiling.
+func GradientNormToHost() float32 {
+	if lastNormGPU == nil {
+		return 0
+	}
+	v := []float32{0}
+	if e := lastNormGPU.CopyToHost(floatBytes(v)); e != nil {
+		panic(e)
+	}
+	return v[0]
+}
 
 // Conv1d uses [batch,time,channels] and [out,in,kernel] weights.
 func Conv1d(x, w, b *Tensor, dilation int) *Tensor {
+	if x.Device == tensor.CUDA {
+		return Conv1dGEMM(x, w, b, dilation)
+	}
 	same(x, w)
 	same(x, b)
 	s := x.Shape
@@ -64,15 +86,18 @@ func GroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
 	same(x, w)
 	same(x, b)
 	s := x.Shape
-	if len(s) != 3 || groups < 1 || s[2]%groups != 0 || len(w.Data) != s[2] || len(b.Data) != s[2] {
+	if len(s) != 3 || groups < 1 || s[2]%groups != 0 || w.Numel() != s[2] || b.Numel() != s[2] {
 		panic("autograd: groupnorm shape")
+	}
+	if x.Device == tensor.CUDA {
+		return gpuGroupNorm(x, w, b, groups, eps)
 	}
 	bs, t, c := s[0], s[1], s[2]
 	cg := c / groups
 	size := float32(t * cg)
-	v := make([]float32, len(x.Data))
-	norm := make([]float32, len(x.Data))
-	inv := make([]float32, bs*groups)
+	v := cpuAlloc(len(x.Data))
+	norm := cpuAlloc(len(x.Data))
+	inv := cpuAlloc(bs * groups)
 	for n := 0; n < bs; n++ {
 		for gr := 0; gr < groups; gr++ {
 			var mean, variance float32
@@ -101,9 +126,11 @@ func GroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
 		}
 	}
 	return result(v, s, []*Tensor{x, w, b}, func(g []float32) {
-		dx := make([]float32, len(g))
-		dw := make([]float32, c)
-		db := make([]float32, c)
+		defer cpuRelease(norm)
+		defer cpuRelease(inv)
+		dx := cpuAlloc(len(g))
+		dw := cpuAlloc(c)
+		db := cpuAlloc(c)
 		for n := 0; n < bs; n++ {
 			for gr := 0; gr < groups; gr++ {
 				var sg, sgn float32
@@ -128,6 +155,9 @@ func GroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
 		x.addGrad(dx)
 		w.addGrad(dw)
 		b.addGrad(db)
+		cpuRelease(dx)
+		cpuRelease(dw)
+		cpuRelease(db)
 	})
 }
 
@@ -138,7 +168,7 @@ func LayerNorm(x, w, b *Tensor, eps float32) *Tensor {
 	}
 	s := x.Shape
 	c := s[len(s)-1]
-	flat := Reshape(x, len(x.Data)/c, 1, c)
+	flat := Reshape(x, x.Numel()/c, 1, c)
 	y := GroupNorm(flat, w, b, 1, eps)
 	return Reshape(y, s...)
 }
@@ -149,6 +179,10 @@ type Parameter struct {
 }
 
 func ClipGradNorm(params []Parameter, maxNorm float32) float32 {
+	if len(params) > 0 && params[0].Value.Device == tensor.CUDA {
+		clipGPU(params, maxNorm)
+		return float32(math.NaN())
+	}
 	var sum float64
 	for _, p := range params {
 		for _, g := range p.Value.Grad {
@@ -171,14 +205,28 @@ type AdamW struct {
 	Params                             []Parameter
 	LR, WeightDecay, Beta1, Beta2, Eps float32
 	M, V                               [][]float32
+	mGPU, vGPU                         []*cuda.Buffer
+	unityGPU                           *cuda.Buffer
 	StepCount                          int
 }
 
 func NewAdamW(params []Parameter, lr, decay float32) *AdamW {
 	o := &AdamW{Params: params, LR: lr, WeightDecay: decay, Beta1: .9, Beta2: .999, Eps: 1e-8}
+	if len(params) > 0 && params[0].Value.Device == tensor.CUDA {
+		o.unityGPU = mustAlloc(1)
+		setOne(o.unityGPU)
+	}
 	for _, p := range params {
-		o.M = append(o.M, make([]float32, len(p.Value.Data)))
-		o.V = append(o.V, make([]float32, len(p.Value.Data)))
+		if p.Value.Device == tensor.CUDA {
+			m, v := mustAlloc(p.Value.Numel()), mustAlloc(p.Value.Numel())
+			m.Memset(0, m.Size())
+			v.Memset(0, v.Size())
+			o.mGPU = append(o.mGPU, m)
+			o.vGPU = append(o.vGPU, v)
+		} else {
+			o.M = append(o.M, make([]float32, p.Value.Numel()))
+			o.V = append(o.V, make([]float32, p.Value.Numel()))
+		}
 	}
 	return o
 }
@@ -186,6 +234,17 @@ func (o *AdamW) Step() {
 	o.StepCount++
 	bc1 := float32(1 - math.Pow(float64(o.Beta1), float64(o.StepCount)))
 	bc2 := float32(1 - math.Pow(float64(o.Beta2), float64(o.StepCount)))
+	if len(o.Params) > 0 && o.Params[0].Value.Device == tensor.CUDA {
+		for n, p := range o.Params {
+			if p.Value.gradBuf == nil {
+				continue
+			}
+			if e := kernels.AdamWUpdate(p.Value.buf, p.Value.gradBuf, o.mGPU[n], o.vGPU[n], o.unityGPU, p.Value.Numel(), o.Beta1, o.Beta2, o.LR/bc1, bc2, o.LR*o.WeightDecay, o.Eps, math.MaxFloat32); e != nil {
+				panic(e)
+			}
+		}
+		return
+	}
 	for n, p := range o.Params {
 		for i, g := range p.Value.Grad {
 			o.M[n][i] = o.Beta1*o.M[n][i] + (1-o.Beta1)*g

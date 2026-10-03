@@ -8,12 +8,15 @@ func Conv1dGEMM(x, w, b *Tensor, dilation int) *Tensor {
 	same(x, w)
 	same(x, b)
 	s := x.Shape
-	if len(s) != 3 || len(w.Shape) != 3 || w.Shape[1] != s[2] || len(b.Data) != w.Shape[0] || w.Shape[2]%2 != 1 || dilation < 1 {
+	if len(s) != 3 || len(w.Shape) != 3 || w.Shape[1] != s[2] || b.Numel() != w.Shape[0] || w.Shape[2]%2 != 1 || dilation < 1 {
 		panic("autograd: conv1d shape")
+	}
+	if x.Device == tensor.CUDA {
+		return gpuConv1d(x, w, b, dilation)
 	}
 	bs, t, ci, co, k := s[0], s[1], s[2], w.Shape[0], w.Shape[2]
 	rows, depth := bs*t, ci*k
-	cols := make([]float32, rows*depth)
+	cols := cpuAlloc(rows * depth)
 	for n := 0; n < bs; n++ {
 		for at := 0; at < t; at++ {
 			for i := 0; i < ci; i++ {
@@ -26,7 +29,7 @@ func Conv1dGEMM(x, w, b *Tensor, dilation int) *Tensor {
 			}
 		}
 	}
-	v := make([]float32, rows*co)
+	v := cpuAlloc(rows * co)
 	tensor.SGEMMOp(v, cols, w.Data, rows, co, depth, false, true)
 	for r := 0; r < rows; r++ {
 		for o := 0; o < co; o++ {
@@ -34,23 +37,24 @@ func Conv1dGEMM(x, w, b *Tensor, dilation int) *Tensor {
 		}
 	}
 	return result(v, []int{bs, t, co}, []*Tensor{x, w, b}, func(g []float32) {
-		db := make([]float32, co)
+		defer cpuRelease(cols)
+		db := cpuAlloc(co)
 		for r := 0; r < rows; r++ {
 			for o := 0; o < co; o++ {
 				db[o] += g[r*co+o]
 			}
 		}
-		dwT := make([]float32, depth*co)
+		dwT := cpuAlloc(depth * co)
 		tensor.SGEMMOp(dwT, cols, g, depth, co, rows, true, false)
-		dw := make([]float32, len(w.Data))
+		dw := cpuAlloc(len(w.Data))
 		for o := 0; o < co; o++ {
 			for j := 0; j < depth; j++ {
 				dw[o*depth+j] = dwT[j*co+o]
 			}
 		}
-		dcols := make([]float32, len(cols))
+		dcols := cpuAlloc(len(cols))
 		tensor.SGEMM(dcols, g, w.Data, rows, depth, co)
-		dx := make([]float32, len(x.Data))
+		dx := cpuAlloc(len(x.Data))
 		for n := 0; n < bs; n++ {
 			for at := 0; at < t; at++ {
 				for i := 0; i < ci; i++ {
@@ -66,5 +70,10 @@ func Conv1dGEMM(x, w, b *Tensor, dilation int) *Tensor {
 		x.addGrad(dx)
 		w.addGrad(dw)
 		b.addGrad(db)
+		cpuRelease(db)
+		cpuRelease(dwT)
+		cpuRelease(dw)
+		cpuRelease(dcols)
+		cpuRelease(dx)
 	})
 }

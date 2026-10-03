@@ -1,12 +1,28 @@
 package autograd
 
-import "math"
+import (
+	"github.com/yh2237/gograd/cuda"
+	"github.com/yh2237/gograd/tensor"
+	"math"
+	"runtime"
+	"sync"
+)
 
 func Reshape(a *Tensor, s ...int) *Tensor {
-	if numel(s) != len(a.Data) {
+	if numel(s) != a.Numel() {
 		panic("autograd: reshape size")
 	}
-	return result(a.Data, append([]int(nil), s...), []*Tensor{a}, func(g []float32) { a.addGrad(g) })
+	if a.Device == tensor.CUDA {
+		req := a.RequiresGrad && recording
+		return &Tensor{Shape: append([]int(nil), s...), Strides: strides(s), DType: Float32, Device: tensor.CUDA, buf: a.buf, RequiresGrad: req, parents: []*Tensor{a}, backwardGPU: func(g *cuda.Buffer) {
+			if da := a.ensureGradGPU(); da != nil {
+				addDevice(da, g, a.Numel())
+			}
+		}}
+	}
+	r := result(a.Data, append([]int(nil), s...), []*Tensor{a}, func(g []float32) { a.addGrad(g) })
+	r.ownsData = false
+	return r
 }
 func Permute(a *Tensor, axes ...int) *Tensor {
 	n := len(a.Shape)
@@ -22,7 +38,10 @@ func Permute(a *Tensor, axes ...int) *Tensor {
 		seen[x] = true
 		s[i] = a.Shape[x]
 	}
-	v := make([]float32, len(a.Data))
+	if a.Device == tensor.CUDA {
+		return gpuPermute(a, axes, s)
+	}
+	v := cpuAlloc(len(a.Data))
 	mapping := make([]int, len(v))
 	os := strides(s)
 	for i := range v {
@@ -68,20 +87,53 @@ func reduce(a *Tensor, mean bool, axes ...int) *Tensor {
 			s = append(s, d)
 		}
 	}
-	v := make([]float32, numel(s))
+	if a.Device == tensor.CUDA {
+		return gpuReduce(a, s, selected, mean)
+	}
+	v := cpuAlloc(numel(s))
 	mapping := make([]int, len(a.Data))
 	count := float32(len(a.Data) / len(v))
-	for i, x := range a.Data {
+	outStrides := strides(s)
+	mapAt := func(i int) int {
 		j := 0
 		shift := len(s) - 1
 		for k := len(a.Shape) - 1; k >= 0; k-- {
 			if !selected[k] {
-				j += (i / a.Strides[k] % a.Shape[k]) * strides(s)[shift]
+				j += (i / a.Strides[k] % a.Shape[k]) * outStrides[shift]
 				shift--
 			}
 		}
-		mapping[i] = j
-		v[j] += x
+		return j
+	}
+	workers := min(runtime.GOMAXPROCS(0), len(a.Data)/65536)
+	if workers >= 2 && len(v) <= 65536 {
+		partials := make([][]float32, workers)
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			start, end := len(a.Data)*w/workers, len(a.Data)*(w+1)/workers
+			partials[w] = make([]float32, len(v))
+			wg.Add(1)
+			go func(w, start, end int) {
+				defer wg.Done()
+				for i := start; i < end; i++ {
+					j := mapAt(i)
+					mapping[i] = j
+					partials[w][j] += a.Data[i]
+				}
+			}(w, start, end)
+		}
+		wg.Wait()
+		for _, p := range partials {
+			for i, x := range p {
+				v[i] += x
+			}
+		}
+	} else {
+		for i, x := range a.Data {
+			j := mapAt(i)
+			mapping[i] = j
+			v[j] += x
+		}
 	}
 	if mean {
 		for i := range v {
@@ -90,12 +142,14 @@ func reduce(a *Tensor, mean bool, axes ...int) *Tensor {
 	}
 	return result(v, s, []*Tensor{a}, func(g []float32) {
 		dx := make([]float32, len(a.Data))
-		for i, j := range mapping {
-			dx[i] = g[j]
-			if mean {
-				dx[i] /= count
+		parallelFor(len(mapping), func(start, end int) {
+			for i := start; i < end; i++ {
+				dx[i] = g[mapping[i]]
+				if mean {
+					dx[i] /= count
+				}
 			}
-		}
+		})
 		a.addGrad(dx)
 	})
 }
@@ -117,7 +171,14 @@ func Concat(axis int, inputs ...*Tensor) *Tensor {
 		}
 		s[axis] += x.Shape[axis]
 	}
-	v := make([]float32, numel(s))
+	if inputs[0].Device == tensor.CUDA {
+		out := inputs[0]
+		for _, p := range inputs[1:] {
+			out = gpuConcat(axis, out, p)
+		}
+		return out
+	}
+	v := cpuAlloc(numel(s))
 	outer := numel(s[:axis])
 	inner := numel(s[axis+1:])
 	for o := 0; o < outer; o++ {
@@ -155,7 +216,10 @@ func Slice(a *Tensor, axis, start, end int) *Tensor {
 	}
 	s := append([]int(nil), a.Shape...)
 	s[axis] = end - start
-	v := make([]float32, numel(s))
+	if a.Device == tensor.CUDA {
+		return gpuSlice(a, axis, start, end, s)
+	}
+	v := cpuAlloc(numel(s))
 	mapping := make([]int, len(v))
 	for i := range v {
 		j := 0
@@ -189,7 +253,10 @@ func MatMul(a, b *Tensor) *Tensor {
 	n := b.Shape[len(b.Shape)-1]
 	batch := bshape(a.Shape[:len(a.Shape)-2], b.Shape[:len(b.Shape)-2])
 	s := append(append([]int(nil), batch...), m, n)
-	v := make([]float32, numel(s))
+	if a.Device == tensor.CUDA {
+		return gpuMatMul(a, b, s, m, n, k, batch)
+	}
+	v := cpuAlloc(numel(s))
 	for z := 0; z < numel(batch); z++ {
 		ai := bindex(z, batch, a.Shape[:len(a.Shape)-2]) * m * k
 		bi := bindex(z, batch, b.Shape[:len(b.Shape)-2]) * k * n
@@ -229,7 +296,15 @@ func Embedding(weight *Tensor, ids []int, shape []int) *Tensor {
 	}
 	dim := weight.Shape[1]
 	s := append(append([]int(nil), shape...), dim)
-	v := make([]float32, len(ids)*dim)
+	if weight.Device == tensor.CUDA {
+		for _, id := range ids {
+			if id < 0 || id >= weight.Shape[0] {
+				panic("autograd: embedding index")
+			}
+		}
+		return gpuEmbedding(weight, ids, shape)
+	}
+	v := cpuAlloc(len(ids) * dim)
 	for i, id := range ids {
 		if id < 0 || id >= weight.Shape[0] {
 			panic("autograd: embedding index")
@@ -248,8 +323,11 @@ func Embedding(weight *Tensor, ids []int, shape []int) *Tensor {
 }
 func MaskedLoss(pred, target *Tensor, mse bool) *Tensor {
 	same(pred, target)
-	if len(pred.Shape) != 3 || numel(pred.Shape) != len(target.Data) {
+	if len(pred.Shape) != 3 || numel(pred.Shape) != target.Numel() {
 		panic("autograd: loss shape")
+	}
+	if pred.Device == tensor.CUDA {
+		return gpuMaskedLoss(pred, target, mse)
 	}
 	c := pred.Shape[2]
 	g := make([]float32, len(pred.Data))
@@ -285,7 +363,9 @@ func MaskedLoss(pred, target *Tensor, mse bool) *Tensor {
 			g[i] /= float32(count)
 		}
 	}
-	return result([]float32{total}, []int{}, []*Tensor{pred}, func(up []float32) {
+	value := cpuAlloc(1)
+	value[0] = total
+	return result(value, []int{}, []*Tensor{pred}, func(up []float32) {
 		dx := make([]float32, len(g))
 		for i := range g {
 			dx[i] = g[i] * up[0]

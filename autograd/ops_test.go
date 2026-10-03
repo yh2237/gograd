@@ -1,6 +1,8 @@
 package autograd
 
 import (
+	"github.com/yh2237/gograd/cuda"
+	"github.com/yh2237/gograd/tensor"
 	"math"
 	"testing"
 )
@@ -22,6 +24,46 @@ func TestBroadcastAndMatmulGrad(t *testing.T) {
 	}
 	closeValues(t, "matmul x", x.Grad, []float32{11, 15, 11, 15}, 0)
 	closeValues(t, "matmul w", w.Grad, []float32{4, 4, 6, 6}, 0)
+}
+func TestCUDAOpsResident(t *testing.T) {
+	if !cuda.Available() {
+		t.Skip("CUDA unavailable")
+	}
+	context, e := NewCUDAContext()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer context.Close()
+	a, e := New([]float32{1, 2, 3, 4, 5, 6}, []int{2, 3}, tensor.CUDA, true)
+	if e != nil {
+		t.Fatal(e)
+	}
+	b, e := New([]float32{2, 3, 4}, []int{3}, tensor.CUDA, true)
+	if e != nil {
+		t.Fatal(e)
+	}
+	loss := Sum(Mul(a, b), 0, 1)
+	if loss.Buffer() == nil || loss.Data != nil {
+		t.Fatal("reduction staged on host")
+	}
+	v, e := loss.ToHost()
+	if e != nil {
+		t.Fatal(e)
+	}
+	closeValues(t, "loss", v, []float32{67}, 1e-5)
+	if e = loss.Backward(); e != nil {
+		t.Fatal(e)
+	}
+	ag, e := a.GradToHost()
+	if e != nil {
+		t.Fatal(e)
+	}
+	bg, e := b.GradToHost()
+	if e != nil {
+		t.Fatal(e)
+	}
+	closeValues(t, "a", ag, []float32{2, 3, 4, 2, 3, 4}, 1e-5)
+	closeValues(t, "b", bg, []float32{5, 7, 9}, 1e-5)
 }
 func TestShapeEmbeddingAndScheduler(t *testing.T) {
 	p := Must([]float32{1, 2, 3, 4, 5, 6}, []int{3, 2}, true)

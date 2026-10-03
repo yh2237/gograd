@@ -33,7 +33,11 @@ func (m *Module) StateDict() map[string][]float32 {
 	var walk func(string, *Module)
 	walk = func(prefix string, node *Module) {
 		for _, p := range append(append([]Parameter(nil), node.Parameters...), node.Buffers...) {
-			out[prefix+p.Name] = append([]float32(nil), p.Value.Data...)
+			values, e := p.Value.ToHost()
+			if e != nil {
+				panic(e)
+			}
+			out[prefix+p.Name] = values
 		}
 		for _, child := range node.Children {
 			walk(prefix+child.Name+".", child.Module)
@@ -53,15 +57,19 @@ func (m *Module) LoadStateDict(state map[string][]float32) error {
 			return fmt.Errorf("autograd: missing or mismatched %s", name)
 		}
 	}
-	var walk func(string, *Module)
-	walk = func(prefix string, node *Module) {
+	var walk func(string, *Module) error
+	walk = func(prefix string, node *Module) error {
 		for _, p := range append(append([]Parameter(nil), node.Parameters...), node.Buffers...) {
-			copy(p.Value.Data, state[prefix+p.Name])
+			if e := p.Value.CopyFrom(state[prefix+p.Name]); e != nil {
+				return e
+			}
 		}
 		for _, child := range node.Children {
-			walk(prefix+child.Name+".", child.Module)
+			if e := walk(prefix+child.Name+".", child.Module); e != nil {
+				return e
+			}
 		}
+		return nil
 	}
-	walk("", m)
-	return nil
+	return walk("", m)
 }
