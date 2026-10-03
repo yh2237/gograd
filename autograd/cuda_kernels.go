@@ -70,13 +70,16 @@ func timedGPU(name string, fn func() error) {
 const graphSource = `
 extern "C" __global__ void copy_values(const float* a,float* y,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)y[i]=a[i];}
 extern "C" __global__ void f32_to_bf16(const float* x,unsigned short* y,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){unsigned int bits=__float_as_uint(x[i]);unsigned int round=0x7fffu+((bits>>16)&1u);y[i]=(unsigned short)((bits+round)>>16);}}
+__device__ unsigned short round_bf16(float x){unsigned int bits=__float_as_uint(x);return (unsigned short)((bits+0x7fffu+((bits>>16)&1u))>>16);}
 extern "C" __global__ void set_one(float* x){x[0]=1.0f;}
 extern "C" __global__ void write_clip_entry(unsigned long long* ptrs,int* sizes,int index,unsigned long long address,int size){ptrs[index]=address;sizes[index]=size;}
 struct Axes6 {int d[6];};
 __device__ int view_index(int i,Axes6 shape,Axes6 stride,int offset){int j=offset;for(int axis=5;axis>=0;axis--){int dim=shape.d[axis];int c=i%dim;i/=dim;j+=c*stride.d[axis];}return j;}
 extern "C" __global__ void view_gather(const float* x,float* y,int n,Axes6 shape,Axes6 stride,int offset){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)y[i]=x[view_index(i,shape,stride,offset)];}
+extern "C" __global__ void view_gather_bf16(const unsigned short* x,unsigned short* y,int n,Axes6 shape,Axes6 stride,int offset){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)y[i]=x[view_index(i,shape,stride,offset)];}
 extern "C" __global__ void view_scatter(const float* g,float* dx,int n,Axes6 shape,Axes6 stride,int offset){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)atomicAdd(&dx[view_index(i,shape,stride,offset)],g[i]);}
 extern "C" __global__ void binary_nd_f(const float* a,const float* b,float* y,int n,Axes6 shape,Axes6 as,Axes6 bs,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;float x=a[view_index(i,shape,as,0)],z=b[view_index(i,shape,bs,0)];y[i]=op==0?x+z:op==1?x-z:op==2?x*z:x/z;}
+extern "C" __global__ void binary_nd_bf16_f(const float* a,const float* b,float* y,unsigned short* y16,int n,Axes6 shape,Axes6 as,Axes6 bs,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;float x=a[view_index(i,shape,as,0)],z=b[view_index(i,shape,bs,0)];float result=op==0?x+z:op==1?x-z:op==2?x*z:x/z;y[i]=result;y16[i]=round_bf16(result);}
 extern "C" __global__ void binary_nd_b(const float* a,const float* b,const float* g,float* da,float* db,int n,Axes6 shape,Axes6 as,Axes6 bs,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;int ai=view_index(i,shape,as,0),bi=view_index(i,shape,bs,0);float x=a[ai],z=b[bi],up=g[i];if(da)atomicAdd(&da[ai],up*(op==2?z:op==3?1.0f/z:1.0f));if(db)atomicAdd(&db[bi],up*(op==0?1.0f:op==1?-1.0f:op==2?x:-x/(z*z)));}
 extern "C" __global__ void reduce_nd_f(const float* x,float* y,int n,Axes6 shape,Axes6 map,float scale){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)atomicAdd(&y[view_index(i,shape,map,0)],x[i]*scale);}
 extern "C" __global__ void reduce_nd_b(const float* g,float* dx,int n,Axes6 shape,Axes6 map,float scale){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)dx[i]+=g[view_index(i,shape,map,0)]*scale;}
@@ -86,7 +89,67 @@ extern "C" __global__ void softmax_f(const float* x,float* y,int rows,int dim,in
 extern "C" __global__ void softmax_b(const float* y,const float* g,float* dx,int rows,int dim,int inner,int logmode){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int o=row/inner,j=row%inner,base=o*dim*inner+j;float dot=0;for(int k=lane;k<dim;k+=32){int idx=base+k*inner;dot+=g[idx]*(logmode?1.0f:y[idx]);}dot=warp_sum(dot);for(int k=lane;k<dim;k+=32){int idx=base+k*inner;dx[idx]+=logmode?g[idx]-expf(y[idx])*dot:y[idx]*(g[idx]-dot);}}
 extern "C" __global__ void attn_softmax_f(const float* scores,const float* mask,float* probs,int rows,int dim,float scale,Axes6 shape,Axes6 ms){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int base=row*dim;float mx=-3.402823466e38f;for(int k=lane;k<dim;k+=32){int i=base+k;float z=scores[i]*scale+(mask?mask[view_index(i,shape,ms,0)]:0.0f);mx=fmaxf(mx,z);}mx=warp_max(mx);float sum=0;for(int k=lane;k<dim;k+=32){int i=base+k;float z=scores[i]*scale+(mask?mask[view_index(i,shape,ms,0)]:0.0f);sum+=expf(z-mx);}sum=warp_sum(sum);for(int k=lane;k<dim;k+=32){int i=base+k;float z=scores[i]*scale+(mask?mask[view_index(i,shape,ms,0)]:0.0f);probs[i]=expf(z-mx)/sum;}}
 extern "C" __global__ void attn_softmax_b(const float* probs,const float* dp,float* ds,float* dmask,int rows,int dim,float scale,Axes6 shape,Axes6 ms){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int base=row*dim;float dot=0;for(int k=lane;k<dim;k+=32){int i=base+k;dot+=probs[i]*dp[i];}dot=warp_sum(dot);for(int k=lane;k<dim;k+=32){int i=base+k;float z=probs[i]*(dp[i]-dot);ds[i]=z*scale;if(dmask)atomicAdd(&dmask[view_index(i,shape,ms,0)],z);}}
+// One warp owns one query row. Its online normalizer and output accumulator
+// stay in registers; only two scalars per query are saved for backward.
+extern "C" __global__ void flash_attention_f(const float* q,const float* k,const float* v,const float* mask,float* out,float* stats,int rows,int nq,int nk,int d,int e,float scale,Axes6 shape,Axes6 ms){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int batch=row/nq,qi=row%nq;const float* qr=q+row*d;float mx=-3.402823466e38f,den=0.0f;for(int key=0;key<nk;key++){const float* kr=k+(batch*nk+key)*d;float dot=0.0f;for(int j=lane;j<d;j+=32)dot+=qr[j]*kr[j];float score=warp_sum(dot)*scale;if(mask)score+=mask[view_index(row*nk+key,shape,ms,0)];float next=fmaxf(mx,score),old=expf(mx-next),p=expf(score-next);den=den*old+p;mx=next;for(int c=lane;c<e;c+=32){float previous=key==0?0.0f:out[row*e+c];out[row*e+c]=previous*old+p*v[(batch*nk+key)*e+c];}}for(int c=lane;c<e;c+=32)out[row*e+c]/=den;if(lane==0){stats[row*2]=mx;stats[row*2+1]=den;}}
+extern "C" __global__ void flash_attention_b(const float* q,const float* k,const float* v,const float* mask,const float* out,const float* stats,const float* g,float* dq,float* dk,float* dv,float* dmask,int rows,int nq,int nk,int d,int e,float scale,Axes6 shape,Axes6 ms){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int batch=row/nq;const float* qr=q+row*d;const float* gr=g+row*e;float delta=0.0f;for(int c=lane;c<e;c+=32)delta+=gr[c]*out[row*e+c];delta=warp_sum(delta);float mx=stats[row*2],den=stats[row*2+1];for(int key=0;key<nk;key++){const float* kr=k+(batch*nk+key)*d;const float* vr=v+(batch*nk+key)*e;float dot=0.0f;for(int j=lane;j<d;j+=32)dot+=qr[j]*kr[j];float score=warp_sum(dot)*scale;if(mask)score+=mask[view_index(row*nk+key,shape,ms,0)];float p=expf(score-mx)/den;float dp=0.0f;for(int c=lane;c<e;c+=32)dp+=gr[c]*vr[c];float ds=p*(warp_sum(dp)-delta);for(int c=lane;c<e;c+=32)if(dv)atomicAdd(&dv[(batch*nk+key)*e+c],p*gr[c]);for(int j=lane;j<d;j+=32){if(dq)atomicAdd(&dq[row*d+j],ds*scale*kr[j]);if(dk)atomicAdd(&dk[(batch*nk+key)*d+j],ds*scale*qr[j]);}if(dmask && lane==0)atomicAdd(&dmask[view_index(row*nk+key,shape,ms,0)],ds);}}
+// Sixteen keys and values are cooperatively loaded once per eight query warps.
+// Each warp keeps its online softmax and output (or dQ) in registers.
+extern "C" __global__ void flash_attention_tiled_f(const float* q,const float* k,const float* v,const float* mask,float* out,float* stats,int nq,int nk,int d,int e,int qblocks,float scale,Axes6 shape,Axes6 ms){
+  __shared__ float sk[16*128],sv[16*128];
+  int batch=blockIdx.x/qblocks,warp=threadIdx.x>>5,lane=threadIdx.x&31;
+  int query=(blockIdx.x%qblocks)*8+warp,row=batch*nq+query;
+  bool valid=query<nq;float acc[4]={0,0,0,0},mx=-3.402823466e38f,den=0.0f;
+  for(int base=0;base<nk;base+=16){
+    int tile=min(16,nk-base);
+    for(int z=threadIdx.x;z<tile*d;z+=256)sk[z]=k[(batch*nk+base)*d+z];
+    for(int z=threadIdx.x;z<tile*e;z+=256)sv[z]=v[(batch*nk+base)*e+z];
+    __syncthreads();
+    if(valid)for(int t=0;t<tile;t++){
+      float dot=0.0f;for(int j=lane;j<d;j+=32)dot+=q[row*d+j]*sk[t*d+j];
+      float score=warp_sum(dot)*scale;
+      if(mask)score+=mask[view_index(row*nk+base+t,shape,ms,0)];
+      float next=fmaxf(mx,score),old=expf(mx-next),p=expf(score-next);
+      den=den*old+p;mx=next;
+      for(int c=lane,slot=0;c<e;c+=32,slot++)acc[slot]=acc[slot]*old+p*sv[t*e+c];
+    }
+    __syncthreads();
+  }
+  if(valid){for(int c=lane,slot=0;c<e;c+=32,slot++)out[row*e+c]=acc[slot]/den;
+    if(lane==0){stats[row*2]=mx;stats[row*2+1]=den;}}
+}
+extern "C" __global__ void flash_attention_tiled_b(const float* q,const float* k,const float* v,const float* mask,const float* out,const float* stats,const float* g,float* dq,float* dk,float* dv,float* dmask,int nq,int nk,int d,int e,int qblocks,float scale,Axes6 shape,Axes6 ms){
+  __shared__ float sk[16*128],sv[16*128];
+  int batch=blockIdx.x/qblocks,warp=threadIdx.x>>5,lane=threadIdx.x&31;
+  int query=(blockIdx.x%qblocks)*8+warp,row=batch*nq+query;
+  bool valid=query<nq;float dqacc[4]={0,0,0,0},delta=0.0f,mx=0.0f,den=1.0f;
+  if(valid){for(int c=lane;c<e;c+=32)delta+=g[row*e+c]*out[row*e+c];delta=warp_sum(delta);mx=stats[row*2];den=stats[row*2+1];}
+  for(int base=0;base<nk;base+=16){
+    int tile=min(16,nk-base);
+    for(int z=threadIdx.x;z<tile*d;z+=256)sk[z]=k[(batch*nk+base)*d+z];
+    for(int z=threadIdx.x;z<tile*e;z+=256)sv[z]=v[(batch*nk+base)*e+z];
+    __syncthreads();
+    if(valid)for(int t=0;t<tile;t++){
+      int key=base+t;float dot=0.0f;
+      for(int j=lane;j<d;j+=32)dot+=q[row*d+j]*sk[t*d+j];
+      float score=warp_sum(dot)*scale;
+      if(mask)score+=mask[view_index(row*nk+key,shape,ms,0)];
+      float p=expf(score-mx)/den,dp=0.0f;
+      for(int c=lane;c<e;c+=32)dp+=g[row*e+c]*sv[t*e+c];
+      float ds=p*(warp_sum(dp)-delta);
+      for(int c=lane;c<e;c+=32)if(dv)atomicAdd(&dv[(batch*nk+key)*e+c],p*g[row*e+c]);
+      for(int j=lane,slot=0;j<d;j+=32,slot++){
+        dqacc[slot]+=ds*scale*sk[t*d+j];
+        if(dk)atomicAdd(&dk[(batch*nk+key)*d+j],ds*scale*q[row*d+j]);
+      }
+      if(dmask && lane==0)atomicAdd(&dmask[view_index(row*nk+key,shape,ms,0)],ds);
+    }
+    __syncthreads();
+  }
+  if(valid && dq)for(int j=lane,slot=0;j<d;j+=32,slot++)dq[row*d+j]+=dqacc[slot];
+}
 extern "C" __global__ void layernorm_f(const float* x,const float* w,const float* b,float* y,float* stats,int rows,int dim,float eps){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int base=row*dim;float sum=0;for(int j=lane;j<dim;j+=32)sum+=x[base+j];float mean=warp_sum(sum)/(float)dim;float ss=0;for(int j=lane;j<dim;j+=32){float z=x[base+j]-mean;ss+=z*z;}float inv=rsqrtf(warp_sum(ss)/(float)dim+eps);if(lane==0){stats[row*2]=mean;stats[row*2+1]=inv;}for(int j=lane;j<dim;j+=32)y[base+j]=(x[base+j]-mean)*inv*w[j]+b[j];}
+extern "C" __global__ void layernorm_bf16_f(const float* x,const float* w,const float* b,float* y,unsigned short* y16,float* stats,int rows,int dim,float eps){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int base=row*dim;float sum=0;for(int j=lane;j<dim;j+=32)sum+=x[base+j];float mean=warp_sum(sum)/(float)dim;float ss=0;for(int j=lane;j<dim;j+=32){float z=x[base+j]-mean;ss+=z*z;}float inv=rsqrtf(warp_sum(ss)/(float)dim+eps);if(lane==0){stats[row*2]=mean;stats[row*2+1]=inv;}for(int j=lane;j<dim;j+=32){float z=(x[base+j]-mean)*inv*w[j]+b[j];y[base+j]=z;y16[base+j]=round_bf16(z);}}
 extern "C" __global__ void layernorm_b(const float* x,const float* w,const float* g,const float* stats,float* dx,float* dw,float* db,int rows,int dim){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int base=row*dim;float mean=stats[row*2],inv=stats[row*2+1];float sg=0,sgn=0;for(int j=lane;j<dim;j+=32){int i=base+j;float norm=(x[i]-mean)*inv,z=g[i]*w[j];sg+=z;sgn+=z*norm;}sg=warp_sum(sg)/(float)dim;sgn=warp_sum(sgn)/(float)dim;for(int j=lane;j<dim;j+=32){int i=base+j;float norm=(x[i]-mean)*inv;if(dx)dx[i]+=inv*(g[i]*w[j]-sg-norm*sgn);if(dw)atomicAdd(&dw[j],g[i]*norm);if(db)atomicAdd(&db[j],g[i]);}}
 __device__ unsigned int dropout_hash(unsigned int i,unsigned int seed){unsigned int x=i^seed;x^=x>>16;x*=0x7feb352du;x^=x>>15;x*=0x846ca68bu;x^=x>>16;return x;}
 extern "C" __global__ void dropout_f(const float* x,float* y,int n,float p,unsigned int seed,unsigned int cutoff){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)y[i]=dropout_hash(i,seed)<cutoff?0.0f:x[i]/(1.0f-p);}
@@ -101,12 +164,15 @@ extern "C" __global__ void scalar_f(const float* a,float* out,int n,float value,
 extern "C" __global__ void scalar_b(const float* g,float* da,int n,float value,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)da[i]+=g[i]*(op==2?value:op==3?1.0f/value:1.0f);}
 __device__ int index3(int i,int d1,int d2,int s0,int s1,int s2){int z=i%d2;int y=(i/d2)%d1;int x=i/(d1*d2);return (s0==1?0:x*s1*s2)+(s1==1?0:y*s2)+(s2==1?0:z);}
 extern "C" __global__ void binary_f(const float* a,const float* b,float* out,int n,int d1,int d2,int a0,int a1,int a2,int b0,int b1,int b2,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;float x=a[index3(i,d1,d2,a0,a1,a2)],y=b[index3(i,d1,d2,b0,b1,b2)];out[i]=op==0?x+y:op==1?x-y:op==2?x*y:x/y;}
+extern "C" __global__ void binary_bf16_f(const float* a,const float* b,float* out,unsigned short* out16,int n,int d1,int d2,int a0,int a1,int a2,int b0,int b1,int b2,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;float x=a[index3(i,d1,d2,a0,a1,a2)],y=b[index3(i,d1,d2,b0,b1,b2)];float z=op==0?x+y:op==1?x-y:op==2?x*y:x/y;out[i]=z;out16[i]=round_bf16(z);}
 extern "C" __global__ void binary_b(const float* a,const float* b,const float* g,float* da,float* db,int n,int d1,int d2,int a0,int a1,int a2,int b0,int b1,int b2,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;int ai=index3(i,d1,d2,a0,a1,a2),bi=index3(i,d1,d2,b0,b1,b2);float x=a[ai],y=b[bi],z=g[i];if(da)atomicAdd(&da[ai],z*(op==2?y:op==3?1.0f/y:1.0f));if(db)atomicAdd(&db[bi],z*(op==0?1.0f:op==1?-1.0f:op==2?x:-x/(y*y)));}
 __device__ float fun(float x,int op){if(op==0)return expf(x);if(op==1)return logf(x);if(op==2)return fabsf(x);if(op==3)return tanhf(x);if(op==4)return fmaxf(x,0.0f);if(op==5)return .5f*x*(1.0f+erff(x*.7071067811865475f));float u=.7978845608028654f*(x+.044715f*x*x*x);return .5f*x*(1.0f+tanhf(u));}
 __device__ float deriv(float x,int op){if(op==0)return expf(x);if(op==1)return 1.0f/x;if(op==2)return x>0?1.0f:x<0?-1.0f:0.0f;if(op==3){float y=tanhf(x);return 1-y*y;}if(op==4)return x>0?1.0f:0.0f;if(op==5)return .5f*(1.0f+erff(x*.7071067811865475f))+x*expf(-.5f*x*x)*.3989422804014327f;float u=.7978845608028654f*(x+.044715f*x*x*x),y=tanhf(u);return .5f*(1+y)+.5f*x*(1-y*y)*.7978845608028654f*(1+3*.044715f*x*x);}
 extern "C" __global__ void bias_gelu_f(const float* x,const float* b,float* y,int n,int c){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)y[i]=fun(x[i]+b[i%c],5);}
+extern "C" __global__ void bias_gelu_bf16_f(const float* x,const float* b,float* y,unsigned short* y16,int n,int c){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=fun(x[i]+b[i%c],5);y[i]=z;y16[i]=round_bf16(z);}}
 extern "C" __global__ void bias_gelu_b(const float* x,const float* b,const float* g,float* dx,float* db,int n,int c){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=g[i]*deriv(x[i]+b[i%c],5);if(dx)dx[i]+=z;if(db)atomicAdd(&db[i%c],z);}}
 extern "C" __global__ void bias_residual_f(const float* x,const float* b,const float* r,float* y,int n,int c){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)y[i]=x[i]+b[i%c]+r[i];}
+extern "C" __global__ void bias_residual_bf16_f(const float* x,const float* b,const float* r,float* y,unsigned short* y16,int n,int c){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=x[i]+b[i%c]+r[i];y[i]=z;y16[i]=round_bf16(z);}}
 extern "C" __global__ void bias_residual_b(const float* g,float* dx,float* db,float* dr,int n,int c){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=g[i];if(dx)dx[i]+=z;if(db)atomicAdd(&db[i%c],z);if(dr)dr[i]+=z;}}
 extern "C" __global__ void unary_f(const float* a,float* out,int n,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=fun(a[i],op);}
 extern "C" __global__ void unary_b(const float* a,const float* g,float* da,int n,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)da[i]+=g[i]*deriv(a[i],op);}
@@ -144,7 +210,7 @@ func graphKernel(name string) *cuda.Kernel {
 			return
 		}
 		graphKernels = map[string]*cuda.Kernel{}
-		for _, n := range []string{"copy_values", "f32_to_bf16", "set_one", "write_clip_entry", "view_gather", "view_scatter", "binary_nd_f", "binary_nd_b", "reduce_nd_f", "reduce_nd_b", "softmax_f", "softmax_b", "attn_softmax_f", "attn_softmax_b", "layernorm_f", "layernorm_b", "bias_gelu_f", "bias_gelu_b", "bias_residual_f", "bias_residual_b", "dropout_f", "dropout_b", "ce_f", "ce_finish", "ce_b", "graph_adam_inc", "graph_adamw", "add_values", "scalar_f", "scalar_b", "binary_f", "binary_b", "unary_f", "unary_b", "permute_f", "permute_b", "concat_f", "concat_b", "slice_f", "slice_b", "embedding_f", "embedding_b", "reduce_f", "reduce_b", "group_stats", "group_f", "group_backstats", "group_b", "masked_f", "masked_finish", "masked_b", "scale_grad", "global_norm_parts", "scale_all_grads"} {
+		for _, n := range []string{"copy_values", "f32_to_bf16", "set_one", "write_clip_entry", "view_gather", "view_gather_bf16", "view_scatter", "binary_nd_f", "binary_nd_bf16_f", "binary_nd_b", "reduce_nd_f", "reduce_nd_b", "softmax_f", "softmax_b", "attn_softmax_f", "attn_softmax_b", "flash_attention_tiled_f", "flash_attention_tiled_b", "layernorm_f", "layernorm_b", "layernorm_bf16_f", "bias_gelu_f", "bias_gelu_bf16_f", "bias_gelu_b", "bias_residual_f", "bias_residual_bf16_f", "bias_residual_b", "dropout_f", "dropout_b", "ce_f", "ce_finish", "ce_b", "graph_adam_inc", "graph_adamw", "add_values", "scalar_f", "scalar_b", "binary_f", "binary_b", "binary_bf16_f", "unary_f", "unary_b", "permute_f", "permute_b", "concat_f", "concat_b", "slice_f", "slice_b", "embedding_f", "embedding_b", "reduce_f", "reduce_b", "group_stats", "group_f", "group_backstats", "group_b", "masked_f", "masked_finish", "masked_b", "scale_grad", "global_norm_parts", "scale_all_grads"} {
 			graphKernels[n], graphErr = graphProgram.Function(n)
 			if graphErr != nil {
 				return

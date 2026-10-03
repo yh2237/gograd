@@ -30,6 +30,12 @@ func gpuViewGather(src, dst *cuda.Buffer, shape, stride []int, offset int) {
 	a, b := ptr(src), ptr(dst)
 	launch("view_gather", int(n), unsafe.Pointer(&a), unsafe.Pointer(&b), unsafe.Pointer(&n), unsafe.Pointer(&s), unsafe.Pointer(&st), unsafe.Pointer(&o))
 }
+func gpuViewGatherBF16(src, dst *cuda.Buffer, shape, stride []int, offset int) {
+	s, st := viewMeta(shape, stride)
+	n, o := int32(numel(shape)), int32(offset)
+	a, b := ptr(src), ptr(dst)
+	launch("view_gather_bf16", int(n), unsafe.Pointer(&a), unsafe.Pointer(&b), unsafe.Pointer(&n), unsafe.Pointer(&s), unsafe.Pointer(&st), unsafe.Pointer(&o))
+}
 func gpuViewScatter(src, dst *cuda.Buffer, shape, stride []int, offset int) {
 	s, st := viewMeta(shape, stride)
 	n, o := int32(numel(shape)), int32(offset)
@@ -67,18 +73,30 @@ func gpuBinary(a, b *Tensor, op int) *Tensor {
 		return gpuBinaryND(a, b, s, op)
 	}
 	out := mustAlloc(numel(s))
+	var shadow *cuda.Buffer
+	if BF16Autocast {
+		shadow = allocBF16(numel(s))
+	}
 	ad, bd := aligned3(a.Shape), aligned3(b.Shape)
 	od := aligned3(s)
 	ap, bp, yp := ptr(a.buf), ptr(b.buf), ptr(out)
 	n, d1, d2 := int32(numel(s)), od[1], od[2]
 	ao, bo := int32(op), int32(op)
 	_ = bo
-	launch("binary_f", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&bp), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&d1), unsafe.Pointer(&d2), unsafe.Pointer(&ad[0]), unsafe.Pointer(&ad[1]), unsafe.Pointer(&ad[2]), unsafe.Pointer(&bd[0]), unsafe.Pointer(&bd[1]), unsafe.Pointer(&bd[2]), unsafe.Pointer(&ao))
-	return resultGPU(out, s, []*Tensor{a, b}, func(g *cuda.Buffer) {
+	if BF16Autocast {
+		sh := ptr(shadow)
+		launch("binary_bf16_f", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&bp), unsafe.Pointer(&yp), unsafe.Pointer(&sh), unsafe.Pointer(&n), unsafe.Pointer(&d1), unsafe.Pointer(&d2), unsafe.Pointer(&ad[0]), unsafe.Pointer(&ad[1]), unsafe.Pointer(&ad[2]), unsafe.Pointer(&bd[0]), unsafe.Pointer(&bd[1]), unsafe.Pointer(&bd[2]), unsafe.Pointer(&ao))
+	} else {
+		launch("binary_f", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&bp), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&d1), unsafe.Pointer(&d2), unsafe.Pointer(&ad[0]), unsafe.Pointer(&ad[1]), unsafe.Pointer(&ad[2]), unsafe.Pointer(&bd[0]), unsafe.Pointer(&bd[1]), unsafe.Pointer(&bd[2]), unsafe.Pointer(&ao))
+	}
+	res := resultGPU(out, s, []*Tensor{a, b}, func(g *cuda.Buffer) {
 		ag, bg := ptr(a.ensureGradGPU()), ptr(b.ensureGradGPU())
 		gp := ptr(g)
 		launch("binary_b", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&bp), unsafe.Pointer(&gp), unsafe.Pointer(&ag), unsafe.Pointer(&bg), unsafe.Pointer(&n), unsafe.Pointer(&d1), unsafe.Pointer(&d2), unsafe.Pointer(&ad[0]), unsafe.Pointer(&ad[1]), unsafe.Pointer(&ad[2]), unsafe.Pointer(&bd[0]), unsafe.Pointer(&bd[1]), unsafe.Pointer(&bd[2]), unsafe.Pointer(&ao))
 	})
+	res.bf16Buf = shadow
+	res.bf16Owner = shadow != nil
+	return res
 }
 func gpuBinaryND(a, b *Tensor, s []int, op int) *Tensor {
 	broadcastStride := func(t *Tensor) []int {
@@ -96,13 +114,25 @@ func gpuBinaryND(a, b *Tensor, s []int, op int) *Tensor {
 	_, bs := viewMeta(s, broadcastStride(b))
 	n, kind := int32(numel(s)), int32(op)
 	out := mustAlloc(int(n))
+	var shadow *cuda.Buffer
+	if BF16Autocast {
+		shadow = allocBF16(int(n))
+	}
 	ap, bp, yp := ptr(a.buf), ptr(b.buf), ptr(out)
-	launch("binary_nd_f", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&bp), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&shape), unsafe.Pointer(&as), unsafe.Pointer(&bs), unsafe.Pointer(&kind))
-	return resultGPU(out, s, []*Tensor{a, b}, func(g *cuda.Buffer) {
+	if BF16Autocast {
+		sh := ptr(shadow)
+		launch("binary_nd_bf16_f", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&bp), unsafe.Pointer(&yp), unsafe.Pointer(&sh), unsafe.Pointer(&n), unsafe.Pointer(&shape), unsafe.Pointer(&as), unsafe.Pointer(&bs), unsafe.Pointer(&kind))
+	} else {
+		launch("binary_nd_f", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&bp), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&shape), unsafe.Pointer(&as), unsafe.Pointer(&bs), unsafe.Pointer(&kind))
+	}
+	res := resultGPU(out, s, []*Tensor{a, b}, func(g *cuda.Buffer) {
 		ag, bg := ptr(a.ensureGradGPU()), ptr(b.ensureGradGPU())
 		gp := ptr(g)
 		launch("binary_nd_b", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&bp), unsafe.Pointer(&gp), unsafe.Pointer(&ag), unsafe.Pointer(&bg), unsafe.Pointer(&n), unsafe.Pointer(&shape), unsafe.Pointer(&as), unsafe.Pointer(&bs), unsafe.Pointer(&kind))
 	})
+	res.bf16Buf = shadow
+	res.bf16Owner = shadow != nil
+	return res
 }
 func gpuUnary(a *Tensor, op int) *Tensor {
 	n := int32(a.Numel())

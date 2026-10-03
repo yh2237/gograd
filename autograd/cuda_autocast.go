@@ -12,13 +12,50 @@ import (
 var BF16Autocast bool
 
 func castBF16(src uintptr, count int) *cuda.Buffer {
+	b := allocBF16(count)
+	dst, n := ptr(b), int32(count)
+	launch("f32_to_bf16", count, unsafe.Pointer(&src), unsafe.Pointer(&dst), unsafe.Pointer(&n))
+	return b
+}
+
+func allocBF16(count int) *cuda.Buffer {
 	b, err := cuda.Alloc(count * 2)
 	if err != nil {
 		panic(err)
 	}
-	dst, n := ptr(b), int32(count)
-	launch("f32_to_bf16", count, unsafe.Pointer(&src), unsafe.Pointer(&dst), unsafe.Pointer(&n))
 	return b
+}
+
+func (t *Tensor) invalidateBF16() {
+	if t.bf16Buf != nil {
+		if t.bf16Owner {
+			t.bf16Buf.Free()
+		}
+		t.bf16Buf = nil
+		t.bf16Owner = false
+	}
+}
+func (t *Tensor) ensureBF16() *cuda.Buffer {
+	if t.bf16Buf == nil {
+		t.bf16Buf = castBF16(ptr(t.buf), t.Numel())
+		t.bf16Owner = true
+	}
+	return t.bf16Buf
+}
+
+// gemmBatchedPrepared receives BF16 operand buffers created by a producer or
+// cached on a tensor. This avoids a cast per GEMM while preserving FP32 output.
+func gemmBatchedPrepared(m, n, k int, ta, tb bool, a, a16 uintptr, as int64, b, b16 uintptr, bs int64, c uintptr, cs int64, count int, beta float32) error {
+	if !BF16Autocast {
+		return blas().SgemmRowMajorStridedBatched(m, n, k, ta, tb, 1, a, as, b, bs, beta, c, cs, count)
+	}
+	return blas().GemmRowMajorStridedBF16(m, n, k, ta, tb, 1, a16, as, b16, bs, beta, c, cs, count)
+}
+func gemmSinglePrepared(m, n, k int, ta, tb bool, a, a16, b, b16, c uintptr, beta float32) error {
+	if !BF16Autocast {
+		return gemmSingle(m, n, k, ta, tb, a, b, c, beta)
+	}
+	return blas().GemmRowMajorBF16(m, n, k, ta, tb, 1, a16, b16, beta, c)
 }
 
 func gemmSingle(m, n, k int, ta, tb bool, a, b, c uintptr, beta float32) error {

@@ -37,14 +37,24 @@ func gpuAttention(q, k, v, mask *Tensor) *Tensor {
 	}
 	scores, probs, out := mustAlloc(count*m*n), mustAlloc(count*m*n), mustAlloc(count*m*e)
 	qa, ka, va, sa, pa, oa := ptr(q.buf), ptr(k.buf), ptr(v.buf), ptr(scores), ptr(probs), ptr(out)
+	var q16, k16, v16 uintptr
+	if BF16Autocast {
+		q16 = ptr(q.ensureBF16())
+		k16 = ptr(k.ensureBF16())
+		v16 = ptr(v.ensureBF16())
+	}
 	timedGPU("attn_qk", func() error {
-		return gemmBatched(m, n, d, false, true, qa, int64(m*d), ka, int64(n*d), sa, int64(m*n), count, 0)
+		return gemmBatchedPrepared(m, n, d, false, true, qa, q16, int64(m*d), ka, k16, int64(n*d), sa, int64(m*n), count, 0)
 	})
 	rows, dim, scale := int32(count*m), int32(n), float32(1/math.Sqrt(float64(d)))
 	launch("attn_softmax_f", int(rows)*32, unsafe.Pointer(&sa), unsafe.Pointer(&maskPtr), unsafe.Pointer(&pa), unsafe.Pointer(&rows), unsafe.Pointer(&dim), unsafe.Pointer(&scale), unsafe.Pointer(&shape), unsafe.Pointer(&ms))
 	scores.Free()
+	var probs16 *cuda.Buffer
+	if BF16Autocast {
+		probs16 = castBF16(pa, count*m*n)
+	}
 	timedGPU("attn_pv", func() error {
-		return gemmBatched(m, e, n, false, false, pa, int64(m*n), va, int64(n*e), oa, int64(m*e), count, 0)
+		return gemmBatchedPrepared(m, e, n, false, false, pa, ptr(probs16), int64(m*n), va, v16, int64(n*e), oa, int64(m*e), count, 0)
 	})
 	parents := []*Tensor{q, k, v}
 	if mask != nil {
@@ -52,10 +62,15 @@ func gpuAttention(q, k, v, mask *Tensor) *Tensor {
 	}
 	r := resultGPU(out, outShape, parents, func(g *cuda.Buffer) {
 		gp := ptr(g)
+		var g16 *cuda.Buffer
+		if BF16Autocast {
+			g16 = castBF16(gp, g.Size()/4)
+			defer g16.Free()
+		}
 		if dv := v.ensureGradGPU(); dv != nil {
 			vp := ptr(dv)
 			timedGPU("attn_dv", func() error {
-				return gemmBatched(n, e, m, true, false, pa, int64(m*n), gp, int64(m*e), vp, int64(n*e), count, 1)
+				return gemmBatchedPrepared(n, e, m, true, false, pa, ptr(probs16), int64(m*n), gp, ptr(g16), int64(m*e), vp, int64(n*e), count, 1)
 			})
 		}
 		if !q.RequiresGrad && !k.RequiresGrad && (mask == nil || !mask.RequiresGrad) {
@@ -66,27 +81,35 @@ func gpuAttention(q, k, v, mask *Tensor) *Tensor {
 		defer ds.Free()
 		dpp, dsp := ptr(dp), ptr(ds)
 		timedGPU("attn_dp", func() error {
-			return gemmBatched(m, n, e, false, true, gp, int64(m*e), va, int64(n*e), dpp, int64(m*n), count, 0)
+			return gemmBatchedPrepared(m, n, e, false, true, gp, ptr(g16), int64(m*e), va, v16, int64(n*e), dpp, int64(m*n), count, 0)
 		})
 		var dmask uintptr
 		if mask != nil {
 			dmask = ptr(mask.ensureGradGPU())
 		}
 		launch("attn_softmax_b", int(rows)*32, unsafe.Pointer(&pa), unsafe.Pointer(&dpp), unsafe.Pointer(&dsp), unsafe.Pointer(&dmask), unsafe.Pointer(&rows), unsafe.Pointer(&dim), unsafe.Pointer(&scale), unsafe.Pointer(&shape), unsafe.Pointer(&ms))
+		var ds16 *cuda.Buffer
+		if BF16Autocast {
+			ds16 = castBF16(dsp, count*m*n)
+			defer ds16.Free()
+		}
 		if dq := q.ensureGradGPU(); dq != nil {
 			qp := ptr(dq)
 			timedGPU("attn_dq", func() error {
-				return gemmBatched(m, d, n, false, false, dsp, int64(m*n), ka, int64(n*d), qp, int64(m*d), count, 1)
+				return gemmBatchedPrepared(m, d, n, false, false, dsp, ptr(ds16), int64(m*n), ka, k16, int64(n*d), qp, int64(m*d), count, 1)
 			})
 		}
 		if dk := k.ensureGradGPU(); dk != nil {
 			kp := ptr(dk)
 			timedGPU("attn_dk", func() error {
-				return gemmBatched(n, d, m, true, false, dsp, int64(m*n), qa, int64(m*d), kp, int64(n*d), count, 1)
+				return gemmBatchedPrepared(n, d, m, true, false, dsp, ptr(ds16), int64(m*n), qa, q16, int64(m*d), kp, int64(n*d), count, 1)
 			})
 		}
 	})
 	r.aux = []*cuda.Buffer{probs}
+	if probs16 != nil {
+		r.aux = append(r.aux, probs16)
+	}
 	return r
 }
 

@@ -4,12 +4,11 @@ import (
 	"unsafe"
 
 	"github.com/yh2237/gograd/cuda"
-	"github.com/yh2237/gograd/tensor"
 )
 
 // BiasGELU combines the feed-forward bias and exact GELU on CUDA.
 func BiasGELU(x, b *Tensor) *Tensor {
-	if x.Device != tensor.CUDA {
+	if !dispatchBackend("bias_gelu", x.Device) {
 		return GELU(Add(x, b), false)
 	}
 	same(x, b)
@@ -21,18 +20,30 @@ func BiasGELU(x, b *Tensor) *Tensor {
 	n := int32(x.Numel())
 	channels := int32(c)
 	out := mustAlloc(int(n))
+	var shadow *cuda.Buffer
+	if BF16Autocast {
+		shadow = allocBF16(int(n))
+	}
 	xp, bp, yp := ptr(x.buf), ptr(b.buf), ptr(out)
-	launch("bias_gelu_f", int(n), unsafe.Pointer(&xp), unsafe.Pointer(&bp), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&channels))
-	return resultGPU(out, x.Shape, []*Tensor{x, b}, func(g *cuda.Buffer) {
+	if BF16Autocast {
+		sh := ptr(shadow)
+		launch("bias_gelu_bf16_f", int(n), unsafe.Pointer(&xp), unsafe.Pointer(&bp), unsafe.Pointer(&yp), unsafe.Pointer(&sh), unsafe.Pointer(&n), unsafe.Pointer(&channels))
+	} else {
+		launch("bias_gelu_f", int(n), unsafe.Pointer(&xp), unsafe.Pointer(&bp), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&channels))
+	}
+	res := resultGPU(out, x.Shape, []*Tensor{x, b}, func(g *cuda.Buffer) {
 		gp := ptr(g)
 		dx, db := ptr(x.ensureGradGPU()), ptr(b.ensureGradGPU())
 		launch("bias_gelu_b", int(n), unsafe.Pointer(&xp), unsafe.Pointer(&bp), unsafe.Pointer(&gp), unsafe.Pointer(&dx), unsafe.Pointer(&db), unsafe.Pointer(&n), unsafe.Pointer(&channels))
 	})
+	res.bf16Buf = shadow
+	res.bf16Owner = shadow != nil
+	return res
 }
 
 // BiasResidual combines a channel bias and a residual addition on CUDA.
 func BiasResidual(x, b, residual *Tensor) *Tensor {
-	if x.Device != tensor.CUDA {
+	if !dispatchBackend("bias_residual", x.Device) {
 		return Add(Add(x, b), residual)
 	}
 	same(x, b)
@@ -49,11 +60,23 @@ func BiasResidual(x, b, residual *Tensor) *Tensor {
 	}
 	n, channels := int32(x.Numel()), int32(c)
 	out := mustAlloc(int(n))
+	var shadow *cuda.Buffer
+	if BF16Autocast {
+		shadow = allocBF16(int(n))
+	}
 	xp, bp, rp, yp := ptr(x.buf), ptr(b.buf), ptr(residual.buf), ptr(out)
-	launch("bias_residual_f", int(n), unsafe.Pointer(&xp), unsafe.Pointer(&bp), unsafe.Pointer(&rp), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&channels))
-	return resultGPU(out, x.Shape, []*Tensor{x, b, residual}, func(g *cuda.Buffer) {
+	if BF16Autocast {
+		sh := ptr(shadow)
+		launch("bias_residual_bf16_f", int(n), unsafe.Pointer(&xp), unsafe.Pointer(&bp), unsafe.Pointer(&rp), unsafe.Pointer(&yp), unsafe.Pointer(&sh), unsafe.Pointer(&n), unsafe.Pointer(&channels))
+	} else {
+		launch("bias_residual_f", int(n), unsafe.Pointer(&xp), unsafe.Pointer(&bp), unsafe.Pointer(&rp), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&channels))
+	}
+	res := resultGPU(out, x.Shape, []*Tensor{x, b, residual}, func(g *cuda.Buffer) {
 		gp := ptr(g)
 		dx, db, dr := ptr(x.ensureGradGPU()), ptr(b.ensureGradGPU()), ptr(residual.ensureGradGPU())
 		launch("bias_residual_b", int(n), unsafe.Pointer(&gp), unsafe.Pointer(&dx), unsafe.Pointer(&db), unsafe.Pointer(&dr), unsafe.Pointer(&n), unsafe.Pointer(&channels))
 	})
+	res.bf16Buf = shadow
+	res.bf16Owner = shadow != nil
+	return res
 }

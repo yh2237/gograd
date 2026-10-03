@@ -322,10 +322,28 @@ type Buffer struct {
 }
 
 var (
-	poolMu         sync.Mutex
-	poolTable      = map[int][]uintptr{}
-	captureTouched map[uintptr]int
+	poolMu                   sync.Mutex
+	poolTable                = map[int][]uintptr{}
+	captureTouched           map[uintptr]int
+	liveBytes, peakLiveBytes int
 )
+
+// AllocationStats counts live Buffer bytes, including reused pool buffers.
+// ResetAllocationPeak starts a new peak measurement from the current live set.
+type AllocationStats struct{ LiveBytes, PeakLiveBytes int }
+
+func MemoryStats() AllocationStats {
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	return AllocationStats{liveBytes, peakLiveBytes}
+}
+func ResetAllocationPeak() { poolMu.Lock(); peakLiveBytes = liveBytes; poolMu.Unlock() }
+func addLiveBytes(size int) {
+	liveBytes += size
+	if liveBytes > peakLiveBytes {
+		peakLiveBytes = liveBytes
+	}
+}
 
 // Alloc reserves size bytes on the current device. Freed buffers of the same
 // size are reused from an internal pool, which avoids the cost of repeated
@@ -346,6 +364,7 @@ func Alloc(size int) (*Buffer, error) {
 		if capturing && captureTouched != nil {
 			captureTouched[pointer] = size
 		}
+		addLiveBytes(size)
 		poolMu.Unlock()
 		return &Buffer{pointer: pointer, size: size}, nil
 	}
@@ -362,6 +381,9 @@ func Alloc(size int) (*Buffer, error) {
 		}
 		poolMu.Unlock()
 	}
+	poolMu.Lock()
+	addLiveBytes(size)
+	poolMu.Unlock()
 	return &Buffer{pointer: pointer, size: size}, nil
 }
 
@@ -373,6 +395,7 @@ func (b *Buffer) Free() error {
 	}
 	b.freed = true
 	poolMu.Lock()
+	liveBytes -= b.size
 	if capturing && captureTouched != nil {
 		captureTouched[b.pointer] = b.size
 	}

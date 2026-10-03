@@ -43,9 +43,14 @@ func gpuMatMul(a, b *Tensor, s []int, m, n, k int, batch []int) *Tensor {
 	as, aRegular := matrixBatchStride(ab, batch, m*k)
 	bs, bRegular := matrixBatchStride(bb, batch, k*n)
 	regular := aRegular && bRegular && count > 1
+	var ap16, bp16 uintptr
+	if BF16Autocast && regular {
+		ap16 = ptr(a.ensureBF16())
+		bp16 = ptr(b.ensureBF16())
+	}
 	if regular {
 		timedGPU("matmul_strided", func() error {
-			return gemmBatched(m, n, k, false, false, a.buf.Pointer(), as, b.buf.Pointer(), bs, out.Pointer(), int64(m*n), count, 0)
+			return gemmBatchedPrepared(m, n, k, false, false, a.buf.Pointer(), ap16, as, b.buf.Pointer(), bp16, bs, out.Pointer(), int64(m*n), count, 0)
 		})
 	} else {
 		for z := 0; z < count; z++ {
@@ -58,19 +63,25 @@ func gpuMatMul(a, b *Tensor, s []int, m, n, k int, batch []int) *Tensor {
 	}
 	return resultGPU(out, s, []*Tensor{a, b}, func(g *cuda.Buffer) {
 		da, db := a.ensureGradGPU(), b.ensureGradGPU()
+		var g16 *cuda.Buffer
+		if BF16Autocast && regular && (da != nil || db != nil) {
+			g16 = castBF16(g.Pointer(), g.Size()/4)
+			defer g16.Free()
+		}
+		gp16 := ptr(g16)
 		if regular && da != nil && as != 0 {
 			timedGPU("matmul_dx_strided", func() error {
-				return gemmBatched(m, k, n, false, true, g.Pointer(), int64(m*n), b.buf.Pointer(), bs, da.Pointer(), as, count, 1)
+				return gemmBatchedPrepared(m, k, n, false, true, g.Pointer(), gp16, int64(m*n), b.buf.Pointer(), bp16, bs, da.Pointer(), as, count, 1)
 			})
 		}
 		if regular && db != nil {
 			if bs == 0 && as != 0 {
 				timedGPU("matmul_dw_flat", func() error {
-					return gemmSingle(k, n, m*count, true, false, a.buf.Pointer(), g.Pointer(), db.Pointer(), 1)
+					return gemmSinglePrepared(k, n, m*count, true, false, a.buf.Pointer(), ap16, g.Pointer(), gp16, db.Pointer(), 1)
 				})
 			} else if bs != 0 {
 				timedGPU("matmul_dw_strided", func() error {
-					return gemmBatched(k, n, m, true, false, a.buf.Pointer(), as, g.Pointer(), int64(m*n), db.Pointer(), bs, count, 1)
+					return gemmBatchedPrepared(k, n, m, true, false, a.buf.Pointer(), ap16, as, g.Pointer(), gp16, int64(m*n), db.Pointer(), bs, count, 1)
 				})
 			}
 		}
@@ -101,15 +112,26 @@ func gpuConv1d(x, w, b *Tensor, dilation int) *Tensor {
 	cols := mustAlloc(rows * depth)
 	out := mustAlloc(rows * co)
 	timedGPU("conv_im2col", func() error { return kernels.Im2col(x.buf, cols, bs, ci, t, k, dilation) })
+	var cols16 *cuda.Buffer
+	var wp16 uintptr
+	if BF16Autocast {
+		cols16 = castBF16(cols.Pointer(), rows*depth)
+		wp16 = ptr(w.ensureBF16())
+	}
 	timedGPU("conv_forward_sgemm", func() error {
-		return gemmSingle(rows, co, depth, false, true, cols.Pointer(), w.buf.Pointer(), out.Pointer(), 0)
+		return gemmSinglePrepared(rows, co, depth, false, true, cols.Pointer(), ptr(cols16), w.buf.Pointer(), wp16, out.Pointer(), 0)
 	})
 	timedGPU("conv_bias", func() error { return kernels.AddBiasColumns(out, b.buf, rows, co) })
 	r := resultGPU(out, []int{bs, t, co}, []*Tensor{x, w, b}, func(g *cuda.Buffer) {
 		defer cols.Free()
+		var g16 *cuda.Buffer
+		if BF16Autocast && (w.RequiresGrad || x.RequiresGrad) {
+			g16 = castBF16(g.Pointer(), g.Size()/4)
+			defer g16.Free()
+		}
 		if dw := w.ensureGradGPU(); dw != nil {
 			timedGPU("conv_dw_sgemm", func() error {
-				return gemmSingle(co, depth, rows, true, false, g.Pointer(), cols.Pointer(), dw.Pointer(), 1)
+				return gemmSinglePrepared(co, depth, rows, true, false, g.Pointer(), ptr(g16), cols.Pointer(), ptr(cols16), dw.Pointer(), 1)
 			})
 		}
 		if db := b.ensureGradGPU(); db != nil {
@@ -119,11 +141,14 @@ func gpuConv1d(x, w, b *Tensor, dilation int) *Tensor {
 			dcols := mustAlloc(rows * depth)
 			defer dcols.Free()
 			timedGPU("conv_dx_sgemm", func() error {
-				return gemmSingle(rows, depth, co, false, false, g.Pointer(), w.buf.Pointer(), dcols.Pointer(), 0)
+				return gemmSinglePrepared(rows, depth, co, false, false, g.Pointer(), ptr(g16), w.buf.Pointer(), wp16, dcols.Pointer(), 0)
 			})
 			timedGPU("conv_col2im", func() error { return kernels.Col2im(dcols, dx, bs, ci, t, k, dilation) })
 		}
 	})
 	r.aux = []*cuda.Buffer{cols}
+	if cols16 != nil {
+		r.aux = append(r.aux, cols16)
+	}
 	return r
 }

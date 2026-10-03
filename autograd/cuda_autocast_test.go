@@ -61,3 +61,13 @@ func TestBF16AutocastCUDA(t *testing.T) {
 		}
 	}
 }
+
+func TestBF16GraphCaptureCUDA(t *testing.T) {
+	if !cuda.Available() {
+		t.Skip("CUDA unavailable")
+	}
+	BF16Autocast = true
+	defer func() { BF16Autocast = false }()
+	t.Run("acoustic", TestAcousticGraphCaptureCUDA)
+	t.Run("transformer", TestTransformerGraphCaptureCUDA)
+}
