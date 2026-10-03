@@ -36,6 +36,12 @@ func (m *Module) namedState() map[string]*Tensor {
 
 // SaveSafeTensors writes F32 tensors using the safetensors v1 file layout.
 func (m *Module) SaveSafeTensors(path string) error {
+	return m.SaveSafeTensorsMetadata(path, nil)
+}
+
+// SaveSafeTensorsMetadata writes state_dict weights and string metadata in a
+// format accepted by PyTorch safetensors and UtauTTS's speech-timing loader.
+func (m *Module) SaveSafeTensorsMetadata(path string, metadata map[string]string) error {
 	state := m.namedState()
 	names := make([]string, 0, len(state))
 	for name := range state {
@@ -63,7 +69,14 @@ func (m *Module) SaveSafeTensors(path string) error {
 		copy(shape, t.Shape)
 		header[name] = safeHeader{"F32", shape, [2]int{start, raw.Len()}}
 	}
-	h, err := json.Marshal(header)
+	entries := make(map[string]any, len(header)+1)
+	for name, entry := range header {
+		entries[name] = entry
+	}
+	if metadata != nil {
+		entries["__metadata__"] = metadata
+	}
+	h, err := json.Marshal(entries)
 	if err != nil {
 		return err
 	}
