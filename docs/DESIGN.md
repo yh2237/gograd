@@ -101,6 +101,18 @@ provides `StateDict`, `LoadStateDict`, `SaveSafeTensors`, and
 offsets, and byte lengths before changing weights. Train/eval propagation,
 device/dtype moves, atomic checkpoint writes, and optimizer state serialization
 remain.
+Reusable Embedding, Conv1d, LayerNorm, Linear, Dropout and GELU layers now
+compose `SpeechTiming` through a plain struct and child `Module` nodes.
+Its state names (`phone.weight`, `inp.weight`, `blocks.0.weight`,
+`norms.0.bias`, `out.weight`, and peers) and convolution weight layout match
+the UtauTTS PyTorch trainer and Go `speechtiming.LoadTCN`. `Train(false)`
+disables dropout for validation. Safetensors metadata carries UtauTTS's
+format, phones, context, kernel, dilations, mel count, license and best
+validation score. The separate feature-cache exporter writes I64 phone IDs
+and F32 continuous inputs and targets to safetensors; it records the Python
+validation shuffle for a comparable split. This is a task-specific cache
+bridge, not yet a general data-loader API.
+
 Parameters are graph leaves; nontrainable running statistics are buffers.
 Names are stable dotted paths and duplicate aliases are stored once.
 
@@ -129,8 +141,9 @@ Existing `nn` JSON checkpoints remain readable during migration.
    `nn.Linear` and `nn.Conv1d` to graph operators, then make their explicit
    backward methods compatibility wrappers.
 2. Move `gputcn` layers and its sequence loss onto the same operators. Retain
-   its optimized CUDA graph path as a compiled execution plan. Add dataset
-   loaders, optimizer state checkpoints, and model train/eval propagation.
+   its optimized CUDA graph path as a compiled execution plan. Add general
+   dataset loaders, optimizer state checkpoints, and recursive module
+   train/eval propagation. `SpeechTiming` already toggles its dropout state.
 3. Improve tiled attention occupancy and backward throughput, complete BF16
    storage and dtype-aware kernels, and add FP16 loss scaling. Extend the
    general CUDA graph capture API beyond fixed Acoustic and transformer
@@ -176,3 +189,32 @@ forward/backward medians and peak extra live buffer use were:
 The tiled path passed forward and gradient parity at all three lengths. The
 large-sequence memory saving is real, but its current backward kernel needs
 more tiling and parallelism before it can replace the materialized fast path.
+
+## UtauTTS speech-timing adoption (2026-10-04)
+
+`SpeechTiming` composes the eight-block PyTorch Target on the float32 graph:
+three phone embeddings of width 32 plus 4 or 15 continuous inputs, 1x1 input
+convolution, dilated kernel-5 convolution/LayerNorm/exact GELU/dropout/residual
+blocks, and an 80-channel 1x1 output convolution. Forward, NaN-masked L1,
+all parameter gradients, clipping and an AdamW step pass a generated PyTorch
+fixture on CPU and CUDA. A separate OneCycle test checks the PyTorch schedule
+at six positions. The CUDA fixture asserts that forward output remains in a
+device buffer.
+
+An exported v1 cache contained 700 utterances and 286,260 frames. The exporter
+recorded Python's seed-0 shuffle; both trainers used the same 30 validation
+utterances and ran 6,000 CUDA steps at batch 16 and 400 frames. Gograd's
+training-loop wall time was 66.477 s with best L1 0.285379 at step 4500.
+PyTorch's measured `train()` loop took 73.625 s with best L1 0.284177 at step
+3750. The quality difference is 0.42%, inside the 2% goal. Their initialization,
+sampling and dropout random streams differ, so this is comparable architecture
+and validation data rather than an identical optimization trace. A separate
+full PyTorch script invocation took 81.862 s and reported best L1 0.2844.
+
+The Go checkpoint loaded through the unchanged UtauTTS `speechtiming.LoadTCN`
+and produced a one-frame, 80-bin prediction. PyTorch's safetensors reader also
+accepted its metadata and 37 named tensors. The v2 context model can be built,
+but a context feature cache was unavailable for a full training run. Optimizer
+state, atomic checkpoint replacement and general-purpose data prefetch remain
+open before broader adoption. `docs/API.md` lists the proposed v0.1 API; no
+tag has been created.

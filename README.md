@@ -36,6 +36,14 @@ test rejects an operation that bypasses dispatch. Pre-norm
 `TransformerEncoderLayer` and batch-first `MultiheadAttention` compose these
 ops. `Module` supports named state and F32 safetensors files compatible with
 PyTorch exports.
+Reusable `EmbeddingLayer`, `Conv1dLayer`, `LayerNormLayer`, `LinearLayer`,
+`DropoutLayer`, and `GELULayer` modules compose the UtauTTS speech-timing
+`Target` as `autograd.SpeechTiming`. Its checkpoint names and weight layouts
+match PyTorch and UtauTTS's `speechtiming.LoadTCN`. The
+`cmd/speech-timing-train` command trains from an exported safetensors feature
+cache and saves the best validation checkpoint with UtauTTS metadata. See
+[`docs/API.md`](docs/API.md) for the proposed v0.1 surface.
+
 CUDA batched matmul uses one strided cuBLAS call for regular and broadcast
 batches. Attention combines batched GEMMs with fused masked softmax kernels.
 An optional tiled CUDA path uses online softmax, recomputes scores in backward,
@@ -115,6 +123,9 @@ baseline:
   including sequence lengths 256, 1024 and 4096, against the materialized
   CUDA path. CUDA residency tests assert device kernel launches; BF16 graph
   tests check captured training steps.
+- `tools/gen_speech_timing_fixture.py` compares the full 8-block Target with
+  PyTorch on CPU and CUDA: forward, NaN-masked L1, every parameter gradient,
+  clipping norm, and one AdamW step. CUDA output residency is asserted.
 
 ## Commands
 
@@ -138,6 +149,8 @@ python tools/bench_transformer.py --device cuda --threads 12 --warmup 1
 python tools/bench_transformer.py --device cuda --warmup 2 --graph --bf16
 go run ./cmd/attention-bench -seq 4096 -algorithm materialized
 go run ./cmd/attention-bench -seq 4096 -algorithm flash
+python tools/export_speech_timing_features.py --input D:/project/UtauTTS/out/speech-timing-target/features.pt --output $env:TEMP/gograd-speech-timing/features.safetensors
+go run ./cmd/speech-timing-train -cache $env:TEMP/gograd-speech-timing/features.safetensors -steps 6000 -device cuda -out $env:TEMP/gograd-speech-timing/model.safetensors
 ```
 
 `tcn-train` fits a tiny synthetic corpus on the CPU and writes
@@ -197,6 +210,26 @@ lower scratch use at long sequences. Output and gradient parity against the
 materialized path passes at all three lengths; a separate test covers an
 additive broadcast mask and its gradient.
 
+### UtauTTS speech-timing target
+
+The v1 feature cache contains 700 utterances and 286,260 frames. The exporter
+stores the Python seed-0 shuffle in its safetensors metadata, so the Go and
+PyTorch trainers use the same 30-utterance validation split. Both ran 6,000
+steps with batch 16, 400-frame windows, AdamW, OneCycle, clip 1.0 and CUDA.
+
+| Trainer | Best validation L1 | Best step | Training-loop wall time |
+| --- | ---: | ---: | ---: |
+| UtauTTS PyTorch | 0.284177 | 3750 | 73.625 s |
+| gograd | 0.285379 | 4500 | 66.477 s |
+
+The Go checkpoint is 0.42% above the measured PyTorch L1 and loads with
+UtauTTS's `speechtiming.LoadTCN`; its `Predict` returned one 80-bin frame in
+the read-only integration check. PyTorch's complete script, including cache
+loading, export and startup, took 81.862 s in a separate run and reached
+0.2844. Different initialization, sampling and dropout streams mean the
+training trajectories are not identical. The 15-feature context path is
+implemented but had no context cache available for a full run.
+
 `gputcn-fit` trains on a prepared dataset (frame features, targets and mask)
 instead of the synthetic corpus:
 
@@ -226,6 +259,11 @@ go test ./cuda/
 
 ## Layout
 
+- `autograd/layers.go`, `autograd/speech_timing.go` — reusable modules and the
+  UtauTTS speech-timing Target composition
+- `cmd/speech-timing-train`, `tools/export_speech_timing_features.py`,
+  `tools/gen_speech_timing_fixture.py` — feature bridge, trainer, and parity
+- `docs/API.md` — proposed v0.1 API and experimental boundaries
 - `autograd/cpu_binary.go`, `autograd/cuda_flash_attention.go`,
   `autograd/cuda_autocast.go` — optimized CPU gradients, tiled attention,
   and cached BF16 device buffers
@@ -273,8 +311,10 @@ are `[batch,time,channels]` and zero same-padding extends by
 
 The graph still materializes many contiguous FP32 results. BF16 is optional
 and keeps FP32 authoritative storage; FP16, loss scaling, a dtype/layout keyed
-kernel registry, and data loading are not present. The registry selects CPU or
-CUDA implementations but does not yet support runtime kernel plugins. The
+kernel registry, and a general prefetching data loader are not present. The
+speech-timing trainer reads an exported feature cache and samples windows on
+the host. The registry selects CPU or CUDA implementations but does not yet
+support runtime kernel plugins. The
 recording flag and attention algorithm selection are process-wide. Tiled
 attention currently supports head dimensions up to 128 and is slower than the
 materialized GEMM path at the measured sequence lengths. GPU inference callers
