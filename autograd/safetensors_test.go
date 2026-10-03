@@ -11,6 +11,7 @@ import (
 )
 
 func TestPyTorchSafeTensorsRoundTrip(t *testing.T) {
+	requirePyTorch(t)
 	path := filepath.Join(t.TempDir(), "torch.safetensors")
 	run := func(mode, path string) {
 		t.Helper()

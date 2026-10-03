@@ -26,6 +26,7 @@ type fixtureCase struct {
 
 func loadTransformerFixture(t *testing.T, device tensor.Device) map[string]fixtureCase {
 	t.Helper()
+	requirePyTorch(t)
 	path := filepath.Join(t.TempDir(), "fixture.json")
 	arg := "cpu"
 	if device == tensor.CUDA {

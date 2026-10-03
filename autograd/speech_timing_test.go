@@ -14,6 +14,7 @@ import (
 )
 
 func TestSpeechTimingPyTorchParity(t *testing.T) {
+	requirePyTorch(t)
 	dir := t.TempDir()
 	cmd := exec.Command("python", "../tools/gen_speech_timing_fixture.py", "--output", dir)
 	if reference := os.Getenv("GOGRAD_SPEECH_REFERENCE"); reference != "" {
