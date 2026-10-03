@@ -280,7 +280,7 @@ func TestTransformerOpParity(t *testing.T) {
 			})
 			if device == tensor.CUDA {
 				p := GPUProfile()
-				for _, name := range []string{"softmax_f", "softmax_b", "dropout_f", "dropout_b", "ce_f", "ce_b", "embedding_f", "embedding_b"} {
+				for _, name := range []string{"softmax_f", "softmax_b", "dropout_f", "dropout_b", "ce_f", "ce_b", "embedding_f", "embedding_b", "attn_qk", "attn_softmax_f", "attn_softmax_b", "attn_pv", "layernorm_f", "layernorm_b", "bias_gelu_f", "bias_gelu_b", "matmul_strided"} {
 					if p[name].Count == 0 {
 						t.Errorf("CUDA kernel %s was not launched", name)
 					}

@@ -8,6 +8,7 @@ p = argparse.ArgumentParser()
 p.add_argument("--device", choices=("cpu", "cuda"), required=True)
 p.add_argument("--threads", type=int, default=12)
 p.add_argument("--graph", action="store_true", help="capture and replay a fixed-shape CUDA step")
+p.add_argument("--bf16", action="store_true")
 a = p.parse_args()
 torch.set_num_threads(a.threads)
 torch.manual_seed(733)
@@ -25,8 +26,9 @@ opt = torch.optim.AdamW(model.parameters(), lr=.001, weight_decay=.0001, captura
 
 def step():
     opt.zero_grad(set_to_none=not a.graph)
-    pred = model(ids, cont, speakers)
-    loss = ((pred - safe_target).abs() * valid.unsqueeze(-1)).sum() / denominator
+    with torch.autocast(device_type=a.device, dtype=torch.bfloat16, enabled=a.bf16):
+        pred = model(ids, cont, speakers)
+        loss = ((pred - safe_target).abs() * valid.unsqueeze(-1)).sum() / denominator
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     opt.step()
@@ -44,8 +46,9 @@ if a.graph:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         opt.zero_grad(set_to_none=False)
-        pred = model(ids, cont, speakers)
-        static_loss = ((pred - safe_target).abs() * valid.unsqueeze(-1)).sum() / denominator
+        with torch.autocast(device_type=a.device, dtype=torch.bfloat16, enabled=a.bf16):
+            pred = model(ids, cont, speakers)
+            static_loss = ((pred - safe_target).abs() * valid.unsqueeze(-1)).sum() / denominator
         static_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()

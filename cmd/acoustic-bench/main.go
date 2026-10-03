@@ -20,6 +20,7 @@ func main() {
 	profile := flag.String("cpuprofile", "", "CPU profile path")
 	gpuProfile := flag.Bool("gpu-profile", false, "synchronize and report CUDA operator timings")
 	graph := flag.Bool("graph", false, "capture and time one fixed-shape CUDA training-step replay")
+	bf16 := flag.Bool("bf16", false, "BF16 tensor-core GEMM with FP32 weights")
 	flag.Parse()
 	if *profile != "" {
 		f, e := os.Create(*profile)
@@ -39,6 +40,13 @@ func main() {
 			panic(e)
 		}
 		defer context.Close()
+	}
+	if *bf16 {
+		if device != tensor.CUDA {
+			panic("BF16 autocast requires CUDA")
+		}
+		autograd.BF16Autocast = true
+		defer func() { autograd.BF16Autocast = false }()
 	}
 	m, e := autograd.NewAcoustic(384, 102, 88, []int{1, 2, 4, 8, 16, 1, 2, 4, 8, 16}, device)
 	if e != nil {
@@ -189,9 +197,11 @@ func main() {
 		if e := captured.Launch(); e != nil {
 			panic(e)
 		}
+		submission := time.Since(start)
 		if e := stream.Synchronize(); e != nil {
 			panic(e)
 		}
+		synchronized := time.Since(start)
 		lossValue, e := capturedLoss.ToHost()
 		if e != nil {
 			panic(e)
@@ -201,7 +211,7 @@ func main() {
 		if e != nil {
 			panic(e)
 		}
-		fmt.Printf("gograd cuda graph replay: %.3f ms (device AdamW step %d, loss %.6f)\n", float64(elapsed.Microseconds())/1000, stepCount, lossValue[0])
+		fmt.Printf("gograd cuda graph replay: %.3f ms (submit %.3f, wait %.3f, readback %.3f; device AdamW step %d, loss %.6f)\n", float64(elapsed.Microseconds())/1000, float64(submission.Microseconds())/1000, float64((synchronized-submission).Microseconds())/1000, float64((elapsed-synchronized).Microseconds())/1000, stepCount, lossValue[0])
 		capturedLoss.Close()
 	}
 }
