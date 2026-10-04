@@ -6,10 +6,12 @@
 package cuda
 
 import (
+	"container/list"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -316,33 +318,153 @@ func LastError() error {
 // Buffer is a device allocation. Callers must Free it explicitly; no finalizer
 // is used because release order matters.
 type Buffer struct {
-	pointer uintptr
-	size    int
-	freed   bool
+	pointer  uintptr
+	size     int // requested size
+	capacity int // physical allocation and pool class
+	freed    bool
 }
 
+type cachedPointer struct {
+	pointer uintptr
+	size    int
+}
+
+const defaultPoolCacheLimit = 2 << 30
+
 var (
-	poolMu                   sync.Mutex
-	poolTable                = map[int][]uintptr{}
-	captureTouched           map[uintptr]int
-	liveBytes, peakLiveBytes int
+	poolMu                           sync.Mutex
+	poolTable                        = map[int][]uintptr{}
+	poolLRU                          list.List
+	poolNodes                        = map[uintptr]*list.Element{}
+	cachedBytes, poolCacheLimit      = 0, defaultPoolCacheLimit
+	captureTouched                   map[uintptr]int
+	liveBytes, peakLiveBytes         int
+	reservedBytes, peakReservedBytes int
 )
 
-// AllocationStats counts live Buffer bytes, including reused pool buffers.
-// ResetAllocationPeak starts a new peak measurement from the current live set.
-type AllocationStats struct{ LiveBytes, PeakLiveBytes int }
+// AllocationStats reports active buffers and driver allocations owned by the
+// pool. Reserved includes live, cached and CUDA graph-reserved allocations.
+type AllocationStats struct {
+	LiveBytes, PeakLiveBytes         int
+	CachedBytes, CachedBuffers       int
+	ReservedBytes, PeakReservedBytes int
+	CacheLimitBytes                  int
+}
 
 func MemoryStats() AllocationStats {
 	poolMu.Lock()
 	defer poolMu.Unlock()
-	return AllocationStats{liveBytes, peakLiveBytes}
+	stats := AllocationStats{LiveBytes: liveBytes, PeakLiveBytes: peakLiveBytes,
+		CachedBytes: cachedBytes, CachedBuffers: len(poolNodes),
+		ReservedBytes: reservedBytes, PeakReservedBytes: peakReservedBytes,
+		CacheLimitBytes: poolCacheLimit}
+	return stats
 }
-func ResetAllocationPeak() { poolMu.Lock(); peakLiveBytes = liveBytes; poolMu.Unlock() }
+func ResetAllocationPeak() {
+	poolMu.Lock()
+	peakLiveBytes = liveBytes
+	peakReservedBytes = reservedBytes
+	poolMu.Unlock()
+}
 func addLiveBytes(size int) {
 	liveBytes += size
 	if liveBytes > peakLiveBytes {
 		peakLiveBytes = liveBytes
 	}
+}
+
+func poolSizeClass(size int) int {
+	if size == 0 {
+		return 0
+	}
+	quantum := 256
+	switch {
+	case size > 1<<20:
+		quantum = 1 << 20
+	case size > 64<<10:
+		quantum = 64 << 10
+	case size > 4<<10:
+		quantum = 4 << 10
+	}
+	return (size + quantum - 1) / quantum * quantum
+}
+
+func cachePointerLocked(pointer uintptr, size int) {
+	poolTable[size] = append(poolTable[size], pointer)
+	poolNodes[pointer] = poolLRU.PushBack(cachedPointer{pointer, size})
+	cachedBytes += size
+}
+func uncacheAccountingLocked(pointer uintptr, size int) {
+	if node := poolNodes[pointer]; node != nil {
+		poolLRU.Remove(node)
+		delete(poolNodes, pointer)
+		cachedBytes -= size
+	}
+}
+func trimPoolLocked() []cachedPointer {
+	if capturing {
+		return nil
+	} // A captured graph may still reference these pointers.
+	var victims []cachedPointer
+	for cachedBytes > poolCacheLimit {
+		oldest := poolLRU.Front()
+		if oldest == nil {
+			break
+		}
+		v := oldest.Value.(cachedPointer)
+		list := poolTable[v.size]
+		for i, pointer := range list {
+			if pointer == v.pointer {
+				list[i] = list[len(list)-1]
+				list = list[:len(list)-1]
+				break
+			}
+		}
+		if len(list) == 0 {
+			delete(poolTable, v.size)
+		} else {
+			poolTable[v.size] = list
+		}
+		uncacheAccountingLocked(v.pointer, v.size)
+		victims = append(victims, v)
+	}
+	return victims
+}
+func freeCachedPointers(victims []cachedPointer) error {
+	if len(victims) == 0 {
+		return nil
+	}
+	a, err := load()
+	if err != nil {
+		return err
+	}
+	for _, v := range victims {
+		code, _, _ := a.free.Call(v.pointer)
+		if err := runtimeError("cudaFree", code); err != nil {
+			return err
+		}
+		poolMu.Lock()
+		reservedBytes -= v.size
+		poolMu.Unlock()
+	}
+	return nil
+}
+
+// SetPoolCacheLimit changes the maximum bytes held in the reusable cache.
+// Active buffers and buffers reserved by a CUDA graph are unaffected.
+func SetPoolCacheLimit(bytes int) error {
+	if bytes < 0 {
+		return fmt.Errorf("cuda: negative pool cache limit")
+	}
+	poolMu.Lock()
+	if capturing {
+		poolMu.Unlock()
+		return fmt.Errorf("cuda: cannot trim pool during capture")
+	}
+	poolCacheLimit = bytes
+	victims := trimPoolLocked()
+	poolMu.Unlock()
+	return freeCachedPointers(victims)
 }
 
 // Alloc reserves size bytes on the current device. Freed buffers of the same
@@ -352,39 +474,54 @@ func Alloc(size int) (*Buffer, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("cuda: negative allocation size %d", size)
 	}
+	capacity := poolSizeClass(size)
 	a, err := load()
 	if err != nil {
 		return nil, err
 	}
 	poolMu.Lock()
-	list := poolTable[size]
+	list := poolTable[capacity]
 	if len(list) > 0 {
 		pointer := list[len(list)-1]
-		poolTable[size] = list[:len(list)-1]
-		if capturing && captureTouched != nil {
-			captureTouched[pointer] = size
+		if len(list) == 1 {
+			delete(poolTable, capacity)
+		} else {
+			poolTable[capacity] = list[:len(list)-1]
 		}
-		addLiveBytes(size)
+		uncacheAccountingLocked(pointer, capacity)
+		if capturing && captureTouched != nil {
+			captureTouched[pointer] = capacity
+		}
+		addLiveBytes(capacity)
 		poolMu.Unlock()
-		return &Buffer{pointer: pointer, size: size}, nil
+		return &Buffer{pointer: pointer, size: size, capacity: capacity}, nil
 	}
 	poolMu.Unlock()
 	var pointer uintptr
-	code, _, _ := a.malloc.Call(uintptr(unsafe.Pointer(&pointer)), uintptr(size))
+	code, _, _ := a.malloc.Call(uintptr(unsafe.Pointer(&pointer)), uintptr(capacity))
+	if code == 2 && !capturing { // cudaErrorMemoryAllocation: cached blocks may be reclaimable.
+		if releaseErr := ReleasePool(); releaseErr == nil {
+			code, _, _ = a.malloc.Call(uintptr(unsafe.Pointer(&pointer)), uintptr(capacity))
+		}
+	}
 	if err := runtimeError("cudaMalloc", code); err != nil {
 		return nil, err
 	}
 	if capturing {
 		poolMu.Lock()
 		if captureTouched != nil {
-			captureTouched[pointer] = size
+			captureTouched[pointer] = capacity
 		}
 		poolMu.Unlock()
 	}
 	poolMu.Lock()
-	addLiveBytes(size)
+	reservedBytes += capacity
+	if reservedBytes > peakReservedBytes {
+		peakReservedBytes = reservedBytes
+	}
+	addLiveBytes(capacity)
 	poolMu.Unlock()
-	return &Buffer{pointer: pointer, size: size}, nil
+	return &Buffer{pointer: pointer, size: size, capacity: capacity}, nil
 }
 
 // Free returns the allocation to the internal pool. It is safe to call more
@@ -395,14 +532,15 @@ func (b *Buffer) Free() error {
 	}
 	b.freed = true
 	poolMu.Lock()
-	liveBytes -= b.size
+	liveBytes -= b.capacity
 	if capturing && captureTouched != nil {
-		captureTouched[b.pointer] = b.size
+		captureTouched[b.pointer] = b.capacity
 	}
-	poolTable[b.size] = append(poolTable[b.size], b.pointer)
+	cachePointerLocked(b.pointer, b.capacity)
+	victims := trimPoolLocked()
 	poolMu.Unlock()
 	b.pointer = 0
-	return nil
+	return freeCachedPointers(victims)
 }
 
 // ReleasePool frees every buffer currently held by the internal pool.
@@ -413,15 +551,19 @@ func ReleasePool() error {
 	}
 	poolMu.Lock()
 	defer poolMu.Unlock()
-	for _, list := range poolTable {
+	for size, list := range poolTable {
 		for _, pointer := range list {
 			code, _, _ := a.free.Call(pointer)
 			if err := runtimeError("cudaFree", code); err != nil {
 				return err
 			}
+			reservedBytes -= size
 		}
 	}
 	poolTable = map[int][]uintptr{}
+	poolLRU.Init()
+	poolNodes = map[uintptr]*list.Element{}
+	cachedBytes = 0
 	return nil
 }
 
@@ -461,6 +603,7 @@ func (b *Buffer) copy(kind int, data []byte, offset int) error {
 		destination, source = uintptr(unsafe.Pointer(&data[0])), b.pointer+uintptr(offset)
 	}
 	code, _, _ := a.memcpy.Call(destination, source, uintptr(len(data)), uintptr(kind))
+	runtime.KeepAlive(data)
 	return runtimeError("cudaMemcpy", code)
 }
 

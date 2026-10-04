@@ -94,6 +94,7 @@ func Capture(stream *Stream, fn func() error) (*Graph, error) {
 		for _, pointer := range list {
 			if _, used := captureTouched[pointer]; used {
 				reserved[pointer] = size
+				uncacheAccountingLocked(pointer, size)
 			} else {
 				kept = append(kept, pointer)
 			}
@@ -132,9 +133,13 @@ func (g *Graph) Close() error {
 	g.exec = 0
 	poolMu.Lock()
 	for pointer, size := range g.reserved {
-		poolTable[size] = append(poolTable[size], pointer)
+		cachePointerLocked(pointer, size)
 	}
 	g.reserved = nil
+	victims := trimPoolLocked()
 	poolMu.Unlock()
-	return driverError("cuGraphExecDestroy", code)
+	if err := driverError("cuGraphExecDestroy", code); err != nil {
+		return err
+	}
+	return freeCachedPointers(victims)
 }

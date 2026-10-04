@@ -54,10 +54,16 @@ func (b *Buffer) Free() error { return ErrUnavailable }
 // ReleasePool returns nil on this platform.
 func ReleasePool() error { return nil }
 
-type AllocationStats struct{ LiveBytes, PeakLiveBytes int }
+type AllocationStats struct {
+	LiveBytes, PeakLiveBytes         int
+	CachedBytes, CachedBuffers       int
+	ReservedBytes, PeakReservedBytes int
+	CacheLimitBytes                  int
+}
 
-func MemoryStats() AllocationStats { return AllocationStats{} }
-func ResetAllocationPeak()         {}
+func MemoryStats() AllocationStats      { return AllocationStats{} }
+func ResetAllocationPeak()              {}
+func SetPoolCacheLimit(bytes int) error { return ErrUnavailable }
 
 // SetCurrentStream does nothing on this platform.
 func SetCurrentStream(s *Stream) {}
