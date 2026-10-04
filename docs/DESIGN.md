@@ -53,8 +53,13 @@ an OS thread, so callers hold `NewCUDAContext` through the training step.
 The graph currently uses one stream. Captured graphs reserve their temporary
 pool allocations until `Graph.Close`, and cuBLAS is bound to the capture
 stream. This does not yet support overlapping independent streams or concurrent
-captures. Pools should eventually be
-bounded and keyed by device as well as size.
+captures. The CUDA pool now rounds requests into size classes (256 B, 4 KiB,
+64 KiB or 1 MiB alignment by size), caches at most 2 GiB by default, and
+evicts least-recently-used cached buffers above that limit. `MemoryStats`
+reports active, cached and driver-reserved bytes and their peaks;
+`SetPoolCacheLimit` can lower the cap, and `ReleasePool` frees cached memory.
+Graph-reserved pointers are removed from the ordinary cache until graph close.
+The pool is still global rather than keyed by device and stream.
 
 Warp reductions fuse softmax forward and backward. The materialized attention path
 uses batched QK and PV GEMMs around fused masked scale/softmax forward and
@@ -218,3 +223,21 @@ but a context feature cache was unavailable for a full training run. Optimizer
 state, atomic checkpoint replacement and general-purpose data prefetch remain
 open before broader adoption. `docs/API.md` lists the proposed v0.1 API; no
 tag has been created.
+
+## Variable-length CUDA pool fix (2026-10-04)
+
+The UtauTTS frame-intonation trainer already releases its graph and owned
+tensors each update. A reproducer with 64 different padded lengths kept active
+buffers near 11 MB but grew the old exact-size, unlimited cache to
+6,154,440,208 bytes (6,165,368,020 bytes reserved). With size classes and
+bounded caching, the same 64 steps ended at 762,475,264 cached and
+773,425,152 reserved bytes. In a 200-step run the cache stayed at that level;
+after lowering the cap to 256 MiB, another 64 steps ended at 265,028,352
+cached and 275,978,240 reserved bytes. Active buffers stayed at 10,949,888
+bytes. A cudaMalloc allocation failure now releases cached blocks and retries
+once. Host transfer slices are kept alive through the DLL call.
+
+For fixed-shape Acoustic training, the final three paired CUDA runs measured
+medians of 77.3 ms before and 77.8 ms after, a 0.7% difference. Earlier pairs
+were slower for both binaries as device load changed. Remaining pool work includes
+multi-device isolation and an optional driver-level free/total memory query.

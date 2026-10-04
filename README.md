@@ -21,10 +21,12 @@ through the system loader, so no cgo or C compiler is needed. It provides device
 queries, device buffers with explicit `Free`, streams, events, a row-major
 `SgemmRowMajor` wrapper, an im2col + SGEMM `Conv1dForward`, and NVRTC-compiled
 kernels loaded through the CUDA driver. It can capture a sequence of work into
-a `Graph` and replay it with one launch. Freed buffers are reused from an
-internal size pool, which cuts cudaMalloc/cudaFree traffic; `ReleasePool`
-returns that memory to the driver. On other platforms every call reports
-`ErrUnavailable`.
+a `Graph` and replay it with one launch. Freed buffers are reused from a
+size-class pool capped at 2 GiB by default, so variable sequence lengths do
+not retain every exact allocation size. `cuda.MemoryStats` reports live,
+cached, reserved and peak bytes; `SetPoolCacheLimit` changes the cap, and
+`ReleasePool` returns cached memory to the driver. On other platforms CUDA
+operations report `ErrUnavailable` and `MemoryStats` returns zero counters.
 
 The `autograd` package is a define-by-run float32 graph with rank-six views,
 N-D broadcasting and reductions, batched matmul, embedding with padding,
@@ -141,6 +143,7 @@ go test ./gputcn/ -run XXX -bench .
 go run ./cmd/acoustic-bench -device cpu
 go run ./cmd/acoustic-bench -device cuda -warmup 1 -gpu-profile
 go run ./cmd/acoustic-bench -device cuda -warmup 2 -graph
+go run ./cmd/acoustic-bench -device cuda -warmup 2 -memory-stats
 python tools/bench_acoustic.py --device cuda --threads 12
 python tools/bench_acoustic.py --device cuda --threads 12 --graph
 go run ./cmd/transformer-bench -device cuda -warmup 1
@@ -229,6 +232,25 @@ loading, export and startup, took 81.862 s in a separate run and reached
 0.2844. Different initialization, sampling and dropout streams mean the
 training trajectories are not identical. The 15-feature context path is
 implemented but had no context cache available for a full run.
+
+### Variable-length CUDA memory
+
+In a 64-step, batch-8 speech-timing training reproduction with changing frame
+lengths, active allocation bytes stayed nearly constant while the old
+exact-size pool retained 6.15 GB. The size-class, bounded pool reduced the
+same workload's cache to 0.76 GB (decimal bytes below). A 200-step test checks
+the default cap and also repeats training with a 256 MiB cap.
+
+| Allocator after 64 steps | Live bytes | Cached bytes | Reserved bytes |
+| --- | ---: | ---: | ---: |
+| Previous | 10,927,812 | 6,154,440,208 | 6,165,368,020 |
+| Current | 10,949,888 | 762,475,264 | 773,425,152 |
+
+The fixed-shape Acoustic CUDA step had paired median times of 77.3 ms before
+and 77.8 ms after in the final three-pair check. Earlier pairs were slower
+for both binaries as device load changed. Captured graph
+allocations stay reserved until `Graph.Close` and are excluded from the cache
+limit while the graph is live.
 
 `gputcn-fit` trains on a prepared dataset (frame features, targets and mask)
 instead of the synthetic corpus:

@@ -21,6 +21,7 @@ func main() {
 	gpuProfile := flag.Bool("gpu-profile", false, "synchronize and report CUDA operator timings")
 	graph := flag.Bool("graph", false, "capture and time one fixed-shape CUDA training-step replay")
 	bf16 := flag.Bool("bf16", false, "BF16 tensor-core GEMM with FP32 weights")
+	memoryStats := flag.Bool("memory-stats", false, "print CUDA pool memory after the step")
 	flag.Parse()
 	if *profile != "" {
 		f, e := os.Create(*profile)
@@ -159,6 +160,10 @@ func main() {
 				}
 			}
 		}
+	}
+	if *memoryStats && device == tensor.CUDA {
+		s := cuda.MemoryStats()
+		fmt.Printf("cuda memory: live=%d cached=%d reserved=%d peak_reserved=%d cache_limit=%d\n", s.LiveBytes, s.CachedBytes, s.ReservedBytes, s.PeakReservedBytes, s.CacheLimitBytes)
 	}
 	if *graph {
 		if e := opt.PrepareGraph(); e != nil {

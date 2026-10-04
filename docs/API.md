@@ -14,6 +14,7 @@ The first intended consumer is UtauTTS's speech-timing target trainer. A
 | `autograd` | `NewEmbeddingLayer`, `NewConv1dLayer`, `NewLayerNormLayer`, `NewLinearLayer`, `DropoutLayer`, `GELULayer`, `Sequential` | Reusable graph modules. Convolution activations are `[batch,time,channels]`; weights are `[out,in,kernel]`. |
 | `autograd` | `Module.StateDict`, `LoadStateDict`, `SaveSafeTensors`, `SaveSafeTensorsMetadata`, `LoadSafeTensors` | Named float32 state. Metadata values are strings. The speech-timing model emits UtauTTS loader names and shapes. |
 | `autograd` | `MaskedLoss(pred,target,false)`, `ClipGradNorm`, `NewAdamW`, `NewOneCycle` | NaN-frame masked L1, clipping, AdamW, and PyTorch two-phase cosine OneCycle LR. |
+| `cuda` | `MemoryStats`, `ResetAllocationPeak`, `SetPoolCacheLimit`, `ReleasePool` | Query active, cached, and reserved bytes; bound or release reusable CUDA allocations. |
 
 `NewSpeechTiming(4, device, seed)` builds v1; `NewSpeechTiming(15, device,
 seed)` builds the context model. The final seed argument initializes weights
@@ -27,6 +28,16 @@ safetensors cache written by `tools/export_speech_timing_features.py`. Its
 `00000.ids`, `00000.cont`, and `00000.target`, and metadata stores record IDs.
 This cache format is experimental; it is a bridge from UtauTTS's trusted
 PyTorch `.pt` cache, not a general dataset API.
+
+`cuda.MemoryStats()` reports physical bytes owned by gograd's CUDA allocator:
+`LiveBytes`, `CachedBytes`, `ReservedBytes`, `PeakLiveBytes`,
+`PeakReservedBytes`, `CachedBuffers`, and `CacheLimitBytes`. The default cache
+limit is 2 GiB. `SetPoolCacheLimit` evicts least-recently-used cached buffers
+immediately when lowering it; live tensors and allocations reserved by a
+captured graph remain allocated. `ResetAllocationPeak` resets peak counters
+to the current levels. The counters do not include allocations made directly
+by CUDA libraries outside gograd's pool. `Buffer.Size()` remains the requested
+logical byte count even when its physical size class is larger.
 
 ## Experimental and compatibility limits
 
