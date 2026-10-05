@@ -14,6 +14,8 @@ The first intended consumer is UtauTTS's speech-timing target trainer. A
 | `autograd` | `NewEmbeddingLayer`, `NewConv1dLayer`, `NewLayerNormLayer`, `NewLinearLayer`, `DropoutLayer`, `GELULayer`, `Sequential` | Reusable graph modules. Convolution activations are `[batch,time,channels]`; weights are `[out,in,kernel]`. |
 | `autograd` | `Module.StateDict`, `LoadStateDict`, `SaveSafeTensors`, `SaveSafeTensorsMetadata`, `LoadSafeTensors` | Named float32 state. Metadata values are strings. The speech-timing model emits UtauTTS loader names and shapes. |
 | `autograd` | `MaskedLoss(pred,target,false)`, `ClipGradNorm`, `NewAdamW`, `NewOneCycle` | NaN-frame masked L1, clipping, AdamW, and PyTorch two-phase cosine OneCycle LR. |
+| `autograd` | `AdamW.State`, `LoadState`, `SaveSafeTensors`, `LoadSafeTensors` | Resumable AdamW moments and step count on CPU and CUDA. |
+| `autograd` | `SetTraining`, `IndexLoader` | Training-mode propagation for modules such as `DropoutLayer`; deterministic shuffled mini-batch indices. |
 | `cuda` | `MemoryStats`, `ResetAllocationPeak`, `SetPoolCacheLimit`, `ReleasePool` | Query active, cached, and reserved bytes; bound or release reusable CUDA allocations. |
 
 `NewSpeechTiming(4, device, seed)` builds v1; `NewSpeechTiming(15, device,
@@ -46,9 +48,9 @@ logical byte count even when its physical size class is larger.
   is currently float32-first; BF16 uses optional shadow buffers.
 - `NoGrad`, BF16 mode, and attention selection use process-wide state. Do not
   concurrently mutate these settings or run independent training contexts.
-- Optimizer moments and scheduler position are not serialized. The speech
-  trainer saves best inference weights with UtauTTS metadata, not a resumable
-  training checkpoint.
+- Optimizer moments and the AdamW step count are serialized with
+  `SaveSafeTensors`/`LoadSafeTensors`; the OneCycle scheduler position is not,
+  so restore it from the saved step count.
 - Safetensors loading validates names, shapes, and byte ranges. Atomic saves,
   overlapping-range rejection, and a file-size limit are still open.
 - The Go and PyTorch training runs use different random streams for sampling,

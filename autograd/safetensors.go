@@ -16,6 +16,107 @@ type safeHeader struct {
 	Offsets [2]int `json:"data_offsets"`
 }
 
+// safeTensorEntryはsafetensorsの1テンソル。
+type safeTensorEntry struct {
+	Values []float32
+	Shape  []int
+}
+
+// writeSafetensorsはF32テンソル群をsafetensors v1形式で書く。
+func writeSafetensors(path string, entries map[string]safeTensorEntry, metadata map[string]string) error {
+	names := make([]string, 0, len(entries))
+	for name := range entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	header := make(map[string]safeHeader, len(names))
+	var raw bytes.Buffer
+	for _, name := range names {
+		entry := entries[name]
+		start := raw.Len()
+		for _, v := range entry.Values {
+			if err := encodingbinary.Write(&raw, encodingbinary.LittleEndian, math.Float32bits(v)); err != nil {
+				return err
+			}
+		}
+		shape := make([]int, len(entry.Shape))
+		copy(shape, entry.Shape)
+		header[name] = safeHeader{"F32", shape, [2]int{start, raw.Len()}}
+	}
+	jsonEntries := make(map[string]any, len(header)+1)
+	for name, entry := range header {
+		jsonEntries[name] = entry
+	}
+	if metadata != nil {
+		jsonEntries["__metadata__"] = metadata
+	}
+	h, err := json.Marshal(jsonEntries)
+	if err != nil {
+		return err
+	}
+	var file bytes.Buffer
+	if err := encodingbinary.Write(&file, encodingbinary.LittleEndian, uint64(len(h))); err != nil {
+		return err
+	}
+	file.Write(h)
+	file.Write(raw.Bytes())
+	return os.WriteFile(path, file.Bytes(), 0600)
+}
+
+// readSafetensorsは全テンソルとmetadataを返す。
+func readSafetensors(path string) (map[string]safeTensorEntry, map[string]string, error) {
+	file, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(file) < 8 {
+		return nil, nil, fmt.Errorf("autograd: short safetensors file")
+	}
+	hlen := encodingbinary.LittleEndian.Uint64(file[:8])
+	if hlen > uint64(len(file)-8) {
+		return nil, nil, fmt.Errorf("autograd: invalid safetensors header length")
+	}
+	var header map[string]json.RawMessage
+	if err := json.Unmarshal(file[8:8+int(hlen)], &header); err != nil {
+		return nil, nil, err
+	}
+	metadata := map[string]string{}
+	if rawMetadata, ok := header["__metadata__"]; ok {
+		if err := json.Unmarshal(rawMetadata, &metadata); err != nil {
+			return nil, nil, fmt.Errorf("autograd: invalid safetensors metadata: %w", err)
+		}
+		delete(header, "__metadata__")
+	}
+	data := file[8+int(hlen):]
+	entries := make(map[string]safeTensorEntry, len(header))
+	for name, rawEntry := range header {
+		var meta safeHeader
+		if err := json.Unmarshal(rawEntry, &meta); err != nil {
+			return nil, nil, fmt.Errorf("autograd: %s: %w", name, err)
+		}
+		if meta.DType != "F32" {
+			return nil, nil, fmt.Errorf("autograd: incompatible dtype %s for %s", meta.DType, name)
+		}
+		count := 1
+		for _, d := range meta.Shape {
+			if d < 0 {
+				return nil, nil, fmt.Errorf("autograd: invalid shape %s", name)
+			}
+			count *= d
+		}
+		start, end := meta.Offsets[0], meta.Offsets[1]
+		if start < 0 || end < start || end > len(data) || end-start != count*4 {
+			return nil, nil, fmt.Errorf("autograd: invalid offsets %s", name)
+		}
+		values := make([]float32, count)
+		for i := range values {
+			values[i] = math.Float32frombits(encodingbinary.LittleEndian.Uint32(data[start+i*4:]))
+		}
+		entries[name] = safeTensorEntry{Values: values, Shape: meta.Shape}
+	}
+	return entries, metadata, nil
+}
+
 func (m *Module) namedState() map[string]*Tensor {
 	out := map[string]*Tensor{}
 	var walk func(string, *Module)
@@ -43,15 +144,8 @@ func (m *Module) SaveSafeTensors(path string) error {
 // format accepted by PyTorch safetensors and UtauTTS's speech-timing loader.
 func (m *Module) SaveSafeTensorsMetadata(path string, metadata map[string]string) error {
 	state := m.namedState()
-	names := make([]string, 0, len(state))
-	for name := range state {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	header := make(map[string]safeHeader, len(names))
-	var raw bytes.Buffer
-	for _, name := range names {
-		t := state[name]
+	entries := make(map[string]safeTensorEntry, len(state))
+	for name, t := range state {
 		if t.DType != Float32 {
 			return fmt.Errorf("autograd: unsupported dtype %s", t.DType)
 		}
@@ -59,90 +153,43 @@ func (m *Module) SaveSafeTensorsMetadata(path string, metadata map[string]string
 		if err != nil {
 			return err
 		}
-		start := raw.Len()
-		for _, v := range values {
-			if err := encodingbinary.Write(&raw, encodingbinary.LittleEndian, math.Float32bits(v)); err != nil {
-				return err
-			}
-		}
 		shape := make([]int, len(t.Shape))
 		copy(shape, t.Shape)
-		header[name] = safeHeader{"F32", shape, [2]int{start, raw.Len()}}
+		entries[name] = safeTensorEntry{Values: values, Shape: shape}
 	}
-	entries := make(map[string]any, len(header)+1)
-	for name, entry := range header {
-		entries[name] = entry
-	}
-	if metadata != nil {
-		entries["__metadata__"] = metadata
-	}
-	h, err := json.Marshal(entries)
-	if err != nil {
-		return err
-	}
-	var file bytes.Buffer
-	if err := encodingbinary.Write(&file, encodingbinary.LittleEndian, uint64(len(h))); err != nil {
-		return err
-	}
-	file.Write(h)
-	file.Write(raw.Bytes())
-	return os.WriteFile(path, file.Bytes(), 0600)
+	return writeSafetensors(path, entries, metadata)
 }
 
 // LoadSafeTensors validates all names, shapes, dtype, and byte ranges before
 // copying any weights into the module.
 func (m *Module) LoadSafeTensors(path string) error {
-	file, err := os.ReadFile(path)
+	entries, _, err := readSafetensors(path)
 	if err != nil {
 		return err
 	}
-	if len(file) < 8 {
-		return fmt.Errorf("autograd: short safetensors file")
-	}
-	hlen := encodingbinary.LittleEndian.Uint64(file[:8])
-	if hlen > uint64(len(file)-8) {
-		return fmt.Errorf("autograd: invalid safetensors header length")
-	}
-	var header map[string]json.RawMessage
-	if err := json.Unmarshal(file[8:8+int(hlen)], &header); err != nil {
-		return err
-	}
-	delete(header, "__metadata__")
 	state := m.namedState()
-	if len(header) != len(state) {
-		return fmt.Errorf("autograd: safetensors entry count %d != %d", len(header), len(state))
+	if len(entries) != len(state) {
+		return fmt.Errorf("autograd: safetensors entry count %d != %d", len(entries), len(state))
 	}
-	data := file[8+int(hlen):]
-	values := make(map[string][]float32, len(state))
 	for name, t := range state {
-		entry, ok := header[name]
+		entry, ok := entries[name]
 		if !ok {
 			return fmt.Errorf("autograd: missing tensor %s", name)
 		}
-		var meta safeHeader
-		if err := json.Unmarshal(entry, &meta); err != nil {
-			return fmt.Errorf("autograd: %s: %w", name, err)
-		}
-		if meta.DType != "F32" || len(meta.Shape) != len(t.Shape) {
+		if len(entry.Shape) != len(t.Shape) {
 			return fmt.Errorf("autograd: incompatible tensor %s", name)
 		}
 		for i, d := range t.Shape {
-			if d != meta.Shape[i] {
+			if d != entry.Shape[i] {
 				return fmt.Errorf("autograd: shape mismatch %s", name)
 			}
 		}
-		start, end := meta.Offsets[0], meta.Offsets[1]
-		if start < 0 || end < start || end > len(data) || end-start != t.Numel()*4 {
-			return fmt.Errorf("autograd: invalid offsets %s", name)
+		if len(entry.Values) != t.Numel() {
+			return fmt.Errorf("autograd: invalid value count %s", name)
 		}
-		v := make([]float32, t.Numel())
-		for i := range v {
-			v[i] = math.Float32frombits(encodingbinary.LittleEndian.Uint32(data[start+i*4:]))
-		}
-		values[name] = v
 	}
 	for name, t := range state {
-		if err := t.CopyFrom(values[name]); err != nil {
+		if err := t.CopyFrom(entries[name].Values); err != nil {
 			return err
 		}
 	}

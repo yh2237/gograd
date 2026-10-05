@@ -131,6 +131,8 @@ func (l *DropoutLayer) Forward(x *Tensor, seed uint32) *Tensor {
 	return Dropout(x, l.Probability, seed, l.Training)
 }
 
+func (l *DropoutLayer) Train(training bool) { l.Training = training }
+
 type GELULayer struct{ Approximate bool }
 
 func (l GELULayer) Forward(x *Tensor) *Tensor { return GELU(x, l.Approximate) }

@@ -2,6 +2,18 @@ package autograd
 
 import "fmt"
 
+// Trainerは学習モードを切り替えられるモジュール。
+type Trainer interface{ Train(training bool) }
+
+// SetTrainingは学習モードをまとめて切り替える。
+func SetTraining(training bool, trainers ...Trainer) {
+	for _, trainer := range trainers {
+		if trainer != nil {
+			trainer.Train(training)
+		}
+	}
+}
+
 // Module is an ordered parameter/buffer registry. StateDict returns copies so
 // checkpoint writers cannot mutate live tensors.
 type Module struct {
