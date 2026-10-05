@@ -147,8 +147,10 @@ Existing `nn` JSON checkpoints remain readable during migration.
    backward methods compatibility wrappers.
 2. Move `gputcn` layers and its sequence loss onto the same operators. Retain
    its optimized CUDA graph path as a compiled execution plan. Add general
-   dataset loaders, optimizer state checkpoints, and recursive module
-   train/eval propagation. `SpeechTiming` already toggles its dropout state.
+   prefetching dataset loaders and continue trainer adoption. Resumable AdamW /
+   OneCycle / model checkpoints, restorable index/window samplers, and recursive
+   `Module.Train` propagation are implemented in v1.2.0. `speech-timing-train`
+   additionally retains the data split and best model for complete resume.
 3. Improve tiled attention occupancy and backward throughput, complete BF16
    storage and dtype-aware kernels, and add FP16 loss scaling. Extend the
    general CUDA graph capture API beyond fixed Acoustic and transformer

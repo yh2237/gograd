@@ -98,15 +98,10 @@ func TestAdamWStateCUDA(t *testing.T) {
 	defer value.Close()
 	parameter := Parameter{Name: "weight", Value: value}
 	optimizer := NewAdamW([]Parameter{parameter}, 0.1, 0.01)
-	grad, err := Zeros([]int{3}, tensor.CUDA, false)
-	if err != nil {
+	defer optimizer.Close()
+	if err := parameter.Value.ensureGradGPU().CopyFromHost(floatBytes([]float32{0.3, -0.1, 0.2})); err != nil {
 		t.Fatal(err)
 	}
-	defer grad.Close()
-	if err := grad.CopyFrom([]float32{0.3, -0.1, 0.2}); err != nil {
-		t.Fatal(err)
-	}
-	parameter.Value.gradBuf = grad.buf
 	optimizer.Step()
 	state, err := optimizer.State()
 	if err != nil {

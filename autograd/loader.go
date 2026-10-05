@@ -1,5 +1,7 @@
 package autograd
 
+import "fmt"
+
 // IndexLoaderは決定的なシャッフル順でミニバッチの添字を列挙する。
 // エポックごとに順列が変わり、同じseedなら再現できる。
 type IndexLoader struct {
@@ -10,6 +12,9 @@ type IndexLoader struct {
 }
 
 func NewIndexLoader(size, batchSize int, seed uint64) *IndexLoader {
+	if size < 0 {
+		size = 0
+	}
 	if batchSize < 1 {
 		batchSize = 1
 	}
@@ -18,6 +23,9 @@ func NewIndexLoader(size, batchSize int, seed uint64) *IndexLoader {
 
 // Epochは1エポック分のバッチを返し、次のエポックへ進む。最後のバッチは小さいことがある。
 func (l *IndexLoader) Epoch() [][]int {
+	if l.Size < 0 || l.BatchSize < 1 {
+		panic("autograd: invalid index loader configuration")
+	}
 	order := make([]int, l.Size)
 	for i := range order {
 		order[i] = i
@@ -37,6 +45,23 @@ func (l *IndexLoader) Epoch() [][]int {
 		batches = append(batches, order[start:end])
 	}
 	return batches
+}
+
+type IndexLoaderState struct {
+	Size, BatchSize int
+	Seed, Epoch     uint64
+}
+
+func (l *IndexLoader) State() IndexLoaderState {
+	return IndexLoaderState{l.Size, l.BatchSize, l.seed, l.epoch}
+}
+
+func (l *IndexLoader) LoadState(state IndexLoaderState) error {
+	if state.Size != l.Size || state.BatchSize != l.BatchSize || state.Seed != l.seed {
+		return fmt.Errorf("autograd: index loader state does not match configuration")
+	}
+	l.epoch = state.Epoch
+	return nil
 }
 
 func nextRandom(state *uint64) uint64 {

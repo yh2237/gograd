@@ -113,6 +113,13 @@ func TestAcousticGraphCaptureCUDA(t *testing.T) {
 	if count != 3 {
 		t.Fatalf("device optimizer step %d, want 3", count)
 	}
+	state, e := graphOpt.State()
+	if e != nil {
+		t.Fatal(e)
+	}
+	if state.StepCount != count {
+		t.Fatalf("checkpoint used stale host step %d, want %d", state.StepCount, count)
+	}
 	for i := 0; i < 2; i++ {
 		if e := step(eagerModel, eagerOpt); e != nil {
 			t.Fatal(e)

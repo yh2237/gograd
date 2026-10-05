@@ -20,7 +20,24 @@ type Module struct {
 	Parameters []Parameter
 	Buffers    []Parameter
 	Children   []NamedModule
+	Training   bool
+	// OnTrainingChange connects stateful layers (dropout, normalization) to
+	// recursive train/eval propagation. It is not part of StateDict.
+	OnTrainingChange func(bool)
 }
+
+func (m *Module) Train(training bool) {
+	m.Training = training
+	if m.OnTrainingChange != nil {
+		m.OnTrainingChange(training)
+	}
+	for _, child := range m.Children {
+		if child.Module != nil {
+			child.Module.Train(training)
+		}
+	}
+}
+
 type NamedModule struct {
 	Name   string
 	Module *Module

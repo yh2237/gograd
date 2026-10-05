@@ -53,10 +53,12 @@ func NewSpeechTiming(continuous int, device tensor.Device, seed int64) (*SpeechT
 		return nil, e
 	}
 	m.Module.Children = append(m.Module.Children, NamedModule{"out", m.Output.StateModule()})
+	m.Module.OnTrainingChange = m.Dropout.Train
+	m.Module.Train(true)
 	return m, nil
 }
 func (m *SpeechTiming) Parameters() []Parameter { return m.Module.NamedParameters() }
-func (m *SpeechTiming) Train(training bool)     { m.Dropout.Training = training }
+func (m *SpeechTiming) Train(training bool)     { m.Module.Train(training) }
 func (m *SpeechTiming) Forward(ids []int, cont *Tensor, seed uint32) *Tensor {
 	s := cont.Shape
 	if len(s) != 3 || s[2] != m.Continuous || len(ids) != s[0]*s[1]*3 {

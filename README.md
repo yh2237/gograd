@@ -43,8 +43,12 @@ Reusable `EmbeddingLayer`, `Conv1dLayer`, `LayerNormLayer`, `LinearLayer`,
 `Target` as `autograd.SpeechTiming`. Its checkpoint names and weight layouts
 match PyTorch and UtauTTS's `speechtiming.LoadTCN`. The
 `cmd/speech-timing-train` command trains from an exported safetensors feature
-cache and saves the best validation checkpoint with UtauTTS metadata. See
-[`docs/API.md`](docs/API.md) for the proposed v0.1 surface.
+cache and saves the best validation weights with UtauTTS metadata. In v1.2.0,
+it also saves a resumable training checkpoint containing current/best weights,
+AdamW moments and hyperparameters, OneCycle state, split, and PCG sampler state.
+`Module.Train` recursively propagates train/eval mode to registered children;
+`WindowSampler` and `IndexLoader` expose restorable sampling state. See
+[`docs/API.md`](docs/API.md) for the training surface.
 
 CUDA batched matmul uses one strided cuBLAS call for regular and broadcast
 batches. Attention combines batched GEMMs with fused masked softmax kernels.
@@ -225,13 +229,43 @@ steps with batch 16, 400-frame windows, AdamW, OneCycle, clip 1.0 and CUDA.
 | UtauTTS PyTorch | 0.284177 | 3750 | 73.625 s |
 | gograd | 0.285379 | 4500 | 66.477 s |
 
-The Go checkpoint is 0.42% above the measured PyTorch L1 and loads with
+These measurements used the v0.1 trainer/sampler. The Go checkpoint is 0.42% above the measured PyTorch L1 and loads with
 UtauTTS's `speechtiming.LoadTCN`; its `Predict` returned one 80-bin frame in
 the read-only integration check. PyTorch's complete script, including cache
 loading, export and startup, took 81.862 s in a separate run and reached
 0.2844. Different initialization, sampling and dropout streams mean the
 training trajectories are not identical. The 15-feature context path is
 implemented but had no context cache available for a full run.
+
+### Resumable speech-timing training (v1.2.0)
+
+`--steps` is the complete OneCycle schedule, not the number of additional
+updates after resuming. Use a fresh `--out` path on each invocation; the best
+inference weights are retained inside the training checkpoint and re-exported.
+
+```sh
+go run ./cmd/speech-timing-train --cache features.safetensors \
+  --steps 6000 --valid 30 --seed 0 --device cpu \
+  --out out/best-first.safetensors --checkpoint out/training.safetensors \
+  --checkpoint-every 250 --stop-after 2000
+
+go run ./cmd/speech-timing-train --cache features.safetensors \
+  --steps 6000 --valid 30 --seed 0 --device cpu \
+  --out out/best-resumed.safetensors --checkpoint out/training.safetensors \
+  --resume out/training.safetensors
+```
+
+Ctrl+C requests a stop after the current update and writes the training
+checkpoint. A forced termination can only resume from the last periodic save.
+Keep cache contents, seed, validation count, context mode, total steps,
+batch/window size and evaluation interval unchanged. Inference weights alone
+are not resumable checkpoints. CPU resume tests compare final files byte for
+byte; CUDA tests check all tensors within `1e-6` absolute error and exact
+sampler/scheduler state because atomic gradient reductions can reorder sums.
+
+The window sampler now uses a restorable PCG stream and includes the final
+complete window. A fresh v1.2.0 run does not reproduce the old Go RNG trajectory.
+This command's resumable state is new; legacy `nn`/`gputcn` trainers are unchanged.
 
 ### Variable-length CUDA memory
 

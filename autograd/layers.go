@@ -36,6 +36,7 @@ func NewEmbeddingLayer(count, width, paddingIdx int, device tensor.Device, rng *
 	return l, nil
 }
 func (l *EmbeddingLayer) StateModule() *Module { return &l.Module }
+func (l *EmbeddingLayer) Train(training bool)  { l.Module.Train(training) }
 func (l *EmbeddingLayer) Forward(ids []int, shape []int) *Tensor {
 	return EmbeddingWithPadding(l.Weight, ids, shape, l.PaddingIdx)
 }
@@ -67,6 +68,7 @@ func NewConv1dLayer(in, out, kernel, dilation int, device tensor.Device, rng *ra
 	return l, nil
 }
 func (l *Conv1dLayer) StateModule() *Module      { return &l.Module }
+func (l *Conv1dLayer) Train(training bool)       { l.Module.Train(training) }
 func (l *Conv1dLayer) Forward(x *Tensor) *Tensor { return Conv1dGEMM(x, l.Weight, l.Bias, l.Dilation) }
 
 type LayerNormLayer struct {
@@ -90,6 +92,7 @@ func NewLayerNormLayer(width int, eps float32, device tensor.Device) (*LayerNorm
 	return l, nil
 }
 func (l *LayerNormLayer) StateModule() *Module      { return &l.Module }
+func (l *LayerNormLayer) Train(training bool)       { l.Module.Train(training) }
 func (l *LayerNormLayer) Forward(x *Tensor) *Tensor { return LayerNorm(x, l.Weight, l.Bias, l.Eps) }
 
 // LinearLayer applies a PyTorch-layout [out,in] affine projection on the last axis.
@@ -118,6 +121,7 @@ func NewLinearLayer(in, out int, device tensor.Device, rng *rand.Rand) (*LinearL
 	return l, nil
 }
 func (l *LinearLayer) StateModule() *Module { return &l.Module }
+func (l *LinearLayer) Train(training bool)  { l.Module.Train(training) }
 func (l *LinearLayer) Forward(x *Tensor) *Tensor {
 	return Add(MatMul(x, Transpose(l.Weight, 0, 1)), l.Bias)
 }
@@ -141,6 +145,14 @@ func (l GELULayer) Forward(x *Tensor) *Tensor { return GELU(x, l.Approximate) }
 // inputs (embedding indices or a dropout seed) are composed in a plain struct.
 type TensorLayer interface{ Forward(*Tensor) *Tensor }
 type Sequential []TensorLayer
+
+func (s Sequential) Train(training bool) {
+	for _, layer := range s {
+		if trainer, ok := layer.(Trainer); ok {
+			trainer.Train(training)
+		}
+	}
+}
 
 func (s Sequential) Forward(x *Tensor) *Tensor {
 	for _, l := range s {

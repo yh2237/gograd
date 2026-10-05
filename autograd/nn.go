@@ -339,7 +339,6 @@ func NewAdamW(params []Parameter, lr, decay float32) *AdamW {
 	return o
 }
 func (o *AdamW) Step() {
-	o.StepCount++
 	if cuda.InCapture() {
 		if o.graphStep == nil {
 			panic("autograd: call AdamW.PrepareGraph before capture")
@@ -356,6 +355,12 @@ func (o *AdamW) Step() {
 		}
 		return
 	}
+	if o.graphStep != nil {
+		if err := o.SyncGraphStepCount(); err != nil {
+			panic(err)
+		}
+	}
+	o.StepCount++
 	bc1 := float32(1 - math.Pow(float64(o.Beta1), float64(o.StepCount)))
 	bc2 := float32(1 - math.Pow(float64(o.Beta2), float64(o.StepCount)))
 	if len(o.Params) > 0 && o.Params[0].Value.Device == tensor.CUDA {
@@ -367,6 +372,11 @@ func (o *AdamW) Step() {
 				panic(e)
 			}
 			p.Value.invalidateBF16()
+		}
+		if o.graphStep != nil {
+			if err := o.PrepareGraph(); err != nil {
+				panic(err)
+			}
 		}
 		return
 	}
@@ -401,7 +411,9 @@ func (c *OneCycle) LR() float64 {
 	var start, end, p float64
 	if step <= warm {
 		start, end = initial, c.MaxLR
-		p = step / warm
+		if warm > 0 {
+			p = step / warm
+		}
 	} else {
 		start, end = c.MaxLR, final
 		p = (step - warm) / (float64(c.Total-1) - warm)
