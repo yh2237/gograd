@@ -22,7 +22,10 @@ use a separate `gograd-training-1` envelope.
 | `cuda` | `MemoryStats`, `ResetAllocationPeak`, `SetPoolCacheLimit`, `ReleasePool` | Query active, cached, and reserved bytes; bound or release reusable CUDA allocations. |
 
 `NewSpeechTiming(4, device, seed)` builds v1; `NewSpeechTiming(15, device,
-seed)` builds the context model. The final seed argument initializes weights
+seed)` builds the context model. `NewSpeechTimingWithPhones(phones, continuous,
+device, seed)` builds the same architecture for a language-specific phone
+vocabulary (for example UtauTTS English or Mandarin timing targets); the
+embedding row count equals `phones`. The final seed argument initializes weights
 with Go's random stream. Loading a PyTorch safetensors state provides exact
 weight parity. `SpeechTiming.Forward(ids, cont, dropoutSeed)` uses a deterministic
 CPU/CUDA hash mask while training and disables dropout after `Train(false)`.

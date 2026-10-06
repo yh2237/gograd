@@ -22,14 +22,24 @@ type SpeechTiming struct {
 	Continuous    int
 }
 
+// NewSpeechTiming builds the UtauTTS Target model with the original 40-phone vocabulary.
 func NewSpeechTiming(continuous int, device tensor.Device, seed int64) (*SpeechTiming, error) {
+	return NewSpeechTimingWithPhones(40, continuous, device, seed)
+}
+
+// NewSpeechTimingWithPhones builds the model for a language-specific phone vocabulary.
+// phones must match the embedding size expected by the runtime model metadata.
+func NewSpeechTimingWithPhones(phones, continuous int, device tensor.Device, seed int64) (*SpeechTiming, error) {
 	if continuous < 1 {
 		return nil, fmt.Errorf("autograd: invalid continuous width")
+	}
+	if phones < 1 {
+		return nil, fmt.Errorf("autograd: invalid phone count")
 	}
 	rng := rand.New(rand.NewSource(seed))
 	m := &SpeechTiming{Continuous: continuous, Dropout: DropoutLayer{Probability: .15, Training: true}}
 	var e error
-	if m.Phone, e = NewEmbeddingLayer(40, 32, -1, device, rng); e != nil {
+	if m.Phone, e = NewEmbeddingLayer(phones, 32, -1, device, rng); e != nil {
 		return nil, e
 	}
 	if m.Input, e = NewConv1dLayer(96+continuous, 128, 1, 1, device, rng); e != nil {

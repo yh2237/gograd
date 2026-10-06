@@ -167,6 +167,38 @@ func TestSpeechTimingOneCyclePyTorch(t *testing.T) {
 	}
 }
 
+func TestSpeechTimingWithPhonesUsesVocabularySize(t *testing.T) {
+	m, e := NewSpeechTimingWithPhones(44, 4, tensor.CPU, 0)
+	if e != nil {
+		t.Fatal(e)
+	}
+	path := filepath.Join(t.TempDir(), "model.safetensors")
+	if e = m.Module.SaveSafeTensorsMetadata(path, map[string]string{"format": "test"}); e != nil {
+		t.Fatal(e)
+	}
+	data, e := os.ReadFile(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	hlen := encodingbinary.LittleEndian.Uint64(data[:8])
+	var header map[string]json.RawMessage
+	if e = json.Unmarshal(data[8:8+hlen], &header); e != nil {
+		t.Fatal(e)
+	}
+	var entry struct {
+		Shape []int `json:"shape"`
+	}
+	if e = json.Unmarshal(header["phone.weight"], &entry); e != nil {
+		t.Fatal(e)
+	}
+	if len(entry.Shape) != 2 || entry.Shape[0] != 44 || entry.Shape[1] != 32 {
+		t.Fatalf("phone embedding shape = %v, want [44 32]", entry.Shape)
+	}
+	if _, e := NewSpeechTimingWithPhones(0, 4, tensor.CPU, 0); e == nil {
+		t.Fatal("zero phone count was accepted")
+	}
+}
+
 func TestSpeechTimingCheckpointMetadata(t *testing.T) {
 	m, e := NewSpeechTiming(4, tensor.CPU, 0)
 	if e != nil {
