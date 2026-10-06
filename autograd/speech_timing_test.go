@@ -167,6 +167,40 @@ func TestSpeechTimingOneCyclePyTorch(t *testing.T) {
 	}
 }
 
+func TestSpeechTimingMultiHeadShapesAndParameters(t *testing.T) {
+	m, e := NewSpeechTimingMultiHead(44, 4, 2, tensor.CPU, 0)
+	if e != nil {
+		t.Fatal(e)
+	}
+	cont, e := New(make([]float32, 2*5*4), []int{2, 5, 4}, tensor.CPU, false)
+	if e != nil {
+		t.Fatal(e)
+	}
+	f0Cont, e := New(make([]float32, 2*5*2), []int{2, 5, 2}, tensor.CPU, false)
+	if e != nil {
+		t.Fatal(e)
+	}
+	mel, f0 := m.Forward(make([]int, 2*5*3), cont, f0Cont, 7)
+	if len(mel.Shape) != 3 || mel.Shape[2] != 80 || mel.Shape[0] != 2 || mel.Shape[1] != 5 {
+		t.Fatalf("mel shape %v", mel.Shape)
+	}
+	if len(f0.Shape) != 3 || f0.Shape[2] != 1 || f0.Shape[0] != 2 || f0.Shape[1] != 5 {
+		t.Fatalf("f0 shape %v", f0.Shape)
+	}
+	names := map[string]bool{}
+	for _, p := range m.Parameters() {
+		names[p.Name] = true
+	}
+	for _, want := range []string{"phone.weight", "inp.weight", "blocks.0.weight", "norms.0.weight", "out.weight", "f0_inp.weight", "f0_blocks.0.weight", "f0_norms.0.weight", "f0_out.weight"} {
+		if !names[want] {
+			t.Errorf("missing parameter %q", want)
+		}
+	}
+	if _, e := NewSpeechTimingMultiHead(44, 4, 0, tensor.CPU, 0); e == nil {
+		t.Fatal("zero f0 context width was accepted")
+	}
+}
+
 func TestSpeechTimingWithPhonesUsesVocabularySize(t *testing.T) {
 	m, e := NewSpeechTimingWithPhones(44, 4, tensor.CPU, 0)
 	if e != nil {
