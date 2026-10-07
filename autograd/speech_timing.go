@@ -103,6 +103,8 @@ type SpeechTimingMultiHead struct {
 	F0Norms   []*LayerNormLayer
 	F0Output  *Conv1dLayer
 	F0Context int
+
+	EnergyOutput *Conv1dLayer
 }
 
 // NewSpeechTimingMultiHead builds the mel trunk plus a context-only F0 trunk.
@@ -165,6 +167,10 @@ func NewSpeechTimingMultiHead(phones, continuous, f0Context int, device tensor.D
 		return nil, e
 	}
 	m.Module.Children = append(m.Module.Children, NamedModule{"f0_out", m.F0Output.StateModule()})
+	if m.EnergyOutput, e = NewConv1dLayer(128, 1, 1, 1, device, rng); e != nil {
+		return nil, e
+	}
+	m.Module.Children = append(m.Module.Children, NamedModule{"energy_out", m.EnergyOutput.StateModule()})
 	m.Module.OnTrainingChange = m.Dropout.Train
 	m.Module.Train(true)
 	return m, nil
@@ -173,8 +179,9 @@ func NewSpeechTimingMultiHead(phones, continuous, f0Context int, device tensor.D
 func (m *SpeechTimingMultiHead) Parameters() []Parameter { return m.Module.NamedParameters() }
 func (m *SpeechTimingMultiHead) Train(training bool)     { m.Module.Train(training) }
 
-// Forward returns the mel prediction and the context-only F0 prediction.
-func (m *SpeechTimingMultiHead) Forward(ids []int, cont, f0Cont *Tensor, seed uint32) (*Tensor, *Tensor) {
+// Forward returns the mel prediction, the context-only F0 prediction and the
+// context-only energy prediction (centered dB/10).
+func (m *SpeechTimingMultiHead) Forward(ids []int, cont, f0Cont *Tensor, seed uint32) (*Tensor, *Tensor, *Tensor) {
 	s := cont.Shape
 	if len(s) != 3 || s[2] != m.Continuous || len(ids) != s[0]*s[1]*3 {
 		panic("autograd: speech timing input shape")
@@ -202,5 +209,5 @@ func (m *SpeechTimingMultiHead) Forward(ids []int, cont, f0Cont *Tensor, seed ui
 		y = m.Dropout.Forward(y, seed+uint32(64+i))
 		g = Add(g, y)
 	}
-	return mel, m.F0Output.Forward(g)
+	return mel, m.F0Output.Forward(g), m.EnergyOutput.Forward(g)
 }

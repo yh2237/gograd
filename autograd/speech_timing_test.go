@@ -180,18 +180,21 @@ func TestSpeechTimingMultiHeadShapesAndParameters(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	mel, f0 := m.Forward(make([]int, 2*5*3), cont, f0Cont, 7)
+	mel, f0, energy := m.Forward(make([]int, 2*5*3), cont, f0Cont, 7)
 	if len(mel.Shape) != 3 || mel.Shape[2] != 80 || mel.Shape[0] != 2 || mel.Shape[1] != 5 {
 		t.Fatalf("mel shape %v", mel.Shape)
 	}
 	if len(f0.Shape) != 3 || f0.Shape[2] != 1 || f0.Shape[0] != 2 || f0.Shape[1] != 5 {
 		t.Fatalf("f0 shape %v", f0.Shape)
 	}
+	if len(energy.Shape) != 3 || energy.Shape[2] != 1 || energy.Shape[0] != 2 || energy.Shape[1] != 5 {
+		t.Fatalf("energy shape %v", energy.Shape)
+	}
 	names := map[string]bool{}
 	for _, p := range m.Parameters() {
 		names[p.Name] = true
 	}
-	for _, want := range []string{"phone.weight", "inp.weight", "blocks.0.weight", "norms.0.weight", "out.weight", "f0_inp.weight", "f0_blocks.0.weight", "f0_norms.0.weight", "f0_out.weight"} {
+	for _, want := range []string{"phone.weight", "inp.weight", "blocks.0.weight", "norms.0.weight", "out.weight", "f0_inp.weight", "f0_blocks.0.weight", "f0_norms.0.weight", "f0_out.weight", "energy_out.weight"} {
 		if !names[want] {
 			t.Errorf("missing parameter %q", want)
 		}
