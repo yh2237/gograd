@@ -9,7 +9,17 @@ import (
 
 // CheckpointDiT runs a v4.1-Small denoiser forward with already-encoded
 // text, speaker and caption contexts. Each block's weights are streamed.
-type CheckpointDiT struct{ State *autograd.SafeTensorFile }
+type CheckpointDiT struct {
+	State   *autograd.SafeTensorFile
+	UseCUDA bool
+}
+
+func (p CheckpointDiT) linear(x, w []float32, rows, in, out int) ([]float32, error) {
+	if p.UseCUDA {
+		return LinearRowsCUDA(x, w, rows, in, out)
+	}
+	return linearRows(x, w, rows, in, out), nil
+}
 
 func (p CheckpointDiT) parameter(name string, shape ...int) ([]float32, error) {
 	v, s, err := p.State.ReadF32(name)
@@ -32,7 +42,10 @@ func (p CheckpointDiT) project(name string, x []float32, rows, in, out int, bias
 	if err != nil {
 		return nil, err
 	}
-	y := linearRows(x, w, rows, in, out)
+	y, err := p.linear(x, w, rows, in, out)
+	if err != nil {
+		return nil, err
+	}
 	if bias {
 		b, err := p.parameter(name+".bias", out)
 		if err != nil {
@@ -227,7 +240,14 @@ func (p CheckpointDiT) swiglu(name string, x []float32, rows, dim, hidden int) (
 	if err != nil {
 		return nil, err
 	}
-	a, b := linearRows(x, w1, rows, dim, hidden), linearRows(x, w3, rows, dim, hidden)
+	a, err := p.linear(x, w1, rows, dim, hidden)
+	if err != nil {
+		return nil, err
+	}
+	b, err := p.linear(x, w3, rows, dim, hidden)
+	if err != nil {
+		return nil, err
+	}
 	for i := range a {
 		a[i] = silu(a[i]) * b[i]
 	}
@@ -235,7 +255,7 @@ func (p CheckpointDiT) swiglu(name string, x []float32, rows, dim, hidden int) (
 	if err != nil {
 		return nil, err
 	}
-	return linearRows(a, w2, rows, hidden, dim), nil
+	return p.linear(a, w2, rows, hidden, dim)
 }
 
 // Forward returns [latentLen,32] velocity predictions for one sample.
