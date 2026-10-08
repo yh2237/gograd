@@ -22,6 +22,7 @@ var registeredPublicOps = map[string]string{
 	"Embedding": "embedding", "EmbeddingWithPadding": "embedding_padding", "EmbeddingFromIndexBuffer": "embedding_index_buffer",
 	"MaskedLoss": "masked_loss", "Conv1d": "conv1d", "Conv1dGEMM": "conv1d_gemm",
 	"GroupNorm": "group_norm", "LayerNorm": "layer_norm", "Softmax": "softmax", "LogSoftmax": "log_softmax",
+	"RMSNormLast": "rms_norm_last",
 	"Dropout": "dropout", "ScaledDotProductAttention": "attention", "CrossEntropy": "cross_entropy",
 	"BiasGELU": "bias_gelu", "BiasResidual": "bias_residual",
 }
