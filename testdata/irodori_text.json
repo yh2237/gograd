@@ -1,0 +1,50 @@
+[
+  {
+    "input": "「（ﾃｽﾄ！）...」",
+    "output": "(テスト!)…"
+  },
+  {
+    "input": "【「今日は〜いい天気です？」】",
+    "output": "今日はーいい天気です?"
+  },
+  {
+    "input": "　[ n ]\t[n]　",
+    "output": "[ n ]"
+  },
+  {
+    "input": "『あ…...…い』",
+    "output": "あ………い"
+  },
+  {
+    "input": "「あ」い",
+    "output": "「あ」い"
+  },
+  {
+    "input": "(abc)",
+    "output": "abc"
+  },
+  {
+    "input": "(a)(b)",
+    "output": "(a)(b)"
+  },
+  {
+    "input": "㌔㍍①②－―",
+    "output": "キロメートル-"
+  },
+  {
+    "input": "\n  あ  \n",
+    "output": "\n  あ  \n"
+  },
+  {
+    "input": "(（あ）)",
+    "output": "あ"
+  },
+  {
+    "input": "《VOICE▼ACTRESS》",
+    "output": "VOICEACTRESS"
+  },
+  {
+    "input": "⏩[n]こんにちは！",
+    "output": "⏩こんにちは!"
+  }
+]
