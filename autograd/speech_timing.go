@@ -110,6 +110,21 @@ type SpeechTimingMultiHead struct {
 // NewSpeechTimingMultiHead builds the mel trunk plus a context-only F0 trunk.
 // f0Context is the width of the F0-branch continuous input (position and duration).
 func NewSpeechTimingMultiHead(phones, continuous, f0Context int, device tensor.Device, seed int64) (*SpeechTimingMultiHead, error) {
+	return NewSpeechTimingMultiHeadWithF0Dilations(phones, continuous, f0Context, SpeechTimingDilations, device, seed)
+}
+
+// NewSpeechTimingMultiHeadWithF0Dilations is NewSpeechTimingMultiHead with a custom
+// dilation schedule for the F0 trunk, which sets how much sentence context the F0
+// and energy heads see. The mel trunk keeps SpeechTimingDilations.
+func NewSpeechTimingMultiHeadWithF0Dilations(phones, continuous, f0Context int, f0Dilations []int, device tensor.Device, seed int64) (*SpeechTimingMultiHead, error) {
+	if len(f0Dilations) == 0 {
+		return nil, fmt.Errorf("autograd: empty f0 dilation schedule")
+	}
+	for _, d := range f0Dilations {
+		if d < 1 {
+			return nil, fmt.Errorf("autograd: invalid f0 dilation %d", d)
+		}
+	}
 	if continuous < 1 {
 		return nil, fmt.Errorf("autograd: invalid continuous width")
 	}
@@ -150,7 +165,7 @@ func NewSpeechTimingMultiHead(phones, continuous, f0Context int, device tensor.D
 		return nil, e
 	}
 	m.Module.Children = append(m.Module.Children, NamedModule{"f0_inp", m.F0Input.StateModule()})
-	for i, d := range SpeechTimingDilations {
+	for i, d := range f0Dilations {
 		block, e := NewConv1dLayer(128, 128, 5, d, device, rng)
 		if e != nil {
 			return nil, e

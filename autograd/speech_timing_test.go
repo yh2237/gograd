@@ -277,3 +277,37 @@ func TestSpeechTimingCheckpointMetadata(t *testing.T) {
 		checkSpeechValues(t, name, loaded[name], values, 0)
 	}
 }
+
+func TestSpeechTimingMultiHeadCustomF0Dilations(t *testing.T) {
+	dilations := []int{1, 2, 4, 8, 16, 32, 64}
+	m, e := NewSpeechTimingMultiHeadWithF0Dilations(44, 4, 2, dilations, tensor.CPU, 0)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if len(m.F0Blocks) != len(dilations) || len(m.Blocks) != len(SpeechTimingDilations) {
+		t.Fatalf("blocks: f0 %d mel %d", len(m.F0Blocks), len(m.Blocks))
+	}
+	names := map[string]bool{}
+	for _, p := range m.Parameters() {
+		names[p.Name] = true
+	}
+	if !names["f0_blocks.6.weight"] || names["f0_blocks.7.weight"] {
+		t.Fatal("f0 block parameters do not follow the dilation schedule")
+	}
+	cont, e := New(make([]float32, 1*300*4), []int{1, 300, 4}, tensor.CPU, false)
+	if e != nil {
+		t.Fatal(e)
+	}
+	f0Cont, e := New(make([]float32, 1*300*2), []int{1, 300, 2}, tensor.CPU, false)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, f0, _ := m.Forward(make([]int, 300*3), cont, f0Cont, 1); f0.Shape[1] != 300 {
+		t.Fatalf("f0 shape %v", f0.Shape)
+	}
+	for _, bad := range [][]int{nil, {1, 0}} {
+		if _, e := NewSpeechTimingMultiHeadWithF0Dilations(44, 4, 2, bad, tensor.CPU, 0); e == nil {
+			t.Fatalf("dilations %v were accepted", bad)
+		}
+	}
+}
