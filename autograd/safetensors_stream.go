@@ -9,6 +9,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"sync"
 )
 
 // SafeTensorFile reads individual F32 tensors without retaining the full
@@ -18,6 +19,8 @@ type SafeTensorFile struct {
 	dataBase int64
 	entries  map[string]safeHeader
 	Metadata map[string]string
+	cacheMu  sync.RWMutex
+	cache    map[string][]float32
 }
 
 // OpenSafeTensorFile validates the complete safetensors index before exposing
@@ -120,6 +123,12 @@ func (s *SafeTensorFile) ReadF32(name string) ([]float32, []int, error) {
 	if !ok {
 		return nil, nil, fmt.Errorf("autograd: missing tensor %s", name)
 	}
+	s.cacheMu.RLock()
+	if values, ok := s.cache[name]; ok {
+		s.cacheMu.RUnlock()
+		return values, slices.Clone(h.Shape), nil
+	}
+	s.cacheMu.RUnlock()
 	n := (h.Offsets[1] - h.Offsets[0]) / 4
 	raw := make([]byte, n*4)
 	if _, err := s.file.ReadAt(raw, s.dataBase+int64(h.Offsets[0])); err != nil {
@@ -130,6 +139,41 @@ func (s *SafeTensorFile) ReadF32(name string) ([]float32, []int, error) {
 		values[i] = math.Float32frombits(encodingbinary.LittleEndian.Uint32(raw[i*4:]))
 	}
 	return values, slices.Clone(h.Shape), nil
+}
+
+// PreloadF32 keeps selected checkpoint tensors resident in host memory.
+// Cached slices returned by ReadF32 are shared and must be treated as read-only.
+// Passing no names preloads the entire checkpoint. Call before concurrent reads.
+func (s *SafeTensorFile) PreloadF32(names ...string) error {
+	if len(names) == 0 {
+		names = s.Names()
+	}
+	for _, name := range names {
+		values, _, err := s.ReadF32(name)
+		if err != nil {
+			return err
+		}
+		s.cacheMu.Lock()
+		if s.cache == nil {
+			s.cache = make(map[string][]float32, len(names))
+		}
+		if _, ok := s.cache[name]; !ok {
+			s.cache[name] = values
+		}
+		s.cacheMu.Unlock()
+	}
+	return nil
+}
+
+// CachedBytes reports the host memory retained by PreloadF32.
+func (s *SafeTensorFile) CachedBytes() int64 {
+	s.cacheMu.RLock()
+	defer s.cacheMu.RUnlock()
+	var bytes int64
+	for _, v := range s.cache {
+		bytes += int64(len(v)) * 4
+	}
+	return bytes
 }
 
 // LoadSafeTensorsStream loads an exact F32 state dict one tensor at a time.

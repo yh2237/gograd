@@ -26,6 +26,20 @@ func TestSafeTensorStream(t *testing.T) {
 	if s.Metadata["format"] != "test" || !slices.Equal(s.Names(), []string{"block.bias", "block.weight"}) {
 		t.Fatal("invalid index")
 	}
+	if err := s.PreloadF32("block.bias"); err != nil {
+		t.Fatal(err)
+	}
+	first, _, err := s.ReadF32("block.bias")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := s.ReadF32("block.bias")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.CachedBytes() != 8 || &first[0] != &second[0] {
+		t.Fatal("resident tensor was reloaded")
+	}
 	s.Close()
 	w, err := Zeros([]int{2, 2}, tensor.CPU, true)
 	if err != nil {
