@@ -50,10 +50,10 @@ must load the original weights and reproduce outputs before replacing Python.
 | Stage | Verified in Go | Open gate |
 | --- | --- | --- |
 | Text | Cached ModernBERT-ja Unigram tokenizer matches 65 reference cases, including BOS, padding and truncation; streamed 25-layer ModernBERT and both text/caption projectors match real-checkpoint hidden-state slices | Encoder training/backward and optimized CUDA execution |
-| DiT/duration | Streamed real-checkpoint 12-block denoiser and token-sum duration predictor match fixed encoded-condition PyTorch forwards; reusable graph RoPE, GeGLU, SwiGLU, masked attention and embedding pass CPU/CUDA forward fixtures | End-to-end encoded conditions from real reference latents, DiT training/backward and optimized CUDA execution |
-| RF | Linear/sway grid and temporal score rescale fixtures | Seeded PyTorch noise, CFG branch combinations and Euler loop |
-| Reference/audio | No codec inference yet | WAV normalization/resample, latent encoder, DACVAE encode/decode and `.pth` conversion |
-| Output | No Go waveform produced | SilentCipher watermark and end-to-end waveform parity |
+| DiT/duration | Integrated raw text/caption, eight-clip speaker context, real-checkpoint denoiser and duration parity; 1.463 GB DiT host cache reduces repeated forward time | DiT training/backward and complete CUDA execution |
+| RF | Injected PyTorch seed noise, sway/linear grid, independent/joint/alternating CFG and Euler loop; three-step real-checkpoint final-latent fixture | Native PyTorch CPU/CUDA RNG reproduction, longer/full-sentence sampler parity, optional score rescale and speaker KV scaling |
+| Reference/audio | WAV and K-weighted loudness normalization, torchaudio-compatible 44.1-to-48 kHz resampling, deterministic DACVAE encode, reference latent encoder, safe `.pth` conversion and deterministic decoder parity | More input rate/channel fixtures and faster codec kernels |
+| Output | One-step 2.32-second sentence reaches waveform sample parity internally | SilentCipher `IRDTS` watermark and production 40-step/full CUDA parity; CLI refuses WAV output |
 
 For a 256x1024 RMSNorm microbenchmark this round, standalone Go CPU took
 419,073 ns/op, reusable graph Go CPU took 3,170,007 ns/op, and PyTorch CPU
@@ -86,3 +86,75 @@ duration, and 4172 ms for DiT. These were not paired steady-state benchmarks;
 Go pays file reads on every call, and the first PyTorch duration call includes
 warmup. Cache weights and add fused CPU/CUDA kernels before treating the ratios
 as representative inference performance.
+
+## Reference audio and integrated inference progress (2026-10-08)
+
+The read-only cached DACVAE `weights.pth` can be converted with
+`tools/convert_irodori_codec.py SOURCE.pth DEST.safetensors`, where the
+destination **must be outside this repository**. The converter uses
+`torch.load` only on the trusted local checkpoint, folds weight normalization
+into F32 convolution weights, and writes safetensors with the model kwargs in
+metadata. No checkpoint weights or converted weights belong in test fixtures.
+`IRODORI_CODEC_SAFE` selects that local converted file for Go parity tests.
+
+The eight specified 48 kHz PCM reference WAVs pass Go loading and K-weighted
+loudness normalization parity. A 44.1-to-48 kHz real-clip excerpt matches
+torchaudio's default sinc resampler to 2.98e-8 max absolute error. The AudioTools/Julius loudness window includes
+a zero-padded trailing block, which matters for short clips. A four-frame
+DACVAE decoder waveform segment matches PyTorch to 1.13e-6 max absolute
+error (Go 968 ms, PyTorch 678 ms). The speaker encoder on the eight-clip
+PyTorch latent fixture matches sampled speaker-state values to 2.98e-6
+(Go 1.58 s, PyTorch 166 ms). End-to-end loading and encoding of all eight
+WAVs matches every stored latent element to 6.18e-5 maximum absolute error;
+the sampled final speaker state differs by at most 4.41e-6. The Go codec and
+speaker passes took 93.2 s and 1.50 s in that run.
+
+Raw Japanese text and caption plus the eight-clip latent fixture feed the
+shared ModernBERT, projectors, speaker encoder, 12-block DiT and duration
+predictor in one Go call. Sampled denoiser velocity differs from PyTorch by
+7.36e-6 and duration matches at reported F32 precision. A three-step sway
+Euler sample with independent text/speaker/caption CFG and injected PyTorch
+seed noise differs by 0.00107 on sampled final-latent elements. The same
+real-checkpoint three-step fixture reaches 1.97e-6 for joint CFG and
+1.24e-5 for alternating CFG. The larger independent-CFG difference still
+needs a branch-by-branch audit of the reference's batched evaluation. The RNG is
+still injected from a small fixture; Go does not yet reproduce PyTorch's
+generator bit-for-bit. This is a short numerical parity case, not a
+full-sentence audio benchmark.
+
+`PreloadDenoiser` retains 1,462,937,728 bytes of F32 DiT weights in host RAM
+for repeated sampling calls. In one four-frame CPU comparison, streamed and
+resident calls took 3,428 ms and 2,520 ms, with identical output; preloading
+took 1,401 ms. `LinearRowsCUDA` exercises the existing CUDA matmul kernel
+with per-layer uploads, matching one real-checkpoint projection to 1.19e-7.
+For that 4x32-to-1280 projection, 20 repeated Go CUDA calls averaged
+0.209 ms each with upload/readback; PyTorch CUDA averaged 0.064 ms with
+resident input/weight and synchronized output. The transfer difference makes
+this a path smoke test, not a comparable model-level throughput claim.
+One 2.32-second sentence with all eight raw reference WAVs, raw text/caption,
+predicted 116 latent steps, one independent-CFG Euler step and DACVAE decode
+matches PyTorch final-latent slices to 3.40e-5 and 256 sampled waveform
+points to 4.43e-5 max absolute error. Go CPU stages took 92.6 s for eight
+codec encodes, 4.42 s conditioning, 0.89 s DiT preloading, 99.4 s sampling
+and 14.3 s decoding (212 s test total). PyTorch CPU took 14.4 s, 1.33 s and
+2.95 s for codec, sampler and decoder, respectively; its conditioning cost
+was not separately measured in that full run. These are single-run timings.
+The F32 DiT/ModernBERT/speaker checkpoint occupies about 3.06 GB before
+intermediates, so an all-CUDA run would exceed the shared ~3 GB budget.
+End-to-end CUDA execution and a 40-step full sentence comparison remain open.
+The same full sentence through the mixed backend (CPU codec, text encoder,
+attention and norms; CUDA DiT dense projections) had 4.03e-5 final-latent
+slice error and 4.50e-5 sampled waveform error. Its Go sampler took 94.2 s;
+the other stages took 90.7 s for codec, 4.19 s for conditioning, 0.91 s
+for preloading and 14.6 s for decode (205 s test total). A corresponding
+PyTorch F32 CUDA DiT-only one-step batched CFG call took 2.79 s and peaked
+at 1,531,809,280 allocated GPU bytes; its first latent slice differed from
+the CPU reference fixture by 1.14e-5. The Go path transfers each projection
+separately and evaluates CFG branches serially, so the GPU matmul does not
+yet offset CPU attention and transfer costs. This comparison isolates the
+denoiser stage and is not an end-to-end PyTorch CUDA benchmark.
+
+**Release gate:** the Go CLI continues to refuse WAV output. The reference
+pipeline applies a SilentCipher `IRDTS` watermark to generated audio. Port
+and verify it before exposing any output WAV. More input audio formats and
+production 40-step waveform parity remain open as well.

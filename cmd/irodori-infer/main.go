@@ -32,7 +32,7 @@ func run(args []string) error {
 	fs.StringVar(&output, "out", "", "output WAV path (currently disabled)")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: irodori-infer -text TEXT -ref WAV -seed N -checkpoint MODEL -out WAV")
-		fmt.Fprintln(os.Stderr, "Status: preflight only. Reference-latent/audio path, RF sampler, DACVAE and SilentCipher IRDTS watermark are not ported; no WAV is written.")
+		fmt.Fprintln(os.Stderr, "Status: preflight only. Reference conditioning, resampling, DACVAE and RF sampler have parity fixtures; full CUDA inference and SilentCipher IRDTS watermark remain open. No WAV is written.")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -56,7 +56,7 @@ func run(args []string) error {
 	}
 	defer s.Close()
 	fmt.Fprintf(os.Stderr, "preflight: normalized_text=%q references=%d seed=%d checkpoint_tensors=%d\n", irodori.NormalizeText(text), len(refs), seed, len(s.Names()))
-	return errors.New("inference unavailable: reference-latent/audio path, RF sampler, DACVAE and SilentCipher IRDTS watermark need parity verification; no WAV written")
+	return errors.New("inference unavailable: SilentCipher IRDTS watermark is required before writing audio; full CUDA inference remains open; no WAV written")
 }
 
 func main() {
