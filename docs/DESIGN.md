@@ -243,3 +243,52 @@ For fixed-shape Acoustic training, the final three paired CUDA runs measured
 medians of 77.3 ms before and 77.8 ms after, a 0.7% difference. Earlier pairs
 were slower for both binaries as device load changed. Remaining pool work includes
 multi-device isolation and an optional driver-level free/total memory query.
+
+## Irodori-TTS v4.1-Small inference inventory (2026-10-08)
+
+The read-only reference is `irodori_tts` in UtauTTS's Irodori checkout. Its
+v4.1-Small safetensors file has 714 F32 tensors and embeds both model and
+ModernBERT configuration JSON. The model is 12 DiT blocks at width 1280 with
+20 heads, a 32-dimensional latent, text and caption context width 512,
+speaker context width 768, speaker patch size 4, and AdaLN rank 192. The
+pretrained text and caption backbone is the 25-layer, width-768
+`sbintuitions/modernbert-ja-310m` (HF Transformers 5.12.1 configuration).
+The codec is a separate `weights.pth`, not safetensors. The following is the
+complete runtime path and the gap against gograd as of this inventory:
+
+| Stage | Reference behavior | gograd status / required work |
+| --- | --- | --- |
+| Text input | Ordered Japanese substitutions, bracket stripping, NFKC; HF fast tokenizer from `tokenizer.json`, BOS prepend, right padding/truncation to 256 text or 512 caption tokens | Normalization has a 12-case reference fixture; HF tokenizer JSON and token-ID fixtures remain open. The normalization function itself preserves ordinary whitespace. |
+| Text/caption encoding | ModernBERT shared backbone, alternating full and 128-token sliding attention, two RoPE theta values (160000 and 10000), GELU MLP, RMS/normalization details, residual MLP projectors | General attention, linear, embedding, GELU and layer norm exist; ModernBERT architecture, sliding mask, RoPE variants, and checkpoint naming are missing. |
+| Reference audio | WAV load, mono mix, resample to 48 kHz, AudioTools loudness normalization to -16 dB and peak limiting, deterministic DACVAE encode (encoder plus quantizer mean), patch/mask/clip/concat of up to eight reference clips | WAV/resampler/loudness parity and DACVAE encoder are missing. Latent reshape alone is straightforward. |
+| Speaker context | ReferenceLatentEncoder: projected 32-dim latents, 4-token speaker patches, transformer self-attention with RoPE, gated attention, SwiGLU and RMSNorm | Gograd attention is reusable conceptually, but gated attention, RMSNorm, RoPE and model module are absent from its graph. CPU standalone RMSNorm/RoPE primitives now have PyTorch fixtures. |
+| Duration | 14 text features, text token states, speaker/caption pooling/fusion, 3-layer token-sum dual AdaRN-zero duration predictor; `expm1` and frame-to-seconds clamp | Feature construction now has CPU fixture parity. Predictor, pooling, fusion and length parity are open. |
+| DiT | Timestep cosine/sine embedding (512), latent input/output projections, 12 blocks with joint self+text+speaker+caption attention; Q/K RMSNorm, RoPE on half the heads, gated projection, context KV cache, SwiGLU and Low-Rank AdaLN with three shift/scale/gate low-rank paths | Timestep embedding, RMSNorm, full-head RoPE and Low-Rank AdaLN standalone CPU primitives have fixtures. Half-head RoPE, multi-segment masks, cached KV, SwiGLU and complete blocks require implementation and layer-by-layer fixtures. Existing generic MHA does not have these exact semantics. |
+| RF sampler | Seeded PyTorch normal latent, 40-step Euler 0.999-to-0 grid (optional sway), independent/joint/alternating text/speaker/caption CFG in a time window, optional truncation, temporal score rescale and speaker KV scaling | Schedule and temporal score rescale have CPU fixture parity. PyTorch RNG equivalence, all CFG modes and the complete Euler loop are open. |
+| Decoder/output | Unpatch latents, optional flat-tail trim, DACVAE decoder with deterministic message path and disabled codec watermark branch, trim to target sample count, SilentCipher `IRDTS` watermark, WAV write | DACVAE decoder and `.pth` loading, tail trim, watermark model, and audio parity are open. A generated WAV must not be called a drop-in reference output until SilentCipher is handled. |
+
+`autograd.OpenSafeTensorFile` now validates a safetensors F32 index and reads
+one named tensor at a time; `Module.LoadSafeTensorsStream` validates all state
+names/shapes before copying. This avoids the existing all-file host read for
+the multi-GB checkpoint. A small tensor from the real 714-tensor file was
+dumped with `tools/gen_irodori_checkpoint_fixture.py` for exact byte/value
+parity. The model modules are not yet built, so the full state dict cannot be
+loaded into a runnable graph. CUDA work must stay below about 2 GB until the
+other batch-generation job releases the 8 GB device.
+
+Parity fixtures are generated with `tools/gen_irodori_fixture.py` from the
+read-only Python implementation; this script needs no checkpoint. The current
+CPU primitives and checkpoint indexing are foundations for a future Go-only
+runtime, not a working TTS synthesizer. Whole-model numerical parity, a Go
+inference CLI, real WAV output, and CPU/CUDA throughput comparison remain open.
+
+Measured CPU fixture errors: RMSNorm and three duration-feature rows have
+zero max-absolute error; full-head RoPE and sway schedule each have
+`1.1920929e-7`; timestep embedding and temporal score rescale each have
+`5.96046448e-8`; Low-Rank AdaLN output and gate have `2.38418579e-7` and
+`5.96046448e-8`; linear schedule has zero error. The selected real checkpoint
+tensor has zero max-absolute and relative error. A 256x1024 RMSNorm microbenchmark
+on the i5-12400 measured 504,573 ns/op for Go (100 iterations) and a
+285,800 ns/op median for PyTorch (100 iterations, one thread). These are
+separate microbenchmarks, not a full-model speed comparison; no CUDA benchmark
+was run while the device was occupied.
