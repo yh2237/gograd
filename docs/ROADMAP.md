@@ -49,8 +49,8 @@ must load the original weights and reproduce outputs before replacing Python.
 
 | Stage | Verified in Go | Open gate |
 | --- | --- | --- |
-| Text | Ordered normalization has a 12-case fixture from the reference; duration features have PyTorch fixtures | HF fast tokenizer `tokenizer.json` token IDs, padding/truncation, full text/caption encoder |
-| DiT/duration | Standalone RMSNorm, RoPE, timestep, Low-Rank AdaLN and duration features have CPU fixtures; reusable graph RMSNorm has CPU/CUDA forward parity | Full modules, intermediate layer parity, complete checkpoint mapping |
+| Text | Cached ModernBERT-ja Unigram tokenizer matches 65 reference cases, including BOS, padding and truncation; streamed 25-layer ModernBERT and both text/caption projectors match real-checkpoint hidden-state slices | Encoder training/backward and optimized CUDA execution |
+| DiT/duration | Streamed real-checkpoint 12-block denoiser and token-sum duration predictor match fixed encoded-condition PyTorch forwards; reusable graph RoPE, GeGLU, SwiGLU, masked attention and embedding pass CPU/CUDA forward fixtures | End-to-end encoded conditions from real reference latents, DiT training/backward and optimized CUDA execution |
 | RF | Linear/sway grid and temporal score rescale fixtures | Seeded PyTorch noise, CFG branch combinations and Euler loop |
 | Reference/audio | No codec inference yet | WAV normalization/resample, latent encoder, DACVAE encode/decode and `.pth` conversion |
 | Output | No Go waveform produced | SilentCipher watermark and end-to-end waveform parity |
@@ -62,3 +62,27 @@ synchronized host readback per call, reusable graph Go CUDA took 849,393 ns/op
 and PyTorch CUDA took 245,700 ns/op. These separate runs are sensitive to
 shared GPU load and do not measure full-model inference. The graph composition
 needs a fused kernel before it is a competitive RMSNorm implementation.
+
+## Checkpoint-backed inference progress (2026-10-08)
+
+`irodori.ModernBERT` streams the 25-layer F32 backbone; `Project` applies the
+checkpoint's text/caption residual MLP projectors and final RMSNorm. On three
+fixture lengths (16, 32, 160), final-hidden-state slice max absolute errors
+were 3.34e-6, 1.79e-6, and 2.98e-6. Text/caption projector slice errors
+stayed below 2.87e-6. The 160-token case exercises local attention.
+
+`CheckpointDurationPredictor` matches two real-checkpoint cases to at most
+2.38e-7 absolute error. `CheckpointDiT` matches all 128 values of one
+12-block denoiser forward to 1.16e-5 maximum absolute error. These stage-three
+fixtures supply fixed already-encoded text, speaker and caption states. They
+verify the full duration and DiT modules but do not verify the reference
+latent encoder or an integrated prompt-to-latent call.
+
+Reference fixture timings (CPU, PyTorch, six threads) were 74.7/85.2/304.2 ms
+for ModernBERT at 16/32/160 tokens, 211.5 ms cold and 4.68 ms warm for the
+duration cases, and 336.2 ms for the DiT forward. Go CPU streamed weights on
+each call: 1549/1721/2908 ms for the encoder and projectors, 195/163 ms for
+duration, and 4172 ms for DiT. These were not paired steady-state benchmarks;
+Go pays file reads on every call, and the first PyTorch duration call includes
+warmup. Cache weights and add fused CPU/CUDA kernels before treating the ratios
+as representative inference performance.

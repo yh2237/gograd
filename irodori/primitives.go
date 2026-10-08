@@ -1,5 +1,5 @@
-// Package irodori contains CPU inference primitives for Irodori-TTS.
-// The full checkpoint graph and audio codec are not implemented yet.
+// Package irodori contains checkpoint-backed CPU inference components for
+// Irodori-TTS. Reference audio encoding and waveform generation remain open.
 package irodori
 
 import (
