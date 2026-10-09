@@ -14,6 +14,15 @@
 // The streams are bit-exact for the same seed, element count and dtype. A
 // state captured from Python is not byte-compatible: use State and SetState
 // to move a generator inside Go.
+//
+// Bit-exactness also depends on how the target compiles floating point. Go
+// permits an implementation to contract a multiply and an add into one fused
+// operation, and on arm64 the compiler does that by default while amd64's
+// baseline does not. The reference's amd64 kernels use separate multiply and
+// add, so every product-then-sum in the cephes chains and the uniform
+// transforms goes through mulAdd32 or mulAdd64 instead of a bare expression.
+// That is why the code reads the way it does, and it is worth keeping if this
+// file is ever simplified.
 package torchrng
 
 import "math"
@@ -154,14 +163,27 @@ func uniform32(v uint32, from, to float32) float32 {
 	const mask = 0x00ffffff
 	const divisor = float32(1) / float32(uint32(1)<<24)
 	x := float32(v&mask) * divisor
-	return x*(to-from) + from
+	// The reference writes this as one product followed by one sum.
+	return mulAdd32(x, to-from, from)
 }
+
+// product64 exists to keep a float64 multiply and its following add as two
+// roundings. Go may contract the pair into a fused operation on some
+// architectures, as mulAdd32 documents, and float64 has no wider type to widen
+// into, so the product goes through a call the compiler cannot fold.
+//
+//go:noinline
+func product64(a, b float64) float64 { return a * b }
+
+// mulAdd64 evaluates a*b+c with the separate roundings of a float64 multiply
+// and add, matching the reference's serial Box-Muller.
+func mulAdd64(a, b, c float64) float64 { return product64(a, b) + c }
 
 func uniform64(v uint64, from, to float64) float64 {
 	const mask = (uint64(1) << 53) - 1
 	const divisor = 1.0 / float64(uint64(1)<<53)
 	x := float64(v&mask) * divisor
-	return x*(to-from) + from
+	return mulAdd64(x, to-from, from)
 }
 
 // Normal fills dst with torch.randn(*dst.shape, mean=mean, std=std) for a
@@ -227,7 +249,7 @@ func (g *Generator) uniform64Into(dst []float64) {
 func (g *Generator) normalSerial64(mean, std float64) float64 {
 	if g.cachedFloat64 {
 		g.cachedFloat64 = false
-		return g.nextFloat64*std + mean
+		return mulAdd64(g.nextFloat64, std, mean)
 	}
 	u1 := uniform64(g.Uint64(), 0, 1)
 	u2 := uniform64(g.Uint64(), 0, 1)
@@ -236,5 +258,5 @@ func (g *Generator) normalSerial64(mean, std float64) float64 {
 	sin, cos := math.Sincos(theta)
 	g.nextFloat64 = r * sin
 	g.cachedFloat64 = true
-	return r*cos*std + mean
+	return mulAdd64(r*cos, std, mean)
 }

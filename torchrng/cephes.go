@@ -46,6 +46,10 @@ const (
 
 // log256 is log256_ps. Non-positive input returns the same negative NaN the
 // intrinsic produces by OR-ing an all-ones mask into the result.
+//
+// Every product-then-sum passes through mulAdd32, because a compiler may
+// contract the two into one fused operation and the reference's separate
+// _mm256_mul_ps and _mm256_add_ps do not. See mulAdd32.
 func log256(x float32) float32 {
 	if x <= 0 {
 		return math.Float32frombits(0xffffffff)
@@ -79,25 +83,26 @@ func log256(x float32) float32 {
 
 	z := x * x
 	y := float32(logP0)
-	y = y*x + logP1
-	y = y*x + logP2
-	y = y*x + logP3
-	y = y*x + logP4
-	y = y*x + logP5
-	y = y*x + logP6
-	y = y*x + logP7
-	y = y*x + logP8
+	y = mulAdd32(y, x, logP1)
+	y = mulAdd32(y, x, logP2)
+	y = mulAdd32(y, x, logP3)
+	y = mulAdd32(y, x, logP4)
+	y = mulAdd32(y, x, logP5)
+	y = mulAdd32(y, x, logP6)
+	y = mulAdd32(y, x, logP7)
+	y = mulAdd32(y, x, logP8)
 	y = y * x
 	y = y * z
-	y += e * logQ1
-	y -= z * 0.5
-	x += y
-	x += e * logQ2
+	y = mulAdd32(e, logQ1, y)
+	y = mulAdd32(z, -0.5, y)
+	x = add32(x, y)
+	x = mulAdd32(e, logQ2, x)
 	return x
 }
 
 // sincos256 is sincos256_ps for a theta in [0, 2*pi), which is the only range
-// Box-Muller produces.
+// Box-Muller produces. Its argument reductions and polynomial chains keep the
+// reference's separate multiply and add roundings, as mulAdd32 documents.
 func sincos256(theta float32) (sin, cos float32) {
 	original := math.Float32bits(theta)
 	absolute := math.Float32frombits(original & invSignBit)
@@ -115,9 +120,9 @@ func sincos256(theta float32) (sin, cos float32) {
 
 	signSin = xorSign(signSin, swapSin)
 
-	r := absolute + quadrant*dp1
-	r += quadrant * dp2
-	r += quadrant * dp3
+	r := mulAdd32(quadrant, dp1, absolute)
+	r = mulAdd32(quadrant, dp2, r)
+	r = mulAdd32(quadrant, dp3, r)
 
 	// The cosine sign comes from (quadrant - 2), with the low bits of two pi
 	// cleared, not from the quadrant itself.
@@ -125,19 +130,19 @@ func sincos256(theta float32) (sin, cos float32) {
 
 	z := r * r
 	c := float32(coscof0)
-	c = c*z + coscof1
-	c = c*z + coscof2
+	c = mulAdd32(c, z, coscof1)
+	c = mulAdd32(c, z, coscof2)
 	c = c * z
 	c = c * z
-	c -= z * 0.5
-	c += 1
+	c = mulAdd32(z, -0.5, c)
+	c = add32(c, 1)
 
 	s := float32(sincof0)
-	s = s*z + sincof1
-	s = s*z + sincof2
+	s = mulAdd32(s, z, sincof1)
+	s = mulAdd32(s, z, sincof2)
 	s = s * z
 	s = s * r
-	s = s + r
+	s = add32(s, r)
 
 	// Even quadrants select the sine polynomial for sine and the cosine
 	// polynomial for cosine; odd quadrants swap them. The reference stores the
@@ -187,10 +192,30 @@ func normalFill16Scalar(d []float64, mean, std float64) {
 	}
 }
 
-// fma32 evaluates a*b+c with a single rounding, matching _mm256_fmadd_ps. The
-// float64 intermediate makes the transform exact: the product of two float32
-// values fits in 53 bits, and double rounding from float64 to float32 is
-// innocuous because float64 carries more than 2*24+2 bits.
+// mulAdd32 evaluates a*b+c with the two separate roundings of a float32
+// multiply followed by a float32 add, which is what the reference's
+// _mm256_mul_ps and _mm256_add_ps produce.
+//
+// This cannot be written as a*b+c in Go, because the language permits an
+// implementation to contract a multiply and an add into one fused operation,
+// and on arm64 the compiler does exactly that while amd64's baseline does not.
+// The fused result differs from the two-rounding one by one ulp, which is
+// visible in the sampled values. Rounding the product to float32 first forces
+// the multiply to be observed by the add, and the float64 intermediate is exact:
+// a product of two float32 values fits in 53 bits, and double rounding from
+// float64 is innocuous when it carries more than 2*24+2 bits.
+func mulAdd32(a, b, c float32) float32 {
+	product := float32(float64(a) * float64(b))
+	return float32(float64(product) + float64(c))
+}
+
+// add32 evaluates a+b with the two operands observed separately, for sums whose
+// addend is itself a product. The float64 conversions force the product to be
+// materialized, which a compiler would otherwise contract into a fused
+// multiply-add on some architectures.
+func add32(a, b float32) float32 { return float32(float64(a) + float64(b)) }
+
+// fma32 evaluates a*b+c with a single rounding, matching _mm256_fmadd_ps.
 func fma32(a, b, c float32) float32 {
-	return float32(float64(a)*float64(b) + float64(c))
+	return float32(math.FMA(float64(a), float64(b), float64(c)))
 }

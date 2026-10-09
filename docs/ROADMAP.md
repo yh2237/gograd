@@ -225,6 +225,18 @@ should. `TestStreamParity` pins both against 88 recorded streams covering eight
 seeds and lengths around the block boundary, including the exact 3712-element
 Irodori noise.
 
+The first push failed CI on macOS with one-ulp differences, which is worth
+recording because it will bite again. Go permits an implementation to contract a
+multiply and an add into a single fused operation, and the arm64 compiler does
+that by default while amd64's baseline does not; the reference's amd64 kernels use
+separate multiply and add. Every product-then-sum in the cephes chains and the
+uniform transforms now goes through `mulAdd32` or `mulAdd64`, which round the
+product to float32 first and so cannot be folded. The remaining fused
+multiply-adds in `torchrng` are the three places the reference itself uses one.
+The same hazard applies anywhere else the code base evaluates a polynomial in
+float32, including the DiT's RoPE rotation, but only `torchrng` asserts bit
+exactness, so only it has been rewritten.
+
 ## SilentCipher IRDTS watermark (2026-10-09)
 
 The watermark is not a HiFi-GAN vocoder. It is an AudioSeal-style model that
