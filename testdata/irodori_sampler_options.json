@@ -1,0 +1,1 @@
+{"cases":[{"name":"baseline","values":128,"offset":0},{"name":"truncation","values":128,"offset":512},{"name":"rescale","values":128,"offset":1024},{"name":"speaker_kv","values":128,"offset":1536},{"name":"speaker_kv_floor","values":128,"offset":2048},{"name":"speaker_kv_layers","values":128,"offset":2560},{"name":"all","values":128,"offset":3072}]}

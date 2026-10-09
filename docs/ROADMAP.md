@@ -51,7 +51,7 @@ must load the original weights and reproduce outputs before replacing Python.
 | --- | --- | --- |
 | Text | Cached ModernBERT-ja Unigram tokenizer matches 65 reference cases, including BOS, padding and truncation; streamed 25-layer ModernBERT and both text/caption projectors match real-checkpoint hidden-state slices | Encoder training/backward and optimized CUDA execution |
 | DiT/duration | Integrated raw text/caption, eight-clip speaker context, real-checkpoint denoiser and duration parity; 1.463 GB DiT host cache reduces repeated forward time | DiT training/backward and complete CUDA execution |
-| RF | Injected PyTorch seed noise, sway/linear grid, independent/joint/alternating CFG and Euler loop; three-step real-checkpoint final-latent fixture, with the independent residual traced to float32 guidance amplification | Native PyTorch CPU/CUDA RNG reproduction, longer/full-sentence sampler parity, optional score rescale and speaker KV scaling |
+| RF | Injected PyTorch seed noise, sway/linear grid, independent/joint/alternating CFG and Euler loop; three-step real-checkpoint final-latent fixture, with the independent residual traced to float32 guidance amplification; optional truncation, temporal score rescaling and speaker key/value scaling | Native PyTorch CPU/CUDA RNG reproduction, longer/full-sentence sampler parity, optional score rescale and speaker KV scaling |
 | Reference/audio | WAV and K-weighted loudness normalization, torchaudio-compatible 44.1-to-48 kHz resampling, deterministic DACVAE encode, reference latent encoder, safe `.pth` conversion and deterministic decoder parity | More input rate/channel fixtures and faster codec kernels |
 | Output | SilentCipher `IRDTS` watermark ported with per-stage parity, and `dsp.Resample` generalized to any rate pair so the 48-to-44.1 kHz round trip is exact | Remaining output gap is a WAV writer; the CLI still refuses to write audio because production waveform parity is unverified |
 
@@ -260,3 +260,27 @@ from any carrier I tried, including its own watermarked output from this one. Th
 Irodori pipeline never calls it, so encode is all the release gate needs, but a
 decode round trip is unverified and the watermark should not be claimed as
 detectable until it is.
+
+## Sampler refinements (2026-10-09)
+
+The reference's sampler exposes three refinements beyond its grid and guidance,
+all now ported and checked against its own loop over the same three-step sway
+grid: `TruncationFactor` scales the initial noise before the first step,
+`RescaleK`/`RescaleSigma` apply temporal score rescaling after guidance, and
+`SpeakerKVScale` multiplies the speaker context's keys and values.
+
+The speaker option needed care, because the reference implements it against a
+precomputed context cache that gograd does not keep. The cache turns out to be a
+pure memoization of the same per-block projections, so multiplying the
+recomputed ones is equivalent bit for bit — provided the factor is applied
+*after* the key normalization, which is nonlinear, rather than to the speaker
+state. Two asymmetries matter too: only the first `max_layers` blocks are scaled,
+counting from zero, and the joint guidance mode leaves its unconditional branch
+unscaled while independent and alternating scale every branch. `SpeakerContext`
+carries both, so the scale and the layer limit travel together.
+
+`torchrng` also removes the fixture dependency for seed-driven sampling, and the
+resampler generalization means the watermark's 48-to-44.1 kHz round trip no
+longer depends on Irodori-specific code. `SamplerConfig.validate` rejects the
+pairings the reference rejects, so a half-set option fails instead of silently
+disabling itself.

@@ -107,7 +107,7 @@ func TestIntegratedCheckpointParity(t *testing.T) {
 		latent[i] = float32(math.Sin(float64(i)*.17) * .4)
 	}
 	start = time.Now()
-	velocity, err := c.Denoise(latent, .7, cond)
+	velocity, err := c.Denoise(latent, .7, cond, SpeakerContext{})
 	if err != nil {
 		t.Fatal(err)
 	}

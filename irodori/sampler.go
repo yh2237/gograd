@@ -8,8 +8,10 @@ import (
 )
 
 // SamplerConfig describes the reference Euler rectified-flow schedule and CFG.
-// The initial Gaussian noise is supplied by the caller because PyTorch's
-// seeded CPU/CUDA generators are not yet reproduced in Go.
+// The initial Gaussian noise is supplied by the caller, because a caller either
+// injects the reference's own noise for a parity fixture or calls SampleSeeded,
+// which draws it with the reference generator. Everything the reference's
+// sampler exposes is settable; the three optional refinements default to off.
 type SamplerConfig struct {
 	Steps                                 int
 	Schedule                              string // linear or sway
@@ -18,6 +20,49 @@ type SamplerConfig struct {
 	TextScale, SpeakerScale, CaptionScale float32
 	CFGMinT, CFGMaxT                      float32
 	UseCUDA                               bool // CUDA DiT projections, CPU attention/codec
+
+	// TruncationFactor scales the initial noise when set, which the reference
+	// applies before its first step.
+	TruncationFactor float32
+
+	// RescaleK and RescaleSigma enable temporal score rescaling and must be set
+	// together, exactly as the reference requires.
+	RescaleK, RescaleSigma float32
+
+	// SpeakerKVScale multiplies the speaker context's keys and values, the
+	// optional speaker inversion. A zero scale leaves the context untouched.
+	// SpeakerKVLayers limits how many blocks are scaled; zero means all of them.
+	SpeakerKVScale, SpeakerKVMinT float32
+	SpeakerKVLayers               int
+}
+
+// validate checks the optional refinements against the reference's own rules.
+func (cfg SamplerConfig) validate() error {
+	if (cfg.RescaleK != 0) != (cfg.RescaleSigma != 0) {
+		return fmt.Errorf("irodori: rescale_k and rescale_sigma must be set together")
+	}
+	if cfg.RescaleK != 0 && cfg.RescaleK <= 0 {
+		return fmt.Errorf("irodori: rescale_k must be positive")
+	}
+	if cfg.RescaleSigma != 0 && cfg.RescaleSigma <= 0 {
+		return fmt.Errorf("irodori: rescale_sigma must be positive")
+	}
+	if cfg.TruncationFactor < 0 {
+		return fmt.Errorf("irodori: truncation_factor must not be negative")
+	}
+	if cfg.SpeakerKVScale != 0 && cfg.SpeakerKVScale < 0 {
+		return fmt.Errorf("irodori: speaker_kv_scale must not be negative")
+	}
+	if cfg.SpeakerKVLayers < 0 {
+		return fmt.Errorf("irodori: speaker_kv_max_layers must not be negative")
+	}
+	return nil
+}
+
+// speakerDeactivates reports whether a step crosses the speaker inversion's
+// floor, after which the original magnitude is restored.
+func (cfg SamplerConfig) speakerDeactivates(t, next float32) bool {
+	return cfg.SpeakerKVMinT > 0 && next < cfg.SpeakerKVMinT && t >= cfg.SpeakerKVMinT
 }
 
 func (cfg SamplerConfig) times() ([]float32, error) {
@@ -86,6 +131,9 @@ func (c Conditioner) sampleEulerRF(noise []float32, condition Conditions, cfg Sa
 	if len(noise) == 0 || len(noise)%32 != 0 {
 		return nil, fmt.Errorf("irodori: invalid initial noise")
 	}
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
 	times, err := cfg.times()
 	if err != nil {
 		return nil, err
@@ -95,6 +143,13 @@ func (c Conditioner) sampleEulerRF(noise []float32, condition Conditions, cfg Sa
 		return nil, fmt.Errorf("irodori: unsupported CFG mode %q", mode)
 	}
 	x := append([]float32(nil), noise...)
+	// The reference scales its initial noise by the truncation factor before the
+	// first step, whatever produced the noise.
+	if cfg.TruncationFactor != 0 && cfg.TruncationFactor != 1 {
+		for i := range x {
+			x[i] *= cfg.TruncationFactor
+		}
+	}
 	names := make([]string, 0, 3)
 	scales := map[string]float32{}
 	for _, v := range []struct {
@@ -113,13 +168,20 @@ func (c Conditioner) sampleEulerRF(noise []float32, condition Conditions, cfg Sa
 			}
 		}
 	}
+	speakerActive := cfg.SpeakerKVScale != 0
 	for step := 0; step < cfg.Steps; step++ {
 		t, next := times[step], times[step+1]
-		denoise := c.Denoise
-		if cfg.UseCUDA {
-			denoise = c.DenoiseCUDA
+		speaker := SpeakerContext{}
+		if speakerActive && cfg.SpeakerKVScale != 0 {
+			speaker = SpeakerContext{Scale: cfg.SpeakerKVScale, Layers: cfg.SpeakerKVLayers}
 		}
-		velocity, err := denoise(x, t, condition)
+		denoise := func(latent []float32, at float32, conditions Conditions, ctx SpeakerContext) ([]float32, error) {
+			if cfg.UseCUDA {
+				return c.DenoiseCUDA(latent, at, conditions, ctx)
+			}
+			return c.Denoise(latent, at, conditions, ctx)
+		}
+		velocity, err := denoise(x, t, condition, speaker)
 		if err != nil {
 			return nil, err
 		}
@@ -133,7 +195,14 @@ func (c Conditioner) sampleEulerRF(noise []float32, condition Conditions, cfg Sa
 			}
 			base := append([]float32(nil), velocity...)
 			for _, name := range selected {
-				uncond, err := denoise(x, t, withoutCondition(condition, name))
+				// The reference scales every branch's speaker cache for independent
+				// and alternating guidance, but leaves the joint unconditional branch
+				// untouched.
+				branchContext := speaker
+				if name == "all" {
+					branchContext = SpeakerContext{}
+				}
+				branch, err := denoise(x, t, withoutCondition(condition, name), branchContext)
 				if err != nil {
 					return nil, err
 				}
@@ -142,12 +211,22 @@ func (c Conditioner) sampleEulerRF(noise []float32, condition Conditions, cfg Sa
 					scale = scales[names[0]]
 				}
 				for i := range velocity {
-					velocity[i] += scale * (base[i] - uncond[i])
+					velocity[i] += scale * (base[i] - branch[i])
 				}
 			}
 		}
+		if cfg.RescaleK != 0 && cfg.RescaleSigma != 0 {
+			scaled, err := TemporalScoreRescale(velocity, x, t, cfg.RescaleK, cfg.RescaleSigma)
+			if err != nil {
+				return nil, err
+			}
+			velocity = scaled
+		}
 		for i := range x {
 			x[i] += velocity[i] * (next - t)
+		}
+		if speakerActive && cfg.speakerDeactivates(t, next) {
+			speakerActive = false
 		}
 	}
 	return x, nil

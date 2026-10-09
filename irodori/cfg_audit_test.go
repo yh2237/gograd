@@ -86,7 +86,7 @@ func independentCFGBranches(t *testing.T, c Conditioner, x []float32, time float
 		if branch > 0 {
 			condition = withoutCondition(cond, which)
 		}
-		v, err := c.Denoise(x, time, condition)
+		v, err := c.Denoise(x, time, condition, SpeakerContext{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -147,7 +147,7 @@ func TestIndependentCFGBranchAudit(t *testing.T) {
 // update. It mirrors the reference's own per-mode evaluation.
 func modeTraceStep(t *testing.T, fixture *integratedFixture, x []float32, time, next float32, mode string, step int) []float32 {
 	t.Helper()
-	velocity, err := fixture.Conditioner.Denoise(x, time, fixture.Conditions)
+	velocity, err := fixture.Conditioner.Denoise(x, time, fixture.Conditions, SpeakerContext{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,7 @@ func modeTraceStep(t *testing.T, fixture *integratedFixture, x []float32, time, 
 		case "independent":
 			branches := [][]float32{velocity}
 			for _, name := range names {
-				branch, err := fixture.Conditioner.Denoise(x, time, withoutCondition(fixture.Conditions, name))
+				branch, err := fixture.Conditioner.Denoise(x, time, withoutCondition(fixture.Conditions, name), SpeakerContext{})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -167,7 +167,7 @@ func modeTraceStep(t *testing.T, fixture *integratedFixture, x []float32, time, 
 			velocity = independentCFGVelocity(branches, true)
 		case "joint":
 			all := withoutCondition(withoutCondition(withoutCondition(fixture.Conditions, "text"), "speaker"), "caption")
-			uncond, err := fixture.Conditioner.Denoise(x, time, all)
+			uncond, err := fixture.Conditioner.Denoise(x, time, all, SpeakerContext{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -175,7 +175,7 @@ func modeTraceStep(t *testing.T, fixture *integratedFixture, x []float32, time, 
 				velocity[i] += scales[0] * (velocity[i] - uncond[i])
 			}
 		case "alternating":
-			uncond, err := fixture.Conditioner.Denoise(x, time, withoutCondition(fixture.Conditions, names[step%len(names)]))
+			uncond, err := fixture.Conditioner.Denoise(x, time, withoutCondition(fixture.Conditions, names[step%len(names)]), SpeakerContext{})
 			if err != nil {
 				t.Fatal(err)
 			}

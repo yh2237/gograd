@@ -95,21 +95,27 @@ func RFSchedule(steps int, mode string, sway float64) ([]float32, error) {
 }
 
 // TemporalScoreRescale applies the optional sampling-time score correction.
+// The reference computes its guide values as Python floats, so the signal-to-noise
+// ratio, the sigma square and the final ratio are all taken in float64 and
+// narrowed once, which keeps the tensor arithmetic in float32.
 func TemporalScoreRescale(velocity, latent []float32, t, k, sigma float32) ([]float32, error) {
 	if len(velocity) != len(latent) || k <= 0 || t < 0 || t > 1 {
 		return nil, fmt.Errorf("irodori: invalid temporal score inputs")
 	}
 	out := make([]float32, len(velocity))
-	if t == 1 {
+	time := float64(t)
+	if time >= 1 {
 		copy(out, velocity)
 		return out, nil
 	}
-	oneMinus := 1 - t
-	snr := oneMinus * oneMinus / (t * t)
-	sigmaSq := sigma * sigma
-	ratio := (snr*sigmaSq + 1) / (snr*sigmaSq/k + 1)
+	oneMinus := 1 - time
+	snr := oneMinus * oneMinus / (time * time)
+	sigmaSq := float64(sigma) * float64(sigma)
+	ratio := (snr*sigmaSq + 1) / (snr*sigmaSq/float64(k) + 1)
+	factor := float32(ratio)
+	step := float32(oneMinus)
 	for i := range out {
-		out[i] = (ratio*(oneMinus*velocity[i]+latent[i]) - latent[i]) / oneMinus
+		out[i] = (factor*(step*velocity[i]+latent[i]) - latent[i]) / step
 	}
 	return out, nil
 }

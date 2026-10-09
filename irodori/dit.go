@@ -12,6 +12,10 @@ import (
 type CheckpointDiT struct {
 	State   *autograd.SafeTensorFile
 	UseCUDA bool
+
+	// Speaker is the optional speaker inversion, applied to the speaker
+	// context's keys and values after their key normalization.
+	Speaker SpeakerContext
 }
 
 func (p CheckpointDiT) linear(x, w []float32, rows, in, out int) ([]float32, error) {
@@ -108,7 +112,15 @@ func normalizeHeads(x, w []float32) {
 	}
 }
 
-func (p CheckpointDiT) attention(name string, x, text, speaker, caption []float32, textMask, speakerMask, captionMask []bool) ([]float32, error) {
+// scaleInPlace multiplies every element, as the reference's in-place scaling of
+// the cached speaker keys and values does.
+func scaleInPlace(v []float32, factor float32) {
+	for i := range v {
+		v[i] *= factor
+	}
+}
+
+func (p CheckpointDiT) attention(name string, x, text, speaker, caption []float32, textMask, speakerMask, captionMask []bool, block int) ([]float32, error) {
 	const dim, heads, headDim = 1280, 20, 64
 	seq, textLen, speakerLen, captionLen := len(x)/dim, len(textMask), len(speakerMask), len(captionMask)
 	q, err := p.project(name+"wq", x, seq, dim, dim, false)
@@ -160,6 +172,15 @@ func (p CheckpointDiT) attention(name string, x, text, speaker, caption []float3
 	normalizeHeads(kt, kweight)
 	normalizeHeads(ksp, kweight)
 	normalizeHeads(kc, kweight)
+	// The reference caches the speaker keys and values once, after k_norm, and
+	// scales them in place. gograd recomputes them per block, so the same factor
+	// is applied here, which is equivalent because k_norm is nonlinear and the
+	// value is not normalized afterwards. Only the first SpeakerKVLayers blocks
+	// are scaled, matching the reference's layer truncation from zero.
+	if p.Speaker.Scale != 0 && p.Speaker.Scale != 1 && (p.Speaker.Layers == 0 || block < p.Speaker.Layers) {
+		scaleInPlace(ksp, p.Speaker.Scale)
+		scaleInPlace(vsp, p.Speaker.Scale)
+	}
 	for pos := 0; pos < seq; pos++ {
 		for h := 0; h < heads/2; h++ {
 			for d := 0; d < headDim; d += 2 {
@@ -289,7 +310,7 @@ func (p CheckpointDiT) Forward(latent []float32, t float32, text []float32, text
 		if err != nil {
 			return nil, err
 		}
-		attn, err := p.attention(base+"attention.", h, text, speaker, caption, textMask, speakerMask, captionMask)
+		attn, err := p.attention(base+"attention.", h, text, speaker, caption, textMask, speakerMask, captionMask, block)
 		if err != nil {
 			return nil, err
 		}

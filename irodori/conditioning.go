@@ -59,17 +59,25 @@ func (c Conditioner) Encode(text, caption string, reference []float32, maxLength
 	return Conditions{Text: textState, TextMask: masks[0], Speaker: speaker, SpeakerMask: speakerMask, Caption: captionState, CaptionMask: masks[1]}, nil
 }
 
+// SpeakerContext carries the optional speaker inversion across a sampling step:
+// the speaker context's keys and values are multiplied by Scale for the first
+// Layers blocks. A zero Scale leaves the context untouched.
+type SpeakerContext struct {
+	Scale  float32
+	Layers int
+}
+
 // Denoise predicts one rectified-flow velocity at t for an already encoded
 // reference and raw text/caption pair.
-func (c Conditioner) Denoise(latent []float32, t float32, conditions Conditions) ([]float32, error) {
-	return (CheckpointDiT{State: c.State}).Forward(latent, t, conditions.Text, conditions.TextMask, conditions.Speaker, conditions.SpeakerMask, conditions.Caption, conditions.CaptionMask)
+func (c Conditioner) Denoise(latent []float32, t float32, conditions Conditions, speaker SpeakerContext) ([]float32, error) {
+	return (CheckpointDiT{State: c.State, Speaker: speaker}).Forward(latent, t, conditions.Text, conditions.TextMask, conditions.Speaker, conditions.SpeakerMask, conditions.Caption, conditions.CaptionMask)
 }
 
 // DenoiseCUDA uses CUDA GEMM for the DiT's dense projections while retaining
 // the attention and normalization paths on CPU. Hold a CUDAContext through
 // this call; each projection is uploaded separately to bound device memory.
-func (c Conditioner) DenoiseCUDA(latent []float32, t float32, conditions Conditions) ([]float32, error) {
-	return (CheckpointDiT{State: c.State, UseCUDA: true}).Forward(latent, t, conditions.Text, conditions.TextMask, conditions.Speaker, conditions.SpeakerMask, conditions.Caption, conditions.CaptionMask)
+func (c Conditioner) DenoiseCUDA(latent []float32, t float32, conditions Conditions, speaker SpeakerContext) ([]float32, error) {
+	return (CheckpointDiT{State: c.State, UseCUDA: true, Speaker: speaker}).Forward(latent, t, conditions.Text, conditions.TextMask, conditions.Speaker, conditions.SpeakerMask, conditions.Caption, conditions.CaptionMask)
 }
 
 func (c Conditioner) PredictDuration(conditions Conditions) (float32, error) {
