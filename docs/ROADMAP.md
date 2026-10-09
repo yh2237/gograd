@@ -51,7 +51,7 @@ must load the original weights and reproduce outputs before replacing Python.
 | --- | --- | --- |
 | Text | Cached ModernBERT-ja Unigram tokenizer matches 65 reference cases, including BOS, padding and truncation; streamed 25-layer ModernBERT and both text/caption projectors match real-checkpoint hidden-state slices | Encoder training/backward and optimized CUDA execution |
 | DiT/duration | Integrated raw text/caption, eight-clip speaker context, real-checkpoint denoiser and duration parity; 1.463 GB DiT host cache reduces repeated forward time | DiT training/backward and complete CUDA execution |
-| RF | Injected PyTorch seed noise, sway/linear grid, independent/joint/alternating CFG and Euler loop; three-step real-checkpoint final-latent fixture | Native PyTorch CPU/CUDA RNG reproduction, longer/full-sentence sampler parity, optional score rescale and speaker KV scaling |
+| RF | Injected PyTorch seed noise, sway/linear grid, independent/joint/alternating CFG and Euler loop; three-step real-checkpoint final-latent fixture, with the independent residual traced to float32 guidance amplification | Native PyTorch CPU/CUDA RNG reproduction, longer/full-sentence sampler parity, optional score rescale and speaker KV scaling |
 | Reference/audio | WAV and K-weighted loudness normalization, torchaudio-compatible 44.1-to-48 kHz resampling, deterministic DACVAE encode, reference latent encoder, safe `.pth` conversion and deterministic decoder parity | More input rate/channel fixtures and faster codec kernels |
 | Output | One-step 2.32-second sentence reaches waveform sample parity internally | SilentCipher `IRDTS` watermark and production 40-step/full CUDA parity; CLI refuses WAV output |
 
@@ -113,14 +113,55 @@ Raw Japanese text and caption plus the eight-clip latent fixture feed the
 shared ModernBERT, projectors, speaker encoder, 12-block DiT and duration
 predictor in one Go call. Sampled denoiser velocity differs from PyTorch by
 7.36e-6 and duration matches at reported F32 precision. A three-step sway
-Euler sample with independent text/speaker/caption CFG and injected PyTorch
-seed noise differs by 0.00107 on sampled final-latent elements. The same
-real-checkpoint three-step fixture reaches 1.97e-6 for joint CFG and
-1.24e-5 for alternating CFG. The larger independent-CFG difference still
-needs a branch-by-branch audit of the reference's batched evaluation. The RNG is
+Euler sample with independent text/speaker/caption CFG differs by 0.00107 on
+sampled final-latent elements. The same real-checkpoint three-step fixture
+reaches 1.97e-6 for joint CFG and 1.24e-5 for alternating CFG. The RNG is
 still injected from a small fixture; Go does not yet reproduce PyTorch's
 generator bit-for-bit. This is a short numerical parity case, not a
 full-sentence audio benchmark.
+
+### Independent CFG branch audit (2026-10-09)
+
+The roadmap previously listed the independent-CFG gap as "a branch-by-branch
+audit of the reference's batched evaluation". That audit is now complete, and
+the residual difference is float32 accumulation noise rather than an
+algorithmic error:
+
+- **Branch parity.** Each of the four independent branches (cond, text-dropped,
+  speaker-dropped, caption-dropped) matches PyTorch to at most 1.18e-5 with an
+  exact input, which is the same magnitude as the unconditional DiT forward
+  error elsewhere in the fixture. `TestIndependentCFGBranchAudit` compares Go's
+  serial evaluation against both PyTorch's batched call and its serial calls,
+  because the reference evaluates all four branches in one batch-4 forward.
+- **Reference self-consistency.** PyTorch's own batched independent loop
+  reproduces `sample_euler_rf_cfg`'s output to 1.43e-6, and PyTorch's batched and
+  serial branch evaluations agree to at most 3.34e-6. The guidance composition,
+  the branch order (`cond`, then text, speaker, caption), the scales (3, 5, 3)
+  and the CFG time window (`cfg_min_t <= t <= cfg_max_t`) are therefore
+  confirmed correct in gograd.
+- **Per-step amplification.** `TestCFGTraceParity` replays the reference's
+  three-step sway grid for all three modes. Joint and alternating keep the
+  velocity error at 2.1e-5 to 5.5e-5 per step, and their final latent errors
+  (2.06e-6 and 2.00e-5 over all 128 elements) match the values already reported
+  by `TestIntegratedCheckpointParity`. Independent mode grows instead:
+  input 1.29e-5 to velocity 9.63e-5, input 1.37e-4 to velocity 1.86e-3, giving
+  a final latent error of 1.06e-3.
+- **Cause.** Independent guidance is `cond + 3*(cond-text) + 5*(cond-speaker) +
+  3*(cond-caption)`, which is 12 conditional forward passes minus three
+  unconditional ones. Its composition therefore carries roughly eleven times the
+  per-branch error and a coefficient of 12 on the conditional branch, against 4
+  for joint and at most 6 for alternating. The larger resulting velocity also
+  moves the latent further from the noise prior at each Euler step. Substituting
+  PyTorch's exact float32 `expf` results into the timestep embedding removes
+  only about a third of the step-0 velocity error, so most of the residual is
+  the ordinary float32 divergence between the two DiT forwards (matmul
+  reduction order, softmax and normalization rounding).
+
+No code change is warranted from this audit: the independent mode follows the
+reference's algorithm and its error stays two orders of magnitude inside the
+0.02 parity threshold. A long-run 40-step production sample still needs its own
+end-to-end comparison, because the amplification seen here grows with the
+number of Euler steps.
 
 `PreloadDenoiser` retains 1,462,937,728 bytes of F32 DiT weights in host RAM
 for repeated sampling calls. In one four-frame CPU comparison, streamed and

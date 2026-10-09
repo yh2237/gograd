@@ -126,3 +126,51 @@ if os.environ.get("IRODORI_DIT_CUDA_BENCH") == "1":
     torch_final=torch.tensor(fixture["final_latent"]["first"])
     error=(final.cpu().reshape(-1)[:16]-torch_final).abs().max().item()
     print(f"PyTorch CUDA DiT one-step 116 frames: {elapsed:.3f} ms, peak_allocated={torch.cuda.max_memory_allocated()} bytes, fixture_first_max_abs={error:.9g}")
+
+if os.environ.get("IRODORI_CFG_AUDIT") == "1":
+    zero=lambda x:torch.zeros_like(x)
+    bundles=[(ts,tm,ss,sm,cs,cm),(zero(ts),zero(tm),ss,sm,cs,cm),(ts,tm,zero(ss),zero(sm),cs,cm),(ts,tm,ss,sm,zero(cs),zero(cm))]
+    t=torch.tensor([.999],dtype=torch.float32)
+    with torch.inference_mode():
+        serial=[model.forward_with_encoded_conditions(noise,t,*bundle)[0] for bundle in bundles]
+        batch_args=[torch.cat([bundle[i] for bundle in bundles],dim=0) for i in range(6)]
+        batched=model.forward_with_encoded_conditions(noise.repeat(4,1,1),t.repeat(4),*batch_args)
+        errors=[(batched[i]-serial[i]).abs().max().item() for i in range(4)]
+    print("independent branch batch-versus-serial max_abs",errors)
+    u=torch.linspace(0.0,1.0,4);u=u-(torch.cos(.5*math.pi*u)+u-1.0);grid=(1-u)*.999
+    print("independent grid",grid.tolist())
+    traces={}
+    # Independent: all CFG branches in one batched forward.
+    xt=noise.clone();trace=[]
+    with torch.inference_mode():
+        for step in range(3):
+            time_val=grid[step];next_time=grid[step+1]
+            batched_args=[torch.cat([bundle[i] for bundle in bundles],dim=0) for i in range(6)]
+            branches=model.forward_with_encoded_conditions(xt.repeat(4,1,1),time_val.expand(4),*batched_args).chunk(4,dim=0)
+            a,b,c,d=branches;v=a+3*(a-b)+5*(a-c)+3*(a-d) if .5<=time_val.item()<=1.0 else a
+            xt=xt+v*(next_time-time_val)
+            trace.append({"t":time_val.item(),"next":next_time.item(),"velocity":v[0].tolist(),"x":xt[0].tolist()})
+    print("independent trace final vs fixture",(xt-sampled).abs().max().item())
+    traces["independent"]=trace
+    # Joint and alternating: the reference evaluates one conditional and one
+    # unconditional forward per step with batch 1, exactly like gograd does.
+    for mode,spk in [("joint",3.0),("alternating",5.0)]:
+        xt=noise.clone();trace=[]
+        for step in range(3):
+            time_val=grid[step];next_time=grid[step+1]
+            with torch.inference_mode():
+                cond=model.forward_with_encoded_conditions(xt,time_val.reshape(1),ts,tm,ss,sm,cs,cm)[0]
+                if .5<=time_val.item()<=1.0:
+                    if mode=="joint":
+                        branch=(zero(ts),zero(tm),zero(ss),zero(sm),zero(cs),zero(cm))
+                    else:
+                        name=("text","speaker","caption")[step%3]
+                        branch=(zero(ts),zero(tm),ss,sm,cs,cm) if name=="text" else (ts,tm,zero(ss),zero(sm),cs,cm) if name=="speaker" else (ts,tm,ss,sm,zero(cs),zero(cm))
+                    unc=model.forward_with_encoded_conditions(xt,time_val.reshape(1),*branch)[0]
+                    v=cond+(spk if mode=="joint" else {"text":3.0,"speaker":5.0,"caption":3.0}[("text","speaker","caption")[step%3]])*(cond-unc)
+                else:
+                    v=cond
+                xt=xt+v*(next_time-time_val)
+            trace.append({"t":time_val.item(),"next":next_time.item(),"velocity":v.tolist(),"x":xt[0].tolist()})
+        traces[mode]=trace
+    Path("testdata/irodori_cfg_branches.json").write_text(json.dumps({"t":.999,"batch_vs_serial_max_abs":errors,"batched":[v.tolist() for v in batched],"serial":[v.tolist() for v in serial],"trace":trace,"traces":traces},separators=(",",":"))+"\n",encoding="utf-8")
