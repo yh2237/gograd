@@ -3,6 +3,8 @@ package irodori
 import (
 	"fmt"
 	"math"
+
+	"github.com/yh2237/gograd/torchrng"
 )
 
 // SamplerConfig describes the reference Euler rectified-flow schedule and CFG.
@@ -59,8 +61,28 @@ func withoutCondition(c Conditions, which string) Conditions {
 }
 
 // SampleEulerRF runs the reference timestep grid, CFG and Euler update with
-// injected initial noise. It accepts conditions encoded once for all steps.
+// caller-supplied initial noise. It accepts conditions encoded once for all
+// steps. The parity fixtures use this entry point because they inject the
+// reference's own noise; SampleSeeded is the equivalent call that draws the
+// noise with the reference generator instead.
 func (c Conditioner) SampleEulerRF(noise []float32, condition Conditions, cfg SamplerConfig) ([]float32, error) {
+	return c.sampleEulerRF(noise, condition, cfg)
+}
+
+// SampleSeeded runs the same sampler but draws the initial latent noise from
+// the reference generator, so inference needs no Python-produced fixture. The
+// reference seeds torch.Generator(device="cpu") with the same value, which
+// torchrng reproduces bit for bit.
+func (c Conditioner) SampleSeeded(condition Conditions, cfg SamplerConfig, frames int, seed uint64) ([]float32, error) {
+	if frames <= 0 {
+		return nil, fmt.Errorf("irodori: latent frames must be positive")
+	}
+	noise := make([]float32, frames*32)
+	torchrng.New(seed).Normal(noise, 0, 1)
+	return c.sampleEulerRF(noise, condition, cfg)
+}
+
+func (c Conditioner) sampleEulerRF(noise []float32, condition Conditions, cfg SamplerConfig) ([]float32, error) {
 	if len(noise) == 0 || len(noise)%32 != 0 {
 		return nil, fmt.Errorf("irodori: invalid initial noise")
 	}

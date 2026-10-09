@@ -53,7 +53,7 @@ must load the original weights and reproduce outputs before replacing Python.
 | DiT/duration | Integrated raw text/caption, eight-clip speaker context, real-checkpoint denoiser and duration parity; 1.463 GB DiT host cache reduces repeated forward time | DiT training/backward and complete CUDA execution |
 | RF | Injected PyTorch seed noise, sway/linear grid, independent/joint/alternating CFG and Euler loop; three-step real-checkpoint final-latent fixture, with the independent residual traced to float32 guidance amplification | Native PyTorch CPU/CUDA RNG reproduction, longer/full-sentence sampler parity, optional score rescale and speaker KV scaling |
 | Reference/audio | WAV and K-weighted loudness normalization, torchaudio-compatible 44.1-to-48 kHz resampling, deterministic DACVAE encode, reference latent encoder, safe `.pth` conversion and deterministic decoder parity | More input rate/channel fixtures and faster codec kernels |
-| Output | One-step 2.32-second sentence reaches waveform sample parity internally | SilentCipher `IRDTS` watermark and production 40-step/full CUDA parity; CLI refuses WAV output |
+| Output | SilentCipher `IRDTS` watermark ported with per-stage parity, and `dsp.Resample` generalized to any rate pair so the 48-to-44.1 kHz round trip is exact | Remaining output gap is a WAV writer; the CLI still refuses to write audio because production waveform parity is unverified |
 
 For a 256x1024 RMSNorm microbenchmark this round, standalone Go CPU took
 419,073 ns/op, reusable graph Go CPU took 3,170,007 ns/op, and PyTorch CPU
@@ -195,7 +195,68 @@ separately and evaluates CFG branches serially, so the GPU matmul does not
 yet offset CPU attention and transfer costs. This comparison isolates the
 denoiser stage and is not an end-to-end PyTorch CUDA benchmark.
 
-**Release gate:** the Go CLI continues to refuse WAV output. The reference
-pipeline applies a SilentCipher `IRDTS` watermark to generated audio. Port
-and verify it before exposing any output WAV. More input audio formats and
-production 40-step waveform parity remain open as well.
+**Release gate:** the Go CLI continues to refuse WAV output. The SilentCipher
+`IRDTS` watermark is now ported and verified, but two gates remain: a WAV writer,
+and production 40-step waveform parity. More input audio formats are open too.
+
+## Native PyTorch randomness (2026-10-09)
+
+Until now every sampler parity test injected the reference's own noise from a
+committed fixture, so a Python-produced seed was the only way to get one. The new
+`torchrng` package reproduces `torch.Generator(device="cpu")` natively: MT19937
+with the reference's state initialization and tempering, the 24-bit and 53-bit
+uniform transforms, and the Box-Muller layout `torch.randn` uses. `Conditioner.
+SampleSeeded` draws the initial latent noise with it, so inference needs no
+fixture.
+
+The float32 path is bit-exact, which required porting the cephes polynomial
+approximations that PyTorch's AVX2 kernels use for log, sin and cos rather than
+libm: the two differ by one ulp, and `cos(t*freq)` is evaluated at arguments up to
+999, where one ulp of the frequency shows up as a 6e-5 error in the embedding.
+The float64 path agrees to about five ulps, because it goes through libm, whose
+log and sin are not the same the reference's C runtime computes.
+
+Two details were worth verifying rather than assuming: `torch.Generator`.
+`manual_seed` uses only the low 32 bits of the seed for the state array, and the
+float32 vector path pairs its Box-Muller samples across a block of sixteen with
+the last short block recomputed from sixteen further words, which is why a draw
+of 60 elements does not continue a 128-element stream where it looks like it
+should. `TestStreamParity` pins both against 88 recorded streams covering eight
+seeds and lengths around the block boundary, including the exact 3712-element
+Irodori noise.
+
+## SilentCipher IRDTS watermark (2026-10-09)
+
+The watermark is not a HiFi-GAN vocoder. It is an AudioSeal-style model that
+works on the magnitude STFT of the 44.1 kHz signal: encode the carrier, expand a
+five-symbol message into a per-bin bias over the lowest 1024 frequency bins, and
+let a carrier decoder predict the magnitude perturbation. There are no transposed
+convolutions, no residual blocks and no upsampling, so the new work is a
+two-dimensional convolution, a batch normalization, a sigmoid, and a radix-2 FFT
+with the STFT pair the reference's singleton defines. All of them live in `dsp`
+where they are reusable, except the convolution, which shares the `grid` layout
+with the watermark itself.
+
+**The reference never calls `eval()` on this model.** Its `load_models` only
+copies state dictionaries, so `BatchNorm2d` runs in training mode and normalizes
+by the batch statistics of its own input, not by the checkpoint's running
+statistics. The running statistics are still updated on every call and still
+never feed back into a forward pass, so the watermark's output is deterministic
+per utterance rather than order-dependent. Assuming inference mode, as a first
+reading of the code invites, moves the encoded carrier by tens of units. `dsp`
+now carries the FFT, Hann window, STFT and inverse; `irodori` carries the
+convolution, the gated layer with training-mode batch statistics, the message
+coding and the encode pass.
+
+Parity is checked stage by stage, so a regression localizes itself: the carrier
+spectrum is the STFT alone (1.5e-5 on a 76.7 peak), the encoded carrier adds the
+encoder (6.1e-4), the merged grid adds the message projection, and the decoder's
+raw output adds the carrier decoder and its post-processing (5.1e-6). The full
+waveform agrees with the reference's own `encode_wav` to 4.8e-7 over 144,000
+samples, which is float32 rounding.
+
+One gap remains open here: the reference's decoder does not recover the payload
+from any carrier I tried, including its own watermarked output from this one. The
+Irodori pipeline never calls it, so encode is all the release gate needs, but a
+decode round trip is unverified and the watermark should not be claimed as
+detectable until it is.

@@ -61,6 +61,17 @@ handles arbitrary axes. Optional `-bf16` caches BF16 GEMM operands on device,
 carries BF16 shadows through views, and fuses BF16 output writes into pointwise
 kernels. GEMMEx uses FP32 accumulation; gradients and master weights remain
 FP32. The default remains FP32.
+The `dsp` package holds the signal-processing primitives the Irodori reference
+needs and that are not specific to it: a power-of-two complex FFT, the periodic
+Hann window, the magnitude/phase STFT and its inverse, and a polyphase
+resampler generalized from the one used for the reference audio. The FFT
+accumulates in float64 and rounds on the way out, so it matches PyTorch's float32
+pocketfft to about one ulp. `torchrng` reproduces `torch.Generator(device="cpu")`
+bit for bit, including the cephes polynomial approximations PyTorch's AVX2
+kernels use for float32 log, sin and cos, so a sampler no longer needs a
+Python-seeded noise fixture. `Conditioner.SampleSeeded` draws the initial latent
+noise with it.
+
 `autograd.Acoustic` composes the reference acoustic model and is checked
 against a PyTorch training-step fixture on CPU and CUDA. CUDA tensors and
 gradients now live in device buffers; graph operators use cuBLAS and NVRTC
@@ -335,6 +346,8 @@ go test ./cuda/
 - `export.go` — runtime JSON layout
 - `cuda/` — CUDA runtime, cuBLAS and NVRTC binding, streams and graph capture
 - `kernels/` — custom GPU kernels (activation, convolution, loss, AdamW) on top of `cuda`
+- `dsp/` — FFT, Hann window, STFT/iSTFT and resampling, mirroring torch and torchaudio
+- `torchrng/` — bit-exact `torch.Generator(device="cpu")` for float32 and float64 streams
 - `tensor/` — shape-aware float32 CPU/CUDA tensor and blocked CPU SGEMM
 - `autograd/` — define-by-run graph, operators, and Acoustic model
 - `nn/` — CPU/CUDA modules, masked losses, AdamW, and JSON checkpoints
@@ -375,7 +388,9 @@ recording flag and attention algorithm selection are process-wide. Tiled
 attention currently supports head dimensions up to 128 and is slower than the
 materialized GEMM path at the measured sequence lengths. GPU inference callers
 should release unused graphs with `ReleaseGraph`. The older `nn` path still
-uses explicit module backward methods.
+uses explicit module backward methods. The watermark's message decoder and a
+WAV writer are not ported, and the remaining Irodori gates are listed in
+[`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## License
 

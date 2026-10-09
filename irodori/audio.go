@@ -6,6 +6,8 @@ import (
 	"io"
 	"math"
 	"os"
+
+	"github.com/yh2237/gograd/dsp"
 )
 
 // ReadWAVMono reads uncompressed PCM16 or F32 RIFF audio and averages channels.
@@ -168,52 +170,11 @@ func NormalizeReference48k(input []float32) ([]float32, error) {
 
 // ResampleTo48k follows torchaudio.functional.resample's default F32
 // sinc_interp_hann kernel, including GCD-reduced phases and zero padding.
+// ResampleTo48k resamples a mono block to 48 kHz, the rate the codec, the
+// reference loudness normalization and the watermark all operate at.
 func ResampleTo48k(input []float32, sampleRate int) ([]float32, error) {
 	if sampleRate <= 0 || len(input) == 0 {
 		return nil, fmt.Errorf("irodori: invalid resampling input")
 	}
-	if sampleRate == 48000 {
-		return append([]float32(nil), input...), nil
-	}
-	gcd := func(a, b int) int {
-		for b != 0 {
-			a, b = b, a%b
-		}
-		return a
-	}(sampleRate, 48000)
-	orig, newRate := sampleRate/gcd, 48000/gcd
-	base := float32(min(orig, newRate)) * .99
-	width := int(math.Ceil(6 * float64(orig) / float64(base)))
-	kernelLength := 2*width + orig
-	kernels := make([]float32, newRate*kernelLength)
-	for phase := 0; phase < newRate; phase++ {
-		for tap := 0; tap < kernelLength; tap++ {
-			idx := float32(tap-width) / float32(orig)
-			t := (float32(-phase)/float32(newRate) + idx) * base
-			t = max(-6, min(6, t))
-			window := float32(math.Cos(float64(t * float32(math.Pi) / 12)))
-			window *= window
-			t *= float32(math.Pi)
-			sinc := float32(1)
-			if t != 0 {
-				sinc = float32(math.Sin(float64(t))) / t
-			}
-			kernels[phase*kernelLength+tap] = sinc * window * (base / float32(orig))
-		}
-	}
-	outLength := (newRate*len(input) + orig - 1) / orig
-	out := make([]float32, outLength)
-	for q := range out {
-		phase, step := q%newRate, q/newRate
-		start := step*orig - width
-		var sum float32
-		for tap := 0; tap < kernelLength; tap++ {
-			at := start + tap
-			if at >= 0 && at < len(input) {
-				sum += input[at] * kernels[phase*kernelLength+tap]
-			}
-		}
-		out[q] = sum
-	}
-	return out, nil
+	return dsp.Resample(input, sampleRate, 48000), nil
 }

@@ -32,7 +32,7 @@ func run(args []string) error {
 	fs.StringVar(&output, "out", "", "output WAV path (currently disabled)")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: irodori-infer -text TEXT -ref WAV -seed N -checkpoint MODEL -out WAV")
-		fmt.Fprintln(os.Stderr, "Status: preflight only. Reference conditioning, resampling, DACVAE and RF sampler have parity fixtures; full CUDA inference and SilentCipher IRDTS watermark remain open. No WAV is written.")
+		fmt.Fprintln(os.Stderr, "Status: preflight only. Reference conditioning, resampling, DACVAE, RF sampler and the SilentCipher watermark have parity fixtures; production 40-step and full CUDA waveform parity, plus a WAV writer, remain open. No WAV is written.")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
