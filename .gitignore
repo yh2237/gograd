@@ -5,3 +5,4 @@
 *.out
 *.prof
 /.go-cache/
+notes/
