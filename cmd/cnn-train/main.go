@@ -18,6 +18,7 @@ import (
 type classifier struct {
 	module        autograd.Module
 	first, second *autograd.Conv2dLayer
+	norm1, norm2  *autograd.BatchNormLayer
 	head          *autograd.LinearLayer
 }
 
@@ -30,11 +31,21 @@ func newClassifier(device tensor.Device) (*classifier, error) {
 		return nil, err
 	}
 	m.module.Children = append(m.module.Children, autograd.NamedModule{Name: "conv1", Module: m.first.StateModule()})
+	if m.norm1, err = autograd.NewBatchNormLayer(8, autograd.BatchNormLayerOptions{}, device); err != nil {
+		m.close()
+		return nil, err
+	}
+	m.module.Children = append(m.module.Children, autograd.NamedModule{Name: "norm1", Module: m.norm1.StateModule()})
 	if m.second, err = autograd.NewConv2dLayer(8, 8, [2]int{3, 3}, opts, true, device, rng); err != nil {
 		m.close()
 		return nil, err
 	}
 	m.module.Children = append(m.module.Children, autograd.NamedModule{Name: "conv2", Module: m.second.StateModule()})
+	if m.norm2, err = autograd.NewBatchNormLayer(8, autograd.BatchNormLayerOptions{}, device); err != nil {
+		m.close()
+		return nil, err
+	}
+	m.module.Children = append(m.module.Children, autograd.NamedModule{Name: "norm2", Module: m.norm2.StateModule()})
 	if m.head, err = autograd.NewLinearLayer(8, 2, device, rng); err != nil {
 		m.close()
 		return nil, err
@@ -44,9 +55,9 @@ func newClassifier(device tensor.Device) (*classifier, error) {
 }
 
 func (m *classifier) forward(x *autograd.Tensor) *autograd.Tensor {
-	h := autograd.ReLU(m.first.Forward(x))
+	h := autograd.ReLU(m.norm1.Forward(m.first.Forward(x)))
 	h = autograd.MaxPool2d(h, autograd.MaxPool2dOptions{KernelSize: [2]int{2, 2}})
-	h = autograd.ReLU(m.second.Forward(h))
+	h = autograd.ReLU(m.norm2.Forward(m.second.Forward(h)))
 	// Adaptive pooling keeps the classifier independent of spatial dimensions.
 	h = autograd.AdaptiveAvgPool2d(h, [2]int{1, 1})
 	return m.head.Forward(autograd.Reshape(h, h.Shape[0], h.Shape[1]))
@@ -55,6 +66,11 @@ func (m *classifier) forward(x *autograd.Tensor) *autograd.Tensor {
 func (m *classifier) close() {
 	for _, p := range m.module.NamedParameters() {
 		p.Value.Close()
+	}
+	for _, norm := range []*autograd.BatchNormLayer{m.norm1, m.norm2} {
+		if norm != nil {
+			norm.Close()
+		}
 	}
 }
 
@@ -181,6 +197,7 @@ func train(device tensor.Device, steps int, output string, log io.Writer) (train
 		if err = loaded.module.LoadSafeTensors(output); err != nil {
 			return stats, err
 		}
+		loaded.module.Train(false)
 		original, restoredState := m.module.StateDict(), loaded.module.StateDict()
 		for name, want := range original {
 			got := restoredState[name]

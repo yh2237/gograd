@@ -229,6 +229,39 @@ outputs and VJPs with PyTorch; independent finite differences, alias/retained
 history tests and CUDA capture exercise composition. The CNN example now
 includes max downsampling and adaptive global averaging before its classifier.
 
+## Batch normalization and mutable state
+
+BatchNorm normalizes all non-channel dimensions of rank 2..6 tensors. A small
+outer/channel/inner descriptor supports both channels-first and channels-last
+layouts after view materialization. The functional operation accepts optional
+affine parameters and paired running buffers. BatchNormLayer registers weight,
+bias, running mean/variance and a batch counter through Module, and its mode
+callback participates in recursive Train propagation. NoGrad does not disable
+training-state updates.
+
+Training computes biased variance for normalization and uses the unbiased
+estimate for running variance. CPU and CUDA moment reductions accumulate in
+float64; each forward saves FP32 mean/inverse-standard-deviation values in an
+independent ephemeral Tensor. That Tensor is a saved lifetime/context dependency;
+running buffers themselves are not backward dependencies. Consequently, a later
+forward can update running state without invalidating an earlier graph, and
+evaluation backward survives closing the running buffers. Input/affine versions
+are still validated, and retained history keeps its saved statistics alive.
+
+CUDA uses one reduction block per channel plus elementwise forward/input-VJP
+kernels. Weight/bias VJPs reduce per channel without atomic scatter. A separate
+counter kernel precedes statistics updates, so cumulative momentum reads the
+new device-side count without racing another channel's block. Capture/replay
+updates state on device, including the counter; no per-forward readback is
+required. The current Module state remains F32, so num_batches_tracked is an
+F32 scalar rather than I64 and integer precision is bounded by 2^24.
+
+Checkpoint reload tests reconstruct layer configuration and explicitly enter
+evaluation. The CNN example now trains Conv2d/BatchNorm/ReLU blocks, saves affine
+and running state, and verifies logits after reload on CPU/CUDA. PyTorch fixtures,
+numerical gradients, independent-worker race tests, history/lifetime tests and
+captured-vs-eager state comparisons cover the general operation and layer.
+
 ## Migration and phases
 
 1. Extend the operation registry from backend selection to callable kernels

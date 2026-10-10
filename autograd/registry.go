@@ -36,6 +36,7 @@ var operationRegistry = map[string]KernelPair{
 	"avg_pool2d":             {"NCHW average windows", "pool2d_f/b"},
 	"adaptive_avg_pool2d":    {"adaptive NCHW bins", "pool2d_f/b"},
 	"group_norm":             {"GroupNorm", "group_f/b"},
+	"batch_norm":             {"channel batch/running statistics", "bn_stats/f/grad_stats/dx"},
 	"layer_norm":             {"LayerNorm", "layernorm_f/b"},
 	"rms_norm_last":          {"Mean+Log+Exp+Mul", "reduce_nd+unary+binary"},
 	"rotary_half":            {"Slice+Mul+Concat", "view+binary+concat"},

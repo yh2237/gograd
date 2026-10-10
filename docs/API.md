@@ -18,6 +18,7 @@ use a separate `gograd-training-1` envelope.
 | `autograd` | `NewEmbeddingLayer`, `NewConv1dLayer`, `NewLayerNormLayer`, `NewLinearLayer`, `DropoutLayer`, `GELULayer`, `Sequential` | Reusable graph modules. Convolution activations are `[batch,time,channels]`; weights are `[out,in,kernel]`. |
 | `autograd` | `Conv2d`, `Conv2dOptions`, `NewConv2dLayer`, `Conv2dLayer` | NCHW activations, `[out,in/groups,kH,kW]` weights, optional bias, grouped/depthwise convolution and CPU/CUDA gradients. |
 | `autograd` | `MaxPool2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, pooling options and layers | NCHW pooling on CPU/CUDA with overlapping-window gradients, ceil mode and explicit averaging divisors. |
+| `autograd` | `BatchNorm`, `BatchNormOptions`, `NewBatchNormLayer`, `BatchNormLayerOptions`, `BatchNormLayer` | Rank 2..6 channel normalization, CPU/CUDA training/evaluation gradients, named affine parameters and running state. |
 | `autograd` | `Module.StateDict`, `LoadStateDict`, `SaveSafeTensors`, `SaveSafeTensorsMetadata`, `LoadSafeTensors` | Named float32 state. Metadata values are strings. The speech-timing model emits UtauTTS loader names and shapes. |
 | `autograd` | `MaskedLoss(pred,target,false)`, `ClipGradNorm`, `NewAdamW`, `NewOneCycle` | NaN-frame masked L1, clipping, AdamW, and PyTorch two-phase cosine OneCycle LR. |
 | `autograd` | `AdamW.State`, `LoadState`, `SaveSafeTensors`, `LoadSafeTensors`, `Close` | Named parameter shapes, moments, hyperparameters and step count on CPU/CUDA; release optimizer-owned buffers. |
@@ -286,7 +287,7 @@ host staging. Conv2d currently computes in FP32 even when BF16 autocast is
 enabled. CUDA input-gradient scatter uses atomic additions and is numerically,
 not bit-for-bit, reproducible.
 
-`cmd/cnn-train` exercises two Conv2d/ReLU blocks, max downsampling, adaptive
+`cmd/cnn-train` exercises two Conv2d/BatchNorm/ReLU blocks, max downsampling, adaptive
 global average pooling, a linear classifier, cross-entropy and AdamW on synthetic noisy vertical and
 horizontal stripe images. Saving reconstructs a fresh model, reloads every
 parameter exactly, and compares inference logits (CUDA reductions may reorder
@@ -364,6 +365,101 @@ kernels, dilated max pooling, ceil-mode correction, include/exclude padding,
 divisor override, non-divisible adaptive bins and adaptive upsampling.
 Regeneration requires PyTorch (`python tools/gen_pool2d_fixture.py`); Go tests
 use the JSON directly. Finite differences independently verify all three ops.
+
+## Batch normalization
+
+`BatchNorm(x, weight, bias, runningMean, runningVar, options)` normalizes all
+dimensions except the channel axis. Inputs have rank 2..6 with channels on
+axis 1 (`NC`, `NCL`, `NCHW`, etc.), or the last axis with `ChannelsLast: true`
+(`NC`, `NLC`, `NHWC`, etc.). Shape is preserved. Weight/bias are independently
+optional `[channels]` vectors; missing weight/bias mean one/zero respectively.
+All tensors must share a device and compatible execution context.
+
+`BatchNormOptions` contains `Training`, `ChannelsLast`, `Eps`, and `Momentum`:
+
+- Zero epsilon defaults to `1e-5`; other values must be positive and finite.
+- Training requires more than one sample per channel. The sample count is the
+  product of all non-channel dimensions. Output uses the biased batch variance
+  (divide by sample count). Running variance updates use the unbiased estimate
+  (divide by sample count minus one).
+- Running mean/variance must both be nil or contiguous, non-gradient
+  `[channels]` buffers. Training with nil buffers uses batch statistics without
+  recording running state. Evaluation requires both buffers and permits a
+  single sample per channel.
+- Running updates are `(1-Momentum)*old + Momentum*batch`, with finite
+  momentum in `[0,1]`. Functional zero momentum freezes running values; it does
+  not change training normalization to use running statistics. Mutable running
+  buffers cannot alias other inputs/state allocations.
+- Backward differentiates input and optional affine parameters. Each forward
+  saves its own mean/inverse-standard-deviation allocation. Updating or closing
+  running buffers, or changing layer mode after forward, does not change an
+  already-built graph's derivative. Managed input/affine mutations still trigger
+  the usual saved-version checks.
+
+The layer API registers trainable parameters and non-gradient state with Module:
+
+```go
+norm, err := autograd.NewBatchNormLayer(8, autograd.BatchNormLayerOptions{}, device)
+// Handle err. Zero options default to affine and tracked statistics,
+// epsilon 1e-5, momentum 0.1, channels-first, and training mode.
+_ = err
+defer norm.Close()
+root := autograd.Module{Children: []autograd.NamedModule{
+    {Name: "norm", Module: norm.StateModule()},
+}}
+execution := autograd.NewExecutionContext()
+err = execution.BindModule(&root)
+// Handle err; create inputs on execution before Forward.
+root.Train(true)
+y := norm.Forward(x)
+// Compose loss/backward/update; release the graph when done.
+_ = y
+root.Train(false)
+execution.NoGrad(func() {
+    prediction := norm.Forward(x)
+    prediction.ReleaseGraph()
+})
+err = root.SaveSafeTensors("norm.safetensors")
+// Handle err. Reconstruct the same configuration, load state, then Train(false).
+```
+
+`BatchNormLayerOptions` defaults to affine/running state. `DisableAffine`
+omits weight and bias; `DisableRunningStats` omits every running buffer and
+uses batch statistics in both train and eval (including the training sample
+count requirement). `Momentum` is an optional pointer: nil defaults to `0.1`,
+while a pointer to zero explicitly freezes running values.
+`CumulativeMomentum: true` uses `1/num_batches_tracked` as the update weight,
+matching the average of observed **batches**, not a sample-weighted average.
+Options are copied at construction; changing the supplied momentum variable
+afterward does not change the layer.
+
+- Parameters are `weight`, `bias`; buffers are `running_mean`, `running_var`,
+  and scalar `num_batches_tracked`. All are saved/reloaded through Module,
+  safetensors and training checkpoints. Buffers are excluded from
+  `NamedParameters` and optimizer updates. The current state format is F32,
+  including the batch counter, which represents integers exactly through
+  `2^24`; it is not PyTorch's I64 counter storage. PyTorch state import must
+  convert that counter to the current F32 format.
+- `Train` and recursive `Module.Train` control statistics; NoGrad controls only
+  derivative recording. A NoGrad forward in training still updates running
+  values and the counter. Evaluation with tracked state does not update them.
+  Mode/configuration are reconstructed by the caller, not stored in StateDict.
+- The layer implements `TensorLayer`, `Trainer`, and `ParameterizedLayer`.
+  `Close` releases affine parameters and buffers and is safe to repeat.
+  Independent workers use separate contexts and mutable layer state.
+- CPU and CUDA compute FP32 outputs/gradients even under BF16 autocast.
+  Moment reductions accumulate in float64 and save FP32 statistics. CUDA
+  running updates and batch counting stay on device and support graph replay,
+  including cumulative averaging. Bind the model and hold NewCUDAContext as
+  usual; explicit host readback is needed only for inspecting/exporting state.
+
+PyTorch fixtures cover forward, all input/affine VJPs, biased/unbiased variance,
+channels-first/last layouts, rank 2..6, singleton evaluation and reduction tails.
+Multi-step sequences additionally compare fixed/cumulative updates, NoGrad
+training and tracking-disabled evaluation. Go-only tests verify finite
+differences, selective gradients, shared/retained histories, closed ancestors,
+independent CPU workers, state reload and CUDA capture/memory reclamation.
+Regenerate with `python tools/gen_batchnorm_fixture.py`.
 
 ## Resuming a training run
 
