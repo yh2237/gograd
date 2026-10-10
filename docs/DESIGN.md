@@ -204,6 +204,31 @@ differences independently check gradients. The `cmd/cnn-train` example verifies
 that two convolution blocks compose with reduction, classification loss,
 AdamW and checkpoint reload to learn a spatial classification task in pure Go.
 
+## NCHW pooling
+
+MaxPool2d, AvgPool2d and AdaptiveAvgPool2d share NCHW window geometry and
+separate CPU/CUDA implementations registered at their public entry points.
+Geometry is validated before materializing views or allocating outputs. Max
+pooling supports dilation and saves one selected index per output only for
+recorded graphs. Those indices belong to the derivative history, so retained
+backward and closing an ancestor cannot invalidate them prematurely. Average
+and adaptive-average derivatives need only the captured geometry/divisor.
+
+CPU forward partitions output positions. Backward partitions whole N*C planes
+using output size to choose worker count: overlapping windows accumulate
+serially within each plane, avoiding races on input gradients. CUDA runs one
+thread per output window and uses atomic scatter-add for backward. All values
+remain FP32; device kernels operate without host staging and can be captured
+and replayed. NoGrad max pooling avoids the saved-index allocation.
+
+Ceil mode removes windows starting entirely in right/bottom padding. Average
+divisors distinguish explicit zero-padding from positions beyond that padding
+in a partial ceil window. Adaptive bins use floor/ceil boundaries and may
+overlap when input size is not divisible by output size. Fixtures compare all
+outputs and VJPs with PyTorch; independent finite differences, alias/retained
+history tests and CUDA capture exercise composition. The CNN example now
+includes max downsampling and adaptive global averaging before its classifier.
+
 ## Migration and phases
 
 1. Extend the operation registry from backend selection to callable kernels

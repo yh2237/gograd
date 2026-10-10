@@ -22,6 +22,7 @@ var registeredPublicOps = map[string]string{
 	"Embedding": "embedding", "EmbeddingWithPadding": "embedding_padding", "EmbeddingFromIndexBuffer": "embedding_index_buffer",
 	"MaskedLoss": "masked_loss", "Conv1d": "conv1d", "Conv1dGEMM": "conv1d_gemm",
 	"Conv2d":    "conv2d",
+	"MaxPool2d": "max_pool2d", "AvgPool2d": "avg_pool2d", "AdaptiveAvgPool2d": "adaptive_avg_pool2d",
 	"GroupNorm": "group_norm", "LayerNorm": "layer_norm", "Softmax": "softmax", "LogSoftmax": "log_softmax",
 	"RMSNormLast": "rms_norm_last",
 	"RotaryHalf":  "rotary_half", "GeGLU": "geglu", "SwiGLUProjection": "swiglu_projection", "KeyPaddingAttention": "key_padding_attention",

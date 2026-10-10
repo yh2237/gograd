@@ -17,6 +17,7 @@ use a separate `gograd-training-1` envelope.
 | `autograd` | `NewSpeechTiming`, `SpeechTiming.Forward`, `Train`, `Parameters`, `Module` | The UtauTTS Target architecture and PyTorch-compatible parameter names. `Forward` accepts flattened phone IDs and a `[batch,time,C]` tensor. |
 | `autograd` | `NewEmbeddingLayer`, `NewConv1dLayer`, `NewLayerNormLayer`, `NewLinearLayer`, `DropoutLayer`, `GELULayer`, `Sequential` | Reusable graph modules. Convolution activations are `[batch,time,channels]`; weights are `[out,in,kernel]`. |
 | `autograd` | `Conv2d`, `Conv2dOptions`, `NewConv2dLayer`, `Conv2dLayer` | NCHW activations, `[out,in/groups,kH,kW]` weights, optional bias, grouped/depthwise convolution and CPU/CUDA gradients. |
+| `autograd` | `MaxPool2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, pooling options and layers | NCHW pooling on CPU/CUDA with overlapping-window gradients, ceil mode and explicit averaging divisors. |
 | `autograd` | `Module.StateDict`, `LoadStateDict`, `SaveSafeTensors`, `SaveSafeTensorsMetadata`, `LoadSafeTensors` | Named float32 state. Metadata values are strings. The speech-timing model emits UtauTTS loader names and shapes. |
 | `autograd` | `MaskedLoss(pred,target,false)`, `ClipGradNorm`, `NewAdamW`, `NewOneCycle` | NaN-frame masked L1, clipping, AdamW, and PyTorch two-phase cosine OneCycle LR. |
 | `autograd` | `AdamW.State`, `LoadState`, `SaveSafeTensors`, `LoadSafeTensors`, `Close` | Named parameter shapes, moments, hyperparameters and step count on CPU/CUDA; release optimizer-owned buffers. |
@@ -285,8 +286,8 @@ host staging. Conv2d currently computes in FP32 even when BF16 autocast is
 enabled. CUDA input-gradient scatter uses atomic additions and is numerically,
 not bit-for-bit, reproducible.
 
-`cmd/cnn-train` exercises two Conv2d/ReLU blocks, global spatial averaging,
-a linear classifier, cross-entropy and AdamW on synthetic noisy vertical and
+`cmd/cnn-train` exercises two Conv2d/ReLU blocks, max downsampling, adaptive
+global average pooling, a linear classifier, cross-entropy and AdamW on synthetic noisy vertical and
 horizontal stripe images. Saving reconstructs a fresh model, reloads every
 parameter exactly, and compares inference logits (CUDA reductions may reorder
 sums). No external dataset or Python is needed:
@@ -300,6 +301,69 @@ The `out` parent must exist. These are architecture/training demonstrations,
 not image-recognition quality benchmarks. Committed Conv2d fixtures check all
 output and VJP elements against PyTorch without requiring Python during Go
 tests; regenerate with `python tools/gen_conv2d_fixture.py`.
+
+## NCHW pooling
+
+`MaxPool2d`, `AvgPool2d` and `AdaptiveAvgPool2d` accept float32
+`[batch,channels,height,width]` inputs on CPU or CUDA. Non-contiguous views are
+materialized and their gradients are mapped back to the original storage.
+Input/output dimensions must be positive and total element counts must fit
+signed 32-bit indexing, as for Conv2d. Invalid options/shapes panic before
+materialization or allocating output storage.
+
+```go
+down := autograd.MaxPool2d(x, autograd.MaxPool2dOptions{
+    KernelSize: [2]int{2, 2}, // default stride is also [2,2]
+})
+smoothed := autograd.AvgPool2d(down, autograd.AvgPool2dOptions{
+    KernelSize: [2]int{3, 3}, Stride: [2]int{1, 1},
+    Padding: [2]int{1, 1}, ExcludePad: true,
+})
+pooled := autograd.AdaptiveAvgPool2d(smoothed, [2]int{1, 1})
+features := autograd.Reshape(pooled, pooled.Shape[0], pooled.Shape[1])
+// features is [batch,channels]; compose with a LinearLayer and loss.
+```
+
+- `MaxPool2dOptions` has `KernelSize`, `Stride`, `Padding`, `Dilation` pairs
+  and `CeilMode`. `AvgPool2dOptions` has `KernelSize`, `Stride`, `Padding`,
+  `CeilMode`, `ExcludePad`, and `DivisorOverride`. Pairs are height/width.
+  KernelSize is required. An all-zero stride defaults to KernelSize; an
+  all-zero max-pool dilation defaults to `[1,1]`. Other stride/dilation entries
+  must be positive. Padding is symmetric and between zero and half the kernel
+  size on each axis. Average pooling has unit dilation.
+- Output size on each axis is
+  `floor((input + 2*padding - dilation*(kernel-1) - 1)/stride) + 1`.
+  CeilMode replaces floor with ceil, then removes a final window starting
+  wholly in the right/bottom padding. Windows may extend past the input.
+- Max padding acts as negative infinity. Equal maxima select the first valid
+  row-major sample; NaNs select the last NaN. Selected indices are saved only
+  when gradients are recorded and survive retained backward passes. A dilated
+  window containing no valid sample returns negative infinity and contributes
+  no input gradient. This API returns values, not an indices tensor.
+- Average pooling counts zero padding in its divisor by default, matching
+  PyTorch's `count_include_pad=true`. Set `ExcludePad: true` to count only
+  valid input positions. For ceil-mode partial windows, positions beyond the
+  requested padding are excluded even in the default mode. A positive
+  `DivisorOverride` replaces the count; zero uses the normal count. Negative
+  overrides are rejected.
+- Adaptive pooling requires a positive `[output_height,output_width]`.
+  Each bin starts at `floor(position*input/output)` and ends at
+  `ceil((position+1)*input/output)`. Bins can overlap and output sizes may be
+  larger than input sizes; backward adds every bin's contribution.
+- `MaxPool2dLayer{Options: ...}`, `AvgPool2dLayer{Options: ...}` and
+  `AdaptiveAvgPool2dLayer{OutputSize: ...}` implement `TensorLayer` for
+  `Sequential`. They have no parameters, buffers or train/eval-dependent state.
+  Bound input context identity and NoGrad behavior propagate normally.
+- Pooling computes in FP32, including under BF16 autocast. CUDA uses device
+  kernels without host staging, supports capture/replay, and accumulates
+  overlapping gradients with atomic additions. Compare gradients numerically,
+  rather than requiring bit-for-bit CUDA reproducibility.
+
+Committed PyTorch fixtures cover every output and input VJP for rectangular
+kernels, dilated max pooling, ceil-mode correction, include/exclude padding,
+divisor override, non-divisible adaptive bins and adaptive upsampling.
+Regeneration requires PyTorch (`python tools/gen_pool2d_fixture.py`); Go tests
+use the JSON directly. Finite differences independently verify all three ops.
 
 ## Resuming a training run
 

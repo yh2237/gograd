@@ -45,9 +45,11 @@ func newClassifier(device tensor.Device) (*classifier, error) {
 
 func (m *classifier) forward(x *autograd.Tensor) *autograd.Tensor {
 	h := autograd.ReLU(m.first.Forward(x))
+	h = autograd.MaxPool2d(h, autograd.MaxPool2dOptions{KernelSize: [2]int{2, 2}})
 	h = autograd.ReLU(m.second.Forward(h))
-	// Global spatial averaging produces [batch,channels] for the classifier.
-	return m.head.Forward(autograd.Mean(h, 2, 3))
+	// Adaptive pooling keeps the classifier independent of spatial dimensions.
+	h = autograd.AdaptiveAvgPool2d(h, [2]int{1, 1})
+	return m.head.Forward(autograd.Reshape(h, h.Shape[0], h.Shape[1]))
 }
 
 func (m *classifier) close() {
