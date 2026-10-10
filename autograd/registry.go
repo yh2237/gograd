@@ -31,6 +31,7 @@ var operationRegistry = map[string]KernelPair{
 	"masked_loss":            {"masked-loss", "masked_f/b"},
 	"conv1d":                 {"Conv1d reference", "im2col/col2im+cuBLAS"},
 	"conv1d_gemm":            {"SGEMMOp", "im2col/col2im+cuBLAS"},
+	"conv2d":                 {"tiled im2col+SGEMMOp", "tiled im2col/col2im+cuBLAS"},
 	"group_norm":             {"GroupNorm", "group_f/b"},
 	"layer_norm":             {"LayerNorm", "layernorm_f/b"},
 	"rms_norm_last":          {"Mean+Log+Exp+Mul", "reduce_nd+unary+binary"},
