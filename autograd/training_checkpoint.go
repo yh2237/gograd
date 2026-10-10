@@ -7,31 +7,31 @@ import (
 	"strings"
 )
 
-// SaveTrainingCheckpoint stores current model/buffers, AdamW hyperparameters and
-// moments, OneCycle position, and caller metadata in one atomically replaced
+// SaveTrainingCheckpoint stores model/buffers, optimizer state (AdamW or SGD),
+// OneCycle position, and caller metadata in one atomically replaced
 // safetensors file. Sampler/trainer state can be JSON in caller metadata.
-func SaveTrainingCheckpoint(path string, module *Module, optimizer *AdamW, scheduler *OneCycle, metadata map[string]string) error {
+func SaveTrainingCheckpoint(path string, module *Module, optimizer CheckpointOptimizer, scheduler *OneCycle, metadata map[string]string) error {
 	if module == nil || optimizer == nil || scheduler == nil {
 		return fmt.Errorf("autograd: model, optimizer and scheduler are required")
 	}
-	state, err := optimizer.State()
+	state, err := optimizer.Snapshot()
 	if err != nil {
 		return err
 	}
-	if err := optimizer.validateState(state); err != nil {
+	if err := optimizer.ValidateSnapshot(state); err != nil {
 		return err
 	}
 	if err := validateOneCycle(*scheduler); err != nil {
 		return err
 	}
-	if scheduler.StepCount != state.StepCount {
+	if scheduler.StepCount != snapshotStep(state) {
 		return fmt.Errorf("autograd: optimizer/scheduler step mismatch")
 	}
 	model, err := module.stateEntries()
 	if err != nil {
 		return err
 	}
-	opt, optMeta, err := optimizerEntries(state)
+	opt, optMeta, err := snapshotEntries(state)
 	if err != nil {
 		return err
 	}
@@ -51,6 +51,7 @@ func SaveTrainingCheckpoint(path string, module *Module, optimizer *AdamW, sched
 		return err
 	}
 	optMeta["format"] = "gograd-training-1"
+	optMeta["optimizer_kind"] = state.Kind
 	optMeta["scheduler"] = string(schedule)
 	optMeta["user"] = string(user)
 	return writeSafetensors(path, entries, optMeta)
@@ -74,7 +75,7 @@ func TrainingCheckpointMetadata(path string) (map[string]string, error) {
 
 // LoadTrainingCheckpoint validates every name/shape and all state before copying
 // model or optimizer data. Device transfer failures may still interrupt loading.
-func LoadTrainingCheckpoint(path string, module *Module, optimizer *AdamW, scheduler *OneCycle) (map[string]string, error) {
+func LoadTrainingCheckpoint(path string, module *Module, optimizer CheckpointOptimizer, scheduler *OneCycle) (map[string]string, error) {
 	if module == nil || optimizer == nil || scheduler == nil {
 		return nil, fmt.Errorf("autograd: model, optimizer and scheduler are required")
 	}
@@ -98,12 +99,11 @@ func LoadTrainingCheckpoint(path string, module *Module, optimizer *AdamW, sched
 	if err := module.validateEntries(model); err != nil {
 		return nil, err
 	}
-	metadata["format"] = optimizerStateFormat
-	state, err := optimizerStateFromEntries(opt, metadata, len(optimizer.Params))
+	state, err := snapshotFromEntries(opt, metadata)
 	if err != nil {
 		return nil, err
 	}
-	if err := optimizer.validateState(state); err != nil {
+	if err := optimizer.ValidateSnapshot(state); err != nil {
 		return nil, err
 	}
 	var schedule OneCycle
@@ -113,7 +113,7 @@ func LoadTrainingCheckpoint(path string, module *Module, optimizer *AdamW, sched
 	if err := validateOneCycle(schedule); err != nil {
 		return nil, err
 	}
-	if schedule.StepCount != state.StepCount {
+	if schedule.StepCount != snapshotStep(state) {
 		return nil, fmt.Errorf("autograd: optimizer/scheduler step mismatch")
 	}
 	var user map[string]string
@@ -123,7 +123,7 @@ func LoadTrainingCheckpoint(path string, module *Module, optimizer *AdamW, sched
 	if err := module.loadEntries(model); err != nil {
 		return nil, err
 	}
-	if err := optimizer.LoadState(state); err != nil {
+	if err := optimizer.LoadSnapshot(state); err != nil {
 		return nil, err
 	}
 	*scheduler = schedule

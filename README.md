@@ -35,6 +35,8 @@ max/average/adaptive-average pooling, log-softmax, cross-entropy, deterministic
 dropout, scaled attention, masked losses, clipping, AdamW, and OneCycle LR.
 General BatchNorm supports channels-first/last layouts, train/eval statistics,
 affine parameters and named running state on CPU/CUDA.
+AdamW and SGD share an Optimizer interface and OneCycle scheduling. SGD includes
+momentum/dampening, Nesterov, coupled decay and ascent, with CPU/CUDA state resume.
 The op registry lists the CPU and CUDA implementation for each public
 differentiable tensor operation and selects its device backend; a source-level
 test rejects an operation that bypasses dispatch. Pre-norm
@@ -198,6 +200,7 @@ go run ./cmd/cnn-train -device cuda -steps 60 -out out/cnn-cuda.safetensors
 go run ./cmd/mnist-train -download -device cpu -steps 100 -train-limit 2000 -valid-limit 1000
 go run ./cmd/mnist-train -device cuda -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-cuda.safetensors
 go run ./cmd/mnist-train -device cpu -workers 4 -prefetch 3 -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-prefetch.safetensors
+go run ./cmd/mnist-train -device cpu -optimizer sgd -momentum .9 -nesterov -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-sgd.safetensors
 go run ./cmd/gputcn-train
 go run ./cmd/nn-conv-train -device cpu -hidden 128 -kernel 5 -steps 3
 go run ./cmd/nn-conv-train -device cpu -hidden 128 -kernel 5 -steps 5 -cpuprofile "$env:TEMP/gograd-nn-cpu.pprof"

@@ -48,124 +48,136 @@ func writeDigits(t *testing.T, dir string) {
 	}
 }
 func TestMNISTMidEpochResume(t *testing.T) {
-	for _, device := range []tensor.Device{tensor.CPU, tensor.CUDA} {
-		t.Run(string(device), func(t *testing.T) {
-			if device == tensor.CUDA && !cuda.Available() {
-				t.Skip("CUDA unavailable")
-			}
-			dir := t.TempDir()
-			writeDigits(t, dir)
-			base := trainConfig{DataDir: dir, Device: string(device), Steps: 6, Batch: 4, Seed: 11}
-			full := base
-			full.Out = filepath.Join(dir, "full.safetensors")
-			want, err := train(context.Background(), full, io.Discard)
-			if err != nil {
-				t.Fatal(err)
-			}
-			part := base
-			part.Workers, part.Prefetch = 3, 3
-			part.Out = filepath.Join(dir, "part.safetensors")
-			part.StopAfter = 2
-			if _, err := train(context.Background(), part, io.Discard); err != nil {
-				t.Fatal(err)
-			}
-			resume := base
-			resume.Workers, resume.Prefetch = 1, 2
-			resume.Out = filepath.Join(dir, "resumed.safetensors")
-			resume.Resume = part.Out + ".training.safetensors"
-			got, err := train(context.Background(), resume, io.Discard)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got.Steps != 6 || got.Accuracy != want.Accuracy || got.ReloadMaxAbs > 1e-5 {
-				t.Fatalf("resume metrics %#v != %#v", got, want)
-			}
-			lossTolerance := float64(0)
-			if device == tensor.CUDA {
-				lossTolerance = 1e-6
-			}
-			if math.Abs(got.ValidationLoss-want.ValidationLoss) > lossTolerance {
-				t.Fatal("resumed evaluation loss differed")
-			}
-			// On CUDA model/state readback must itself hold the OS thread.
-			if device == tensor.CUDA {
-				ctx, err := autograd.NewCUDAContext()
+	for _, kind := range []string{"adamw", "sgd"} {
+		for _, device := range []tensor.Device{tensor.CPU, tensor.CUDA} {
+			t.Run(kind+"/"+string(device), func(t *testing.T) {
+				if device == tensor.CUDA && !cuda.Available() {
+					t.Skip("CUDA unavailable")
+				}
+				dir := t.TempDir()
+				writeDigits(t, dir)
+				base := trainConfig{DataDir: dir, Device: string(device), Steps: 6, Batch: 4, Seed: 11, Optimizer: kind, Momentum: .9}
+				full := base
+				full.Out = filepath.Join(dir, "full.safetensors")
+				want, err := train(context.Background(), full, io.Discard)
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer ctx.Close()
-			}
-			a, err := newDigitModel(device, base.Seed)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer a.close()
-			b, err := newDigitModel(device, base.Seed)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer b.close()
-			for i, m := range []*digitModel{a, b} {
-				file := full.Out
-				if i == 1 {
-					file = resume.Out
-				}
-				if err := m.module.LoadSafeTensors(file); err != nil {
+				part := base
+				part.Workers, part.Prefetch = 3, 3
+				part.Out = filepath.Join(dir, "part.safetensors")
+				part.StopAfter = 2
+				if _, err := train(context.Background(), part, io.Discard); err != nil {
 					t.Fatal(err)
 				}
-			}
-			left, right := a.module.StateDict(), b.module.StateDict()
-			for name, values := range left {
-				assertTrainingValues(t, device, name, values, right[name])
-			}
-			// Restore both combined checkpoints and compare AdamW moments too.
-			states := make([]autograd.OptimizerState, 2)
-			schedules := make([]autograd.OneCycle, 2)
-			for i, m := range []*digitModel{a, b} {
-				opt := autograd.NewAdamW(m.module.NamedParameters(), .001, 0)
-				defer opt.Close()
-				schedule := autograd.NewOneCycle(.005, 6, .3)
-				file := full.Out
-				if i == 1 {
-					file = resume.Out
-				}
-				if _, err := autograd.LoadTrainingCheckpoint(file+".training.safetensors", &m.module, opt, schedule); err != nil {
-					t.Fatal(err)
-				}
-				states[i], err = opt.State()
+				resume := base
+				resume.Workers, resume.Prefetch = 1, 2
+				resume.Out = filepath.Join(dir, "resumed.safetensors")
+				resume.Resume = part.Out + ".training.safetensors"
+				got, err := train(context.Background(), resume, io.Discard)
 				if err != nil {
 					t.Fatal(err)
 				}
-				schedules[i] = *schedule
-			}
-			for i, moments := range states[0].Moments {
-				assertTrainingValues(t, device, "AdamW M", moments.M, states[1].Moments[i].M)
-				assertTrainingValues(t, device, "AdamW V", moments.V, states[1].Moments[i].V)
-			}
-			states[0].Moments, states[1].Moments = nil, nil
-			if !reflect.DeepEqual(states[0], states[1]) || !reflect.DeepEqual(schedules[0], schedules[1]) {
-				t.Fatal("resume changed optimizer configuration or schedule")
-			}
-			metadata, _ := autograd.TrainingCheckpointMetadata(full.Out + ".training.safetensors")
-			var finalState checkpointState
-			if err := json.Unmarshal([]byte(metadata["data_state"]), &finalState); err != nil {
-				t.Fatal(err)
-			}
-			other, _ := autograd.TrainingCheckpointMetadata(resume.Out + ".training.safetensors")
-			if metadata["data_state"] != other["data_state"] {
-				t.Fatal("resumed sampler state differed")
-			}
-			bad := resume
-			bad.Batch++
-			if _, err := train(context.Background(), bad, io.Discard); err == nil {
-				t.Fatal("incompatible resume configuration accepted")
-			}
-			bad = resume
-			bad.Checkpoint = bad.Out
-			if _, err := train(context.Background(), bad, io.Discard); err == nil {
-				t.Fatal("inference output could overwrite training state")
-			}
-		})
+				if got.Steps != 6 || got.Accuracy != want.Accuracy || got.ReloadMaxAbs > 1e-5 {
+					t.Fatalf("resume metrics %#v != %#v", got, want)
+				}
+				lossTolerance := float64(0)
+				if device == tensor.CUDA {
+					lossTolerance = 1e-6
+				}
+				if math.Abs(got.ValidationLoss-want.ValidationLoss) > lossTolerance {
+					t.Fatal("resumed evaluation loss differed")
+				}
+				// On CUDA model/state readback must itself hold the OS thread.
+				if device == tensor.CUDA {
+					ctx, err := autograd.NewCUDAContext()
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer ctx.Close()
+				}
+				a, err := newDigitModel(device, base.Seed)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer a.close()
+				b, err := newDigitModel(device, base.Seed)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer b.close()
+				for i, m := range []*digitModel{a, b} {
+					file := full.Out
+					if i == 1 {
+						file = resume.Out
+					}
+					if err := m.module.LoadSafeTensors(file); err != nil {
+						t.Fatal(err)
+					}
+				}
+				left, right := a.module.StateDict(), b.module.StateDict()
+				for name, values := range left {
+					assertTrainingValues(t, device, name, values, right[name])
+				}
+				// Restore both combined checkpoints and compare optimizer buffers too.
+				states := make([]autograd.OptimizerSnapshot, 2)
+				schedules := make([]autograd.OneCycle, 2)
+				for i, m := range []*digitModel{a, b} {
+					opt, err := newTrainingOptimizer(m.module.NamedParameters(), base, .001)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer opt.Close()
+					schedule := autograd.NewOneCycle(.005, 6, .3)
+					file := full.Out
+					if i == 1 {
+						file = resume.Out
+					}
+					if _, err := autograd.LoadTrainingCheckpoint(file+".training.safetensors", &m.module, opt, schedule); err != nil {
+						t.Fatal(err)
+					}
+					states[i], err = opt.Snapshot()
+					if err != nil {
+						t.Fatal(err)
+					}
+					schedules[i] = *schedule
+				}
+				if kind == "adamw" {
+					for i, moments := range states[0].AdamW.Moments {
+						assertTrainingValues(t, device, "AdamW M", moments.M, states[1].AdamW.Moments[i].M)
+						assertTrainingValues(t, device, "AdamW V", moments.V, states[1].AdamW.Moments[i].V)
+					}
+					states[0].AdamW.Moments, states[1].AdamW.Moments = nil, nil
+				} else {
+					for i, buffer := range states[0].SGD.Buffers {
+						assertTrainingValues(t, device, "SGD momentum", buffer, states[1].SGD.Buffers[i])
+					}
+					states[0].SGD.Buffers, states[1].SGD.Buffers = nil, nil
+				}
+				if !reflect.DeepEqual(states[0], states[1]) || !reflect.DeepEqual(schedules[0], schedules[1]) {
+					t.Fatal("resume changed optimizer configuration or schedule")
+				}
+				metadata, _ := autograd.TrainingCheckpointMetadata(full.Out + ".training.safetensors")
+				var finalState checkpointState
+				if err := json.Unmarshal([]byte(metadata["data_state"]), &finalState); err != nil {
+					t.Fatal(err)
+				}
+				other, _ := autograd.TrainingCheckpointMetadata(resume.Out + ".training.safetensors")
+				if metadata["data_state"] != other["data_state"] {
+					t.Fatal("resumed sampler state differed")
+				}
+				bad := resume
+				bad.Batch++
+				if _, err := train(context.Background(), bad, io.Discard); err == nil {
+					t.Fatal("incompatible resume configuration accepted")
+				}
+				bad = resume
+				bad.Checkpoint = bad.Out
+				if _, err := train(context.Background(), bad, io.Discard); err == nil {
+					t.Fatal("inference output could overwrite training state")
+				}
+			})
+		}
 	}
 }
 

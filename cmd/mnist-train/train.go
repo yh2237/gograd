@@ -52,6 +52,9 @@ type runIdentity struct {
 	Version, Steps, Batch, TrainSize, ValidSize int
 	Seed                                        uint64
 	TrainFingerprint, ValidFingerprint          string
+	Optimizer                                   string
+	MaxLR, Momentum                             float64
+	Nesterov                                    bool
 }
 type checkpointState struct {
 	Identity runIdentity
@@ -97,6 +100,27 @@ func readDigits(dir, imagesName, labelsName string, limit int) (*data.Subset[dat
 func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, error) {
 	var stats trainingStats
 	device := tensor.Device(c.Device)
+	if c.Optimizer == "" {
+		c.Optimizer = "adamw"
+	}
+	if c.Optimizer != "adamw" && c.Optimizer != "sgd" {
+		return stats, fmt.Errorf("unknown optimizer %q", c.Optimizer)
+	}
+	if c.MaxLR == 0 {
+		c.MaxLR = .005
+		if c.Optimizer == "sgd" {
+			c.MaxLR = .1
+		}
+	}
+	if c.MaxLR <= 0 || math.IsNaN(c.MaxLR) || math.IsInf(c.MaxLR, 0) || c.MaxLR > math.MaxFloat32 || c.Momentum < 0 || math.IsNaN(c.Momentum) || math.IsInf(c.Momentum, 0) || c.Momentum > math.MaxFloat32 {
+		return stats, fmt.Errorf("invalid learning rate/momentum")
+	}
+	if c.Optimizer == "adamw" {
+		c.Momentum = 0
+		if c.Nesterov {
+			return stats, fmt.Errorf("Nesterov applies to SGD only")
+		}
+	}
 	if ctx == nil || c.Steps < 2 || c.Batch < 1 || c.StopAfter < 0 || c.StopAfter > c.Steps || c.TrainLimit < 0 || c.ValidLimit < 0 || c.Workers < 0 || c.Prefetch < 0 || c.Workers == 0 && c.Prefetch != 0 || (device != tensor.CPU && device != tensor.CUDA) {
 		return stats, fmt.Errorf("invalid training configuration")
 	}
@@ -154,9 +178,12 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 		return stats, err
 	}
 	defer loader.Close()
-	identity := runIdentity{1, c.Steps, c.Batch, trainData.Len(), validData.Len(), c.Seed, trainHash, validHash}
-	schedule := autograd.NewOneCycle(.005, c.Steps, .3)
-	optimizer := autograd.NewAdamW(m.module.NamedParameters(), float32(schedule.LR()), .0001)
+	identity := runIdentity{Version: 1, Steps: c.Steps, Batch: c.Batch, TrainSize: trainData.Len(), ValidSize: validData.Len(), Seed: c.Seed, TrainFingerprint: trainHash, ValidFingerprint: validHash, Optimizer: c.Optimizer, MaxLR: c.MaxLR, Momentum: c.Momentum, Nesterov: c.Nesterov}
+	schedule := autograd.NewOneCycle(c.MaxLR, c.Steps, .3)
+	optimizer, err := newTrainingOptimizer(m.module.NamedParameters(), c, float32(schedule.LR()))
+	if err != nil {
+		return stats, err
+	}
 	defer optimizer.Close()
 	if c.Resume != "" {
 		metadata, err := autograd.TrainingCheckpointMetadata(c.Resume)
@@ -166,6 +193,10 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 		var state checkpointState
 		if err := json.Unmarshal([]byte(metadata["data_state"]), &state); err != nil {
 			return stats, err
+		}
+		if state.Identity.Version == 1 && state.Identity.Optimizer == "" {
+			state.Identity.Optimizer = "adamw"
+			state.Identity.MaxLR = .005
 		}
 		if state.Identity != identity {
 			return stats, fmt.Errorf("checkpoint does not match data/configuration")
@@ -268,7 +299,7 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 	}
 	return stats, nil
 }
-func trainingStep(m *digitModel, execution *autograd.ExecutionContext, optimizer *autograd.AdamW, schedule *autograd.OneCycle, batch data.FloatBatch, device tensor.Device) (float32, error) {
+func trainingStep(m *digitModel, execution *autograd.ExecutionContext, optimizer autograd.Optimizer, schedule *autograd.OneCycle, batch data.FloatBatch, device tensor.Device) (float32, error) {
 	x, err := execution.New(batch.Values, batch.Shape, device, false)
 	if err != nil {
 		return 0, err
@@ -287,6 +318,13 @@ func trainingStep(m *digitModel, execution *autograd.ExecutionContext, optimizer
 	optimizer.Step()
 	schedule.Step(optimizer)
 	return values[0], nil
+}
+
+func newTrainingOptimizer(params []autograd.Parameter, c trainConfig, lr float32) (autograd.CheckpointOptimizer, error) {
+	if c.Optimizer == "sgd" {
+		return autograd.NewSGD(params, autograd.SGDOptions{LR: lr, Momentum: float32(c.Momentum), Nesterov: c.Nesterov, WeightDecay: .0001})
+	}
+	return autograd.NewAdamW(params, lr, .0001), nil
 }
 func evaluate(ctx context.Context, m *digitModel, execution *autograd.ExecutionContext, dataset data.Dataset[data.FloatSample], batchSize, workers, prefetch int, device tensor.Device) (float64, float64, []float32, error) {
 	sampler, err := data.NewIndexSampler(dataset.Len(), data.SamplerOptions{})

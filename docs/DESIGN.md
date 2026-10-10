@@ -321,6 +321,39 @@ at update 40 and resumed using two readers/prefetch two. CUDA used four readers
 and prefetch four. Both retained 86.4% test accuracy, loss 0.455661 and zero
 reload-logit difference. This checks pipeline equivalence, not a throughput claim.
 
+## Common optimizers and SGD state
+
+Optimizer provides a common eager update/reset/LR/lifetime surface for AdamW and
+SGD, and OneCycle now targets this interface. CheckpointOptimizer wraps typed
+state in an algorithm-tagged snapshot while preserving the existing AdamW state
+API. The training-1 envelope carries optimizer_kind; an absent tag remains legacy
+AdamW. Decode and algorithm-specific validation precede live model/state copies.
+Standalone momentum snapshots use SGD-specific metadata rather than inventing
+Adam-style moments for another algorithm.
+
+SGD matches PyTorch's coupled decay and momentum rules, including an undampened
+first buffer, per-parameter lazy initialization, Nesterov and ascent. Eager
+gradient reset removes absent gradients on both backends, so unused parameters
+skip decay/state updates. CPU uses FP32 arithmetic; CUDA updates each parameter
+in one device kernel and marks initialized state in a subsequent kernel to avoid
+a flag-write/read race among threads. Snapshot export includes flags and only
+initialized momentum buffers; restore validates identities/configuration first.
+
+CUDA graph mode has a device step counter and stable per-parameter initialization
+flags. ZeroGrad preserves prepared graph buffers. Captured update/replay has no
+host state readback; eager continuation synchronizes the step count. Eager
+mutations invalidate shared-storage versions/BF16 shadows. Capture/replay and
+state replacement follow existing allocation/thread/opaque-mutation contracts.
+
+The MNIST loop selects AdamW or SGD through the common API and stores optimizer
+identity/options with loader metadata. Both paths have uninterrupted-vs-resumed
+weight, buffer, schedule and data-order tests. With the same 2,000 training/1,000
+test examples, seed 7, batch 64 and 100 updates, SGD momentum .9 + Nesterov with
+OneCycle peak .1 reached 85.2% test accuracy and loss 0.479619 on CPU/CUDA. CPU
+stopped at 40 and resumed with different worker settings; reload-logit difference
+was zero on both. This is another training/state exercise, not an optimizer
+comparison benchmark.
+
 ## Migration and phases
 
 1. Extend the operation registry from backend selection to callable kernels

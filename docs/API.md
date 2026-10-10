@@ -22,7 +22,9 @@ use a separate `gograd-training-1` envelope.
 | `autograd` | `Module.StateDict`, `LoadStateDict`, `SaveSafeTensors`, `SaveSafeTensorsMetadata`, `LoadSafeTensors` | Named float32 state. Metadata values are strings. The speech-timing model emits UtauTTS loader names and shapes. |
 | `autograd` | `MaskedLoss(pred,target,false)`, `ClipGradNorm`, `NewAdamW`, `NewOneCycle` | NaN-frame masked L1, clipping, AdamW, and PyTorch two-phase cosine OneCycle LR. |
 | `autograd` | `AdamW.State`, `LoadState`, `SaveSafeTensors`, `LoadSafeTensors`, `Close` | Named parameter shapes, moments, hyperparameters and step count on CPU/CUDA; release optimizer-owned buffers. |
-| `autograd` | `SaveTrainingCheckpoint`, `LoadTrainingCheckpoint`, `TrainingCheckpointMetadata` | Atomic model/buffer + AdamW + OneCycle checkpoint with caller metadata. All names/shapes/state are validated before copying into live objects. |
+| `autograd` | `Optimizer`, `CheckpointOptimizer`, `OptimizerSnapshot`, `LearningRate`, `SetLearningRate` | Common eager update/reset/LR/lifetime API and typed AdamW/SGD checkpoint snapshots. OneCycle accepts Optimizer. |
+| `autograd` | `NewSGD`, `SGDOptions`, `SGD.State`, `SGDState`, `LoadState`, `SaveSafeTensors`, `LoadSafeTensors` | CPU/CUDA SGD, momentum/dampening, Nesterov, coupled decay, ascent and lazy momentum initialization/state resume. |
+| `autograd` | `SaveTrainingCheckpoint`, `LoadTrainingCheckpoint`, `TrainingCheckpointMetadata` | Atomic model/buffer + AdamW/SGD + OneCycle checkpoint with caller metadata. All names/shapes/state are validated before copying into live objects. |
 | `autograd` | `Module.Train`, `SetTraining` | Recursive train/eval propagation; `OnTrainingChange` connects stateful layers such as dropout to the module tree. |
 | `autograd` | `IndexLoader.State`, `LoadState`, `WindowSampler.Batch`, `State`, `LoadState` | Restorable epoch order or PCG random windows, including short-sequence padding/context-drop decisions. |
 | `cuda` | `MemoryStats`, `ResetAllocationPeak`, `SetPoolCacheLimit`, `ReleasePool` | Query active, cached, and reserved bytes; bound or release reusable CUDA allocations. |
@@ -465,6 +467,90 @@ differences, selective gradients, shared/retained histories, closed ancestors,
 independent CPU workers, state reload and CUDA capture/memory reclamation.
 Regenerate with `python tools/gen_batchnorm_fixture.py`.
 
+## Optimizers and SGD
+
+`Optimizer` exposes `Step()`, `ZeroGrad()`, `LearningRate() float32`,
+`SetLearningRate(float32)` and `Close()`. AdamW and SGD implement it;
+`OneCycle.Step(optimizer)` advances the schedule and sets the next update's LR
+through the interface. Existing direct AdamW LR fields/calls still work.
+SetLearningRate accepts finite nonnegative rates and panics for invalid input.
+CheckpointOptimizer adds `Snapshot`, `ValidateSnapshot` and `LoadSnapshot` with
+a versioned OptimizerSnapshot tagged `adamw` or `sgd`. Existing typed AdamW
+State/LoadState methods are preserved. Custom update implementations can use
+Optimizer with OneCycle; the current checkpoint encoder supports the two builtins.
+
+```go
+schedule := autograd.NewOneCycle(.1, 100, .3)
+sgd, err := autograd.NewSGD(model.NamedParameters(), autograd.SGDOptions{
+    LR: float32(schedule.LR()), Momentum: .9,
+    Nesterov: true, WeightDecay: .0001,
+})
+// Handle err.
+_ = err
+defer sgd.Close()
+var optimizer autograd.Optimizer = sgd
+optimizer.ZeroGrad()
+// Construct a loss, Backward, then release its graph as usual.
+optimizer.Step()
+schedule.Step(optimizer)
+err = autograd.SaveTrainingCheckpoint("run.safetensors", model, sgd, schedule, metadata)
+// Handle err. LoadTrainingCheckpoint restores model, options, buffers and schedule.
+```
+
+`NewSGD(params, options)` returns errors for invalid configuration/parameters.
+Parameters are distinct named, contiguous float32 factory leaves on one device,
+with positive element counts. Constructor copies the parameter slice and options;
+keep parameter identity/order stable. LR is also exposed as the SGD.LR field.
+Other hyperparameters are copied configuration and restored through state.
+
+SGDOptions has LR, Momentum, Dampening, WeightDecay, Nesterov and Maximize:
+
+- Numeric values are finite and nonnegative. Zero LR is allowed and still
+  updates momentum. Nesterov requires positive momentum and zero dampening.
+  Momentum zero uses plain SGD; dampening then has no effect.
+- Start with `d = grad` (or `-grad` for Maximize), then add coupled decay
+  `WeightDecay * parameter`. This differs from AdamW's decoupled decay.
+- For positive momentum, the first buffer is exactly `d`, without dampening.
+  Later updates are `buffer = Momentum*buffer + (1-Dampening)*d`.
+  Descent uses buffer, or `d + Momentum*buffer` for Nesterov, and subtracts
+  `LR * update` from the parameter. Maximize flips only the raw gradient sign;
+  decay still shrinks parameters.
+- An absent gradient skips parameter/decay/buffer updates. A present zero
+  gradient still applies decay and momentum. Lazy initialization is per parameter,
+  so a parameter first used in a later step still gets an undampened first buffer.
+  StepCount counts optimizer Step calls, including calls where all gradients
+  are absent, to align with the scheduler.
+- Eager SGD.ZeroGrad clears gradients to absent on both devices. Prepared or
+  captured CUDA graphs preserve and zero gradient allocations instead, because
+  replay requires stable addresses. AdamW retains its existing ZeroGrad policy.
+- CPU/CUDA updates increment managed storage versions and invalidate BF16
+  shadows on eager mutation. SGD computes FP32 updates even under autocast.
+  CUDA updates/momentum/initialization remain on device without per-step readback.
+  Close releases optimizer state only, leaving model parameters owned by callers.
+
+SGD.State includes ordered names/shapes, complete options, step count, momentum
+buffers and per-parameter Initialized flags. Unused parameters have no buffer
+in the snapshot/file. LoadState validates every option/name/shape/flag/buffer
+before replacing state. Snapshots are independent copies. Standalone SGD
+safetensors use `gograd-sgd` metadata; combined checkpoints keep
+`gograd-training-1` and tag the optimizer kind. Existing AdamW training files
+without a kind tag are treated as AdamW. Loading a mismatched optimizer kind
+is rejected before changing live model values.
+
+CUDA capture uses `SGD.PrepareGraph`, `GraphStepCount`, and SyncGraphStepCount,
+analogous to AdamW. A separate per-parameter device flag handles first momentum
+initialization, followed by a flag-marking kernel after the update completes.
+Captured replays advance a device step count. State/checkpoint export reads that
+count; returning to eager Step synchronizes it. Captured hyperparameters are
+fixed at capture, and restore/reallocation requires ending old graphs first.
+Opaque replay writes are outside host-side storage-version tracking.
+
+Committed PyTorch SGD fixtures cover plain/decay/momentum/dampening/Nesterov,
+ascent, LR changes, delayed/absent gradients and present zero gradients. Go tests
+compare every parameter/buffer value, lazy-state roundtrips, checkpoint resume,
+legacy AdamW loading, saved-version checks and CUDA graph/BF16 cache behavior.
+Regenerate with `python tools/gen_sgd_fixture.py`.
+
 ## Generic host data and batching
 
 The `data` package has no tensor/backend dependency. `Dataset[T]` exposes
@@ -609,7 +695,7 @@ image in `[0,1]` and its integer label. ImageSize and Classes report geometry
 and maximum-label-plus-one; Fingerprint is SHA-256 over both decoded files,
 so changing gzip container bytes alone does not change identity.
 
-`cmd/mnist-train` uses a 784→64→10 MLP, cross-entropy, AdamW and OneCycle. It
+`cmd/mnist-train` uses a 784→64→10 MLP, cross-entropy, AdamW or SGD and OneCycle. It
 reads MNIST training/test IDX pairs, uses shuffled training batches and sequential
 test evaluation, saves inference weights, then reconstructs/reloads and compares
 logits. Download is opt-in and uses Go's HTTP/gzip support. Only missing files
@@ -622,6 +708,7 @@ go run ./cmd/mnist-train -download -device cpu -steps 100 -stop-after 40 -train-
 go run ./cmd/mnist-train -device cpu -steps 100 -train-limit 2000 -valid-limit 1000 -resume out/mnist.safetensors.training.safetensors
 go run ./cmd/mnist-train -device cuda -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-cuda.safetensors
 go run ./cmd/mnist-train -device cpu -workers 4 -prefetch 3 -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-prefetch.safetensors
+go run ./cmd/mnist-train -device cpu -optimizer sgd -momentum .9 -nesterov -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-sgd.safetensors
 ```
 
 Default data directory is `out/mnist`, output is `out/mnist.safetensors`, batch
@@ -633,8 +720,14 @@ schedule and must stay unchanged on resume. Checkpoint defaults to output plus
 `-workers` and `-prefetch` control both training and evaluation loading (defaults
 zero/synchronous). They can change on resume because checkpoints capture only
 delivered data order. Every command loader is closed on completion/error.
+`-optimizer adamw|sgd` selects updates. `-lr` selects the OneCycle peak (zero
+defaults to .005 for AdamW or .1 for SGD); `-momentum` defaults to .9 for SGD and
+`-nesterov` enables its Nesterov variant. Coupled/decoupled decay is .0001 in
+this example. Optimizer selection/rate/momentum/Nesterov are checkpoint identity;
+changing them on resume is rejected. Old MNIST AdamW metadata is recognized
+with its original .005 peak/default settings.
 
-Training state includes model, AdamW moments/hyperparameters, OneCycle and loader
+Training state includes model, AdamW moments or SGD momentum/options, OneCycle and loader
 state, plus full dataset fingerprints and effective subset sizes/seed/batch config.
 Changing these identities is rejected before loading live model state. Interrupts
 save the last completed-update checkpoint before returning cancellation. Tests
@@ -684,7 +777,7 @@ device counter rather than an outdated host step count.
   Unbound tensors use process-wide BF16/attention compatibility settings; do
   not mutate those globals concurrently. Explicit contexts own these settings.
   CUDA stream/capture isolation is not yet implemented.
-- Combined checkpoints restore optimizer and OneCycle state. Old `nn`/`gputcn`
+- Combined checkpoints restore AdamW or SGD optimizer and OneCycle state. Old `nn`/`gputcn`
   trainers still use their existing checkpoint paths. Sampling runs on the host;
   the `data` package provides a separate general loader with optional prefetch.
 - Safetensors writes use a same-directory temporary file, sync and rename.

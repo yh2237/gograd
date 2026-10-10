@@ -431,4 +431,4 @@ func (c *OneCycle) LR() float64 {
 	}
 	return end + (start-end)*(1+math.Cos(math.Pi*p))/2
 }
-func (c *OneCycle) Step(o *AdamW) { c.StepCount++; o.LR = float32(c.LR()) }
+func (c *OneCycle) Step(o Optimizer) { c.StepCount++; o.SetLearningRate(float32(c.LR())) }
