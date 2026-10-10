@@ -262,6 +262,43 @@ and running state, and verifies logits after reload on CPU/CUDA. PyTorch fixture
 numerical gradients, independent-worker race tests, history/lifetime tests and
 captured-vs-eager state comparisons cover the general operation and layer.
 
+## Host data pipeline
+
+The independent `data` package keeps sample access, index scheduling and collation
+separate from autograd/device allocation. Dataset and Loader are generic over
+sample/batch types. A synchronous loader peeks at indices, obtains samples and
+collates a batch, then commits the sampler cursor only after successful callbacks
+and cancellation checks. Failed reads/collation can be retried without skipping
+training data. EOF from callbacks is distinguished from normal epoch termination.
+
+IndexSampler owns a PCG stream, current permutation, cursor and epoch. State
+snapshots preserve partial epochs and future shuffle choices, while validation
+rejects mismatched size/seed/options, invalid permutations and RNG payloads before
+mutation. Loader checkpoints include batching configuration and an opaque
+StatefulSampler payload. Dataset content/split identity belongs to trainer
+metadata rather than an impossible generic content hash. Subsets copy index lists;
+RandomSplit produces deterministic disjoint partitions. Read-only datasets can be
+shared between independent loaders, but mutable samplers/loaders remain serial.
+
+Float collation copies host values, with equal-shape stacking or explicit temporal
+padding/truncation and lengths/bool masks. Tensor creation/upload stays in the
+training loop's ExecutionContext. IDX data is retained as uint8, converted only
+for requested samples, and fingerprinted over decoded image/label files. Raw/gzip
+format validation does not allocate according to an unverified header count.
+
+The MNIST command uses this pipeline with a small MLP and existing combined
+model/AdamW/OneCycle checkpoints. Mid-epoch state and dataset fingerprints are
+caller metadata. CPU resume tests match weights/moments exactly; CUDA tests keep
+sampler/scheduler state exact and allow numeric differences from atomic bias VJPs.
+Tiny local IDX/HTTP fixtures keep tests offline and independent of Python.
+
+A real-data check used the first 2,000 MNIST training examples and first 1,000 test
+examples, seed 7, batch 64 and 100 planned updates. CPU was stopped after 40 and
+resumed to 100; CUDA ran continuously. Both reached test accuracy 86.4%, test loss
+0.455661 and zero inference-reload logit difference. This is a small pipeline/resume
+exercise, not a full-MNIST quality benchmark. Worker/prefetch pipelines and generic
+augmentation/collation-state contracts are later extensions.
+
 ## Migration and phases
 
 1. Extend the operation registry from backend selection to callable kernels

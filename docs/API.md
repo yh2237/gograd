@@ -26,6 +26,10 @@ use a separate `gograd-training-1` envelope.
 | `autograd` | `Module.Train`, `SetTraining` | Recursive train/eval propagation; `OnTrainingChange` connects stateful layers such as dropout to the module tree. |
 | `autograd` | `IndexLoader.State`, `LoadState`, `WindowSampler.Batch`, `State`, `LoadState` | Restorable epoch order or PCG random windows, including short-sequence padding/context-drop decisions. |
 | `cuda` | `MemoryStats`, `ResetAllocationPeak`, `SetPoolCacheLimit`, `ReleasePool` | Query active, cached, and reserved bytes; bound or release reusable CUDA allocations. |
+| `data` | `Dataset[T]`, `SliceDataset`, `NewSubset`, `RandomSplit` | Host-side random-access samples, index views and deterministic disjoint splits. |
+| `data` | `Sampler`, `StatefulSampler`, `NewIndexSampler`, `IndexSamplerState` | Transactional index selection, seeded permutations and mid-epoch/future-epoch resume. |
+| `data` | `NewLoader[T,B]`, `LoaderOptions`, `LoaderState`, `CollateFunc` | Synchronous context-aware batching with drop-last and opaque sampler checkpoint payloads. |
+| `data` | `FloatSample`, `FloatBatch`, `Stack`, `PadSequences`, `PaddingOptions`, `OpenIDX` | Owned float32 host batches, sequence lengths/bool masks and raw/gzip byte-image/label datasets. |
 
 `NewSpeechTiming(4, device, seed)` builds v1; `NewSpeechTiming(15, device,
 seed)` builds the context model. `NewSpeechTimingWithPhones(phones, continuous,
@@ -460,6 +464,126 @@ training and tracking-disabled evaluation. Go-only tests verify finite
 differences, selective gradients, shared/retained histories, closed ancestors,
 independent CPU workers, state reload and CUDA capture/memory reclamation.
 Regenerate with `python tools/gen_batchnorm_fixture.py`.
+
+## Generic host data and batching
+
+The `data` package has no tensor/backend dependency. `Dataset[T]` exposes
+`Len() int` and `Get(context.Context, index) (T, error)`; a sample can be any Go
+type. `SliceDataset[T]` adapts an in-memory slice. `NewSubset` validates and copies
+indices without copying underlying samples; `Indices()` returns a copy.
+`RandomSplit(size, validationCount, seed)` returns disjoint train/validation
+indices covering the full dataset. Keep dataset length/content/index identity
+stable during iteration and checkpoint restoration.
+
+```go
+dataset := data.SliceDataset[data.FloatSample]{
+    {Values: []float32{1, 2}, Shape: []int{2}, Label: 0},
+    {Values: []float32{3, 4}, Shape: []int{2}, Label: 1},
+}
+sampler, err := data.NewIndexSampler(dataset.Len(), data.SamplerOptions{
+    Shuffle: true, Seed: 7,
+})
+// Handle err.
+_ = err
+loader, err := data.NewLoader[data.FloatSample, data.FloatBatch](
+    dataset, sampler, data.Stack, data.LoaderOptions{BatchSize: 2},
+)
+// Handle err.
+_ = err
+for {
+    batch, err := loader.Next(context.Background())
+    if err == io.EOF { break } // end of this epoch, not all future epochs
+    // Handle other errors.
+    x, err := execution.New(batch.Values, batch.Shape, device, false)
+    // Handle err. Use batch.Labels with CrossEntropy; caller closes x.
+    _ = err
+    _ = x
+}
+err = loader.NextEpoch() // resets indices; shuffled order changes deterministically
+// Handle err.
+```
+
+- `IndexSampler` defaults to sequential order. Shuffle uses a private PCG
+  stream seeded by `SamplerOptions.Seed`; it does not use package-global RNGs.
+  `Peek(count)` returns copied upcoming indices and does not advance state.
+  `Advance(count)` commits consumed indices. `NextEpoch` starts the next order
+  and discards any unused current tail. Empty datasets immediately yield EOF.
+- `Loader.Next` gets samples serially, collates them, checks cancellation, then
+  advances the sampler. Read/collate/cancellation errors leave the cursor
+  unchanged for retry. Callback EOF is converted to UnexpectedEOF so truncated
+  input cannot masquerade as normal epoch completion. Cancellation is cooperative
+  at callback boundaries; Dataset.Get should also respect its context.
+- BatchSize must be positive. The final batch is smaller by default. DropLast
+  consumes that incomplete tail and returns EOF. Sampler/dataset size mismatch
+  and dataset-length changes are errors. Loader and mutable sampler are used
+  serially; independent workers need separate samplers/loaders. Read-only datasets
+  may be shared when their Get implementation supports concurrent calls.
+- `Stack` validates equal sample shapes and copies values/labels, prepending the
+  batch axis. Scalars are supported. `PadSequences` requires matching trailing
+  dimensions and pads the first sample axis to the batch maximum or a specified
+  Length. A shorter fixed Length requires `Truncate: true`; it is never implicit.
+  PaddingOptions.Value selects the fill value. FloatBatch.Shape is
+  `[batch,time,...]`, Lengths records retained lengths, and Mask is a flat
+  `[batch,time]` bool slice true only for retained input positions. Empty sequences
+  are valid; an all-empty automatic batch has time size zero.
+- Builtin float collates return fresh owned host slices. Samples may borrow
+  dataset storage, and custom collates must not mutate borrowed samples.
+  Convert/upload batches on the caller's ExecutionContext; integer labels/bool
+  masks remain host data until the application chooses their tensor representation.
+
+### Data checkpoints
+
+`IndexSampler.State` records version, size, seed/shuffle settings, epoch, current
+position, complete order and PCG state. Restore validates configuration,
+permutation and RNG bytes before modifying state. Thus resume preserves both
+the remaining current epoch and later shuffled epochs.
+
+`Loader.State() (LoaderState, error)` adds dataset size, batch size and DropLast
+to an opaque sampler payload. The sampler must implement StatefulSampler
+(MarshalBinary/UnmarshalBinary); IndexSampler does. Loader.LoadState rejects
+incompatible configuration before restoring the sampler. State snapshots copy
+order/payload and can be JSON-encoded in training checkpoint caller metadata.
+Dataset content, subset/split identity and custom collation configuration are
+caller metadata: matching length alone does not prove identical data.
+
+### Raw/gzip IDX and MNIST example
+
+`OpenIDX(imagesPath, labelsPath)` reads MNIST-style byte IDX magic 2051/2049,
+validates dimensions/counts/exact payload lengths, and accepts raw or gzip data
+independent of filename extension. The dataset holds compact uint8 images and
+labels in memory. Get returns an owned normalized float32 `[1,height,width]`
+image in `[0,1]` and its integer label. ImageSize and Classes report geometry
+and maximum-label-plus-one; Fingerprint is SHA-256 over both decoded files,
+so changing gzip container bytes alone does not change identity.
+
+`cmd/mnist-train` uses a 784→64→10 MLP, cross-entropy, AdamW and OneCycle. It
+reads MNIST training/test IDX pairs, uses shuffled training batches and sequential
+test evaluation, saves inference weights, then reconstructs/reloads and compares
+logits. Download is opt-in and uses Go's HTTP/gzip support. Only missing files
+are fetched from the public MNIST mirror; local files can be provided instead.
+Ordinary tests use tiny locally generated IDX files and an HTTP test server,
+requiring neither network access nor Python.
+
+```sh
+go run ./cmd/mnist-train -download -device cpu -steps 100 -stop-after 40 -train-limit 2000 -valid-limit 1000
+go run ./cmd/mnist-train -device cpu -steps 100 -train-limit 2000 -valid-limit 1000 -resume out/mnist.safetensors.training.safetensors
+go run ./cmd/mnist-train -device cuda -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-cuda.safetensors
+```
+
+Default data directory is `out/mnist`, output is `out/mnist.safetensors`, batch
+size is 64 and seed is 7. Directories are created as needed. TrainLimit/ValidLimit
+select the first N examples of their respective official splits (zero means all).
+StopAfter is an absolute completed-update count; Steps is the complete planned
+schedule and must stay unchanged on resume. Checkpoint defaults to output plus
+`.training.safetensors`; inference and training paths must differ.
+
+Training state includes model, AdamW moments/hyperparameters, OneCycle and loader
+state, plus full dataset fingerprints and effective subset sizes/seed/batch config.
+Changing these identities is rejected before loading live model state. Interrupts
+save the last completed-update checkpoint before returning cancellation. Tests
+compare uninterrupted and mid-epoch-resumed weights, moments, schedule and data
+order; CPU values match exactly, while CUDA floating-point values are compared
+numerically because existing bias-gradient kernels use atomic additions.
 
 ## Resuming a training run
 

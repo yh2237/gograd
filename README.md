@@ -62,6 +62,12 @@ and attention selection, with FP32/`auto` defaults. `execution.Autocast` scopes
 precision locally; backward keeps the policy selected during forward even
 after the scope exits or options change.
 
+The `data` package separates generic datasets, index sampling and host collation.
+Synchronous loaders support seeded shuffle, subsets/splits, padded sequences,
+validity masks and mid-epoch checkpoint state. `cmd/mnist-train` reads raw/gzip
+MNIST IDX files, trains an MLP on CPU/CUDA, evaluates, saves inference weights,
+and resumes model/AdamW/OneCycle plus data order without Python.
+
 Tensor/view storage is shared through allocation leases. Closing a base or
 releasing one graph branch preserves values still needed by another dependent.
 `RetainData` pins values, while `BackwardWithOptions` explicitly retains history
@@ -187,6 +193,8 @@ go vet ./...
 go run ./cmd/tcn-train
 go run ./cmd/cnn-train -device cpu -steps 60 -out out/cnn.safetensors
 go run ./cmd/cnn-train -device cuda -steps 60 -out out/cnn-cuda.safetensors
+go run ./cmd/mnist-train -download -device cpu -steps 100 -train-limit 2000 -valid-limit 1000
+go run ./cmd/mnist-train -device cuda -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-cuda.safetensors
 go run ./cmd/gputcn-train
 go run ./cmd/nn-conv-train -device cpu -hidden 128 -kernel 5 -steps 3
 go run ./cmd/nn-conv-train -device cpu -hidden 128 -kernel 5 -steps 5 -cpuprofile "$env:TEMP/gograd-nn-cpu.pprof"
@@ -387,6 +395,8 @@ go test ./cuda/
 - `torchrng/` — bit-exact `torch.Generator(device="cpu")` for float32 and float64 streams
 - `tensor/` — shape-aware float32 CPU/CUDA tensor and blocked CPU SGEMM
 - `autograd/` — define-by-run graph, operators, and Acoustic model
+- `data/`, `cmd/mnist-train` — generic synchronous batching, restorable sampling,
+  raw/gzip IDX reader and a Go-only real-data training/resume example
 - `autograd/conv2d*.go`, `autograd/cuda_conv2d.go`, `cmd/cnn-train` — tiled
   CPU/CUDA Conv2d with backward, named layers and a Python-free CNN training example
 - `nn/` — CPU/CUDA modules, masked losses, AdamW, and JSON checkpoints
@@ -421,7 +431,8 @@ The graph still materializes many contiguous FP32 results. BF16 is optional
 and keeps FP32 authoritative storage; FP16, loss scaling, a dtype/layout keyed
 kernel registry, and a general prefetching data loader are not present. The
 speech-timing trainer reads an exported feature cache and samples windows on
-the host. The registry selects CPU or CUDA implementations but does not yet
+the host. The separate `data` package provides a synchronous generic loader;
+worker/prefetch support remains future work. The registry selects CPU or CUDA implementations but does not yet
 support runtime kernel plugins. The
 compatibility NoGrad scope and BF16/attention settings are shared.
 Explicit execution contexts isolate recording, precision and attention selection;
