@@ -14,6 +14,7 @@ import (
 type trainConfig struct {
 	DataDir, Device, Out, Checkpoint, Resume        string
 	Steps, StopAfter, Batch, TrainLimit, ValidLimit int
+	Workers, Prefetch                               int
 	Seed                                            uint64
 	Download                                        bool
 }
@@ -29,6 +30,8 @@ func main() {
 	flag.IntVar(&c.Steps, "steps", 1000, "total planned updates")
 	flag.IntVar(&c.StopAfter, "stop-after", 0, "stop at this completed update and save state (0: all)")
 	flag.IntVar(&c.Batch, "batch-size", 64, "examples per update")
+	flag.IntVar(&c.Workers, "workers", 0, "parallel host readers (0: synchronous)")
+	flag.IntVar(&c.Prefetch, "prefetch", 0, "pending batches including current (0: two with workers)")
 	flag.IntVar(&c.TrainLimit, "train-limit", 0, "first N training examples (0: all)")
 	flag.IntVar(&c.ValidLimit, "valid-limit", 0, "first N test examples for evaluation (0: all)")
 	flag.Uint64Var(&c.Seed, "seed", 7, "model and shuffle seed")

@@ -97,7 +97,7 @@ func readDigits(dir, imagesName, labelsName string, limit int) (*data.Subset[dat
 func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, error) {
 	var stats trainingStats
 	device := tensor.Device(c.Device)
-	if ctx == nil || c.Steps < 2 || c.Batch < 1 || c.StopAfter < 0 || c.StopAfter > c.Steps || c.TrainLimit < 0 || c.ValidLimit < 0 || (device != tensor.CPU && device != tensor.CUDA) {
+	if ctx == nil || c.Steps < 2 || c.Batch < 1 || c.StopAfter < 0 || c.StopAfter > c.Steps || c.TrainLimit < 0 || c.ValidLimit < 0 || c.Workers < 0 || c.Prefetch < 0 || c.Workers == 0 && c.Prefetch != 0 || (device != tensor.CPU && device != tensor.CUDA) {
 		return stats, fmt.Errorf("invalid training configuration")
 	}
 	if c.Checkpoint == "" && c.Out != "" {
@@ -149,10 +149,11 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 	if err != nil {
 		return stats, err
 	}
-	loader, err := data.NewLoader[data.FloatSample, data.FloatBatch](trainData, sampler, data.Stack, data.LoaderOptions{BatchSize: c.Batch})
+	loader, err := data.NewLoader[data.FloatSample, data.FloatBatch](trainData, sampler, data.Stack, data.LoaderOptions{BatchSize: c.Batch, Workers: c.Workers, Prefetch: c.Prefetch})
 	if err != nil {
 		return stats, err
 	}
+	defer loader.Close()
 	identity := runIdentity{1, c.Steps, c.Batch, trainData.Len(), validData.Len(), c.Seed, trainHash, validHash}
 	schedule := autograd.NewOneCycle(.005, c.Steps, .3)
 	optimizer := autograd.NewAdamW(m.module.NamedParameters(), float32(schedule.LR()), .0001)
@@ -228,7 +229,7 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 		return stats, err
 	}
 	m.module.Train(false)
-	loss, accuracy, logits, err := evaluate(ctx, m, execution, validData, c.Batch, device)
+	loss, accuracy, logits, err := evaluate(ctx, m, execution, validData, c.Batch, c.Workers, c.Prefetch, device)
 	if err != nil {
 		return stats, err
 	}
@@ -253,7 +254,7 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 			return stats, err
 		}
 		loaded.module.Train(false)
-		_, _, restored, err := evaluate(ctx, loaded, execution, validData, c.Batch, device)
+		_, _, restored, err := evaluate(ctx, loaded, execution, validData, c.Batch, c.Workers, c.Prefetch, device)
 		if err != nil {
 			return stats, err
 		}
@@ -287,15 +288,16 @@ func trainingStep(m *digitModel, execution *autograd.ExecutionContext, optimizer
 	schedule.Step(optimizer)
 	return values[0], nil
 }
-func evaluate(ctx context.Context, m *digitModel, execution *autograd.ExecutionContext, dataset data.Dataset[data.FloatSample], batchSize int, device tensor.Device) (float64, float64, []float32, error) {
+func evaluate(ctx context.Context, m *digitModel, execution *autograd.ExecutionContext, dataset data.Dataset[data.FloatSample], batchSize, workers, prefetch int, device tensor.Device) (float64, float64, []float32, error) {
 	sampler, err := data.NewIndexSampler(dataset.Len(), data.SamplerOptions{})
 	if err != nil {
 		return 0, 0, nil, err
 	}
-	loader, err := data.NewLoader[data.FloatSample, data.FloatBatch](dataset, sampler, data.Stack, data.LoaderOptions{BatchSize: batchSize})
+	loader, err := data.NewLoader[data.FloatSample, data.FloatBatch](dataset, sampler, data.Stack, data.LoaderOptions{BatchSize: batchSize, Workers: workers, Prefetch: prefetch})
 	if err != nil {
 		return 0, 0, nil, err
 	}
+	defer loader.Close()
 	var total float64
 	var correct, count int
 	var all []float32

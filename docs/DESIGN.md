@@ -266,7 +266,7 @@ captured-vs-eager state comparisons cover the general operation and layer.
 
 The independent `data` package keeps sample access, index scheduling and collation
 separate from autograd/device allocation. Dataset and Loader are generic over
-sample/batch types. A synchronous loader peeks at indices, obtains samples and
+sample/batch types. The synchronous path peeks at indices, obtains samples and
 collates a batch, then commits the sampler cursor only after successful callbacks
 and cancellation checks. Failed reads/collation can be retried without skipping
 training data. EOF from callbacks is distinguished from normal epoch termination.
@@ -296,8 +296,30 @@ A real-data check used the first 2,000 MNIST training examples and first 1,000 t
 examples, seed 7, batch 64 and 100 planned updates. CPU was stopped after 40 and
 resumed to 100; CUDA ran continuously. Both reached test accuracy 86.4%, test loss
 0.455661 and zero inference-reload logit difference. This is a small pipeline/resume
-exercise, not a full-MNIST quality benchmark. Worker/prefetch pipelines and generic
-augmentation/collation-state contracts are later extensions.
+exercise, not a full-MNIST quality benchmark. Generic augmentation/collation-state
+contracts are later extensions.
+
+Optional worker/prefetch loading now adds a bounded host pipeline. The consumer
+peeks a finite index window without moving the sampler and queues individual
+sample jobs to reader goroutines. Results identify their batch/sample positions;
+the consumer assembles them in sampler order. Collation runs only when Next
+delivers that batch, not in workers or speculative lookahead. Thus existing
+CUDA thread ownership and custom serial collation remain with the training loop.
+
+Cancellation/errors cancel and join readers and discard undelivered samples.
+Close and NextEpoch terminate old sessions. State pauses prefetch and serializes
+only delivered sampler position; LoadState stops old work before restoration.
+Worker/prefetch counts are performance settings rather than checkpoint identity,
+so synchronous/parallel loading and different counts can share the same logical
+checkpoint. Dataset.Get must be concurrently safe and cooperative with context;
+callback side effects/randomness still need application-managed reproducibility.
+Tests gate reads to verify ordering, bounded speculation, deterministic error
+selection, cleanup/retry and checkpoint restoration across worker settings.
+
+The same real-MNIST check also passed with four readers/prefetch three, stopped
+at update 40 and resumed using two readers/prefetch two. CUDA used four readers
+and prefetch four. Both retained 86.4% test accuracy, loss 0.455661 and zero
+reload-logit difference. This checks pipeline equivalence, not a throughput claim.
 
 ## Migration and phases
 

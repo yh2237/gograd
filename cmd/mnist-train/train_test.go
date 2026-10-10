@@ -63,12 +63,14 @@ func TestMNISTMidEpochResume(t *testing.T) {
 				t.Fatal(err)
 			}
 			part := base
+			part.Workers, part.Prefetch = 3, 3
 			part.Out = filepath.Join(dir, "part.safetensors")
 			part.StopAfter = 2
 			if _, err := train(context.Background(), part, io.Discard); err != nil {
 				t.Fatal(err)
 			}
 			resume := base
+			resume.Workers, resume.Prefetch = 1, 2
 			resume.Out = filepath.Join(dir, "resumed.safetensors")
 			resume.Resume = part.Out + ".training.safetensors"
 			got, err := train(context.Background(), resume, io.Discard)

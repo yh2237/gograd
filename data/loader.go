@@ -11,13 +11,21 @@ type CollateFunc[T, B any] func([]T) (B, error)
 type LoaderOptions struct {
 	BatchSize int
 	DropLast  bool
+	// Workers=0 reads synchronously. Parallel Get calls require a dataset that
+	// supports concurrent access. Collate always runs serially in Next's caller.
+	Workers int
+	// Prefetch bounds pending batches, including the current batch. Zero defaults
+	// to two when Workers>0; synchronous mode requires zero.
+	Prefetch int
 }
 type Loader[T, B any] struct {
-	dataset Dataset[T]
-	sampler Sampler
-	collate CollateFunc[T, B]
-	options LoaderOptions
-	size    int
+	dataset  Dataset[T]
+	sampler  Sampler
+	collate  CollateFunc[T, B]
+	options  LoaderOptions
+	size     int
+	closed   bool
+	pipeline *prefetchPipeline[T]
 }
 type LoaderState struct {
 	Version, DatasetSize, BatchSize int
@@ -29,7 +37,16 @@ func NewLoader[T, B any](dataset Dataset[T], sampler Sampler, collate CollateFun
 	if dataset == nil || sampler == nil || collate == nil || options.BatchSize < 1 || dataset.Len() < 0 || sampler.Len() != dataset.Len() {
 		return nil, fmt.Errorf("data: invalid loader configuration")
 	}
-	return &Loader[T, B]{dataset, sampler, collate, options, dataset.Len()}, nil
+	if options.Workers < 0 || options.Prefetch < 0 || options.Workers == 0 && options.Prefetch != 0 {
+		return nil, fmt.Errorf("data: invalid worker/prefetch configuration")
+	}
+	if options.Workers > 0 && options.Prefetch == 0 {
+		options.Prefetch = 2
+	}
+	if options.Prefetch > int(^uint(0)>>1)/options.BatchSize {
+		return nil, fmt.Errorf("data: prefetch capacity overflow")
+	}
+	return &Loader[T, B]{dataset: dataset, sampler: sampler, collate: collate, options: options, size: dataset.Len()}, nil
 }
 
 // Next returns io.EOF only at the end of this epoch. Read/collate/cancellation
@@ -37,15 +54,28 @@ func NewLoader[T, B any](dataset Dataset[T], sampler Sampler, collate CollateFun
 // The caller owns a successful batch; builtin float collates return fresh slices.
 func (l *Loader[T, B]) Next(ctx context.Context) (B, error) {
 	var zero B
+	if l.closed {
+		return zero, ErrLoaderClosed
+	}
 	if ctx == nil {
 		return zero, fmt.Errorf("data: nil context")
 	}
 	if err := ctx.Err(); err != nil {
+		l.stopPipeline()
 		return zero, err
 	}
 	if l.dataset.Len() != l.size || l.sampler.Len() != l.size {
+		l.stopPipeline()
 		return zero, fmt.Errorf("data: dataset length changed")
 	}
+	if l.options.Workers > 0 {
+		return l.nextPrefetched(ctx)
+	}
+	return l.nextSerial(ctx)
+}
+
+func (l *Loader[T, B]) nextSerial(ctx context.Context) (B, error) {
+	var zero B
 	indices, err := l.sampler.Peek(l.options.BatchSize)
 	if err != nil {
 		return zero, err
@@ -90,12 +120,35 @@ func callbackError(operation string, err error) error {
 	}
 	return fmt.Errorf("data: %s: %w", operation, err)
 }
-func (l *Loader[T, B]) NextEpoch() error { return l.sampler.NextEpoch() }
+
+// ErrLoaderClosed identifies use after Close. Loader methods, including Close,
+// are serial; cancel Next's context to interrupt an in-progress call.
+var ErrLoaderClosed = errors.New("data: loader is closed")
+
+// Close cancels and joins readers without consuming pending samples. It is
+// idempotent. Call it when stopping before EOF, even without a checkpoint.
+func (l *Loader[T, B]) Close() error {
+	l.stopPipeline()
+	l.closed = true
+	return nil
+}
+func (l *Loader[T, B]) NextEpoch() error {
+	if l.closed {
+		return ErrLoaderClosed
+	}
+	l.stopPipeline()
+	return l.sampler.NextEpoch()
+}
 func (l *Loader[T, B]) State() (LoaderState, error) {
+	if l.closed {
+		return LoaderState{}, ErrLoaderClosed
+	}
 	s, ok := l.sampler.(StatefulSampler)
 	if !ok {
 		return LoaderState{}, fmt.Errorf("data: sampler does not support checkpoints")
 	}
+	// Serialize delivered state only; no callback may remain active after State.
+	l.stopPipeline()
 	payload, err := s.MarshalBinary()
 	if err != nil {
 		return LoaderState{}, err
@@ -103,6 +156,9 @@ func (l *Loader[T, B]) State() (LoaderState, error) {
 	return LoaderState{1, l.size, l.options.BatchSize, l.options.DropLast, payload}, nil
 }
 func (l *Loader[T, B]) LoadState(state LoaderState) error {
+	if l.closed {
+		return ErrLoaderClosed
+	}
 	if state.Version != 1 || state.DatasetSize != l.size || state.BatchSize != l.options.BatchSize || state.DropLast != l.options.DropLast || l.dataset.Len() != l.size {
 		return fmt.Errorf("data: loader state does not match configuration")
 	}
@@ -110,5 +166,6 @@ func (l *Loader[T, B]) LoadState(state LoaderState) error {
 	if !ok {
 		return fmt.Errorf("data: sampler does not support checkpoints")
 	}
+	l.stopPipeline()
 	return s.UnmarshalBinary(state.Sampler)
 }

@@ -28,7 +28,7 @@ use a separate `gograd-training-1` envelope.
 | `cuda` | `MemoryStats`, `ResetAllocationPeak`, `SetPoolCacheLimit`, `ReleasePool` | Query active, cached, and reserved bytes; bound or release reusable CUDA allocations. |
 | `data` | `Dataset[T]`, `SliceDataset`, `NewSubset`, `RandomSplit` | Host-side random-access samples, index views and deterministic disjoint splits. |
 | `data` | `Sampler`, `StatefulSampler`, `NewIndexSampler`, `IndexSamplerState` | Transactional index selection, seeded permutations and mid-epoch/future-epoch resume. |
-| `data` | `NewLoader[T,B]`, `LoaderOptions`, `LoaderState`, `CollateFunc` | Synchronous context-aware batching with drop-last and opaque sampler checkpoint payloads. |
+| `data` | `NewLoader[T,B]`, `LoaderOptions`, `LoaderState`, `CollateFunc`, `Loader.Close` | Context-aware batching, optional ordered host prefetch, drop-last and opaque sampler checkpoint payloads. |
 | `data` | `FloatSample`, `FloatBatch`, `Stack`, `PadSequences`, `PaddingOptions`, `OpenIDX` | Owned float32 host batches, sequence lengths/bool masks and raw/gzip byte-image/label datasets. |
 
 `NewSpeechTiming(4, device, seed)` builds v1; `NewSpeechTiming(15, device,
@@ -490,6 +490,7 @@ loader, err := data.NewLoader[data.FloatSample, data.FloatBatch](
 )
 // Handle err.
 _ = err
+defer loader.Close() // needed when stopping early with active readers
 for {
     batch, err := loader.Next(context.Background())
     if err == io.EOF { break } // end of this epoch, not all future epochs
@@ -508,7 +509,7 @@ err = loader.NextEpoch() // resets indices; shuffled order changes deterministic
   `Peek(count)` returns copied upcoming indices and does not advance state.
   `Advance(count)` commits consumed indices. `NextEpoch` starts the next order
   and discards any unused current tail. Empty datasets immediately yield EOF.
-- `Loader.Next` gets samples serially, collates them, checks cancellation, then
+- By default, `Loader.Next` gets samples serially, collates them, checks cancellation, then
   advances the sampler. Read/collate/cancellation errors leave the cursor
   unchanged for retry. Callback EOF is converted to UnexpectedEOF so truncated
   input cannot masquerade as normal epoch completion. Cancellation is cooperative
@@ -546,6 +547,58 @@ order/payload and can be JSON-encoded in training checkpoint caller metadata.
 Dataset content, subset/split identity and custom collation configuration are
 caller metadata: matching length alone does not prove identical data.
 
+### Parallel readers and bounded prefetch
+
+Set `LoaderOptions.Workers` to a positive count to enable host reader goroutines.
+Workers=0 retains the synchronous path. `Prefetch` bounds pending batches,
+including the current batch; zero defaults to two in parallel mode and must stay
+zero in synchronous mode. Negative options or overflowing capacity are errors.
+Reader count is capped by available sample slots. Dataset.Get must support
+concurrent calls and return sample storage that stays valid until collation.
+
+```go
+loader, err := data.NewLoader[data.FloatSample, data.FloatBatch](
+    dataset, sampler, data.Stack,
+    data.LoaderOptions{BatchSize: 64, Workers: 4, Prefetch: 3},
+)
+// Handle err; indices are read ahead but delivered in sampler order.
+_ = err
+defer loader.Close()
+```
+
+- Workers only call Dataset.Get. Collation remains serial, in Next's calling
+  goroutine, and is never speculative. Tensor construction/CUDA thread ownership
+  stays with the consumer. Pending jobs, results and sample batches are bounded
+  by the configured prefetch window; completion order does not change delivery.
+- A failed batch reports the first failing sample in that batch's sampler order, not
+  whichever reader happened to finish first. Read/collate errors discard pending
+  lookahead, join readers and preserve the committed cursor for retry. A dataset
+  panic in a worker becomes an ordered read error; a collate panic is re-panicked
+  on the consumer after reader cleanup.
+- Readers inherit the context of the Next call that starts their session. A
+  cancellation during Next cancels/joins readers and leaves that batch unconsumed.
+  If an earlier session's context is cancelled between calls, a subsequent Next
+  with a live context restarts at the committed cursor. Cancellation checks after
+  collation occur before committing indices. Dataset.Get must cooperate with
+  cancellation; cleanup waits for in-progress callbacks to return.
+- `Close() error` is idempotent, cancels/joins readers and drops undelivered
+  samples. EOF and a final delivered batch also release completed readers.
+  `NextEpoch` stops old readers before changing index order. Methods, including
+  Close/State/LoadState, remain serial: cancel Next's context to interrupt a
+  blocked call, rather than concurrently invoking another Loader method.
+- `State` stops readers and discards lookahead before serializing **delivered**
+  sampler position. LoadState likewise stops old reads before restoring. Workers
+  and Prefetch are not part of logical LoaderState, so an existing synchronous
+  checkpoint can resume with parallel readers, or with a different reader count.
+  Batch size, DropLast, data identity and custom collation/augmentation state
+  still have their original contracts. Treat the sampler as loader-owned during
+  active iteration; do not separately advance/reset it with queued lookahead.
+
+Dataset.Get side effects and call-dependent randomness are not rolled back or
+checkpointed by Loader. Reproducible prefetch requires deterministic sample
+access (or application-managed per-sample/epoch randomness), and any custom
+collation state still belongs in caller metadata.
+
 ### Raw/gzip IDX and MNIST example
 
 `OpenIDX(imagesPath, labelsPath)` reads MNIST-style byte IDX magic 2051/2049,
@@ -568,6 +621,7 @@ requiring neither network access nor Python.
 go run ./cmd/mnist-train -download -device cpu -steps 100 -stop-after 40 -train-limit 2000 -valid-limit 1000
 go run ./cmd/mnist-train -device cpu -steps 100 -train-limit 2000 -valid-limit 1000 -resume out/mnist.safetensors.training.safetensors
 go run ./cmd/mnist-train -device cuda -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-cuda.safetensors
+go run ./cmd/mnist-train -device cpu -workers 4 -prefetch 3 -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-prefetch.safetensors
 ```
 
 Default data directory is `out/mnist`, output is `out/mnist.safetensors`, batch
@@ -576,6 +630,9 @@ select the first N examples of their respective official splits (zero means all)
 StopAfter is an absolute completed-update count; Steps is the complete planned
 schedule and must stay unchanged on resume. Checkpoint defaults to output plus
 `.training.safetensors`; inference and training paths must differ.
+`-workers` and `-prefetch` control both training and evaluation loading (defaults
+zero/synchronous). They can change on resume because checkpoints capture only
+delivered data order. Every command loader is closed on completion/error.
 
 Training state includes model, AdamW moments/hyperparameters, OneCycle and loader
 state, plus full dataset fingerprints and effective subset sizes/seed/batch config.
@@ -629,7 +686,7 @@ device counter rather than an outdated host step count.
   CUDA stream/capture isolation is not yet implemented.
 - Combined checkpoints restore optimizer and OneCycle state. Old `nn`/`gputcn`
   trainers still use their existing checkpoint paths. Sampling runs on the host;
-  a prefetching dataset loader is not implemented.
+  the `data` package provides a separate general loader with optional prefetch.
 - Safetensors writes use a same-directory temporary file, sync and rename.
   Loading rejects invalid/overflowing shapes, overlapping ranges and headers
   above 16 MiB. The whole file is read into memory; there is no total file-size

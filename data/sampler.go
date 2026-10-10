@@ -10,6 +10,8 @@ import (
 
 // Sampler separates index order from loading/collation. Peek must not advance
 // state. Loader advances only after a batch succeeds (or drops the final tail).
+// Peek accepts arbitrary positive lookahead counts (clamped at epoch end), and
+// overlapping peeks must describe the same order until Advance/NextEpoch.
 // Methods are serial: do not share a mutable sampler between independent loaders.
 type Sampler interface {
 	Len() int
