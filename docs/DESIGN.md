@@ -14,9 +14,12 @@ state export also read tensors back for inspection.
 The public design uses `Tensor{Shape, Strides, DType, Device}` with CPU slices
 or CUDA buffers. `Backward` returns CUDA intermediates to the allocation
 pool; `ReleaseGraph` releases CPU intermediates for reuse and also frees
-unused CUDA inference graphs. Views currently keep the parent tensor alive,
-and a chained view may materialize its parent. A separate reference-counted
-storage object remains future work. Dtypes start with float32,
+unused CUDA inference graphs. Tensor/view allocations now have shared storage
+leases, and graph edges have independent dependency counts. A Close request is
+deferred internally while a child still needs a closed ancestor's values;
+ReleaseGraph defers reclaiming shared nodes until their last dependent is done.
+RetainData/RetainGrad can keep a view's allocation without keeping its base
+history. Chained views may still materialize their parent. Dtypes start with float32,
 then add float16 and bfloat16 compute with float32 accumulation and int64
 indices. Operators must reject mixed devices and unsupported dtype pairs.
 Operators accept non-contiguous inputs by materializing them before kernel
@@ -27,11 +30,47 @@ dispatch. Views keep their base storage alive.
 Each op records its parents and a vector-Jacobian product when recording is
 enabled. Backward topologically traverses the graph in reverse, accumulating
 all contributions to leaves. Intermediate gradients are discarded unless
-`RetainGrad` is called. `Detach` returns data without history; `NoGrad`
-disables recording for its callback. These controls should become a per-tape
-context when concurrent training is added: the present package-wide recording
-flag is not goroutine safe. In-place mutation after forward must eventually
-use version counters to reject stale saved tensors.
+`RetainGrad` is called. `Detach` returns data without history and preserves
+execution context identity. `ExecutionContext` isolates recording for bound
+tensors; `New`/`Zeros` on the context bind inputs, and `BindModule` binds every
+registered parameter/buffer before a forward. Operators and shared-storage
+views inherit the context, and reject combinations of distinct explicit
+contexts. NoGrad uses an atomic per-context scope depth, so nesting and panics
+restore correctly and separate contexts do not affect one another.
+
+ExecutionOptions adds context-local BF16 precision and attention selection.
+A context's zero value means FP32/auto, independent of the compatibility
+globals. Options are copied under a per-context mutex; SetOptions validates
+before changing state. Autocast temporarily changes precision and restores it
+after nesting/panics. CUDA GEMM nodes capture the option value in their backward
+closures, keeping operand preparation and backward dispatch consistent after
+a scope exits or policy changes. Attention selects its implementation in
+forward and retains that implementation's derivative closure. CUDA capture
+records the chosen kernels; replay does not resolve Go-side options again.
+Scopes affect the whole context, and a multi-op model forward is not an atomic
+policy transaction: configure between forwards and use separate contexts for
+independent workers.
+
+The package-level API retains a shared default scope for unbound tensors.
+Fully isolated execution needs bound parameters too: a parameter-only
+subexpression such as an embedding or weight view must not enter the default
+scope before meeting a bound input. `cmd/cnn-train` exercises this migration.
+Inference results keep their lifetime parents for reclamation, but have no
+derivative callbacks. The context does not yet own storage or CUDA streams and
+does not synchronize mutation of shared tensors/optimizers. Storage versions
+now track CopyFrom and eager optimizer writes across aliases; backward checks
+operand/output snapshots before changing gradients. Raw CPU slice or CUDA
+buffer writes/captured replay do not update those host-side versions.
+
+Default backward consumes saved history. BackwardWithOptions can retain it for
+another loss/pass; intermediate adjoints are fresh each time and leaf gradients
+accumulate. Saved im2col, normalization statistics, masks/targets and index
+buffers outlive their source handles as needed. CUDA nodes being visited by
+backward are protected from disposal until their callbacks finish, so completed
+children can drop edges without reclaiming an ancestor still awaiting backward.
+Data retention and history retention are separate. Explicit graph release is
+still required for inference and retained histories; abandoned graphs are not
+automatically managed by Go GC.
 
 The operation registry names the CPU and CUDA implementation of every public
 differentiable operator and selects its backend. An AST test inventories these
@@ -72,7 +111,9 @@ trade substantial time for memory; automatic selection uses the tiled path
 only when estimated score scratch reaches 1 GiB. BF16 autocast caches GEMM
 operands and carries BF16 shadows through eligible views and fused pointwise
 kernels. GEMMEx accumulates into FP32; weights and optimizer moments remain
-FP32. This mode is optional and process-wide. Full BF16 tensor storage and
+FP32. This mode and attention selection belong to ExecutionOptions for bound
+tensors; only the compatibility API uses process-wide switches. CPU, Conv2d
+and tiled flash attention currently stay FP32. Full BF16 tensor storage and
 dtype-aware dispatch remain future work.
 
 Broadcasting aligns dimensions from the right. Each pair must match or one
@@ -138,11 +179,38 @@ atomically. The current reader checks shapes and ranges but does not yet
 enforce a file-size cap, reject overlapping payloads, or write atomically.
 Existing `nn` JSON checkpoints remain readable during migration.
 
+## General Conv2d
+
+`autograd.Conv2d` adds NCHW cross-correlation with PyTorch-compatible
+`[out,in/groups,kH,kW]` weights. Stride, symmetric padding and dilation are
+independent height/width pairs; groups includes depthwise output multipliers.
+The bias is optional. `Conv2dLayer` registers named parameters through the
+existing `Module` and safetensors APIs.
+
+Both backends lower one batch/group into depth-major spatial tiles and run
+GEMM. A tile contains at most 512 output positions and targets a 4 MiB budget
+for the im2col/output pair. Backward gathers an upstream tile, recomputes
+im2col for the weight gradient, and scatters the input gradient from
+`weight-transpose * upstream`. CPU accumulates per-tile weight contributions;
+CUDA adds them directly into the leaf gradient with cuBLAS beta=1 and uses
+atomic col2im scatter for input gradients. No full lowered matrix is retained
+by the graph, and inference releases all temporary device buffers before
+returning its output. The path is FP32, independent of optional BF16 shadows.
+
+The operation is registered and covered by the source dispatch inventory.
+Committed checkpoint-free PyTorch fixtures exercise batched, grouped,
+depthwise, rectangular, even and strided/dilated cases on CPU/CUDA; finite
+differences independently check gradients. The `cmd/cnn-train` example verifies
+that two convolution blocks compose with reduction, classification loss,
+AdamW and checkpoint reload to learn a spatial classification task in pure Go.
+
 ## Migration and phases
 
 1. Extend the operation registry from backend selection to callable kernels
    keyed by dtype and layout, and make views composable without intermediate
-   materialization. Make tape recording local to an execution context. Port
+   materialization. Tensor-bound execution contexts now isolate recording,
+   precision and attention selection, with shared-storage lifetime management;
+   extend isolation to CUDA streams/devices and allocation pools. Port
    `nn.Linear` and `nn.Conv1d` to graph operators, then make their explicit
    backward methods compatibility wrappers.
 2. Move `gputcn` layers and its sequence loss onto the same operators. Retain
