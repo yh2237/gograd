@@ -8,7 +8,8 @@ import (
 
 // BF16Autocast converts GEMM inputs on the device, computes with tensor cores
 // and FP32 accumulation, and leaves outputs, gradients and master weights FP32.
-// Set this only between training steps; the switch is process-wide.
+// Compatibility policy for unbound tensors only. Explicit contexts use their
+// ExecutionOptions. Do not mutate compatibility globals concurrently.
 var BF16Autocast bool
 
 func castBF16(src uintptr, count int) *cuda.Buffer {
@@ -27,39 +28,66 @@ func allocBF16(count int) *cuda.Buffer {
 }
 
 func (t *Tensor) invalidateBF16() {
-	if t.bf16Buf != nil {
-		if t.bf16Owner {
-			t.bf16Buf.Free()
-		}
-		t.bf16Buf = nil
-		t.bf16Owner = false
+	t.storage.version.Add(1)
+	t.dropBF16()
+}
+
+func (t *Tensor) dropBF16() {
+	if t.bf16Storage != nil {
+		t.bf16Storage.release()
+		t.bf16Storage = nil
 	}
 }
-func (t *Tensor) ensureBF16() *cuda.Buffer {
-	if t.bf16Buf == nil {
-		t.bf16Buf = castBF16(ptr(t.buf), t.Numel())
-		t.bf16Owner = true
+
+func (t *Tensor) currentBF16() *cuda.Buffer {
+	if t.bf16Storage != nil && t.bf16Version != t.storage.version.Load() {
+		t.dropBF16()
 	}
-	return t.bf16Buf
+	if t.bf16Storage == nil {
+		return nil
+	}
+	return t.bf16Storage.buffer
+}
+
+func (t *Tensor) setBF16(buffer *cuda.Buffer) {
+	t.dropBF16()
+	if buffer != nil {
+		t.bf16Storage = deviceStorage(buffer)
+		t.bf16Version = t.storage.version.Load()
+	}
+}
+
+func (t *Tensor) shareBF16(parent *Tensor) {
+	if parent.currentBF16() != nil {
+		t.bf16Storage = parent.bf16Storage.acquire()
+		t.bf16Version = parent.bf16Version
+	}
+}
+
+func (t *Tensor) ensureBF16() *cuda.Buffer {
+	if t.currentBF16() == nil {
+		t.setBF16(castBF16(ptr(t.buf), t.Numel()))
+	}
+	return t.currentBF16()
 }
 
 // gemmBatchedPrepared receives BF16 operand buffers created by a producer or
 // cached on a tensor. This avoids a cast per GEMM while preserving FP32 output.
-func gemmBatchedPrepared(m, n, k int, ta, tb bool, a, a16 uintptr, as int64, b, b16 uintptr, bs int64, c uintptr, cs int64, count int, beta float32) error {
-	if !BF16Autocast {
+func (o ExecutionOptions) gemmBatchedPrepared(m, n, k int, ta, tb bool, a, a16 uintptr, as int64, b, b16 uintptr, bs int64, c uintptr, cs int64, count int, beta float32) error {
+	if !o.BF16Autocast {
 		return blas().SgemmRowMajorStridedBatched(m, n, k, ta, tb, 1, a, as, b, bs, beta, c, cs, count)
 	}
 	return blas().GemmRowMajorStridedBF16(m, n, k, ta, tb, 1, a16, as, b16, bs, beta, c, cs, count)
 }
-func gemmSinglePrepared(m, n, k int, ta, tb bool, a, a16, b, b16, c uintptr, beta float32) error {
-	if !BF16Autocast {
-		return gemmSingle(m, n, k, ta, tb, a, b, c, beta)
+func (o ExecutionOptions) gemmSinglePrepared(m, n, k int, ta, tb bool, a, a16, b, b16, c uintptr, beta float32) error {
+	if !o.BF16Autocast {
+		return o.gemmSingle(m, n, k, ta, tb, a, b, c, beta)
 	}
 	return blas().GemmRowMajorBF16(m, n, k, ta, tb, 1, a16, b16, beta, c)
 }
 
-func gemmSingle(m, n, k int, ta, tb bool, a, b, c uintptr, beta float32) error {
-	if !BF16Autocast {
+func (o ExecutionOptions) gemmSingle(m, n, k int, ta, tb bool, a, b, c uintptr, beta float32) error {
+	if !o.BF16Autocast {
 		switch {
 		case ta && !tb:
 			return blas().SgemmRowMajorTransposeA(m, n, k, 1, a, func() int {
@@ -82,8 +110,8 @@ func gemmSingle(m, n, k int, ta, tb bool, a, b, c uintptr, beta float32) error {
 	return blas().GemmRowMajorBF16(m, n, k, ta, tb, 1, ptr(ab), ptr(bb), beta, c)
 }
 
-func gemmBatched(m, n, k int, ta, tb bool, a uintptr, as int64, b uintptr, bs int64, c uintptr, cs int64, count int, beta float32) error {
-	if !BF16Autocast {
+func (o ExecutionOptions) gemmBatched(m, n, k int, ta, tb bool, a uintptr, as int64, b uintptr, bs int64, c uintptr, cs int64, count int, beta float32) error {
+	if !o.BF16Autocast {
 		return blas().SgemmRowMajorStridedBatched(m, n, k, ta, tb, 1, a, as, b, bs, beta, c, cs, count)
 	}
 	ac, bc := m*k, k*n

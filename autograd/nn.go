@@ -30,8 +30,7 @@ func Conv1d(x, w, b *Tensor, dilation int) *Tensor {
 	if useCUDA {
 		return Conv1dGEMM(x, w, b, dilation)
 	}
-	same(x, w)
-	same(x, b)
+	same(x, w, b)
 	s := x.Shape
 	if len(s) != 3 || len(w.Shape) != 3 || w.Shape[1] != s[2] || len(b.Data) != w.Shape[0] || w.Shape[2]%2 != 1 || dilation < 1 {
 		panic("autograd: conv1d shape")
@@ -88,8 +87,7 @@ func Conv1d(x, w, b *Tensor, dilation int) *Tensor {
 // GroupNorm normalizes each sample across its time and channels per group.
 func GroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
 	useCUDA := dispatchBackend("group_norm", x.Device)
-	same(x, w)
-	same(x, b)
+	same(x, w, b)
 	x, w, b = x.Contiguous(), w.Contiguous(), b.Contiguous()
 	s := x.Shape
 	if len(s) != 3 || groups < 1 || s[2]%groups != 0 || w.Numel() != s[2] || b.Numel() != s[2] {
@@ -131,9 +129,7 @@ func GroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
 			}
 		}
 	}
-	return result(v, s, []*Tensor{x, w, b}, func(g []float32) {
-		defer cpuRelease(norm)
-		defer cpuRelease(inv)
+	r := result(v, s, []*Tensor{x, w, b}, func(g []float32) {
 		dx := cpuAlloc(len(g))
 		dw := cpuAlloc(c)
 		db := cpuAlloc(c)
@@ -165,6 +161,13 @@ func GroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
 		cpuRelease(dw)
 		cpuRelease(db)
 	})
+	if r.RequiresGrad {
+		r.auxCPU = [][]float32{norm, inv}
+	} else {
+		cpuRelease(norm)
+		cpuRelease(inv)
+	}
+	return r
 }
 
 // LayerNorm normalizes over the last dimension.
@@ -173,8 +176,7 @@ func LayerNorm(x, w, b *Tensor, eps float32) *Tensor {
 	if len(x.Shape) < 1 {
 		panic("autograd: layernorm rank")
 	}
-	same(x, w)
-	same(x, b)
+	same(x, w, b)
 	x, w, b = x.Contiguous(), w.Contiguous(), b.Contiguous()
 	c := x.Shape[len(x.Shape)-1]
 	if c < 1 || len(w.Shape) != 1 || len(b.Shape) != 1 || w.Numel() != c || b.Numel() != c {
@@ -204,9 +206,7 @@ func LayerNorm(x, w, b *Tensor, eps float32) *Tensor {
 			}
 		}
 	})
-	return result(out, x.Shape, []*Tensor{x, w, b}, func(g []float32) {
-		defer cpuRelease(means)
-		defer cpuRelease(invs)
+	r := result(out, x.Shape, []*Tensor{x, w, b}, func(g []float32) {
 		dx, dw, db := cpuAlloc(x.Numel()), cpuAlloc(c), cpuAlloc(c)
 		var mu sync.Mutex
 		parallelFor(rows, func(start, end int) {
@@ -244,6 +244,13 @@ func LayerNorm(x, w, b *Tensor, eps float32) *Tensor {
 		cpuRelease(dw)
 		cpuRelease(db)
 	})
+	if r.RequiresGrad {
+		r.auxCPU = [][]float32{means, invs}
+	} else {
+		cpuRelease(means)
+		cpuRelease(invs)
+	}
+	return r
 }
 
 type Parameter struct {
@@ -381,12 +388,16 @@ func (o *AdamW) Step() {
 		return
 	}
 	for n, p := range o.Params {
+		if len(p.Value.Grad) == 0 {
+			continue
+		}
 		for i, g := range p.Value.Grad {
 			o.M[n][i] = o.Beta1*o.M[n][i] + (1-o.Beta1)*g
 			o.V[n][i] = o.Beta2*o.V[n][i] + (1-o.Beta2)*g*g
 			p.Value.Data[i] *= 1 - o.LR*o.WeightDecay
 			p.Value.Data[i] -= o.LR * (o.M[n][i] / bc1) / (float32(math.Sqrt(float64(o.V[n][i]/bc2))) + o.Eps)
 		}
+		p.Value.storage.version.Add(1)
 	}
 }
 func (o *AdamW) ZeroGrad() {

@@ -36,6 +36,7 @@ func matrixBatchStride(shape, batch []int, matrixSize int) (int64, bool) {
 	return int64(matrixSize), true
 }
 func gpuMatMul(a, b *Tensor, s []int, m, n, k int, batch []int) *Tensor {
+	options := executionOptions(a, b)
 	out := mustAlloc(numel(s))
 	ab := a.Shape[:len(a.Shape)-2]
 	bb := b.Shape[:len(b.Shape)-2]
@@ -44,44 +45,44 @@ func gpuMatMul(a, b *Tensor, s []int, m, n, k int, batch []int) *Tensor {
 	bs, bRegular := matrixBatchStride(bb, batch, k*n)
 	regular := aRegular && bRegular && count > 1
 	var ap16, bp16 uintptr
-	if BF16Autocast && regular {
+	if options.BF16Autocast && regular {
 		ap16 = ptr(a.ensureBF16())
 		bp16 = ptr(b.ensureBF16())
 	}
 	if regular {
 		timedGPU("matmul_strided", func() error {
-			return gemmBatchedPrepared(m, n, k, false, false, a.buf.Pointer(), ap16, as, b.buf.Pointer(), bp16, bs, out.Pointer(), int64(m*n), count, 0)
+			return options.gemmBatchedPrepared(m, n, k, false, false, a.buf.Pointer(), ap16, as, b.buf.Pointer(), bp16, bs, out.Pointer(), int64(m*n), count, 0)
 		})
 	} else {
 		for z := 0; z < count; z++ {
 			ai := bindex(z, batch, ab) * m * k
 			bi := bindex(z, batch, bb) * k * n
 			timedGPU("matmul_sgemm", func() error {
-				return gemmSingle(m, n, k, false, false, a.buf.Pointer()+uintptr(ai*4), b.buf.Pointer()+uintptr(bi*4), out.Pointer()+uintptr(z*m*n*4), 0)
+				return options.gemmSingle(m, n, k, false, false, a.buf.Pointer()+uintptr(ai*4), b.buf.Pointer()+uintptr(bi*4), out.Pointer()+uintptr(z*m*n*4), 0)
 			})
 		}
 	}
 	return resultGPU(out, s, []*Tensor{a, b}, func(g *cuda.Buffer) {
 		da, db := a.ensureGradGPU(), b.ensureGradGPU()
 		var g16 *cuda.Buffer
-		if BF16Autocast && regular && (da != nil || db != nil) {
+		if options.BF16Autocast && regular && (da != nil || db != nil) {
 			g16 = castBF16(g.Pointer(), g.Size()/4)
 			defer g16.Free()
 		}
 		gp16 := ptr(g16)
 		if regular && da != nil && as != 0 {
 			timedGPU("matmul_dx_strided", func() error {
-				return gemmBatchedPrepared(m, k, n, false, true, g.Pointer(), gp16, int64(m*n), b.buf.Pointer(), bp16, bs, da.Pointer(), as, count, 1)
+				return options.gemmBatchedPrepared(m, k, n, false, true, g.Pointer(), gp16, int64(m*n), b.buf.Pointer(), bp16, bs, da.Pointer(), as, count, 1)
 			})
 		}
 		if regular && db != nil {
 			if bs == 0 && as != 0 {
 				timedGPU("matmul_dw_flat", func() error {
-					return gemmSinglePrepared(k, n, m*count, true, false, a.buf.Pointer(), ap16, g.Pointer(), gp16, db.Pointer(), 1)
+					return options.gemmSinglePrepared(k, n, m*count, true, false, a.buf.Pointer(), ap16, g.Pointer(), gp16, db.Pointer(), 1)
 				})
 			} else if bs != 0 {
 				timedGPU("matmul_dw_strided", func() error {
-					return gemmBatchedPrepared(k, n, m, true, false, a.buf.Pointer(), ap16, as, g.Pointer(), gp16, int64(m*n), db.Pointer(), bs, count, 1)
+					return options.gemmBatchedPrepared(k, n, m, true, false, a.buf.Pointer(), ap16, as, g.Pointer(), gp16, int64(m*n), db.Pointer(), bs, count, 1)
 				})
 			}
 		}
@@ -94,18 +95,19 @@ func gpuMatMul(a, b *Tensor, s []int, m, n, k int, batch []int) *Tensor {
 			gp := g.Pointer() + uintptr(z*m*n*4)
 			if da != nil && (!regular || as == 0) {
 				timedGPU("matmul_dx_sgemm", func() error {
-					return gemmSingle(m, k, n, false, true, gp, b.buf.Pointer()+uintptr(bi*4), da.Pointer()+uintptr(ai*4), 1)
+					return options.gemmSingle(m, k, n, false, true, gp, b.buf.Pointer()+uintptr(bi*4), da.Pointer()+uintptr(ai*4), 1)
 				})
 			}
 			if db != nil && (!regular || (bs == 0 && as == 0)) {
 				timedGPU("matmul_dw_sgemm", func() error {
-					return gemmSingle(k, n, m, true, false, a.buf.Pointer()+uintptr(ai*4), gp, db.Pointer()+uintptr(bi*4), 1)
+					return options.gemmSingle(k, n, m, true, false, a.buf.Pointer()+uintptr(ai*4), gp, db.Pointer()+uintptr(bi*4), 1)
 				})
 			}
 		}
 	})
 }
 func gpuConv1d(x, w, b *Tensor, dilation int) *Tensor {
+	options := executionOptions(x, w, b)
 	s := x.Shape
 	bs, t, ci, co, k := s[0], s[1], s[2], w.Shape[0], w.Shape[2]
 	rows, depth := bs*t, ci*k
@@ -114,24 +116,23 @@ func gpuConv1d(x, w, b *Tensor, dilation int) *Tensor {
 	timedGPU("conv_im2col", func() error { return kernels.Im2col(x.buf, cols, bs, ci, t, k, dilation) })
 	var cols16 *cuda.Buffer
 	var wp16 uintptr
-	if BF16Autocast {
+	if options.BF16Autocast {
 		cols16 = castBF16(cols.Pointer(), rows*depth)
 		wp16 = ptr(w.ensureBF16())
 	}
 	timedGPU("conv_forward_sgemm", func() error {
-		return gemmSinglePrepared(rows, co, depth, false, true, cols.Pointer(), ptr(cols16), w.buf.Pointer(), wp16, out.Pointer(), 0)
+		return options.gemmSinglePrepared(rows, co, depth, false, true, cols.Pointer(), ptr(cols16), w.buf.Pointer(), wp16, out.Pointer(), 0)
 	})
 	timedGPU("conv_bias", func() error { return kernels.AddBiasColumns(out, b.buf, rows, co) })
 	r := resultGPU(out, []int{bs, t, co}, []*Tensor{x, w, b}, func(g *cuda.Buffer) {
-		defer cols.Free()
 		var g16 *cuda.Buffer
-		if BF16Autocast && (w.RequiresGrad || x.RequiresGrad) {
+		if options.BF16Autocast && (w.RequiresGrad || x.RequiresGrad) {
 			g16 = castBF16(g.Pointer(), g.Size()/4)
 			defer g16.Free()
 		}
 		if dw := w.ensureGradGPU(); dw != nil {
 			timedGPU("conv_dw_sgemm", func() error {
-				return gemmSinglePrepared(co, depth, rows, true, false, g.Pointer(), ptr(g16), cols.Pointer(), ptr(cols16), dw.Pointer(), 1)
+				return options.gemmSinglePrepared(co, depth, rows, true, false, g.Pointer(), ptr(g16), cols.Pointer(), ptr(cols16), dw.Pointer(), 1)
 			})
 		}
 		if db := b.ensureGradGPU(); db != nil {
@@ -141,7 +142,7 @@ func gpuConv1d(x, w, b *Tensor, dilation int) *Tensor {
 			dcols := mustAlloc(rows * depth)
 			defer dcols.Free()
 			timedGPU("conv_dx_sgemm", func() error {
-				return gemmSinglePrepared(rows, depth, co, false, false, g.Pointer(), ptr(g16), w.buf.Pointer(), wp16, dcols.Pointer(), 0)
+				return options.gemmSinglePrepared(rows, depth, co, false, false, g.Pointer(), ptr(g16), w.buf.Pointer(), wp16, dcols.Pointer(), 0)
 			})
 			timedGPU("conv_col2im", func() error { return kernels.Col2im(dcols, dx, bs, ci, t, k, dilation) })
 		}

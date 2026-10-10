@@ -58,12 +58,16 @@ func transposeViewCopy(dst, src []float32, shape []int, backward bool) {
 	})
 }
 func makeView(a *Tensor, shape, stride []int, offset int) *Tensor {
+	a.assertOpen()
 	if !a.IsContiguous() {
 		panic("autograd: view parent must be contiguous")
 	}
-	v := &Tensor{Data: a.Data, Shape: append([]int(nil), shape...), Strides: append([]int(nil), stride...), Offset: offset, DType: Float32, Device: a.Device, buf: a.buf, RequiresGrad: a.RequiresGrad && recording, parents: []*Tensor{a}}
-	if a.bf16Buf != nil {
-		v.bf16Buf = a.bf16Buf
+	context, req := graphRecording([]*Tensor{a})
+	v := &Tensor{Data: a.Data, storage: a.storage.acquire(), outputVersion: a.storage.version.Load(), Shape: append([]int(nil), shape...), Strides: append([]int(nil), stride...), Offset: offset, DType: Float32, Device: a.Device, buf: a.buf, RequiresGrad: req, execution: context, intermediate: true}
+	v.attachParents([]*Tensor{a})
+	v.shareBF16(a)
+	if !req {
+		return v
 	}
 	identity := offset == 0
 	want := strides(shape)
@@ -110,6 +114,7 @@ func makeView(a *Tensor, shape, stride []int, offset int) *Tensor {
 // Contiguous materializes a view in row-major order. A contiguous tensor is
 // returned unchanged. Backward maps the copy's logical gradient to its view.
 func (t *Tensor) Contiguous() *Tensor {
+	t.assertOpen()
 	useCUDA := dispatchBackend("contiguous", t.Device)
 	if t.IsContiguous() {
 		return t
@@ -133,10 +138,10 @@ func (t *Tensor) Contiguous() *Tensor {
 			addDevice(dst, g, n)
 		}
 	})
-	if BF16Autocast && t.bf16Buf != nil {
-		res.bf16Buf = allocBF16(n)
-		res.bf16Owner = true
-		gpuViewGatherBF16(t.bf16Buf, res.bf16Buf, t.Shape, t.Strides, t.Offset)
+	if executionOptions(t).BF16Autocast && t.currentBF16() != nil {
+		shadow := allocBF16(n)
+		gpuViewGatherBF16(t.currentBF16(), shadow, t.Shape, t.Strides, t.Offset)
+		res.setBF16(shadow)
 	}
 	return res
 }

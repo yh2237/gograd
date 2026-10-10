@@ -160,8 +160,9 @@ func Dropout(a *Tensor, p float32, seed uint32, training bool) *Tensor {
 
 // ScaledDotProductAttention accepts [..., query, depth] and [..., key, depth].
 // The additive mask broadcasts over the attention score shape.
-// AttentionAlgorithm is "materialized", "flash", or "auto". Set it between
-// training steps; the choice is process-wide. Auto selects the tiled path only
+// AttentionAlgorithm is the compatibility policy for unbound tensors:
+// "materialized", "flash", or "auto". Explicit contexts use ExecutionOptions.
+// Auto selects the tiled path only
 // when materialized score scratch would exceed roughly 1 GiB.
 var AttentionAlgorithm = "auto"
 
@@ -171,6 +172,8 @@ func ScaledDotProductAttention(q, k, v, mask *Tensor) *Tensor {
 }
 func attentionWithDropout(q, k, v, mask *Tensor, p float32, seed uint32, training bool) *Tensor {
 	useCUDA := dispatchBackend("attention", q.Device)
+	same(q, k, v, mask)
+	options := executionOptions(q, k, v, mask)
 	if len(q.Shape) < 2 || len(k.Shape) < 2 || len(v.Shape) < 2 {
 		panic("autograd: attention rank")
 	}
@@ -180,7 +183,7 @@ func attentionWithDropout(q, k, v, mask *Tensor, p float32, seed uint32, trainin
 	}
 	if useCUDA && (!training || p == 0) && canFuseAttention(q, k, v, mask) {
 		flashSupported := q.Shape[len(q.Shape)-1] <= 128 && v.Shape[len(v.Shape)-1] <= 128
-		switch AttentionAlgorithm {
+		switch options.AttentionAlgorithm {
 		case "flash":
 			if !flashSupported {
 				panic("autograd: flash attention head dimension exceeds 128")
@@ -195,7 +198,7 @@ func attentionWithDropout(q, k, v, mask *Tensor, p float32, seed uint32, trainin
 		default:
 			panic("autograd: unknown attention algorithm")
 		}
-		return gpuAttention(q, k, v, mask)
+		return gpuAttention(q, k, v, mask, options)
 	}
 	scores := MulScalar(MatMul(q, Transpose(k, len(k.Shape)-2, len(k.Shape)-1)), 1/float32(math.Sqrt(float64(depth))))
 	if mask != nil {

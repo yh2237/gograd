@@ -143,6 +143,7 @@ func Concat(axis int, inputs ...*Tensor) *Tensor {
 	if len(inputs) == 0 {
 		panic("autograd: empty concat")
 	}
+	same(inputs[0], inputs[1:]...)
 	s := append([]int(nil), inputs[0].Shape...)
 	if axis < 0 {
 		axis += len(s)
@@ -403,7 +404,7 @@ func MaskedLoss(pred, target *Tensor, mse bool) *Tensor {
 	}
 	value := cpuAlloc(1)
 	value[0] = total
-	return result(value, []int{}, []*Tensor{pred}, func(up []float32) {
+	return resultWithSaved(value, []int{}, []*Tensor{pred}, []*Tensor{target}, func(up []float32) {
 		dx := make([]float32, len(g))
 		for i := range g {
 			dx[i] = g[i] * up[0]

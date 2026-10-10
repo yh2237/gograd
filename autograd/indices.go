@@ -11,8 +11,9 @@ import (
 // IndexBuffer stores fixed embedding indices on CUDA, so repeated forwards
 // and CUDA graph capture do not upload indices each step.
 type IndexBuffer struct {
-	buffer *cuda.Buffer
-	Count  int
+	buffer  *cuda.Buffer
+	storage *tensorStorage
+	Count   int
 }
 
 func NewIndexBuffer(ids []int) (*IndexBuffer, error) {
@@ -34,12 +35,13 @@ func NewIndexBuffer(ids []int) (*IndexBuffer, error) {
 		b.Free()
 		return nil, e
 	}
-	return &IndexBuffer{b, len(ids)}, nil
+	return &IndexBuffer{buffer: b, storage: deviceStorage(b), Count: len(ids)}, nil
 }
 func (ids *IndexBuffer) Close() {
 	if ids != nil && ids.buffer != nil {
-		ids.buffer.Free()
+		ids.storage.release()
 		ids.buffer = nil
+		ids.storage = nil
 	}
 }
 func EmbeddingFromIndexBuffer(weight *Tensor, ids *IndexBuffer, shape []int, paddingIdx int) *Tensor {
@@ -47,5 +49,7 @@ func EmbeddingFromIndexBuffer(weight *Tensor, ids *IndexBuffer, shape []int, pad
 	if weight.Device != tensor.CUDA || ids == nil || ids.buffer == nil || len(weight.Shape) != 2 || numel(shape) != ids.Count {
 		panic("autograd: CUDA embedding indices shape")
 	}
-	return gpuEmbeddingBuffer(weight.Contiguous(), ids.buffer, shape, paddingIdx, false)
+	r := gpuEmbeddingBuffer(weight.Contiguous(), ids.buffer, shape, paddingIdx, false)
+	r.savedLeases = append(r.savedLeases, ids.storage.acquire())
+	return r
 }

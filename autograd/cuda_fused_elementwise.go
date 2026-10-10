@@ -12,6 +12,7 @@ func BiasGELU(x, b *Tensor) *Tensor {
 		return GELU(Add(x, b), false)
 	}
 	same(x, b)
+	options := executionOptions(x, b)
 	x, b = x.Contiguous(), b.Contiguous()
 	c := x.Shape[len(x.Shape)-1]
 	if len(b.Shape) != 1 || b.Numel() != c {
@@ -21,11 +22,11 @@ func BiasGELU(x, b *Tensor) *Tensor {
 	channels := int32(c)
 	out := mustAlloc(int(n))
 	var shadow *cuda.Buffer
-	if BF16Autocast {
+	if options.BF16Autocast {
 		shadow = allocBF16(int(n))
 	}
 	xp, bp, yp := ptr(x.buf), ptr(b.buf), ptr(out)
-	if BF16Autocast {
+	if options.BF16Autocast {
 		sh := ptr(shadow)
 		launch("bias_gelu_bf16_f", int(n), unsafe.Pointer(&xp), unsafe.Pointer(&bp), unsafe.Pointer(&yp), unsafe.Pointer(&sh), unsafe.Pointer(&n), unsafe.Pointer(&channels))
 	} else {
@@ -36,8 +37,7 @@ func BiasGELU(x, b *Tensor) *Tensor {
 		dx, db := ptr(x.ensureGradGPU()), ptr(b.ensureGradGPU())
 		launch("bias_gelu_b", int(n), unsafe.Pointer(&xp), unsafe.Pointer(&bp), unsafe.Pointer(&gp), unsafe.Pointer(&dx), unsafe.Pointer(&db), unsafe.Pointer(&n), unsafe.Pointer(&channels))
 	})
-	res.bf16Buf = shadow
-	res.bf16Owner = shadow != nil
+	res.setBF16(shadow)
 	return res
 }
 
@@ -46,8 +46,8 @@ func BiasResidual(x, b, residual *Tensor) *Tensor {
 	if !dispatchBackend("bias_residual", x.Device) {
 		return Add(Add(x, b), residual)
 	}
-	same(x, b)
-	same(x, residual)
+	same(x, b, residual)
+	options := executionOptions(x, b, residual)
 	x, b, residual = x.Contiguous(), b.Contiguous(), residual.Contiguous()
 	c := x.Shape[len(x.Shape)-1]
 	if len(b.Shape) != 1 || b.Numel() != c || len(x.Shape) != len(residual.Shape) {
@@ -61,11 +61,11 @@ func BiasResidual(x, b, residual *Tensor) *Tensor {
 	n, channels := int32(x.Numel()), int32(c)
 	out := mustAlloc(int(n))
 	var shadow *cuda.Buffer
-	if BF16Autocast {
+	if options.BF16Autocast {
 		shadow = allocBF16(int(n))
 	}
 	xp, bp, rp, yp := ptr(x.buf), ptr(b.buf), ptr(residual.buf), ptr(out)
-	if BF16Autocast {
+	if options.BF16Autocast {
 		sh := ptr(shadow)
 		launch("bias_residual_bf16_f", int(n), unsafe.Pointer(&xp), unsafe.Pointer(&bp), unsafe.Pointer(&rp), unsafe.Pointer(&yp), unsafe.Pointer(&sh), unsafe.Pointer(&n), unsafe.Pointer(&channels))
 	} else {
@@ -76,7 +76,6 @@ func BiasResidual(x, b, residual *Tensor) *Tensor {
 		dx, db, dr := ptr(x.ensureGradGPU()), ptr(b.ensureGradGPU()), ptr(residual.ensureGradGPU())
 		launch("bias_residual_b", int(n), unsafe.Pointer(&gp), unsafe.Pointer(&dx), unsafe.Pointer(&db), unsafe.Pointer(&dr), unsafe.Pointer(&n), unsafe.Pointer(&channels))
 	})
-	res.bf16Buf = shadow
-	res.bf16Owner = shadow != nil
+	res.setBF16(shadow)
 	return res
 }

@@ -4,6 +4,7 @@ package autograd
 // It is a graph composition, so forward and backward use the selected backend.
 func RMSNormLast(x, weight *Tensor, eps float32) *Tensor {
 	dispatchBackend("rms_norm_last", x.Device)
+	same(x, weight)
 	if len(x.Shape) == 0 || len(weight.Shape) != 1 || weight.Shape[0] != x.Shape[len(x.Shape)-1] || eps <= 0 || x.Device != weight.Device {
 		panic("autograd: invalid RMSNorm shape, device, or epsilon")
 	}

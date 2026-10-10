@@ -68,13 +68,14 @@ func aligned3(shape []int) [3]int32 {
 	return out
 }
 func gpuBinary(a, b *Tensor, op int) *Tensor {
+	options := executionOptions(a, b)
 	s := bshape(a.Shape, b.Shape)
 	if len(s) > 3 {
 		return gpuBinaryND(a, b, s, op)
 	}
 	out := mustAlloc(numel(s))
 	var shadow *cuda.Buffer
-	if BF16Autocast {
+	if options.BF16Autocast {
 		shadow = allocBF16(numel(s))
 	}
 	ad, bd := aligned3(a.Shape), aligned3(b.Shape)
@@ -83,7 +84,7 @@ func gpuBinary(a, b *Tensor, op int) *Tensor {
 	n, d1, d2 := int32(numel(s)), od[1], od[2]
 	ao, bo := int32(op), int32(op)
 	_ = bo
-	if BF16Autocast {
+	if options.BF16Autocast {
 		sh := ptr(shadow)
 		launch("binary_bf16_f", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&bp), unsafe.Pointer(&yp), unsafe.Pointer(&sh), unsafe.Pointer(&n), unsafe.Pointer(&d1), unsafe.Pointer(&d2), unsafe.Pointer(&ad[0]), unsafe.Pointer(&ad[1]), unsafe.Pointer(&ad[2]), unsafe.Pointer(&bd[0]), unsafe.Pointer(&bd[1]), unsafe.Pointer(&bd[2]), unsafe.Pointer(&ao))
 	} else {
@@ -94,11 +95,11 @@ func gpuBinary(a, b *Tensor, op int) *Tensor {
 		gp := ptr(g)
 		launch("binary_b", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&bp), unsafe.Pointer(&gp), unsafe.Pointer(&ag), unsafe.Pointer(&bg), unsafe.Pointer(&n), unsafe.Pointer(&d1), unsafe.Pointer(&d2), unsafe.Pointer(&ad[0]), unsafe.Pointer(&ad[1]), unsafe.Pointer(&ad[2]), unsafe.Pointer(&bd[0]), unsafe.Pointer(&bd[1]), unsafe.Pointer(&bd[2]), unsafe.Pointer(&ao))
 	})
-	res.bf16Buf = shadow
-	res.bf16Owner = shadow != nil
+	res.setBF16(shadow)
 	return res
 }
 func gpuBinaryND(a, b *Tensor, s []int, op int) *Tensor {
+	options := executionOptions(a, b)
 	broadcastStride := func(t *Tensor) []int {
 		st := make([]int, len(s))
 		for i := range s {
@@ -115,11 +116,11 @@ func gpuBinaryND(a, b *Tensor, s []int, op int) *Tensor {
 	n, kind := int32(numel(s)), int32(op)
 	out := mustAlloc(int(n))
 	var shadow *cuda.Buffer
-	if BF16Autocast {
+	if options.BF16Autocast {
 		shadow = allocBF16(int(n))
 	}
 	ap, bp, yp := ptr(a.buf), ptr(b.buf), ptr(out)
-	if BF16Autocast {
+	if options.BF16Autocast {
 		sh := ptr(shadow)
 		launch("binary_nd_bf16_f", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&bp), unsafe.Pointer(&yp), unsafe.Pointer(&sh), unsafe.Pointer(&n), unsafe.Pointer(&shape), unsafe.Pointer(&as), unsafe.Pointer(&bs), unsafe.Pointer(&kind))
 	} else {
@@ -130,8 +131,7 @@ func gpuBinaryND(a, b *Tensor, s []int, op int) *Tensor {
 		gp := ptr(g)
 		launch("binary_nd_b", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&bp), unsafe.Pointer(&gp), unsafe.Pointer(&ag), unsafe.Pointer(&bg), unsafe.Pointer(&n), unsafe.Pointer(&shape), unsafe.Pointer(&as), unsafe.Pointer(&bs), unsafe.Pointer(&kind))
 	})
-	res.bf16Buf = shadow
-	res.bf16Owner = shadow != nil
+	res.setBF16(shadow)
 	return res
 }
 func gpuUnary(a *Tensor, op int) *Tensor {
@@ -312,7 +312,6 @@ func gpuGroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
 	launch("group_stats", bs*groups*256, unsafe.Pointer(&xp), unsafe.Pointer(&sp), unsafe.Pointer(&batch), unsafe.Pointer(&time), unsafe.Pointer(&channels), unsafe.Pointer(&ng), unsafe.Pointer(&eps))
 	launch("group_f", int(n), unsafe.Pointer(&xp), unsafe.Pointer(&wp), unsafe.Pointer(&bp), unsafe.Pointer(&sp), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&time), unsafe.Pointer(&channels), unsafe.Pointer(&ng))
 	r := resultGPU(out, s, []*Tensor{x, w, b}, func(g *cuda.Buffer) {
-		defer stats.Free()
 		gp := ptr(g)
 		launch("group_backstats", bs*groups*256, unsafe.Pointer(&xp), unsafe.Pointer(&wp), unsafe.Pointer(&gp), unsafe.Pointer(&sp), unsafe.Pointer(&time), unsafe.Pointer(&channels), unsafe.Pointer(&ng))
 		dx, dw, db := ptr(x.ensureGradGPU()), ptr(w.ensureGradGPU()), ptr(b.ensureGradGPU())
@@ -336,8 +335,7 @@ func gpuMaskedLoss(pred, target *Tensor, mse bool) *Tensor {
 	}
 	launch("masked_f", int(n), unsafe.Pointer(&pp), unsafe.Pointer(&tp), unsafe.Pointer(&ap), unsafe.Pointer(&n), unsafe.Pointer(&c), unsafe.Pointer(&kind))
 	launch("masked_finish", 1, unsafe.Pointer(&ap), unsafe.Pointer(&yp))
-	r := resultGPU(out, []int{}, []*Tensor{pred}, func(g *cuda.Buffer) {
-		defer acc.Free()
+	r := resultGPUWithSaved(out, []int{}, []*Tensor{pred}, []*Tensor{target}, func(g *cuda.Buffer) {
 		dx := ptr(pred.ensureGradGPU())
 		gp := ptr(g)
 		launch("masked_b", int(n), unsafe.Pointer(&pp), unsafe.Pointer(&tp), unsafe.Pointer(&ap), unsafe.Pointer(&gp), unsafe.Pointer(&dx), unsafe.Pointer(&n), unsafe.Pointer(&c), unsafe.Pointer(&kind))

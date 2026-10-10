@@ -8,28 +8,42 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
 type Tensor struct {
-	Data, Grad     []float32
-	Shape, Strides []int
-	Offset         int
-	DType          DType
-	Device         tensor.Device
-	buf            *cuda.Buffer
-	bf16Buf        *cuda.Buffer
-	bf16Owner      bool
-	gradBuf        *cuda.Buffer
-	aux            []*cuda.Buffer
-	ownsBuffer     bool
-	ownsData       bool
-	ephemeral      bool
-	RequiresGrad   bool
-	parents        []*Tensor
-	backward       func([]float32)
-	backwardGPU    func(*cuda.Buffer)
-	retain         bool
+	Data, Grad       []float32
+	Shape, Strides   []int
+	Offset           int
+	DType            DType
+	Device           tensor.Device
+	buf              *cuda.Buffer
+	storage          *tensorStorage
+	bf16Storage      *tensorStorage
+	bf16Version      uint64
+	gradBuf          *cuda.Buffer
+	aux              []*cuda.Buffer
+	auxCPU           [][]float32
+	savedLeases      []*tensorStorage
+	ephemeral        bool
+	RequiresGrad     bool
+	execution        *ExecutionContext
+	parents          []*Tensor
+	gradParents      []*Tensor
+	savedVersions    []uint64
+	outputVersion    uint64
+	backward         func([]float32)
+	backwardGPU      func(*cuda.Buffer)
+	retain           bool
+	retainData       bool
+	intermediate     bool
+	historyReleased  bool
+	children         atomic.Int64
+	closed           atomic.Bool
+	disposed         atomic.Bool
+	releaseRequested atomic.Bool
+	inBackward       atomic.Bool
 }
 type DType string
 
@@ -54,7 +68,6 @@ func (t *Tensor) IsContiguous() bool {
 	return true
 }
 
-var recording = true
 var cpuPools sync.Map
 
 func cpuAlloc(n int) []float32 {
@@ -74,32 +87,28 @@ func cpuRelease(v []float32) {
 	p.(*sync.Pool).Put(v)
 }
 
-// ReleaseGraph returns temporary activations after Backward or inference.
-// Callers must finish reading the graph's outputs first.
+// ReleaseGraph requests reclamation of this graph's intermediates. A node still
+// used by another branch/view is reclaimed only after that dependent releases
+// it. RetainData/RetainGrad pins a handle's data, not its derivative history.
+// Persistent factory leaves (inputs/parameters) are closed by their callers.
 func (t *Tensor) ReleaseGraph() {
-	seen := map[*Tensor]bool{}
-	var walk func(*Tensor)
-	walk = func(v *Tensor) {
-		if seen[v] {
-			return
-		}
-		seen[v] = true
-		for _, p := range v.parents {
-			walk(p)
-		}
-		if v.Device == tensor.CPU && v.ownsData && !v.retain {
-			cpuRelease(v.Data)
-			v.Data = nil
-			v.ownsData = false
-		}
-		if v.Device == tensor.CUDA && ((len(v.parents) > 0 && !v.retain) || v.ephemeral) {
-			v.Close()
+	if t == nil || t.disposed.Load() {
+		return
+	}
+	nodes := t.collectLifetime()
+	for _, v := range nodes {
+		if v.intermediate || v.ephemeral {
+			v.releaseRequested.Store(true)
 		}
 	}
-	walk(t)
+	for _, v := range nodes {
+		v.maybeDispose()
+	}
 }
 
-func NoGrad(fn func()) { old := recording; recording = false; defer func() { recording = old }(); fn() }
+// NoGrad is the compatibility scope for unbound tensors. For independent
+// execution use ExecutionContext.NoGrad with bound parameters and inputs.
+func NoGrad(fn func()) { defaultExecutionContext.NoGrad(fn) }
 func numel(s []int) int {
 	n := 1
 	for _, v := range s {
@@ -135,9 +144,10 @@ func New(data []float32, shape []int, device tensor.Device, grad bool) (*Tensor,
 			buf.Free()
 			return nil, err
 		}
-		return &Tensor{Shape: append([]int(nil), shape...), Strides: strides(shape), DType: Float32, Device: device, buf: buf, ownsBuffer: true, RequiresGrad: grad}, nil
+		return &Tensor{Shape: append([]int(nil), shape...), Strides: strides(shape), DType: Float32, Device: device, buf: buf, storage: deviceStorage(buf), RequiresGrad: grad}, nil
 	}
-	return &Tensor{Data: append([]float32(nil), data...), Shape: append([]int(nil), shape...), Strides: strides(shape), DType: Float32, Device: device, RequiresGrad: grad}, nil
+	values := append([]float32(nil), data...)
+	return &Tensor{Data: values, storage: cpuStorage(values, false), Shape: append([]int(nil), shape...), Strides: strides(shape), DType: Float32, Device: device, RequiresGrad: grad}, nil
 }
 func floatBytes(data []float32) []byte {
 	if len(data) == 0 {
@@ -147,15 +157,14 @@ func floatBytes(data []float32) []byte {
 }
 func (t *Tensor) Numel() int { return numel(t.Shape) }
 func (t *Tensor) ToHost() ([]float32, error) {
+	if err := t.checkOpen(); err != nil {
+		return nil, err
+	}
 	if !t.IsContiguous() {
 		c := t.Contiguous()
 		v, e := c.ToHost()
 		if c != t {
-			if c.Device == tensor.CUDA {
-				c.Close()
-			} else {
-				cpuRelease(c.Data)
-			}
+			c.Close()
 		}
 		return v, e
 	}
@@ -169,6 +178,9 @@ func (t *Tensor) ToHost() ([]float32, error) {
 	return v, nil
 }
 func (t *Tensor) GradToHost() ([]float32, error) {
+	if err := t.checkOpen(); err != nil {
+		return nil, err
+	}
 	if t.Device == tensor.CPU {
 		return append([]float32(nil), t.Grad...), nil
 	}
@@ -182,6 +194,9 @@ func (t *Tensor) GradToHost() ([]float32, error) {
 	return v, nil
 }
 func (t *Tensor) CopyFrom(data []float32) error {
+	if err := t.checkOpen(); err != nil {
+		return err
+	}
 	if len(data) != t.Numel() {
 		return errors.New("autograd: copy size mismatch")
 	}
@@ -190,9 +205,11 @@ func (t *Tensor) CopyFrom(data []float32) error {
 			for i, v := range data {
 				t.Data[storageIndex(i, t.Shape, t.Strides, t.Offset)] = v
 			}
+			t.storage.version.Add(1)
 			return nil
 		}
 		copy(t.Data, data)
+		t.storage.version.Add(1)
 		return nil
 	}
 	if !t.IsContiguous() {
@@ -201,21 +218,24 @@ func (t *Tensor) CopyFrom(data []float32) error {
 	t.invalidateBF16()
 	return t.buf.CopyFromHost(floatBytes(data))
 }
-func (t *Tensor) Buffer() *cuda.Buffer { return t.buf }
+
+// Buffer is borrowed; callers must not Free it or retain it after Close.
+func (t *Tensor) Buffer() *cuda.Buffer {
+	if t.closed.Load() {
+		return nil
+	}
+	return t.buf
+}
+
+// Close ends this handle's lifetime. Dependencies still using its values or
+// saved state keep them alive internally until their last edge is released.
+// Repeated Close calls are safe.
 func (t *Tensor) Close() {
-	t.invalidateBF16()
-	for _, b := range t.aux {
-		b.Free()
+	if t == nil {
+		return
 	}
-	t.aux = nil
-	if t.gradBuf != nil {
-		t.gradBuf.Free()
-		t.gradBuf = nil
-	}
-	if t.ownsBuffer && t.buf != nil {
-		t.buf.Free()
-		t.buf = nil
-	}
+	t.closed.Store(true)
+	t.maybeDispose()
 }
 func Must(data []float32, shape []int, grad bool) *Tensor {
 	v, e := New(data, shape, tensor.CPU, grad)
@@ -234,34 +254,41 @@ func Zeros(shape []int, device tensor.Device, grad bool) (*Tensor, error) {
 			buf.Free()
 			return nil, e
 		}
-		return &Tensor{Shape: append([]int(nil), shape...), Strides: strides(shape), DType: Float32, Device: device, buf: buf, ownsBuffer: true, RequiresGrad: grad}, nil
+		return &Tensor{Shape: append([]int(nil), shape...), Strides: strides(shape), DType: Float32, Device: device, buf: buf, storage: deviceStorage(buf), RequiresGrad: grad}, nil
 	}
 	return New(make([]float32, numel(shape)), shape, device, grad)
 }
 func (t *Tensor) Detach() *Tensor {
+	t.assertOpen()
 	if t.Device == tensor.CUDA {
+		src := t
+		if !t.IsContiguous() {
+			src = t.Contiguous()
+			defer src.Close()
+		}
 		v, e := New(make([]float32, t.Numel()), t.Shape, t.Device, false)
 		if e != nil {
 			panic(e)
 		}
-		if e = copyDevice(v.buf, t.buf, t.Numel()); e != nil {
+		if e = copyDevice(v.buf, src.buf, t.Numel()); e != nil {
+			v.Close()
 			panic(e)
 		}
+		v.execution = t.execution
 		return v
 	}
-	v := *t
-	v.Data = append([]float32(nil), t.Data...)
-	v.Grad = nil
-	v.RequiresGrad = false
-	v.parents = nil
-	v.backward = nil
-	return &v
+	values := make([]float32, t.Numel())
+	for i := range values {
+		values[i] = t.Data[storageIndex(i, t.Shape, t.Strides, t.Offset)]
+	}
+	return &Tensor{Data: values, storage: cpuStorage(values, false), Shape: append([]int(nil), t.Shape...), Strides: strides(t.Shape), DType: t.DType, Device: t.Device, execution: t.execution}
 }
-func (t *Tensor) RetainGrad() { t.retain = true }
+func (t *Tensor) RetainGrad() { t.assertOpen(); t.retain = true }
 func (t *Tensor) ZeroGrad() {
+	t.assertOpen()
 	t.Grad = nil
 	if t.gradBuf != nil {
-		if t.Device == tensor.CUDA && len(t.parents) == 0 && t.RequiresGrad {
+		if t.Device == tensor.CUDA && !t.intermediate && t.RequiresGrad {
 			if e := t.gradBuf.Memset(0, t.gradBuf.Size()); e != nil {
 				panic(e)
 			}
@@ -272,18 +299,38 @@ func (t *Tensor) ZeroGrad() {
 	}
 }
 func result(data []float32, shape []int, parents []*Tensor, back func([]float32)) *Tensor {
-	req := false
-	for _, p := range parents {
-		req = req || p.RequiresGrad
+	return resultWithSaved(data, shape, parents, nil, back)
+}
+
+func resultWithSaved(data []float32, shape []int, parents, saved []*Tensor, back func([]float32)) *Tensor {
+	context, req := graphRecording(parents, saved...)
+	if !req {
+		back = nil
 	}
-	return &Tensor{Data: data, Shape: shape, Strides: strides(shape), DType: Float32, Device: parents[0].Device, RequiresGrad: req && recording, parents: parents, backward: back, ownsData: true}
+	// Keep lifetime parents even when derivatives are disabled. ReleaseGraph
+	// needs them to reclaim inference intermediates and shared-storage views.
+	r := &Tensor{Data: data, storage: cpuStorage(data, true), Shape: shape, Strides: strides(shape), DType: Float32, Device: parents[0].Device, RequiresGrad: req, execution: context, backward: back, intermediate: true}
+	r.attachParents(parents)
+	for _, p := range saved {
+		r.keepAlive(p)
+	}
+	return r
 }
 func resultGPU(buf *cuda.Buffer, shape []int, parents []*Tensor, back func(*cuda.Buffer)) *Tensor {
-	req := false
-	for _, p := range parents {
-		req = req || p.RequiresGrad
+	return resultGPUWithSaved(buf, shape, parents, nil, back)
+}
+
+func resultGPUWithSaved(buf *cuda.Buffer, shape []int, parents, saved []*Tensor, back func(*cuda.Buffer)) *Tensor {
+	context, req := graphRecording(parents, saved...)
+	if !req {
+		back = nil
 	}
-	return &Tensor{Shape: append([]int(nil), shape...), Strides: strides(shape), DType: Float32, Device: tensor.CUDA, buf: buf, ownsBuffer: true, RequiresGrad: req && recording, parents: parents, backwardGPU: back}
+	r := &Tensor{Shape: append([]int(nil), shape...), Strides: strides(shape), DType: Float32, Device: tensor.CUDA, buf: buf, storage: deviceStorage(buf), RequiresGrad: req, execution: context, backwardGPU: back, intermediate: true}
+	r.attachParents(parents)
+	for _, p := range saved {
+		r.keepAlive(p)
+	}
+	return r
 }
 func (t *Tensor) ensureGradGPU() *cuda.Buffer {
 	if !t.RequiresGrad {
@@ -313,51 +360,20 @@ func (t *Tensor) addGrad(g []float32) {
 	}
 }
 func (t *Tensor) Backward() error {
-	if t.Numel() != 1 {
-		return errors.New("autograd: backward requires scalar")
-	}
-	topo := []*Tensor{}
-	seen := map[*Tensor]bool{}
-	var visit func(*Tensor)
-	visit = func(v *Tensor) {
-		if seen[v] {
-			return
-		}
-		seen[v] = true
-		for _, p := range v.parents {
-			visit(p)
-		}
-		topo = append(topo, v)
-	}
-	visit(t)
-	if t.Device == tensor.CUDA {
-		setOne(t.ensureGradGPU())
-	} else {
-		t.addGrad([]float32{1})
-	}
-	for i := len(topo) - 1; i >= 0; i-- {
-		v := topo[i]
-		if v.Device == tensor.CUDA {
-			if v.backwardGPU != nil && v.gradBuf != nil {
-				v.backwardGPU(v.gradBuf)
-			}
-			if (len(v.parents) > 0 && !v.retain) || v.ephemeral {
-				v.Close()
-			}
+	return t.BackwardWithOptions(BackwardOptions{})
+}
+func same(a *Tensor, others ...*Tensor) {
+	a.assertOpen()
+	context := a.execution
+	for _, b := range others {
+		if b == nil {
 			continue
 		}
-		if v.backward != nil && v.Grad != nil {
-			v.backward(v.Grad)
+		b.assertOpen()
+		if a.Device != b.Device {
+			panic("autograd: mixed devices")
 		}
-		if len(v.parents) > 0 && !v.retain {
-			v.Grad = nil
-		}
-	}
-	return nil
-}
-func same(a, b *Tensor) {
-	if a.Device != b.Device {
-		panic("autograd: mixed devices")
+		context = mergeExecutionContext(context, b)
 	}
 }
 func bshape(a, b []int) []int {
@@ -558,6 +574,7 @@ func Scalar(a *Tensor, v float32) *Tensor {
 	dispatchBackend("scalar", a.Device)
 	b, _ := New([]float32{v}, []int{}, a.Device, false)
 	b.ephemeral = true
+	b.execution = a.execution
 	return b
 }
 func cpuScalar(a *Tensor, value float32, op int) *Tensor {
