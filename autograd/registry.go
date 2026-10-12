@@ -50,6 +50,9 @@ var operationRegistry = map[string]KernelPair{
 	"cross_entropy":          {"CrossEntropy", "ce_f/b"},
 	"bias_gelu":              {"Add+GELU", "bias_gelu_f/b"},
 	"bias_residual":          {"Add", "bias_residual_f/b"},
+	"mse_loss":               {"Sub+Mul+Mean", "binary_f/b+reduce_nd_f/b"},
+	"l1_loss":                {"Sub+Abs+Mean", "binary_f/b+unary_f/b+reduce_nd_f/b"},
+	"bce_logits_loss":        {"ReLU+Sub+Mul+Exp+Log+Add+Mean", "unary_f/b+binary_f/b+reduce_nd_f/b"},
 }
 
 // dispatchBackend validates registration and selects the implementation.

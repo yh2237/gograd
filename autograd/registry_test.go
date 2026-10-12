@@ -29,6 +29,7 @@ var registeredPublicOps = map[string]string{
 	"RotaryHalf":  "rotary_half", "GeGLU": "geglu", "SwiGLUProjection": "swiglu_projection", "KeyPaddingAttention": "key_padding_attention",
 	"Dropout": "dropout", "ScaledDotProductAttention": "attention", "CrossEntropy": "cross_entropy",
 	"BiasGELU": "bias_gelu", "BiasResidual": "bias_residual",
+	"MSELoss": "mse_loss", "L1Loss": "l1_loss", "BCEWithLogitsLoss": "bce_logits_loss",
 }
 
 func TestDifferentiableOpsUseRegistry(t *testing.T) {

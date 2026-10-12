@@ -444,8 +444,7 @@ func trainingStep(m *denoiser, execution *autograd.ExecutionContext, optimizer a
 	}
 	defer target.Close()
 	optimizer.ZeroGrad()
-	difference := autograd.Sub(m.forward(x), target)
-	loss := autograd.Mean(autograd.Mul(difference, difference), 0, 1)
+	loss := autograd.MSELoss(m.forward(x), target, autograd.LossOptions{})
 	defer loss.ReleaseGraph()
 	values, err := loss.ToHost()
 	if err != nil {

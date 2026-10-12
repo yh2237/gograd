@@ -410,9 +410,7 @@ func trainingStep(m *regressionModel, execution *autograd.ExecutionContext, opti
 	}
 	defer target.Close()
 	optimizer.ZeroGrad()
-	difference := autograd.Sub(m.forward(x), target)
-	// Mean over both [batch,1] axes is the mean squared error.
-	loss := autograd.Mean(autograd.Mul(difference, difference), 0, 1)
+	loss := autograd.MSELoss(m.forward(x), target, autograd.LossOptions{})
 	defer loss.ReleaseGraph()
 	values, err := loss.ToHost()
 	if err != nil {
