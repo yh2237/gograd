@@ -1,223 +1,116 @@
-# v1.2.0 training API
+# 学習API
 
-The first consumer is UtauTTS's speech-timing target trainer. Inference
-safetensors keep their existing names/layouts; resumable training checkpoints
-use a separate `gograd-training-1` envelope.
+gogradの学習で使う公開APIの一覧です。学習checkpointは`safetensors`の`gograd-training-1`形式で保存し、推論用の重みは名前とレイアウトをそのまま保ちます。
 
-## Supported training surface
+## 学習で使うAPI
 
-| Package | API | Contract |
+| パッケージ | API | 役割 |
 | --- | --- | --- |
-| `tensor` | `Device`, `CPU`, `CUDA` | Select the backend when constructing tensors and models. |
-| `autograd` | `NewCUDAContext`, `NewCUDAContextOn`, `CUDAContext.Device`, `CUDAContext.Close` | Hold a CUDA context on the calling OS thread for the training step, optionally selecting and validating a device and restoring the thread's previous device on close. |
-| `autograd` | `New`, `Tensor.ToHost`, `Tensor.Backward`, `Tensor.ReleaseGraph`, `Tensor.Close` | Float32 tensors, explicit readback and lifetime control. |
-| `autograd` | `RetainData`, `RetainGrad`, `BackwardWithOptions`, `BackwardOptions` | Shared-storage lifetimes, retained forward values/gradients and explicit derivative-history retention for multiple backward passes. |
-| `autograd` | `NewExecutionContext`, `ExecutionContext.New`, `Zeros`, `Bind`, `BindModule`, `NoGrad`, `Recording`, `Tensor.ExecutionContext` | Explicit recording scope propagated by tensors and views. Independent CPU models can train/infer concurrently using separate contexts. |
-| `autograd` | `ExecutionOptions`, `ExecutionContext.SetOptions`, `Options`, `Autocast` | Context-local BF16/attention policy, scoped precision and forward-policy snapshots for backward. |
-| `autograd` | `NewSpeechTiming`, `SpeechTiming.Forward`, `Train`, `Parameters`, `Module` | The UtauTTS Target architecture and PyTorch-compatible parameter names. `Forward` accepts flattened phone IDs and a `[batch,time,C]` tensor. |
-| `autograd` | `NewEmbeddingLayer`, `NewConv1dLayer`, `NewLayerNormLayer`, `NewLinearLayer`, `DropoutLayer`, `GELULayer`, `Sequential` | Reusable graph modules. Convolution activations are `[batch,time,channels]`; weights are `[out,in,kernel]`. |
-| `autograd` | `Conv2d`, `Conv2dOptions`, `NewConv2dLayer`, `Conv2dLayer` | NCHW activations, `[out,in/groups,kH,kW]` weights, optional bias, grouped/depthwise convolution and CPU/CUDA gradients. |
-| `autograd` | `MaxPool2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, pooling options and layers | NCHW pooling on CPU/CUDA with overlapping-window gradients, ceil mode and explicit averaging divisors. |
-| `autograd` | `BatchNorm`, `BatchNormOptions`, `NewBatchNormLayer`, `BatchNormLayerOptions`, `BatchNormLayer` | Rank 2..6 channel normalization, CPU/CUDA training/evaluation gradients, named affine parameters and running state. |
-| `autograd` | `Module.StateDict`, `LoadStateDict`, `SaveSafeTensors`, `SaveSafeTensorsMetadata`, `LoadSafeTensors` | Named float32 state. Metadata values are strings. The speech-timing model emits UtauTTS loader names and shapes. |
-| `autograd` | `MaskedLoss(pred,target,false)`, `ClipGradNorm`, `NewAdamW`, `NewOneCycle` | NaN-frame masked L1, clipping, AdamW, and PyTorch two-phase cosine OneCycle LR. |
-| `autograd` | `AdamW.State`, `LoadState`, `SaveSafeTensors`, `LoadSafeTensors`, `Close` | Named parameter shapes, moments, hyperparameters and step count on CPU/CUDA; release optimizer-owned buffers. |
-| `autograd` | `Optimizer`, `CheckpointOptimizer`, `OptimizerSnapshot`, `LearningRate`, `SetLearningRate` | Common eager update/reset/LR/lifetime API and typed AdamW/SGD checkpoint snapshots. OneCycle accepts Optimizer. |
-| `autograd` | `NewSGD`, `SGDOptions`, `SGD.State`, `SGDState`, `LoadState`, `SaveSafeTensors`, `LoadSafeTensors` | CPU/CUDA SGD, momentum/dampening, Nesterov, coupled decay, ascent and lazy momentum initialization/state resume. |
-| `data` | `ParseNumericCSV`, `ParseOptions`, `NumericTable`, `RegressionSamples`, `RegressionSample`, `RegressionBatch`, `StackRegression` | Numeric CSV/TSV tables and regression rows; finite values, header/comment handling, explicit feature/target columns and equal-length stacking. |
-| `data` | `Standardizer`, `FitStandardizer`, `StandardizerState`, `Apply`, `ApplyBatch`, `State`, `LoadState` | Deterministic per-feature centering/scaling fitted on the training split and serializable so training, validation and inference share one transform. |
-| `data` | `ReadWAV`, `ReadWAVFile`, `ReadWAVMono`, `WAV`, `Mono`, `WriteWAV`, `WAVEncoding` | Uncompressed PCM/float RIFF audio including WAVE_FORMAT_EXTENSIBLE, channel-averaged mono access and matching encoders for self-contained examples. |
-| `autograd` | `ParameterGroupSpec`, `PartitionParameters`, `NewSGDGroups`, `NewAdamWGroups`, `OptimizerGroupState` | Named parameter groups with per-group learning-rate scale and weight decay for SGD/AdamW, plus recorded group membership in optimizer state. |
-| `autograd` | `SaveTrainingCheckpoint`, `LoadTrainingCheckpoint`, `TrainingCheckpointMetadata` | Atomic model/buffer + AdamW/SGD + OneCycle checkpoint with caller metadata. All names/shapes/state are validated before copying into live objects. |
-| `autograd` | `Module.Train`, `SetTraining` | Recursive train/eval propagation; `OnTrainingChange` connects stateful layers such as dropout to the module tree. |
-| `autograd` | `IndexLoader.State`, `LoadState`, `WindowSampler.Batch`, `State`, `LoadState` | Restorable epoch order or PCG random windows, including short-sequence padding/context-drop decisions. |
-| `cuda` | `MemoryStats`, `ResetAllocationPeak`, `SetPoolCacheLimit`, `ReleasePool` | Query active, cached, and reserved bytes; bound or release reusable CUDA allocations. |
-| `data` | `Dataset[T]`, `SliceDataset`, `NewSubset`, `RandomSplit` | Host-side random-access samples, index views and deterministic disjoint splits. |
-| `data` | `Sampler`, `StatefulSampler`, `NewIndexSampler`, `IndexSamplerState` | Transactional index selection, seeded permutations and mid-epoch/future-epoch resume. |
-| `data` | `NewLoader[T,B]`, `LoaderOptions`, `LoaderState`, `CollateFunc`, `Loader.Close` | Context-aware batching, optional ordered host prefetch, drop-last and opaque sampler checkpoint payloads. |
-| `data` | `FloatSample`, `FloatBatch`, `Stack`, `PadSequences`, `PaddingOptions`, `OpenIDX` | Owned float32 host batches, sequence lengths/bool masks and raw/gzip byte-image/label datasets. |
+| `tensor` | `Device`、`CPU`、`CUDA` | テンソルやモデルを構築するときにバックエンドを選びます。 |
+| `autograd` | `NewCUDAContext`、`NewCUDAContextOn`、`CUDAContext.Device`、`CUDAContext.Close` | 学習ステップの間、呼び出したOSスレッドにCUDAコンテキストを保持します。deviceを選んで検証し、`Close`でそのスレッドの以前のdeviceを復元できます。 |
+| `autograd` | `New`、`Tensor.ToHost`、`Tensor.Backward`、`Tensor.ReleaseGraph`、`Tensor.Close` | float32テンソル、明示的な読み戻し、寿命の管理。 |
+| `autograd` | `RetainData`、`RetainGrad`、`BackwardWithOptions`、`BackwardOptions` | 共有ストレージの寿命、forward値と勾配の保持、複数回のbackwardのための履歴保持。 |
+| `autograd` | `NewExecutionContext`、`ExecutionContext.New`、`Zeros`、`Bind`、`BindModule`、`NoGrad`、`Recording`、`Tensor.ExecutionContext` | テンソルとviewが伝える明示的な記録スコープ。独立したCPUモデルは別々のコンテキストで学習と推論を並行できます。 |
+| `autograd` | `ExecutionOptions`、`ExecutionContext.SetOptions`、`Options`、`Autocast` | コンテキストごとのBF16とアテンションの方針、スコープ付きの精度、backwardに渡すforward方針のスナップショット。 |
+| `autograd` | `NewEmbeddingLayer`、`NewConv1dLayer`、`NewLayerNormLayer`、`NewLinearLayer`、`DropoutLayer`、`GELULayer`、`Sequential` | 再利用できるグラフモジュール。畳み込みの活性化は`[batch,time,channels]`、重みは`[out,in,kernel]`です。 |
+| `autograd` | `Conv2d`、`Conv2dOptions`、`NewConv2dLayer`、`Conv2dLayer` | NCHWの活性化、`[out,in/groups,kH,kW]`の重み、任意のbias、grouped/depthwise畳み込み、CPU/CUDAの勾配。 |
+| `autograd` | `MaxPool2d`、`AvgPool2d`、`AdaptiveAvgPool2d`、各オプションと層 | CPU/CUDAのNCHW pooling。重複する窓の勾配、ceil mode、明示的な平均の除数を持ちます。 |
+| `autograd` | `BatchNorm`、`BatchNormOptions`、`NewBatchNormLayer`、`BatchNormLayerOptions`、`BatchNormLayer` | rank 2〜6のチャネル正規化、CPU/CUDAの学習・評価の勾配、名前付きのaffineパラメータとrunning state。 |
+| `autograd` | `Module.StateDict`、`LoadStateDict`、`SaveSafeTensors`、`SaveSafeTensorsMetadata`、`LoadSafeTensors` | 名前付きのfloat32 state。metadataの値は文字列です。 |
+| `autograd` | `MaskedLoss(pred,target,false)`、`ClipGradNorm`、`NewAdamW`、`NewOneCycle` | NaNフレームをマスクしたL1、クリップ、AdamW、PyTorchの2段cosineのOneCycle LR。 |
+| `autograd` | `AdamW.State`、`LoadState`、`SaveSafeTensors`、`LoadSafeTensors`、`Close` | CPU/CUDAの名前付きパラメータ形状、モーメント、ハイパーパラメータ、ステップ数。optimizerが持つバッファを解放します。 |
+| `autograd` | `Optimizer`、`CheckpointOptimizer`、`OptimizerSnapshot`、`LearningRate`、`SetLearningRate` | 共通の更新・リセット・学習率・寿命のAPIと、AdamW/SGDの型付きcheckpointスナップショット。OneCycleはOptimizerを受け取ります。 |
+| `autograd` | `NewSGD`、`SGDOptions`、`SGD.State`、`SGDState`、`LoadState`、`SaveSafeTensors`、`LoadSafeTensors` | CPU/CUDAのSGD。momentum/dampening、Nesterov、coupled decay、ascent、momentumの遅延初期化、stateの再開。 |
+| `autograd` | `ParameterGroupSpec`、`PartitionParameters`、`NewSGDGroups`、`NewAdamWGroups`、`OptimizerGroupState` | SGD/AdamWの名前付きパラメータグループ。グループごとの学習率スケールとweight decay、optimizer stateに記録するgroup membership。 |
+| `autograd` | `SaveTrainingCheckpoint`、`LoadTrainingCheckpoint`、`TrainingCheckpointMetadata` | model/bufferとAdamW/SGDとOneCycleを、呼び出し側のmetadataと共に1つのファイルへ原子的に保存するcheckpoint。名前・形状・stateはlive objectへコピーする前に検証します。 |
+| `autograd` | `Module.Train`、`SetTraining` | train/evalモードの再帰的な伝播。`OnTrainingChange`はdropoutなどのstatefulな層をモジュールツリーへ接続します。 |
+| `autograd` | `IndexLoader.State`、`LoadState`、`WindowSampler.Batch`、`State`、`LoadState` | 再開できるepoch順またはPCGのランダムwindow。短い系列のパディングとcontextの破棄の判断を含みます。 |
+| `cuda` | `MemoryStats`、`ResetAllocationPeak`、`SetPoolCacheLimit`、`ReleasePool` | 使用中・キャッシュ・予約バイトの照会。再利用するCUDA割当の上限設定と解放。 |
+| `data` | `Dataset[T]`、`SliceDataset`、`NewSubset`、`RandomSplit` | ホスト側のランダムアクセスsample、index view、決定的で重複しない分割。 |
+| `data` | `Sampler`、`StatefulSampler`、`NewIndexSampler`、`IndexSamplerState` | トランザクション的なindex選択、seed付きの順列、epoch途中と将来のepochの再開。 |
+| `data` | `NewLoader[T,B]`、`LoaderOptions`、`LoaderState`、`CollateFunc`、`Loader.Close` | contextを考慮したバッチ処理、任意の順序付きホストprefetch、drop-last、不透明なsampler checkpoint payload。 |
+| `data` | `FloatSample`、`FloatBatch`、`Stack`、`PadSequences`、`PaddingOptions`、`OpenIDX` | 所有権を持つfloat32のホストバッチ、系列長とboolマスク、raw/gzipのbyte画像・ラベルデータセット。 |
+| `data` | `ParseNumericCSV`、`ParseOptions`、`NumericTable`、`RegressionSamples`、`RegressionSample`、`RegressionBatch`、`StackRegression` | 数値のCSV/TSVテーブルと回帰の行。有限値、ヘッダとコメントの処理、特徴量とtarget列の指定、同じ長さのstacking。 |
+| `data` | `Standardizer`、`FitStandardizer`、`StandardizerState`、`Apply`、`ApplyBatch`、`State`、`LoadState` | training splitでfitする決定的な特徴量の中心化とスケール。直列化でき、学習・検証・推論で同じ変換を共有します。 |
+| `data` | `ReadWAV`、`ReadWAVFile`、`ReadWAVMono`、`WAV`、`Mono`、`WriteWAV`、`WAVEncoding` | 非圧縮のPCM/float RIFF音声（`WAVE_FORMAT_EXTENSIBLE`を含む）、チャネル平均のmono、例で使う書き出し。 |
 
-`NewSpeechTiming(4, device, seed)` builds v1; `NewSpeechTiming(15, device,
-seed)` builds the context model. `NewSpeechTimingWithPhones(phones, continuous,
-device, seed)` builds the same architecture for a language-specific phone
-vocabulary (for example UtauTTS English or Mandarin timing targets); the
-embedding row count equals `phones`. The final seed argument initializes weights
-with Go's random stream. Loading a PyTorch safetensors state provides exact
-weight parity. `SpeechTiming.Forward(ids, cont, dropoutSeed)` uses a deterministic
-CPU/CUDA hash mask while training and disables dropout after `Train(false)`.
+`cuda.MemoryStats()`は、gogradのCUDAアロケータが持つ物理バイト数を返します。`LiveBytes`、`CachedBytes`、`ReservedBytes`、`PeakLiveBytes`、`PeakReservedBytes`、`CachedBuffers`、`CacheLimitBytes`です。既定のキャッシュ上限は2 GiBです。`SetPoolCacheLimit`は上限を下げたときに、最も長く使われていないキャッシュをすぐに解放します。使用中のテンソルと、記録したグラフが予約している割当は解放しません。`ResetAllocationPeak`はピークの値を現在の値に戻します。この値には、gogradのプールを通さずCUDAライブラリが直接確保した分は含まれません。`Buffer.Size()`は、物理的なサイズクラスが大きくても、要求した論理バイト数を返します。
 
-The training command consumes the `gograd-speech-timing-features-1`
-safetensors cache written by `tools/export_speech_timing_features.py`. Its
-`I64` phone indices and `F32` continuous inputs and targets are named
-`00000.ids`, `00000.cont`, and `00000.target`, and metadata stores record IDs.
-This cache format is experimental; it is a bridge from UtauTTS's trusted
-PyTorch `.pt` cache, not a general dataset API.
+CUDAのdevice、stream、captureの状態は、それを使うOSスレッドに属します。`SetDevice`と`CurrentDevice`でdeviceを選び、`autograd.NewCUDAContextOn`はgoroutineを検証済みのdeviceに固定し、`Close`でそのスレッドの以前のdeviceを復元します。`Buffer.Device()`は割当が属するdeviceを返します。再利用するプールの項目はdeviceとサイズクラスをキーにし、`CopyFromHost`、`CopyToHost`、`Memset`/`MemsetAsync`、`Free`はバッファ自身のdeviceを選んで呼び出し側のdeviceを復元するため、複数deviceのコードは周囲のdeviceに依存しません。`SetCurrentStream`と`CurrentStreamHandle`は、呼び出したスレッドでカーネル起動とevent記録が使う暗黙のstreamを選びます。何も選ばないときは既定のstreamを使います。`Capture`は明示的なstreamを必要とし、現在のdeviceを変更せずに記録し、同じスレッドでの入れ子のcaptureを拒否し、記録したdeviceでグラフを再生します。したがって独立したスレッドは、それぞれ別の暗黙のstreamとcaptureの状態を保ちます。
 
-`cuda.MemoryStats()` reports physical bytes owned by gograd's CUDA allocator:
-`LiveBytes`, `CachedBytes`, `ReservedBytes`, `PeakLiveBytes`,
-`PeakReservedBytes`, `CachedBuffers`, and `CacheLimitBytes`. The default cache
-limit is 2 GiB. `SetPoolCacheLimit` evicts least-recently-used cached buffers
-immediately when lowering it; live tensors and allocations reserved by a
-captured graph remain allocated. `ResetAllocationPeak` resets peak counters
-to the current levels. The counters do not include allocations made directly
-by CUDA libraries outside gograd's pool. `Buffer.Size()` remains the requested
-logical byte count even when its physical size class is larger.
+## 実行コンテキストと勾配の記録
 
-CUDA device, stream and capture state belongs to the OS thread that uses it.
-`SetDevice`/`CurrentDevice` select the device, `autograd.NewCUDAContextOn` pins a
-goroutine to one validated device and restores the thread's previous device on
-`Close`, and `Buffer.Device()` reports the device an allocation belongs to.
-Reusable pool entries are keyed by device and size class, and `CopyFromHost`,
-`CopyToHost`, `Memset`/`MemsetAsync` and `Free` select the buffer's own device and
-restore the caller's, so multi-device code no longer depends on the ambient
-device. `SetCurrentStream`/`CurrentStreamHandle` select the implicit stream for
-kernel launches and event records on the calling thread; the default stream is
-used when none is selected. `Capture` requires an explicit stream, records the
-current device without changing it, rejects a nested capture on the same thread,
-and replays the graph on its capture device. Independent threads therefore keep
-separate implicit streams and capture state.
-
-## Execution contexts and gradient recording
-
-Use `ExecutionContext` for independent executions. The context is carried by
-tensors, propagated by operators and views, and preserved by `Detach`; no
-goroutine-local state is used. A zero-value context records gradients.
+独立した実行には`ExecutionContext`を使います。コンテキストはテンソルが持ち、演算とviewが伝え、`Detach`が保ちます。goroutineごとの状態は使いません。ゼロ値のコンテキストは勾配を記録します。
 
 ```go
 execution := autograd.NewExecutionContext()
 model, err := autograd.NewLinearLayer(2, 3, tensor.CPU,
     rand.New(rand.NewSource(7)))
-// Handle err.
+// エラーを処理します。
 _ = err
 err = execution.BindModule(model.StateModule())
-// Handle err. Bind every parameter/buffer before Forward or starting workers.
+// エラーを処理します。Forwardやworkerの起動より前に、全パラメータとバッファをbindします。
 x, err := execution.New([]float32{1, 2}, []int{1, 2}, tensor.CPU, true)
-// Handle err.
+// エラーを処理します。
 _ = err
 loss := autograd.Sum(model.Forward(x), 0, 1)
 err = loss.Backward()
-// Handle err; read gradients before releasing the graph.
+// エラーを処理します。グラフを解放する前に勾配を読みます。
 loss.ReleaseGraph()
 
 execution.NoGrad(func() {
     prediction := model.Forward(x)
-    // prediction.RequiresGrad is false; ToHost can read its values.
+    // prediction.RequiresGradはfalseで、ToHostで値を読めます。
     prediction.ReleaseGraph()
 })
-// execution.Recording() is true again, including after a callback panic.
+// コールバックがpanicしても、execution.Recording()は再びtrueになります。
 ```
 
-- `BindModule` covers registered parameters and buffers recursively and
-  validates all leaves before changing any context. Bind before building a
-  graph, including parameter-only branches (weight transpose, embedding, etc.).
-  `Bind` supports an existing leaf; assigning a foreign context or binding an
-  already-built graph is rejected. Parameter/optimizer values are not copied.
-- An operation combining two different explicit contexts panics. Unbound
-  constants may join a bound graph. For full isolation, bind all model state
-  and construct all inputs/masks on the context, including non-gradient inputs.
-- `execution.NoGrad` is local to that context and nests safely. It preserves
-  factory `requiresGrad` arguments and does not alter existing graphs;
-  Backward on a previously recorded loss is still allowed inside NoGrad.
-  Backward on an unrecorded/constant scalar returns an error on CPU and CUDA.
-- Package `autograd.New`/`Zeros` and `autograd.NoGrad` remain the compatibility
-  API for unbound tensors. Package NoGrad controls a **shared default scope**;
-  it does not disable explicit contexts. New code using an explicit context
-  must call that context's NoGrad rather than the package function.
-- NoGrad controls the entire context, not one goroutine. Use one context and
-  independent model state per independently executing worker. Tensor values,
-  gradients, optimizer state and train/eval switches are not safe to mutate
-  concurrently on a shared model. Binding itself is an initialization step.
-- Inference results keep lifetime parents so `ReleaseGraph` can reclaim CPU
-  intermediates and CUDA auxiliaries; they do not retain derivative callbacks.
-  Retain handles whose values must outlive graph reclamation. `Detach` makes independent storage,
-  drops history and keeps context identity (including non-contiguous views).
+- `BindModule`は登録済みのパラメータとバッファを再帰的に扱い、コンテキストを変える前に全ての末端を検証します。グラフを組む前にbindします。パラメータだけの枝（重みのtranspose、embeddingなど）も対象です。`Bind`は既存の末端を扱います。別のコンテキストの割当や、既に組んだグラフのbindは拒否します。パラメータとoptimizerの値は複製しません。
+- 異なる2つの明示的コンテキストを組み合わせる演算はpanicします。bindしていない定数は、bind済みのグラフに加われます。完全に分離するには、勾配の要らない入力も含めて、全てのモデルstateと入力・マスクをそのコンテキストで作ります。
+- `execution.NoGrad`はそのコンテキストだけに効き、安全に入れ子にできます。factoryの`requiresGrad`引数を保ち、既存のグラフを変えません。記録済みの損失に対するBackwardは、NoGradの中でも実行できます。記録していない定数のスカラーに対するBackwardは、CPUとCUDAのどちらでもエラーを返します。
+- パッケージの`autograd.New`/`Zeros`と`autograd.NoGrad`は、bindしていないテンソル向けの互換APIとして残ります。パッケージのNoGradは共有の既定スコープを制御し、明示的コンテキストを無効にしません。明示的コンテキストを使う新しいコードは、パッケージ関数ではなくそのコンテキストのNoGradを呼びます。
+- NoGradはコンテキスト全体を制御し、1つのgoroutineだけを対象にしません。並行して動かすworkerごとに、コンテキストと独立したモデルstateを用意します。共有するモデルでは、テンソルの値、勾配、optimizerのstate、train/evalの切り替えを並行して変更できません。bind自体は初期化の手順です。
+- 推論の結果は寿命の親を保ち、`ReleaseGraph`がCPUの中間値とCUDAの補助バッファを回収できるようにします。導関数のコールバックは保ちません。グラフの回収後も値が必要な場合はretainしたハンドルを使います。`Detach`は独立したストレージを作り、履歴を切り、非連続なviewも含めてコンテキストの同一性を保ちます。
 
-This context isolates gradient recording, BF16 mode and attention selection.
-It does not own CUDA streams/capture or allocation pools. CUDA
-callers still hold `NewCUDAContext` on the calling OS thread. `NewCUDAContextOn`
-selects a device and restores the thread's previous device on `Close`; the CUDA
-package keeps its implicit stream and capture flag per OS thread, so goroutines
-that hold separate contexts do not overwrite each other's stream. Overlapping
-independent streams inside one recorded step are still not covered by this API.
-`cmd/cnn-train` uses the explicit context API.
+このコンテキストが分離するのは、勾配の記録、BF16モード、アテンションの選択です。CUDAのstreamやcapture、割当プールは持ちません。CUDAを使う呼び出し側は、これまでどおり呼び出したOSスレッドで`NewCUDAContext`を保持します。`NewCUDAContextOn`はdeviceを選び、`Close`でそのスレッドの以前のdeviceを復元します。`cuda`パッケージは暗黙のstreamとcaptureの可否をOSスレッド単位で持つため、別々のコンテキストを持つgoroutineが互いのstreamを上書きしません。1回の記録の中で独立したstreamを重ねる使い方は、このAPIの対象外です。`cmd/cnn-train`は明示的コンテキストのAPIを使います。
 
-### Precision and attention policy
+### 精度とアテンションの方針
 
-Each explicit context defaults to `ExecutionOptions{BF16Autocast: false,
-AttentionAlgorithm: "auto"}`, including a zero-value context. It does not
-inherit package-level `BF16Autocast` or `AttentionAlgorithm`. `Options` returns
-a copy; use `SetOptions` to update it between forwards. Invalid attention names
-return an error without changing the context; an empty name normalizes to `auto`.
+明示的コンテキストの既定は、ゼロ値のコンテキストも含めて`ExecutionOptions{BF16Autocast: false, AttentionAlgorithm: "auto"}`です。パッケージレベルの`BF16Autocast`や`AttentionAlgorithm`は継承しません。`Options`はコピーを返すため、forwardの間に`SetOptions`で更新します。不正なアテンション名はコンテキストを変えずにエラーを返し、空の名前は`auto`に正規化します。
 
 ```go
 err = execution.SetOptions(autograd.ExecutionOptions{
     AttentionAlgorithm: "materialized",
 })
-// Handle err. Bind model state and construct inputs on execution as above.
+// エラーを処理します。上と同じように、モデルstateをbindし、executionで入力を作ります。
 var mixedLoss *autograd.Tensor
 execution.Autocast(true, func() {
     mixedLoss = autograd.Sum(model.Forward(x), 0, 1)
 })
-// Precision has returned to FP32. On CUDA, backward still uses the BF16
-// policy selected by eligible operations during the preceding forward.
+// 精度はFP32に戻ります。CUDAでは、直前のforwardで対象の演算が選んだBF16の方針を
+// backwardも使います。
 err = mixedLoss.Backward()
-// Handle err.
+// エラーを処理します。
 mixedLoss.ReleaseGraph()
 ```
 
-- `Autocast(enabled, fn)` changes only this context's BF16 flag. Nested scopes
-  and panics restore the previous precision; attention selection is unaffected.
-  Like NoGrad, it affects the whole context rather than one goroutine. Independent
-  workers need separate contexts and mutable model state.
-- Each precision-sensitive operation snapshots its settings during forward.
-  Its backward, including retained-history passes, keeps that policy even if
-  the scope exits, `SetOptions` changes, or compatibility globals change.
-  Captured CUDA graphs likewise retain their captured kernel/precision choices
-  on replay. Changing settings requires a new capture to alter those choices.
-- BF16 uses CUDA GEMM operands/shadows with FP32 accumulation, outputs,
-  gradients, master weights and optimizer moments. CPU computations and
-  unsupported CUDA operations such as Conv2d remain FP32. The tiled flash
-  attention implementation currently computes in FP32 too.
-- Attention names are `materialized`, `flash`, and `auto`. For compatible CUDA
-  attention without active dropout, `materialized` uses GEMM/softmax and `flash`
-  uses the tiled path (Q/K and V head dimensions at most 128). `auto` selects
-  tiled attention when estimated materialized score scratch reaches 1 GiB.
-  CPU, active dropout and non-fusible layouts use the composed operator path.
-- Unbound tensors still use the package-level compatibility settings. These
-  globals are shared; do not mutate them concurrently. Explicit contexts never
-  consult them, and unbound constants may join a context-bound operation.
-  Set context options between forwards: changing them partway through a
-  multi-operation forward does not make that entire forward an atomic snapshot.
+- `Autocast(enabled, fn)`が変えるのは、このコンテキストのBF16フラグだけです。入れ子のscopeとpanicは以前の精度を復元し、アテンションの選択には影響しません。NoGradと同じく、1つのgoroutineではなくコンテキスト全体に効きます。独立したworkerには別々のコンテキストと、変更可能なモデルstateが必要です。
+- 精度に影響する演算は、forwardのときに設定をスナップショットします。その後backwardは、scopeを抜けた後や`SetOptions`の変更後、互換用のグローバル設定の変更後でも、保持した履歴の再実行も含めてその方針を保ちます。記録したCUDAグラフも、記録時のカーネルと精度の選択を再生時に保ちます。選択を変えるには、新しく記録し直します。
+- BF16はCUDAのGEMMオペランドとシャドウを使い、累積・出力・勾配・master weight・optimizerのモーメントはFP32です。CPUの計算と、Conv2dのように未対応のCUDA演算はFP32のままです。tiled flash attentionもFP32で計算します。
+- アテンション名は`materialized`、`flash`、`auto`です。dropoutが有効でない対応可能なCUDAアテンションでは、`materialized`はGEMMとsoftmaxを、`flash`はtiled経路を使います（Q/KとVのhead次元は128まで）。`auto`は、実体化したときのスコアのscratchの見積もりが1 GiBに達するとtiledアテンションを選びます。CPU、dropoutが有効な場合、融合できないレイアウトは、演算を組み合わせた経路を使います。
+- bindしていないテンソルは、パッケージレベルの互換設定を使います。このグローバル設定は共有なので、並行して変更しないでください。明示的コンテキストはこれを参照せず、bindしていない定数はコンテキストに束ねた演算へ加われます。コンテキストのオプションはforwardの合間に設定します。複数の演算からなるforwardの途中で変えても、そのforward全体が1つのスナップショットになるわけではありません。
 
-## Tensor storage and graph lifetimes
+## テンソルのストレージとグラフの寿命
 
-Tensor/view allocations are reference-counted independently of graph edges.
-Closing a base handle does not return its allocation to the CPU/CUDA pool while
-a dependent view or saved computation still uses it. Releasing one graph branch
-does not reclaim an ancestor still used by another branch. This is explicit
-lifetime management: abandoned graphs still need `ReleaseGraph`/`Close`.
+テンソルとviewの割当は、グラフの辺とは別に参照カウントします。依存するviewや保存した計算がまだ使っている間は、ベースのハンドルをcloseしても割当はCPU/CUDAのプールへ戻りません。あるグラフの枝をreleaseしても、別の枝が使っている先祖は回収しません。これは明示的な寿命の管理で、放棄したグラフも`ReleaseGraph`/`Close`が必要です。
 
-- Factory leaves from `New`/`Zeros` (inputs, parameters, buffers) remain owned
-  by the caller. `ReleaseGraph` reclaims intermediates and internal ephemeral
-  leaves; persistent inputs/parameters require `Close`.
-- `Close` terminates that handle's public use and is idempotent. Its allocation
-  and saved state remain readable **internally** until dependent graph edges
-  are done. A surviving view can still be read or used in backward, but the
-  closed base's `ToHost`, `GradToHost` and `CopyFrom` return errors.
-- `RetainData` pins forward values; `RetainGrad` pins values and intermediate
-  gradients. Neither retains derivative history. Use `Close` to release those
-  retained handles after reading them. A retained view can keep only its shared
-  allocation after its base graph has been reclaimed.
-- `Backward` consumes derivative callbacks and saved statistics. On CUDA it
-  also reclaims unused intermediates automatically; on CPU forward values
-  remain until `ReleaseGraph`. Read unretained CUDA outputs before backward.
-- `BackwardWithOptions(BackwardOptions{RetainGraph: true})` keeps history and
-  saved allocations for another pass on either backend. Leaf gradients
-  accumulate; intermediate adjoints are fresh for propagation, while requested
-  retained gradients accumulate without being propagated twice.
-- A second backward through consumed history returns an error. Combining
-  losses into a single scalar and running one backward needs no history
-  retention. `ReleaseGraph` is still required when retained passes are done.
+- `New`/`Zeros`が作る末端（入力、パラメータ、バッファ）は呼び出し側が所有します。`ReleaseGraph`は中間値と内部の一時的な末端を回収し、永続する入力とパラメータは`Close`が必要です。
+- `Close`はそのハンドルの公開利用を終わらせ、繰り返し呼べます。割当と保存したstateは、依存するグラフの辺が終わるまで**内部で**読み取れます。生き残ったviewは読み取りやbackwardに使えますが、closeしたベースの`ToHost`、`GradToHost`、`CopyFrom`はエラーを返します。
+- `RetainData`はforwardの値を固定し、`RetainGrad`は値と中間の勾配を固定します。どちらも導関数の履歴は保ちません。読み取った後に解放するには`Close`を使います。retainしたviewは、ベースのグラフを回収した後、共有する割当だけを保てます。
+- `Backward`は導関数のコールバックと保存した統計を使います。CUDAでは未使用の中間値も自動的に回収し、CPUではforwardの値が`ReleaseGraph`まで残ります。retainしていないCUDAの出力は、backwardの前に読み取ります。
+- `BackwardWithOptions(BackwardOptions{RetainGraph: true})`は、どちらのバックエンドでも履歴と保存した割当を保ち、もう一度実行できます。末端の勾配は加算され、中間のadjointは伝播のために新しくなります。要求したretain済みの勾配は、2度伝播せずに加算します。
+- 消費した履歴を通す2度目のbackwardはエラーを返します。損失を1つのスカラーにまとめて1回backwardする場合、履歴の保持は不要です。retainした実行が終わったら`ReleaseGraph`が必要です。
 
 ```go
 x := autograd.Must([]float32{2, 3}, []int{2}, true)
@@ -225,123 +118,75 @@ shared := autograd.Mul(x, x)
 left := autograd.Sum(shared, 0)
 right := autograd.Sum(autograd.MulScalar(shared, 3), 0)
 err := left.BackwardWithOptions(autograd.BackwardOptions{RetainGraph: true})
-// Handle err; x's gradient is [4,6].
+// エラーを処理します。xの勾配は[4,6]です。
 _ = err
 err = right.Backward()
-// Handle err; accumulated x gradient is [16,24].
+// エラーを処理します。加算後のxの勾配は[16,24]です。
 left.ReleaseGraph()
 right.ReleaseGraph()
 x.Close()
 ```
 
-Masked-loss targets and CUDA embedding index buffers are saved lifetime
-dependencies even though they are not differentiated. They remain available
-to retained backward after the caller closes its original handle. CPU
-normalization statistics and im2col buffers likewise return to pools only when
-history is consumed or released. BF16 shadows have shared leases and are
-invalidated across aliases when their FP32 storage changes.
+マスク付き損失のtargetと、CUDAのembedding用indexバッファは、微分しないものの保存された寿命の依存です。呼び出し側が元のハンドルをcloseした後も、retainしたbackwardから使えます。CPUの正規化の統計とim2colのバッファも、履歴を使い切るか解放したときにだけプールへ戻ります。BF16のシャドウは共有のleaseを持ち、対応するFP32ストレージが変わると別名も含めて無効になります。
 
-`CopyFrom` and eager AdamW updates increment a storage version shared by its
-views. Backward validates recorded operand/output versions **before** changing
-gradients and rejects modification since forward, including between retained
-passes. The checks are conservative; some derivatives may not need every
-operand. Direct CPU `Data` writes and opaque CUDA buffer writes/replays are
-not version-tracked: do not change saved values through those paths during a
-graph's lifetime. Initialize weights before building the graph.
+`CopyFrom`とeagerなAdamWの更新は、viewが共有するストレージのversionを進めます。Backwardは、勾配を変える**前に**記録したオペランドと出力のversionを検証し、forward以降の変更を拒否します。retainした実行の間の変更も拒否します。この検証は必要以上に厳しく、導関数によっては全てのオペランドを必要としないこともあります。CPUの`Data`への直接書き込みと、CUDAバッファへの外部からの書き込み・再生はversionを追跡しません。グラフが生きている間に、これらの経路で保存した値を変えないでください。重みの初期化はグラフを組む前に済ませます。
 
-`Data` slices and `Buffer()` are borrowed access, not independent owners. Do not
-replace `Data`, Free a tensor-owned buffer, or use borrowed memory after its
-handle ends. Keep Tensor/IndexBuffer values as pointers rather than copying
-their ownership state. Independent CPU contexts may share read-only constants;
-concurrent mutation/close/backward on shared tensors is not supported.
+`Data`スライスと`Buffer()`は借用であり、独立した所有者ではありません。`Data`の差し替え、テンソルが所有するバッファのFree、ハンドルが終わった後の借用メモリの利用はしないでください。TensorとIndexBufferは所有状態をコピーせずポインタで保ちます。独立したCPUコンテキストは読み取り専用の定数を共有できますが、共有テンソルに対する並行の変更・close・backwardは対応していません。
 
-## General Conv2d and CNN training
+## Conv2dとCNNの学習
 
-`Conv2d(x, weight, bias, options)` performs zero-padded cross-correlation on
-`[batch,channels,height,width]` input. Weights use PyTorch's
-`[out_channels,in_channels/groups,kernel_height,kernel_width]` layout; pass
-`nil` for bias or a tensor of shape `[out_channels]`. Kernel dimensions come
-from the weights, and can be rectangular or even.
+`Conv2d(x, weight, bias, options)`は、`[batch,channels,height,width]`の入力にゼロパディング付きのcross-correlationを行います。重みはPyTorchと同じ`[out_channels,in_channels/groups,kernel_height,kernel_width]`のレイアウトです。biasは`nil`または`[out_channels]`のテンソルを渡します。カーネルの大きさは重みから決まり、矩形や偶数でもかまいません。
 
-`Conv2dOptions` contains `[2]int` pairs in height/width order:
+`Conv2dOptions`はheight/widthの順の`[2]int`の組を持ちます。
 
-- `Stride` and `Dilation`: an all-zero pair defaults to `[1,1]`; otherwise
-  both entries must be positive.
-- `Padding`: non-negative symmetric zero-padding on each axis. The default
-  is valid convolution with no padding.
-- `Groups`: zero defaults to 1. Both channel counts must divide by groups.
-  `Groups == in_channels` implements depthwise convolution, including an
-  output-channel multiplier.
+- `Stride`と`Dilation`: どちらも0の組は`[1,1]`が既定です。それ以外は両方の値が正でなければなりません。
+- `Padding`: 各軸に対する非負の対称なゼロパディングです。既定はパディングなしのvalid convolutionです。
+- `Groups`: 0は1が既定です。どちらのチャネル数もgroupsで割り切れる必要があります。`Groups == in_channels`はdepthwise畳み込みになり、出力チャネルのmultiplierも扱えます。
 
-For each axis the output size is
-`floor((input + 2*padding - dilation*(kernel-1) - 1)/stride) + 1`.
-Invalid device combinations, shapes or options panic at the operation boundary;
-the layer constructor returns errors. Input, kernel and output dimensions must
-be positive, with each tensor's element count bounded by the CUDA signed
-32-bit indexing limit. Non-contiguous views are accepted and receive gradients
-through their materialization.
+各軸の出力サイズは`floor((input + 2*padding - dilation*(kernel-1) - 1)/stride) + 1`です。deviceの組み合わせ、形状、オプションが不正な場合は演算の境界でpanicし、層のコンストラクタはエラーを返します。入力、カーネル、出力の各次元は正で、各テンソルの要素数はCUDAの符号付き32ビットのindex上限に収まる必要があります。非連続のviewも受け取り、実体化を通して勾配を受け取ります。
 
 ```go
-device := tensor.CPU // or tensor.CUDA while holding NewCUDAContext
+device := tensor.CPU // NewCUDAContextを保持している間はtensor.CUDA
 rng := rand.New(rand.NewSource(7))
 conv, err := autograd.NewConv2dLayer(4, 8, [2]int{3, 5},
     autograd.Conv2dOptions{
         Stride: [2]int{1, 2}, Padding: [2]int{1, 2}, Groups: 2,
-    }, true, device, rng) // true registers a bias; false leaves Bias nil
-// Handle err. conv.StateModule() registers "weight" and optionally "bias".
+    }, true, device, rng) // trueでbiasを登録し、falseではBiasはnilのままです
+// エラーを処理します。conv.StateModule()は"weight"と、biasがあれば"bias"を登録します。
 _ = err
 root := autograd.Module{Children: []autograd.NamedModule{
     {Name: "conv", Module: conv.StateModule()},
 }}
 x, err := autograd.New(make([]float32, 2*4*8*10), []int{2, 4, 8, 10}, device, true)
-// Handle err.
+// エラーを処理します。
 _ = err
 y := conv.Forward(x) // [2,8,8,5]
 loss := autograd.Mean(y, 0, 1, 2, 3)
-err = loss.Backward() // input, weight and bias gradients
-// Handle err; read outputs/gradients before releasing the graph.
+err = loss.Backward() // 入力、重み、biasの勾配
+// エラーを処理します。グラフを解放する前に出力と勾配を読みます。
 loss.ReleaseGraph()
 err = root.SaveSafeTensors("conv.safetensors")
-// Handle err. Close input, parameters and optimizer-owned buffers when done.
+// エラーを処理します。終わったら入力、パラメータ、optimizerが持つバッファをcloseします。
 ```
 
-CPU and CUDA both lower one batch/group at a time into spatial tiles. The
-im2col/output tile pair is limited to 4 MiB (or one column if the kernel alone
-exceeds that budget), with at most 512 output positions per tile. Backward
-recomputes the lowering rather than saving a full im2col matrix. CPU uses the
-shared SGEMM; CUDA uses cuBLAS plus device lowering/scatter kernels with no
-host staging. Conv2d currently computes in FP32 even when BF16 autocast is
-enabled. CUDA input-gradient scatter uses atomic additions and is numerically,
-not bit-for-bit, reproducible.
+CPUとCUDAはどちらも、1バッチ1グループずつを空間タイルへ展開します。im2colと出力タイルの組は4 MiBまで（カーネルだけでこの予算を超える場合は1列まで）で、1タイルの出力位置は最大512です。Backwardは完全なim2col行列を保存せず、展開を再計算します。CPUは共有のSGEMMを、CUDAはcuBLASとデバイス側の展開・scatterカーネルをホストへの転送なしで使います。Conv2dはBF16 autocastが有効でもFP32で計算します。CUDAの入力勾配のscatterはatomic加算を使うため、bit単位ではなく数値として再現します。
 
-`cmd/cnn-train` exercises two Conv2d/BatchNorm/ReLU blocks, max downsampling, adaptive
-global average pooling, a linear classifier, cross-entropy and AdamW on synthetic noisy vertical and
-horizontal stripe images. Saving reconstructs a fresh model, reloads every
-parameter exactly, and compares inference logits (CUDA reductions may reorder
-sums). No external dataset or Python is needed:
+`cmd/cnn-train`は、Conv2d/BatchNorm/ReLUの2ブロック、maxによるダウンサンプリング、adaptive global average pooling、線形分類器、cross-entropy、AdamWを、縦横のノイズ付きストライプ画像で動かします。保存時は新しいモデルを作り直し、全てのパラメータを厳密に再読込し、推論のlogitsを比較します（CUDAのreductionは和の順序が変わり得ます）。外部データセットもPythonも不要です。
 
 ```sh
 go run ./cmd/cnn-train -device cpu -steps 60 -out out/cnn.safetensors
 go run ./cmd/cnn-train -device cuda -steps 60 -out out/cnn-cuda.safetensors
 ```
 
-The `out` parent must exist. These are architecture/training demonstrations,
-not image-recognition quality benchmarks. Committed Conv2d fixtures check all
-output and VJP elements against PyTorch without requiring Python during Go
-tests; regenerate with `python tools/gen_conv2d_fixture.py`.
+`out`の親ディレクトリは先に作っておきます。これはアーキテクチャと学習の動作確認用で、画像認識の品質を測るものではありません。リポジトリに含めたConv2dのfixtureは、Goのテスト中にPythonを必要とせず、全ての出力とVJPの要素をPyTorchと照合します。作り直すには`python tools/gen_conv2d_fixture.py`を使います。
 
 ## NCHW pooling
 
-`MaxPool2d`, `AvgPool2d` and `AdaptiveAvgPool2d` accept float32
-`[batch,channels,height,width]` inputs on CPU or CUDA. Non-contiguous views are
-materialized and their gradients are mapped back to the original storage.
-Input/output dimensions must be positive and total element counts must fit
-signed 32-bit indexing, as for Conv2d. Invalid options/shapes panic before
-materialization or allocating output storage.
+`MaxPool2d`、`AvgPool2d`、`AdaptiveAvgPool2d`は、CPUまたはCUDAのfloat32の`[batch,channels,height,width]`入力を受け取ります。非連続のviewは実体化し、勾配を元のストレージへ戻します。入力と出力の各次元は正で、全要素数はConv2dと同じく符号付き32ビットのindexに収まる必要があります。不正なオプションや形状は、実体化や出力の確保より前にpanicします。
 
 ```go
 down := autograd.MaxPool2d(x, autograd.MaxPool2dOptions{
-    KernelSize: [2]int{2, 2}, // default stride is also [2,2]
+    KernelSize: [2]int{2, 2}, // strideの既定も[2,2]です
 })
 smoothed := autograd.AvgPool2d(down, autograd.AvgPool2dOptions{
     KernelSize: [2]int{3, 3}, Stride: [2]int{1, 1},
@@ -349,86 +194,37 @@ smoothed := autograd.AvgPool2d(down, autograd.AvgPool2dOptions{
 })
 pooled := autograd.AdaptiveAvgPool2d(smoothed, [2]int{1, 1})
 features := autograd.Reshape(pooled, pooled.Shape[0], pooled.Shape[1])
-// features is [batch,channels]; compose with a LinearLayer and loss.
+// featuresは[batch,channels]です。LinearLayerと損失を組み合わせます。
 ```
 
-- `MaxPool2dOptions` has `KernelSize`, `Stride`, `Padding`, `Dilation` pairs
-  and `CeilMode`. `AvgPool2dOptions` has `KernelSize`, `Stride`, `Padding`,
-  `CeilMode`, `ExcludePad`, and `DivisorOverride`. Pairs are height/width.
-  KernelSize is required. An all-zero stride defaults to KernelSize; an
-  all-zero max-pool dilation defaults to `[1,1]`. Other stride/dilation entries
-  must be positive. Padding is symmetric and between zero and half the kernel
-  size on each axis. Average pooling has unit dilation.
-- Output size on each axis is
-  `floor((input + 2*padding - dilation*(kernel-1) - 1)/stride) + 1`.
-  CeilMode replaces floor with ceil, then removes a final window starting
-  wholly in the right/bottom padding. Windows may extend past the input.
-- Max padding acts as negative infinity. Equal maxima select the first valid
-  row-major sample; NaNs select the last NaN. Selected indices are saved only
-  when gradients are recorded and survive retained backward passes. A dilated
-  window containing no valid sample returns negative infinity and contributes
-  no input gradient. This API returns values, not an indices tensor.
-- Average pooling counts zero padding in its divisor by default, matching
-  PyTorch's `count_include_pad=true`. Set `ExcludePad: true` to count only
-  valid input positions. For ceil-mode partial windows, positions beyond the
-  requested padding are excluded even in the default mode. A positive
-  `DivisorOverride` replaces the count; zero uses the normal count. Negative
-  overrides are rejected.
-- Adaptive pooling requires a positive `[output_height,output_width]`.
-  Each bin starts at `floor(position*input/output)` and ends at
-  `ceil((position+1)*input/output)`. Bins can overlap and output sizes may be
-  larger than input sizes; backward adds every bin's contribution.
-- `MaxPool2dLayer{Options: ...}`, `AvgPool2dLayer{Options: ...}` and
-  `AdaptiveAvgPool2dLayer{OutputSize: ...}` implement `TensorLayer` for
-  `Sequential`. They have no parameters, buffers or train/eval-dependent state.
-  Bound input context identity and NoGrad behavior propagate normally.
-- Pooling computes in FP32, including under BF16 autocast. CUDA uses device
-  kernels without host staging, supports capture/replay, and accumulates
-  overlapping gradients with atomic additions. Compare gradients numerically,
-  rather than requiring bit-for-bit CUDA reproducibility.
+- `MaxPool2dOptions`は`KernelSize`、`Stride`、`Padding`、`Dilation`の組と`CeilMode`を持ちます。`AvgPool2dOptions`は`KernelSize`、`Stride`、`Padding`、`CeilMode`、`ExcludePad`、`DivisorOverride`を持ちます。組はheight/widthの順です。`KernelSize`は必須です。strideが全て0なら`KernelSize`、max poolingのdilationが全て0なら`[1,1]`が既定です。その他のstrideとdilationの値は正でなければなりません。paddingは対称で、各軸で0からカーネルサイズの半分までです。average poolingのdilationは1です。
+- 各軸の出力サイズは`floor((input + 2*padding - dilation*(kernel-1) - 1)/stride) + 1`です。`CeilMode`はfloorをceilに替え、その後で右端または下端のパディングだけで始まる最後の窓を除きます。窓は入力の外へはみ出せます。
+- max poolingのパディングは負の無限大として扱います。最大値が同じときは、row-majorで最初の有効な要素を選びます。NaNは最後のNaNを選びます。選んだindexは勾配を記録するときだけ保存し、retainしたbackwardでも保ちます。dilationした窓に有効な要素がない場合は負の無限大を返し、入力の勾配を生みません。このAPIは値だけを返し、indexのテンソルは返しません。
+- average poolingは既定でゼロパディングも除数に数え、PyTorchの`count_include_pad=true`と同じです。有効な入力位置だけを数えるには`ExcludePad: true`を設定します。ceil modeの部分的な窓では、要求したパディングを超える位置は既定の設定でも除外します。正の`DivisorOverride`は数えた個数を置き換え、0は通常の個数を使います。負の値は拒否します。
+- adaptive poolingは正の`[output_height,output_width]`を必要とします。各binは`floor(position*input/output)`で始まり、`ceil((position+1)*input/output)`で終わります。binは重なり合い、出力サイズが入力サイズより大きくてもかまいません。backwardは全てのbinの寄与を加算します。
+- `MaxPool2dLayer{Options: ...}`、`AvgPool2dLayer{Options: ...}`、`AdaptiveAvgPool2dLayer{OutputSize: ...}`は`Sequential`用の`TensorLayer`を実装します。パラメータ、バッファ、train/evalに依存するstateは持ちません。bindした入力のコンテキストの同一性とNoGradの動作は通常どおり伝わります。
+- poolingはBF16 autocastの下でもFP32で計算します。CUDAはホストへの転送なしでデバイスカーネルを使い、captureと再生に対応し、重複する勾配をatomic加算で積みます。勾配はbit単位ではなく、数値で比較します。
 
-Committed PyTorch fixtures cover every output and input VJP for rectangular
-kernels, dilated max pooling, ceil-mode correction, include/exclude padding,
-divisor override, non-divisible adaptive bins and adaptive upsampling.
-Regeneration requires PyTorch (`python tools/gen_pool2d_fixture.py`); Go tests
-use the JSON directly. Finite differences independently verify all three ops.
+リポジトリに含めたPyTorchのfixtureは、矩形カーネル、dilationしたmax pooling、ceil modeの補正、パディングを含める・除く場合、除数の上書き、割り切れないadaptive bin、adaptiveのアップサンプリングについて、全ての出力と入力のVJPを確認します。作り直すにはPyTorchが必要で（`python tools/gen_pool2d_fixture.py`）、GoのテストはJSONをそのまま使います。3つの演算は有限差分でも独立に確認します。
 
-## Batch normalization
+## BatchNorm
 
-`BatchNorm(x, weight, bias, runningMean, runningVar, options)` normalizes all
-dimensions except the channel axis. Inputs have rank 2..6 with channels on
-axis 1 (`NC`, `NCL`, `NCHW`, etc.), or the last axis with `ChannelsLast: true`
-(`NC`, `NLC`, `NHWC`, etc.). Shape is preserved. Weight/bias are independently
-optional `[channels]` vectors; missing weight/bias mean one/zero respectively.
-All tensors must share a device and compatible execution context.
+`BatchNorm(x, weight, bias, runningMean, runningVar, options)`は、チャネル軸以外の全ての次元を正規化します。入力はrank 2〜6で、チャネルは軸1（`NC`、`NCL`、`NCHW`など）か、`ChannelsLast: true`のときは最後の軸（`NC`、`NLC`、`NHWC`など）にあります。形状は保たれます。重みとbiasはそれぞれ独立に任意の`[channels]`ベクトルで、省略すると重みは1、biasは0になります。全てのテンソルは同じdeviceと、互換な実行コンテキストを共有する必要があります。
 
-`BatchNormOptions` contains `Training`, `ChannelsLast`, `Eps`, and `Momentum`:
+`BatchNormOptions`は`Training`、`ChannelsLast`、`Eps`、`Momentum`を持ちます。
 
-- Zero epsilon defaults to `1e-5`; other values must be positive and finite.
-- Training requires more than one sample per channel. The sample count is the
-  product of all non-channel dimensions. Output uses the biased batch variance
-  (divide by sample count). Running variance updates use the unbiased estimate
-  (divide by sample count minus one).
-- Running mean/variance must both be nil or contiguous, non-gradient
-  `[channels]` buffers. Training with nil buffers uses batch statistics without
-  recording running state. Evaluation requires both buffers and permits a
-  single sample per channel.
-- Running updates are `(1-Momentum)*old + Momentum*batch`, with finite
-  momentum in `[0,1]`. Functional zero momentum freezes running values; it does
-  not change training normalization to use running statistics. Mutable running
-  buffers cannot alias other inputs/state allocations.
-- Backward differentiates input and optional affine parameters. Each forward
-  saves its own mean/inverse-standard-deviation allocation. Updating or closing
-  running buffers, or changing layer mode after forward, does not change an
-  already-built graph's derivative. Managed input/affine mutations still trigger
-  the usual saved-version checks.
+- epsilonが0なら`1e-5`が既定です。それ以外は正で有限でなければなりません。
+- 学習はチャネルごとに2サンプル以上を必要とします。サンプル数はチャネル以外の次元の積です。出力は偏りのあるバッチ分散（サンプル数で割る）を使います。running分散の更新は不偏推定量（サンプル数から1を引いて割る）を使います。
+- running meanとvarianceは、両方nilであるか、両方とも連続した勾配の要らない`[channels]`バッファでなければなりません。nilでの学習はバッチ統計を使い、running stateを記録しません。評価は両方のバッファを必要とし、チャネルごとに1サンプルでもかまいません。
+- runningの更新は`(1-Momentum)*old + Momentum*batch`で、momentumは`[0,1]`の有限値です。関数版でmomentumが0のときはrunningの値を凍結し、学習の正規化をrunning統計に切り替えるわけではありません。変更可能なrunningバッファは、他の入力やstateの割当と別名になってはいけません。
+- Backwardは入力と任意のaffineパラメータを微分します。各forwardはmeanと逆標準偏差の割当を自分用に保存します。forwardの後にrunningバッファを更新・closeしたり、層のモードを変えたりしても、既に組んだグラフの導関数は変わりません。入力やaffineの管理された変更は、通常どおり保存したversionの検証を起こします。
 
-The layer API registers trainable parameters and non-gradient state with Module:
+層のAPIは、学習するパラメータと勾配の要らないstateをModuleへ登録します。
 
 ```go
 norm, err := autograd.NewBatchNormLayer(8, autograd.BatchNormLayerOptions{}, device)
-// Handle err. Zero options default to affine and tracked statistics,
-// epsilon 1e-5, momentum 0.1, channels-first, and training mode.
+// エラーを処理します。オプションが全て0ならaffineと統計の追跡が有効になり、
+// epsilon 1e-5、momentum 0.1、channels-first、学習モードになります。
 _ = err
 defer norm.Close()
 root := autograd.Module{Children: []autograd.NamedModule{
@@ -436,10 +232,10 @@ root := autograd.Module{Children: []autograd.NamedModule{
 }}
 execution := autograd.NewExecutionContext()
 err = execution.BindModule(&root)
-// Handle err; create inputs on execution before Forward.
+// エラーを処理します。Forwardの前にexecutionで入力を作ります。
 root.Train(true)
 y := norm.Forward(x)
-// Compose loss/backward/update; release the graph when done.
+// 損失、backward、更新を組み合わせます。終わったらグラフを解放します。
 _ = y
 root.Train(false)
 execution.NoGrad(func() {
@@ -447,58 +243,21 @@ execution.NoGrad(func() {
     prediction.ReleaseGraph()
 })
 err = root.SaveSafeTensors("norm.safetensors")
-// Handle err. Reconstruct the same configuration, load state, then Train(false).
+// エラーを処理します。同じ構成を作り直してstateを読み込み、Train(false)にします。
 ```
 
-`BatchNormLayerOptions` defaults to affine/running state. `DisableAffine`
-omits weight and bias; `DisableRunningStats` omits every running buffer and
-uses batch statistics in both train and eval (including the training sample
-count requirement). `Momentum` is an optional pointer: nil defaults to `0.1`,
-while a pointer to zero explicitly freezes running values.
-`CumulativeMomentum: true` uses `1/num_batches_tracked` as the update weight,
-matching the average of observed **batches**, not a sample-weighted average.
-Options are copied at construction; changing the supplied momentum variable
-afterward does not change the layer.
+`BatchNormLayerOptions`は既定でaffineとrunning stateを使います。`DisableAffine`は重みとbiasを省きます。`DisableRunningStats`は全てのrunningバッファを省き、学習と評価の両方でバッチ統計を使います（学習のサンプル数要件も含みます）。`Momentum`は任意のポインタで、nilは`0.1`が既定、0を指すポインタはrunningの値を明示的に凍結します。`CumulativeMomentum: true`は`1/num_batches_tracked`を更新の重みに使い、観測した**バッチ**の平均に一致します（サンプルで重み付けした平均ではありません）。オプションは構築時にコピーするため、後から渡したmomentumの変数を変えても層は変わりません。
 
-- Parameters are `weight`, `bias`; buffers are `running_mean`, `running_var`,
-  and scalar `num_batches_tracked`. All are saved/reloaded through Module,
-  safetensors and training checkpoints. Buffers are excluded from
-  `NamedParameters` and optimizer updates. The current state format is F32,
-  including the batch counter, which represents integers exactly through
-  `2^24`; it is not PyTorch's I64 counter storage. PyTorch state import must
-  convert that counter to the current F32 format.
-- `Train` and recursive `Module.Train` control statistics; NoGrad controls only
-  derivative recording. A NoGrad forward in training still updates running
-  values and the counter. Evaluation with tracked state does not update them.
-  Mode/configuration are reconstructed by the caller, not stored in StateDict.
-- The layer implements `TensorLayer`, `Trainer`, and `ParameterizedLayer`.
-  `Close` releases affine parameters and buffers and is safe to repeat.
-  Independent workers use separate contexts and mutable layer state.
-- CPU and CUDA compute FP32 outputs/gradients even under BF16 autocast.
-  Moment reductions accumulate in float64 and save FP32 statistics. CUDA
-  running updates and batch counting stay on device and support graph replay,
-  including cumulative averaging. Bind the model and hold NewCUDAContext as
-  usual; explicit host readback is needed only for inspecting/exporting state.
+- パラメータは`weight`と`bias`、バッファは`running_mean`、`running_var`、スカラーの`num_batches_tracked`です。いずれもModule、safetensors、学習checkpointを通して保存・再読込します。バッファは`NamedParameters`とoptimizerの更新から除きます。現在のstate形式はバッチカウンタも含めてF32で、整数を正確に表せるのは`2^24`までです。PyTorchのI64カウンタとは形式が異なるため、PyTorchのstateを取り込むときは現在のF32形式へ変換します。
+- `Train`と再帰的な`Module.Train`が統計を制御し、NoGradは導関数の記録だけを制御します。学習中のNoGradのforwardでもrunningの値とカウンタは更新します。追跡ありの評価では更新しません。モードと構成は呼び出し側が再現し、StateDictには保存しません。
+- この層は`TensorLayer`、`Trainer`、`ParameterizedLayer`を実装します。`Close`はaffineパラメータとバッファを解放し、繰り返し呼べます。独立したworkerは別々のコンテキストと、変更可能な層のstateを使います。
+- CPUとCUDAは、BF16 autocastの下でもFP32の出力と勾配を計算します。モーメントのreductionはfloat64で累積し、FP32の統計を保存します。CUDAのrunning更新とバッチ数の計上はデバイス上に留まり、累積平均も含めてグラフの再生に対応します。通常どおりモデルをbindし、`NewCUDAContext`を保持します。stateの確認や書き出しにだけ、明示的なホストへの読み戻しが必要です。
 
-PyTorch fixtures cover forward, all input/affine VJPs, biased/unbiased variance,
-channels-first/last layouts, rank 2..6, singleton evaluation and reduction tails.
-Multi-step sequences additionally compare fixed/cumulative updates, NoGrad
-training and tracking-disabled evaluation. Go-only tests verify finite
-differences, selective gradients, shared/retained histories, closed ancestors,
-independent CPU workers, state reload and CUDA capture/memory reclamation.
-Regenerate with `python tools/gen_batchnorm_fixture.py`.
+PyTorchのfixtureは、forward、入力とaffineの全てのVJP、偏りあり・なしの分散、channels-first/lastのレイアウト、rank 2〜6、サンプルが1つの評価、reductionの端を確認します。複数ステップの列では、固定・累積の更新、NoGradの学習、追跡を無効にした評価を追加で比較します。Goだけのテストは、有限差分、選択的な勾配、共有・retainした履歴、closeした先祖、独立したCPU worker、stateの再読込、CUDAのcaptureとメモリ回収を確認します。作り直すには`python tools/gen_batchnorm_fixture.py`を使います。
 
-## Optimizers and SGD
+## OptimizerとSGD
 
-`Optimizer` exposes `Step()`, `ZeroGrad()`, `LearningRate() float32`,
-`SetLearningRate(float32)` and `Close()`. AdamW and SGD implement it;
-`OneCycle.Step(optimizer)` advances the schedule and sets the next update's LR
-through the interface. Existing direct AdamW LR fields/calls still work.
-SetLearningRate accepts finite nonnegative rates and panics for invalid input.
-CheckpointOptimizer adds `Snapshot`, `ValidateSnapshot` and `LoadSnapshot` with
-a versioned OptimizerSnapshot tagged `adamw` or `sgd`. Existing typed AdamW
-State/LoadState methods are preserved. Custom update implementations can use
-Optimizer with OneCycle; the current checkpoint encoder supports the two builtins.
+`Optimizer`は`Step()`、`ZeroGrad()`、`LearningRate() float32`、`SetLearningRate(float32)`、`Close()`を公開します。AdamWとSGDがこれを実装し、`OneCycle.Step(optimizer)`はスケジュールを進めて次の更新の学習率をインターフェース経由で設定します。AdamWの学習率フィールドや直接の呼び出しはこれまでどおり使えます。`SetLearningRate`は有限で非負の値を受け取り、不正な入力ではpanicします。`CheckpointOptimizer`は`Snapshot`、`ValidateSnapshot`、`LoadSnapshot`を追加し、`adamw`または`sgd`のタグを持つバージョン付きの`OptimizerSnapshot`を扱います。AdamWの型付きのState/LoadStateはそのまま残ります。独自の更新を実装する場合もOptimizerとOneCycleを組み合わせられますが、現在のcheckpointのエンコーダは組み込みの2つに対応します。
 
 ```go
 schedule := autograd.NewOneCycle(.1, 100, .3)
@@ -506,78 +265,38 @@ sgd, err := autograd.NewSGD(model.NamedParameters(), autograd.SGDOptions{
     LR: float32(schedule.LR()), Momentum: .9,
     Nesterov: true, WeightDecay: .0001,
 })
-// Handle err.
+// エラーを処理します。
 _ = err
 defer sgd.Close()
 var optimizer autograd.Optimizer = sgd
 optimizer.ZeroGrad()
-// Construct a loss, Backward, then release its graph as usual.
+// 損失を組み、Backwardしてから、通常どおりグラフを解放します。
 optimizer.Step()
 schedule.Step(optimizer)
 err = autograd.SaveTrainingCheckpoint("run.safetensors", model, sgd, schedule, metadata)
-// Handle err. LoadTrainingCheckpoint restores model, options, buffers and schedule.
+// エラーを処理します。LoadTrainingCheckpointがモデル、オプション、バッファ、スケジュールを復元します。
 ```
 
-`NewSGD(params, options)` returns errors for invalid configuration/parameters.
-Parameters are distinct named, contiguous float32 factory leaves on one device,
-with positive element counts. Constructor copies the parameter slice and options;
-keep parameter identity/order stable. LR is also exposed as the SGD.LR field.
-Other hyperparameters are copied configuration and restored through state.
+`NewSGD(params, options)`は、構成やパラメータが不正なときにエラーを返します。パラメータは、同じdevice上の、名前が異なり連続したfloat32の末端で、要素数が正である必要があります。コンストラクタはパラメータのスライスとオプションをコピーするため、パラメータの同一性と順序を保ってください。学習率は`SGD.LR`フィールドでも参照できます。その他のハイパーパラメータは構成をコピーし、stateを通して復元します。
 
-SGDOptions has LR, Momentum, Dampening, WeightDecay, Nesterov and Maximize:
+`SGDOptions`はLR、Momentum、Dampening、WeightDecay、Nesterov、Maximizeを持ちます。
 
-- Numeric values are finite and nonnegative. Zero LR is allowed and still
-  updates momentum. Nesterov requires positive momentum and zero dampening.
-  Momentum zero uses plain SGD; dampening then has no effect.
-- Start with `d = grad` (or `-grad` for Maximize), then add coupled decay
-  `WeightDecay * parameter`. This differs from AdamW's decoupled decay.
-- For positive momentum, the first buffer is exactly `d`, without dampening.
-  Later updates are `buffer = Momentum*buffer + (1-Dampening)*d`.
-  Descent uses buffer, or `d + Momentum*buffer` for Nesterov, and subtracts
-  `LR * update` from the parameter. Maximize flips only the raw gradient sign;
-  decay still shrinks parameters.
-- An absent gradient skips parameter/decay/buffer updates. A present zero
-  gradient still applies decay and momentum. Lazy initialization is per parameter,
-  so a parameter first used in a later step still gets an undampened first buffer.
-  StepCount counts optimizer Step calls, including calls where all gradients
-  are absent, to align with the scheduler.
-- Eager SGD.ZeroGrad clears gradients to absent on both devices. Prepared or
-  captured CUDA graphs preserve and zero gradient allocations instead, because
-  replay requires stable addresses. AdamW retains its existing ZeroGrad policy.
-- CPU/CUDA updates increment managed storage versions and invalidate BF16
-  shadows on eager mutation. SGD computes FP32 updates even under autocast.
-  CUDA updates/momentum/initialization remain on device without per-step readback.
-  Close releases optimizer state only, leaving model parameters owned by callers.
+- 数値は有限で非負です。学習率が0でもmomentumは更新します。Nesterovは正のmomentumとdampening 0を必要とします。momentumが0なら通常のSGDで、dampeningは効きません。
+- `d = grad`（Maximizeでは`-grad`）から始め、coupled decayの`WeightDecay * parameter`を加えます。これはAdamWのdecoupled decayと異なります。
+- momentumが正のとき、最初のバッファはdampeningなしの`d`そのものです。以降は`buffer = Momentum*buffer + (1-Dampening)*d`です。降下にはバッファを、Nesterovでは`d + Momentum*buffer`を使い、パラメータから`LR * update`を引きます。Maximizeは生の勾配の符号だけを反転し、decayはパラメータを縮めます。
+- 勾配がないパラメータは、パラメータ、decay、バッファの更新を飛ばします。0の勾配は存在するものとして、decayとmomentumを適用します。遅延初期化はパラメータごとなので、後のステップで初めて勾配を受けたパラメータも、dampeningなしの最初のバッファを得ます。StepCountは、全勾配がないステップも含めてoptimizerのStep呼び出しを数え、スケジューラと揃います。
+- eagerな`SGD.ZeroGrad`は、どちらのdeviceでも勾配を無い状態に戻します。準備済みまたは記録済みのCUDAグラフは、再生に安定したアドレスが必要なため、勾配の割当を保って0で埋めます。AdamWはこれまでのZeroGradの方針を保ちます。
+- CPU/CUDAの更新は管理されたストレージのversionを進め、eagerな変更でBF16のシャドウを無効にします。SGDはautocastの下でもFP32で更新します。CUDAの更新、momentum、初期化はデバイス上に留まり、ステップごとの読み戻しはありません。`Close`はoptimizerのstateだけを解放し、モデルのパラメータは呼び出し側が持ちます。
 
-SGD.State includes ordered names/shapes, complete options, step count, momentum
-buffers and per-parameter Initialized flags. Unused parameters have no buffer
-in the snapshot/file. LoadState validates every option/name/shape/flag/buffer
-before replacing state. Snapshots are independent copies. Standalone SGD
-safetensors use `gograd-sgd` metadata; combined checkpoints keep
-`gograd-training-1` and tag the optimizer kind. Existing AdamW training files
-without a kind tag are treated as AdamW. Loading a mismatched optimizer kind
-is rejected before changing live model values.
+`SGD.State`は順序付きの名前と形状、全てのオプション、ステップ数、momentumバッファ、パラメータごとのInitializedフラグを持ちます。使われていないパラメータのバッファは、スナップショットにもファイルにもありません。`LoadState`は全てのオプション、名前、形状、フラグ、バッファを検証してからstateを置き換えます。スナップショットは独立したコピーです。単体のSGDのsafetensorsは`gograd-sgd`のmetadataを使い、統合checkpointは`gograd-training-1`を保ったままoptimizerの種類をタグで示します。種類のタグがない既存のAdamWの学習ファイルはAdamWとして扱います。optimizerの種類が一致しない読込は、liveのモデル値を変える前に拒否します。
 
-CUDA capture uses `SGD.PrepareGraph`, `GraphStepCount`, and SyncGraphStepCount,
-analogous to AdamW. A separate per-parameter device flag handles first momentum
-initialization, followed by a flag-marking kernel after the update completes.
-Captured replays advance a device step count. State/checkpoint export reads that
-count; returning to eager Step synchronizes it. Captured hyperparameters are
-fixed at capture, and restore/reallocation requires ending old graphs first.
-Opaque replay writes are outside host-side storage-version tracking.
+CUDAのcaptureは、AdamWと同じく`SGD.PrepareGraph`、`GraphStepCount`、`SyncGraphStepCount`を使います。パラメータごとのデバイス上のフラグが最初のmomentumの初期化を扱い、更新の完了後にフラグを立てるカーネルを続けます。記録した再生はデバイス上のステップ数を進めます。stateやcheckpointの書き出しはその数を読み、eagerのStepへ戻るときに同期します。記録したハイパーパラメータは記録時に固定され、stateの復元や割当のやり直しは、先に古いグラフを終わらせる必要があります。外部からの再生による書き込みは、ホスト側のストレージversionの追跡対象外です。
 
-Committed PyTorch SGD fixtures cover plain/decay/momentum/dampening/Nesterov,
-ascent, LR changes, delayed/absent gradients and present zero gradients. Go tests
-compare every parameter/buffer value, lazy-state roundtrips, checkpoint resume,
-legacy AdamW loading, saved-version checks and CUDA graph/BF16 cache behavior.
-Regenerate with `python tools/gen_sgd_fixture.py`.
+リポジトリに含めたPyTorchのSGD fixtureは、通常、decay、momentum、dampening、Nesterov、ascent、学習率の変更、遅れて来る勾配と無い勾配、0の勾配を扱います。Goのテストは、全てのパラメータとバッファの値、遅延stateの往復、checkpointの再開、旧AdamWの読込、保存したversionの検証、CUDAグラフとBF16キャッシュの動作を比較します。作り直すには`python tools/gen_sgd_fixture.py`を使います。
 
-### Parameter groups
+### パラメータグループ
 
-`ParameterGroupSpec{Name, Params, LRScale, WeightDecay}` names one set of
-parameters sharing a learning-rate scale and a weight decay. `NewSGDGroups` and
-`NewAdamWGroups` take these specs; the flat `NewSGD`/`NewAdamW` constructors
-remain equivalent to one implicit group named `default`.
+`ParameterGroupSpec{Name, Params, LRScale, WeightDecay}`は、学習率スケールとweight decayを共有する1組のパラメータに名前を付けます。`NewSGDGroups`と`NewAdamWGroups`がこのspecを受け取り、平坦な`NewSGD`/`NewAdamW`は`default`という1つの暗黙のグループと同じです。
 
 ```go
 specs, err := autograd.PartitionParameters(params, func(name string) string {
@@ -586,53 +305,26 @@ specs, err := autograd.PartitionParameters(params, func(name string) string {
     }
     return "decay"
 })
-// Handle err.
+// エラーを処理します。
 _ = err
 for i := range specs {
     specs[i].WeightDecay = 1e-4
 }
-specs[0].WeightDecay = 0 // the bias group keeps the first label's zero decay
+specs[0].WeightDecay = 0 // biasのグループは最初のラベルの0のdecayを保ちます
 optimizer, err := autograd.NewSGDGroups(params, options, specs)
 ```
 
-- Specs must partition the parameters exactly: every parameter belongs to one
-  group, no parameter appears twice, names are unique and nonempty, and each
-  group is nonempty. Constructor-time violations return errors.
-- `LRScale` multiplies the optimizer base learning rate, so `OneCycle` and
-  `SetLearningRate` still drive every group from one rate. It must be finite and
-  nonnegative; zero selects the unscaled base rate. WeightDecay is the group's
-  own absolute decay. Both are recorded in `AdamWState.Groups`/`SGDState.Groups`
-  as ordered `OptimizerGroupState` entries with each group's parameter names.
-- `NewAdamWGroups(params, lr, specs)` takes no base decay. `NewSGDGroups(params,
-  options, specs)` keeps momentum/dampening/Nesterov/Maximize shared and rejects
-  a nonzero `options.WeightDecay`, so decay is always set per group. The exported
-  `AdamW.WeightDecay` field and the state's base `WeightDecay`/`Options.WeightDecay`
-  mirror the first group's decay.
-- Loading validates group count, names, membership, scale and decay before
-  touching live state. State written before groups existed has no group list and
-  only loads into an optimizer with one unscaled group, taking its decay from the
-  saved base hyperparameters. A grouped state is rejected by a flat optimizer and
-  vice versa, so checkpoints keep their training semantics.
-- CUDA applies each group's step size and decay in its own kernel arguments;
-  captured graphs bake the base rate and group scales at capture time, then diverge
-  from eager updates after a scheduler changes the base rate.
+- specはパラメータを過不足なく分割します。全てのパラメータがいずれか1つのグループに属し、同じパラメータが2度現れず、名前は一意で空でなく、各グループは空でありません。コンストラクタの時点での違反はエラーを返します。
+- `LRScale`はoptimizerの基準の学習率に掛かるため、`OneCycle`と`SetLearningRate`は1つの学習率から全てのグループを動かします。有限で非負である必要があり、0は基準の学習率をそのまま使うことを選びます。WeightDecayはそのグループ自身の絶対的なdecayです。どちらも`AdamWState.Groups`/`SGDState.Groups`に、グループのパラメータ名を持つ順序付きの`OptimizerGroupState`として記録します。
+- `NewAdamWGroups(params, lr, specs)`は基準のdecayを取りません。`NewSGDGroups(params, options, specs)`はmomentum/dampening/Nesterov/Maximizeを共有し、`options.WeightDecay`が0でない場合は拒否するため、decayは常にグループごとに設定します。公開フィールドの`AdamW.WeightDecay`と、stateの基準の`WeightDecay`/`Options.WeightDecay`は、最初のグループのdecayを写します。
+- 読込は、liveのstateに触れる前にグループ数、名前、membership、スケール、decayを検証します。グループ以前に書かれたstateはグループの一覧を持たず、スケールを持たない1つのグループのoptimizerにだけ読み込め、decayは保存された基準のハイパーパラメータから取ります。グループ化したstateは平坦なoptimizerが拒否し、その逆も同じです。checkpointは学習の意味を保ちます。
+- CUDAはグループごとのステップサイズとdecayを、それぞれのカーネル引数として適用します。記録したグラフは記録時に基準の学習率とグループのスケールを焼き込むため、スケジューラが基準の学習率を変えた後はeagerの更新とずれます。
 
-Committed PyTorch parameter-group fixtures cover SGD and AdamW with two groups at
-different learning rates and decays, including absent and zero gradients. Go
-tests compare every parameter, momentum/moment value and group record on CPU and
-CUDA, plus state roundtrips, layout reuse, combined-checkpoint resume, scheduler
-scaling and CUDA graph replay. Regenerate with
-`python tools/gen_param_groups_fixture.py`.
+リポジトリに含めたパラメータグループのPyTorch fixtureは、異なる学習率とdecayを持つ2つのグループのSGDとAdamWを、勾配がない場合と0の勾配も含めて扱います。Goのテストは、CPUとCUDAで全てのパラメータ、momentumとmomentの値、グループの記録を比較し、stateの往復、レイアウトの再利用、統合checkpointの再開、スケジューラによるスケール、CUDAグラフの再生も確認します。作り直すには`python tools/gen_param_groups_fixture.py`を使います。
 
-## Generic host data and batching
+## 汎用のホストデータとバッチ処理
 
-The `data` package has no tensor/backend dependency. `Dataset[T]` exposes
-`Len() int` and `Get(context.Context, index) (T, error)`; a sample can be any Go
-type. `SliceDataset[T]` adapts an in-memory slice. `NewSubset` validates and copies
-indices without copying underlying samples; `Indices()` returns a copy.
-`RandomSplit(size, validationCount, seed)` returns disjoint train/validation
-indices covering the full dataset. Keep dataset length/content/index identity
-stable during iteration and checkpoint restoration.
+`data`パッケージはテンソルやバックエンドに依存しません。`Dataset[T]`は`Len() int`と`Get(context.Context, index) (T, error)`を公開し、sampleは任意のGoの型でかまいません。`SliceDataset[T]`はメモリ上のスライスを適合させます。`NewSubset`はindexを検証してコピーし、元のsampleはコピーしません。`Indices()`はコピーを返します。`RandomSplit(size, validationCount, seed)`はデータセット全体を覆う、重複しない学習と検証のindexを返します。反復とcheckpointの復元の間、データセットの長さ、内容、indexの同一性を保ってください。
 
 ```go
 dataset := data.SliceDataset[data.FloatSample]{
@@ -642,208 +334,97 @@ dataset := data.SliceDataset[data.FloatSample]{
 sampler, err := data.NewIndexSampler(dataset.Len(), data.SamplerOptions{
     Shuffle: true, Seed: 7,
 })
-// Handle err.
+// エラーを処理します。
 _ = err
 loader, err := data.NewLoader[data.FloatSample, data.FloatBatch](
     dataset, sampler, data.Stack, data.LoaderOptions{BatchSize: 2},
 )
-// Handle err.
+// エラーを処理します。
 _ = err
-defer loader.Close() // needed when stopping early with active readers
+defer loader.Close() // 読み手が動いている途中で止めるときに必要です
 for {
     batch, err := loader.Next(context.Background())
-    if err == io.EOF { break } // end of this epoch, not all future epochs
-    // Handle other errors.
+    if err == io.EOF { break } // このepochの終わりで、以降のepochの終わりではありません
+    // その他のエラーを処理します。
     x, err := execution.New(batch.Values, batch.Shape, device, false)
-    // Handle err. Use batch.Labels with CrossEntropy; caller closes x.
+    // エラーを処理します。batch.LabelsをCrossEntropyに渡します。xは呼び出し側がcloseします。
     _ = err
     _ = x
 }
-err = loader.NextEpoch() // resets indices; shuffled order changes deterministically
-// Handle err.
+err = loader.NextEpoch() // indexを戻します。shuffleの順序は決定的に変わります
+// エラーを処理します。
 ```
 
-- `IndexSampler` defaults to sequential order. Shuffle uses a private PCG
-  stream seeded by `SamplerOptions.Seed`; it does not use package-global RNGs.
-  `Peek(count)` returns copied upcoming indices and does not advance state.
-  `Advance(count)` commits consumed indices. `NextEpoch` starts the next order
-  and discards any unused current tail. Empty datasets immediately yield EOF.
-- By default, `Loader.Next` gets samples serially, collates them, checks cancellation, then
-  advances the sampler. Read/collate/cancellation errors leave the cursor
-  unchanged for retry. Callback EOF is converted to UnexpectedEOF so truncated
-  input cannot masquerade as normal epoch completion. Cancellation is cooperative
-  at callback boundaries; Dataset.Get should also respect its context.
-- BatchSize must be positive. The final batch is smaller by default. DropLast
-  consumes that incomplete tail and returns EOF. Sampler/dataset size mismatch
-  and dataset-length changes are errors. Loader and mutable sampler are used
-  serially; independent workers need separate samplers/loaders. Read-only datasets
-  may be shared when their Get implementation supports concurrent calls.
-- `Stack` validates equal sample shapes and copies values/labels, prepending the
-  batch axis. Scalars are supported. `PadSequences` requires matching trailing
-  dimensions and pads the first sample axis to the batch maximum or a specified
-  Length. A shorter fixed Length requires `Truncate: true`; it is never implicit.
-  PaddingOptions.Value selects the fill value. FloatBatch.Shape is
-  `[batch,time,...]`, Lengths records retained lengths, and Mask is a flat
-  `[batch,time]` bool slice true only for retained input positions. Empty sequences
-  are valid; an all-empty automatic batch has time size zero.
-- Builtin float collates return fresh owned host slices. Samples may borrow
-  dataset storage, and custom collates must not mutate borrowed samples.
-  Convert/upload batches on the caller's ExecutionContext; integer labels/bool
-  masks remain host data until the application chooses their tensor representation.
+- `IndexSampler`の既定は昇順です。shuffleは`SamplerOptions.Seed`でseedした専用のPCGストリームを使い、パッケージのグローバルな乱数は使いません。`Peek(count)`は次に来るindexのコピーを返し、状態を進めません。`Advance(count)`は消費したindexを確定します。`NextEpoch`は次の順序を始め、未使用の現在の残りを捨てます。空のデータセットはすぐにEOFを返します。
+- 既定では、`Loader.Next`はsampleを逐次取得してcollateし、キャンセルを確認してからsamplerを進めます。読込、collate、キャンセルのエラーはカーソルを変えずに残すため、再試行できます。コールバックのEOFは`UnexpectedEOF`に変換し、切り詰めた入力が正常なepochの終わりに見えるのを防ぎます。キャンセルはコールバックの境界で協調的に行い、`Dataset.Get`も自身のcontextに従う必要があります。
+- `BatchSize`は正でなければなりません。最後のバッチは既定で小さくなります。`DropLast`はその不完全な末尾を消費してEOFを返します。samplerとデータセットのサイズの不一致や、データセットの長さの変化はエラーです。`Loader`と変更可能なsamplerは逐次使うため、独立したworkerには別々のsamplerとloaderが必要です。読み取り専用のデータセットは、その`Get`が並行呼び出しに対応していれば共有できます。
+- `Stack`はsampleの形状が等しいことを検証し、値とラベルをコピーしてバッチの軸を前に付けます。スカラーも扱えます。`PadSequences`は末尾の次元が一致することを必要とし、最初のsampleの軸をバッチの最大か指定した`Length`まで埋めます。短い固定の`Length`には`Truncate: true`が必要で、暗黙には切り詰めません。`PaddingOptions.Value`は埋める値を選びます。`FloatBatch.Shape`は`[batch,time,...]`、`Lengths`は残した長さ、`Mask`は`[batch,time]`の平坦なboolスライスで、残した入力位置だけがtrueです。空の系列も有効で、全て空の自動バッチではtimeの大きさが0になります。
+- 組み込みのfloatのcollateは、所有権を持つ新しいホストスライスを返します。sampleがデータセットのストレージを借用することがあり、独自のcollateは借用したsampleを変更してはいけません。バッチの変換とアップロードは呼び出し側の`ExecutionContext`で行います。整数のラベルとboolのマスクは、アプリがテンソル表現を選ぶまでホストのデータのままです。
 
-### Numeric CSV tables and regression samples
+### 数値のCSVテーブルと回帰のsample
 
-`ParseNumericCSV(r, ParseOptions)` reads a rectangular numeric CSV/TSV table with
-optional comment lines and header. Fields are space-trimmed and must be finite;
-the first malformed row reports its 1-based line. `NumericTable.RegressionSamples`
-splits rows into `RegressionSample{Features, Target}`, defaulting to every column
-except the last as features (`targetColumn` of -1 selects the last).
-`StackRegression` collates equal-length samples into a `RegressionBatch` with
-`Values`/`Shape` `[batch,features]` and scalar `Targets`; it drops into the same
-generic `Loader` as `Stack`.
+`ParseNumericCSV(r, ParseOptions)`は、任意のコメント行とヘッダを持つ矩形の数値CSV/TSVテーブルを読みます。フィールドは前後の空白を除き、有限でなければなりません。最初の不正な行は1始まりの行番号を報告します。`NumericTable.RegressionSamples`は行を`RegressionSample{Features, Target}`へ分けます。特徴量は既定で最後の列以外の全てで、`targetColumn`に-1を渡すと最後の列を選びます。`StackRegression`は同じ長さのsampleを、`Values`/`Shape`が`[batch,features]`で`Targets`がスカラーの`RegressionBatch`へcollateします。`Stack`と同じ汎用の`Loader`にそのまま使えます。
 
 ```go
 file, err := os.Open("data.csv")
-// Handle err; close the file.
+// エラーを処理します。ファイルをcloseします。
 table, err := data.ParseNumericCSV(file, data.ParseOptions{})
 samples, err := table.RegressionSamples(nil, -1)
 batch, err := data.StackRegression(samples[:16])
 ```
 
-`Standardizer` is a deterministic per-feature centering/scaling transform.
-`FitStandardizer` accumulates mean and population variance in float64 over the
-training split so the statistics do not depend on float32 summation order; a
-constant feature gets a unit scale and becomes exactly zero after `Apply`.
-`Apply` returns a copy and `ApplyBatch` standardizes a collated batch in place.
-`State`/`LoadState` round-trip the statistics through JSON, which is the contract
-that makes a run reproducible: fit on the training split, store the state in the
-training checkpoint, and reuse it for validation and inference. `LoadState`
-rejects wrong versions, mismatched sizes and non-finite or non-positive scales.
+`Standardizer`は特徴量ごとの決定的な中心化とスケールの変換です。`FitStandardizer`はtraining splitの平均と母分散をfloat64で累積するため、統計がfloat32の和の順序に依存しません。定数の特徴量はスケール1になり、`Apply`の後で正確に0になります。`Apply`はコピーを返し、`ApplyBatch`はcollate済みのバッチをその場で標準化します。`State`/`LoadState`は統計をJSONで往復させます。これが実行の再現性を支える約束で、training splitでfitし、stateを学習checkpointに保存し、検証と推論で再利用します。`LoadState`は不正なversion、サイズの不一致、非有限または正でないスケールを拒否します。
 
-`cmd/tabular-train` is a Go-only regression example that reads such a table
-(`-generate` writes a deterministic synthetic dataset), splits train/validation
-with `RandomSplit`, fits the standardizer on the training rows only, and trains a
-small MLP with mean squared error. It saves the standardizer state, loader order
-and dataset fingerprint with the AdamW/SGD and OneCycle state, so a stopped run
-resumes exactly; changing the data, split, batch, steps, seed, hidden size or
-optimizer is rejected before loading. Timestamps are not identity.
+`cmd/tabular-train`は、このテーブルを読むGoだけの回帰の例です（`-generate`で決定的な合成データを書きます）。`RandomSplit`で学習と検証に分け、standardizerは学習の行だけでfitし、小さなMLPを平均二乗誤差で学習します。standardizerのstate、loaderの順序、データセットのfingerprintを、AdamW/SGDとOneCycleのstateと共に保存するため、中断した実行は厳密に再開します。データ、分割、batch、steps、seed、hiddenの大きさ、optimizerの変更は、読み込む前に拒否します。時刻は同一性に含みません。
 
-### WAV audio and augmentation
+### WAV音声とaugmentation
 
-`ReadWAV(r)` decodes uncompressed RIFF audio: 8/16/24/32-bit integer PCM (8-bit
-unsigned, as the format requires) and 32/64-bit IEEE float, including
-`WAVE_FORMAT_EXTENSIBLE` fmt chunks. Integer samples are divided by `2^(bits-1)`
-and float samples are kept as written, matching the usual PyTorch loading
-convention. The result exposes `SampleRate`, `Channels`, `Bits`, `Float`,
-`Samples` (interleaved) and `Mono()`. `ReadWAVFile`/`ReadWAVMono` cover the file
-and channel-averaged cases. Compressed codecs, unknown layouts and data sizes that
-are not a whole number of frames are rejected rather than guessed at.
+`ReadWAV(r)`は非圧縮のRIFF音声を復号します。8/16/24/32ビットの整数PCM（8ビットは符号なし）と32/64ビットのIEEE float、`WAVE_FORMAT_EXTENSIBLE`のfmtチャンクを含みます。整数のsampleは`2^(bits-1)`で割り、floatは書かれたまま使います。一般的なPyTorchの読込と同じ扱いです。結果は`SampleRate`、`Channels`、`Bits`、`Float`、`Samples`（インターリーブ）、`Mono()`を公開します。`ReadWAVFile`と`ReadWAVMono`はファイルとチャネル平均の場合を扱います。圧縮コーデック、未知のレイアウト、フレーム数が整数にならないデータサイズは、推測せずに拒否します。
 
-`WriteWAV(w, samples, WAVEncoding{Channels, SampleRate, Bits, Float})` writes the
-same layouts. Integer output clamps to the representable range and rounds to the
-nearest step; float output rejects non-finite samples. A round trip is therefore
-within one and a half least-significant steps for integer PCM and exact for float.
+`WriteWAV(w, samples, WAVEncoding{Channels, SampleRate, Bits, Float})`は同じレイアウトを書き出します。整数の出力は表せる範囲にclampし、最も近い段へ丸めます。floatの出力は非有限のsampleを拒否します。したがって往復の誤差は、整数PCMでは最小段の1.5倍以内、floatでは誤差なしです。
 
 ```go
 wav, err := data.ReadWAVFile("tone.wav")
-// Handle err.
+// エラーを処理します。
 mono := wav.Mono()
-file, err := os.Create("copy.wav") // then WriteWAV(file, wav.Samples, data.WAVEncoding{...})
+file, err := os.Create("copy.wav") // この後WriteWAV(file, wav.Samples, data.WAVEncoding{...})を呼びます
 ```
 
-`cmd/audio-train` is the audio example. It frames a mono signal into fixed
-windows and augments each window with Gaussian noise derived from
-`(seed, window index)` through a private PCG stream, never from iteration order.
-That is the application-side augmentation contract: workers, prefetch and resume
-cannot change the inputs, and the seed is checkpoint identity, so a stopped run
-reproduces the same noisy inputs and the same weights. The example trains an MLP
-denoiser with mean squared error, reports input/output SNR in dB, and checkpoints
-the model, optimizer, schedule, loader order and WAV fingerprint together.
+`cmd/audio-train`は音声の例です。monoの信号を固定長のwindowに分け、各windowへ`(seed, window index)`から専用のPCGストリームで導いたガウスノイズを加えます。反復の順序は使いません。これがアプリ側のaugmentationの約束で、worker、prefetch、再開は入力を変えられず、seedはcheckpointの同一性なので、中断した実行は同じノイズの入力と同じ重みを再現します。例はMLPのdenoiserを平均二乗誤差で学習し、入力と出力のSNRをdBで表示し、モデル、optimizer、スケジュール、loaderの順序、WAVのfingerprintをまとめてcheckpointに保存します。
 
-### Data checkpoints
+### データのcheckpoint
 
-`IndexSampler.State` records version, size, seed/shuffle settings, epoch, current
-position, complete order and PCG state. Restore validates configuration,
-permutation and RNG bytes before modifying state. Thus resume preserves both
-the remaining current epoch and later shuffled epochs.
+`IndexSampler.State`はversion、サイズ、seedとshuffleの設定、epoch、現在位置、完全な順序、PCGのstateを記録します。復元はstateを変える前に構成、順列、乱数のバイト列を検証します。したがって再開は、現在のepochの残りと以降のshuffleされたepochの両方を保ちます。
 
-`Loader.State() (LoaderState, error)` adds dataset size, batch size and DropLast
-to an opaque sampler payload. The sampler must implement StatefulSampler
-(MarshalBinary/UnmarshalBinary); IndexSampler does. Loader.LoadState rejects
-incompatible configuration before restoring the sampler. State snapshots copy
-order/payload and can be JSON-encoded in training checkpoint caller metadata.
-Dataset content, subset/split identity and custom collation configuration are
-caller metadata: matching length alone does not prove identical data.
+`Loader.State() (LoaderState, error)`は、データセットのサイズ、batchサイズ、DropLastを、不透明なsamplerのpayloadに加えます。samplerは`StatefulSampler`（MarshalBinary/UnmarshalBinary）を実装する必要があり、`IndexSampler`は実装しています。`Loader.LoadState`は互換でない構成を、samplerを復元する前に拒否します。stateのスナップショットは順序とpayloadをコピーし、学習checkpointの呼び出し側metadataにJSONで入れられます。データセットの内容、subsetやsplitの同一性、独自のcollateの構成は呼び出し側のmetadataです。長さが一致するだけでは、同じデータであることの証明になりません。
 
-### Parallel readers and bounded prefetch
+### 並列readerと上限付きprefetch
 
-Set `LoaderOptions.Workers` to a positive count to enable host reader goroutines.
-Workers=0 retains the synchronous path. `Prefetch` bounds pending batches,
-including the current batch; zero defaults to two in parallel mode and must stay
-zero in synchronous mode. Negative options or overflowing capacity are errors.
-Reader count is capped by available sample slots. Dataset.Get must support
-concurrent calls and return sample storage that stays valid until collation.
+`LoaderOptions.Workers`に正の数を設定すると、ホスト側のreaderのgoroutineが有効になります。`Workers=0`は同期経路を保ちます。`Prefetch`は現在のバッチも含めて、未処理のバッチ数を制限します。0は並列時に2が既定で、同期時は0のままにします。負の値や、容量が溢れる設定はエラーです。readerの数は、利用できるsampleの枠までに制限します。`Dataset.Get`は並行呼び出しに対応し、collateまで有効なsampleストレージを返す必要があります。
 
 ```go
 loader, err := data.NewLoader[data.FloatSample, data.FloatBatch](
     dataset, sampler, data.Stack,
     data.LoaderOptions{BatchSize: 64, Workers: 4, Prefetch: 3},
 )
-// Handle err; indices are read ahead but delivered in sampler order.
+// エラーを処理します。indexは先読みしますが、渡す順序はsamplerの順です。
 _ = err
 defer loader.Close()
 ```
 
-- Workers only call Dataset.Get. Collation remains serial, in Next's calling
-  goroutine, and is never speculative. Tensor construction/CUDA thread ownership
-  stays with the consumer. Pending jobs, results and sample batches are bounded
-  by the configured prefetch window; completion order does not change delivery.
-- A failed batch reports the first failing sample in that batch's sampler order, not
-  whichever reader happened to finish first. Read/collate errors discard pending
-  lookahead, join readers and preserve the committed cursor for retry. A dataset
-  panic in a worker becomes an ordered read error; a collate panic is re-panicked
-  on the consumer after reader cleanup.
-- Readers inherit the context of the Next call that starts their session. A
-  cancellation during Next cancels/joins readers and leaves that batch unconsumed.
-  If an earlier session's context is cancelled between calls, a subsequent Next
-  with a live context restarts at the committed cursor. Cancellation checks after
-  collation occur before committing indices. Dataset.Get must cooperate with
-  cancellation; cleanup waits for in-progress callbacks to return.
-- `Close() error` is idempotent, cancels/joins readers and drops undelivered
-  samples. EOF and a final delivered batch also release completed readers.
-  `NextEpoch` stops old readers before changing index order. Methods, including
-  Close/State/LoadState, remain serial: cancel Next's context to interrupt a
-  blocked call, rather than concurrently invoking another Loader method.
-- `State` stops readers and discards lookahead before serializing **delivered**
-  sampler position. LoadState likewise stops old reads before restoring. Workers
-  and Prefetch are not part of logical LoaderState, so an existing synchronous
-  checkpoint can resume with parallel readers, or with a different reader count.
-  Batch size, DropLast, data identity and custom collation/augmentation state
-  still have their original contracts. Treat the sampler as loader-owned during
-  active iteration; do not separately advance/reset it with queued lookahead.
+- workerが呼ぶのは`Dataset.Get`だけです。collateは`Next`の呼び出し元のgoroutineで直列に行い、先読みしません。テンソルの生成とCUDAのスレッドの所有権は、受け取る側に留まります。未処理のjob、結果、sampleのバッチは、設定したprefetchの枠までに制限し、完了した順序は渡す順序を変えません。
+- 失敗したバッチは、どのreaderが先に終わったかではなく、そのバッチのsampler順で最初に失敗したsampleを報告します。読込やcollateのエラーは未処理の先読みを捨て、readerをjoinし、確定済みのカーソルを再試行のために保ちます。worker内のデータセットのpanicは順序付きの読込エラーになり、collateのpanicはreaderの後片付けの後に受け取る側で再びpanicします。
+- readerは、その作業を始めた`Next`呼び出しのcontextを引き継ぎます。`Next`の間のキャンセルはreaderをキャンセルしてjoinし、そのバッチは未消費のままです。呼び出しの合間に以前の作業のcontextがキャンセルされていても、生きているcontextでの次の`Next`は確定済みのカーソルからやり直します。collateの後のキャンセル確認は、indexを確定する前に起きます。`Dataset.Get`はキャンセルに協調する必要があり、後片付けは進行中のコールバックの終了を待ちます。
+- `Close() error`は繰り返し呼べ、readerをキャンセルしてjoinし、未配達のsampleを捨てます。EOFと最後に配達したバッチも、終了したreaderを解放します。`NextEpoch`はindexの順序を変える前に古いreaderを止めます。メソッドは`Close`/`State`/`LoadState`も含めて逐次で、`Next`のcontextをキャンセルしてブロックした呼び出しを中断します。別の`Loader`のメソッドを並行して呼ばないでください。
+- `State`はreaderを止めて先読みを捨ててから、**配達済み**のsampler位置を直列化します。`LoadState`も同様に、古い読込を止めてから復元します。WorkersとPrefetchは論理的な`LoaderState`に含まれないため、既存の同期のcheckpointは、並列readerや別のreader数で再開できます。batchサイズ、DropLast、データの同一性、独自のcollateやaugmentationのstateは、元の約束のままです。反復中はsamplerをloaderが所有するものとして扱い、先読みをかかえたまま別途進めたり戻したりしないでください。
 
-Dataset.Get side effects and call-dependent randomness are not rolled back or
-checkpointed by Loader. Reproducible prefetch requires deterministic sample
-access (or application-managed per-sample/epoch randomness), and any custom
-collation state still belongs in caller metadata.
+`Dataset.Get`の副作用と、呼び出しに依存する乱数は、`Loader`が巻き戻したりcheckpointに保存したりしません。再現できるprefetchには、決定的なsampleの取得（またはアプリが管理するsampleごと・epochごとの乱数）が必要で、独自のcollateのstateは呼び出し側のmetadataに置きます。
 
-### Raw/gzip IDX and MNIST example
+### raw/gzip IDXとMNISTの例
 
-`OpenIDX(imagesPath, labelsPath)` reads MNIST-style byte IDX magic 2051/2049,
-validates dimensions/counts/exact payload lengths, and accepts raw or gzip data
-independent of filename extension. The dataset holds compact uint8 images and
-labels in memory. Get returns an owned normalized float32 `[1,height,width]`
-image in `[0,1]` and its integer label. ImageSize and Classes report geometry
-and maximum-label-plus-one; Fingerprint is SHA-256 over both decoded files,
-so changing gzip container bytes alone does not change identity.
+`OpenIDX(imagesPath, labelsPath)`はMNIST形式のbyte IDX（magic 2051/2049）を読み、次元、個数、payloadの正確な長さを検証し、ファイル名の拡張子によらずrawまたはgzipのデータを受け取ります。データセットはコンパクトなuint8の画像とラベルをメモリに保ちます。`Get`は所有権を持つ、`[0,1]`に正規化したfloat32の`[1,height,width]`画像と、その整数ラベルを返します。`ImageSize`と`Classes`は幾何と最大ラベル+1を返します。`Fingerprint`は復号した両ファイルのSHA-256なので、gzipのコンテナのバイト列だけを変えても同一性は変わりません。
 
-`cmd/mnist-train` uses a 784→64→10 MLP, cross-entropy, AdamW or SGD and OneCycle. It
-reads MNIST training/test IDX pairs, uses shuffled training batches and sequential
-test evaluation, saves inference weights, then reconstructs/reloads and compares
-logits. Download is opt-in and uses Go's HTTP/gzip support. Only missing files
-are fetched from the public MNIST mirror; local files can be provided instead.
-Ordinary tests use tiny locally generated IDX files and an HTTP test server,
-requiring neither network access nor Python.
+`cmd/mnist-train`は784→64→10のMLP、cross-entropy、AdamWまたはSGD、OneCycleを使います。MNISTの学習・テストのIDXの組を読み、学習はshuffleしたバッチ、テストは昇順の評価を使い、推論用の重みを保存してから、作り直して再読込し、logitsを比較します。ダウンロードは任意で、GoのHTTPとgzipで行います。公開ミラーから取得するのは不足しているファイルだけで、代わりにローカルのファイルを用意できます。通常のテストは小さなローカル生成のIDXとHTTPのテストサーバーを使い、ネットワークもPythonも必要としません。
 
 ```sh
 go run ./cmd/mnist-train -download -device cpu -steps 100 -stop-after 40 -train-limit 2000 -valid-limit 1000
@@ -853,88 +434,40 @@ go run ./cmd/mnist-train -device cpu -workers 4 -prefetch 3 -steps 100 -train-li
 go run ./cmd/mnist-train -device cpu -optimizer sgd -momentum .9 -nesterov -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-sgd.safetensors
 ```
 
-Default data directory is `out/mnist`, output is `out/mnist.safetensors`, batch
-size is 64 and seed is 7. Directories are created as needed. TrainLimit/ValidLimit
-select the first N examples of their respective official splits (zero means all).
-StopAfter is an absolute completed-update count; Steps is the complete planned
-schedule and must stay unchanged on resume. Checkpoint defaults to output plus
-`.training.safetensors`; inference and training paths must differ.
-`-workers` and `-prefetch` control both training and evaluation loading (defaults
-zero/synchronous). They can change on resume because checkpoints capture only
-delivered data order. Every command loader is closed on completion/error.
-`-optimizer adamw|sgd` selects updates. `-lr` selects the OneCycle peak (zero
-defaults to .005 for AdamW or .1 for SGD); `-momentum` defaults to .9 for SGD and
-`-nesterov` enables its Nesterov variant. Coupled/decoupled decay is .0001 in
-this example. Optimizer selection/rate/momentum/Nesterov are checkpoint identity;
-changing them on resume is rejected. Old MNIST AdamW metadata is recognized
-with its original .005 peak/default settings. `-no-decay-suffix` (default `bias`,
-empty disables) moves matching parameters into a zero-decay group; it is
-checkpoint identity too, so resuming a checkpoint written with a different value
-is rejected. Checkpoints written before groups existed have no suffix recorded
-and require the empty value to resume.
+データの既定のディレクトリは`out/mnist`、出力は`out/mnist.safetensors`、batchサイズは64、seedは7です。ディレクトリは必要に応じて作ります。`TrainLimit`/`ValidLimit`は、それぞれの公式の分割の先頭からN件を選びます（0は全て）。`StopAfter`は完了した更新の絶対数で、`Steps`は計画したスケジュール全体を表し、再開時に変えてはいけません。checkpointの既定は出力に`.training.safetensors`を付けたもので、推論と学習のパスは別にする必要があります。`-workers`と`-prefetch`は学習と評価の両方の読込を制御し、既定は0（同期）です。checkpointは配達済みのデータ順だけを記録するため、再開時に変えられます。コマンドのloaderは、完了時もエラー時もcloseします。
 
-Training state includes model, AdamW moments or SGD momentum/options, OneCycle and loader
-state, plus full dataset fingerprints and effective subset sizes/seed/batch config.
-Changing these identities is rejected before loading live model state. Interrupts
-save the last completed-update checkpoint before returning cancellation. Tests
-compare uninterrupted and mid-epoch-resumed weights, moments, schedule and data
-order; CPU values match exactly, while CUDA floating-point values are compared
-numerically because existing bias-gradient kernels use atomic additions.
+`-optimizer adamw|sgd`は更新を選びます。`-lr`はOneCycleのピークを選び（0ならAdamWは.005、SGDは.1が既定）、`-momentum`はSGDで.9が既定、`-nesterov`はNesterov版を有効にします。この例のcoupled/decoupled decayは.0001です。optimizerの選択、学習率、momentum、Nesterovはcheckpointの同一性で、再開時の変更は拒否します。古いMNISTのAdamWのmetadataは、元の.005のピークと既定の設定として認識します。`-no-decay-suffix`（既定は`bias`、空で無効）は、一致するパラメータをdecayなしのグループへ移します。これもcheckpointの同一性で、別の値で書かれたcheckpointの再開は拒否します。グループ以前に書かれたcheckpointはsuffixを記録していないため、再開には空の値が必要です。
 
-## Resuming a training run
+学習のstateには、モデル、AdamWのモーメントまたはSGDのmomentumとオプション、OneCycleとloaderのstate、データセット全体のfingerprint、実効のsubsetサイズ、seed、batchの構成を含みます。これらの同一性の変更は、liveのモデルstateを読み込む前に拒否します。中断は、キャンセルを返す前に最後に完了した更新のcheckpointを保存します。テストは、中断なしの場合とepoch途中で再開した場合の重み、モーメント、スケジュール、データ順を比較します。CPUの値は厳密に一致し、CUDAの浮動小数点は、既存のbias勾配のカーネルがatomic加算を使うため、数値として比較します。
+
+## 学習の再開
 
 ```go
 sampler, err := autograd.NewWindowSampler(frameCounts, 400, 16, 0.15, 0)
-// Handle err; gather the returned windows into tensors on the chosen device.
+// エラーを処理します。返されたwindowを選んだdeviceのテンソルへ集めます。
 windows := sampler.Batch()
 _ = windows
 sampleJSON, err := json.Marshal(sampler.State())
-// Handle err; save only after an optimizer update and scheduler.Step(opt).
+// エラーを処理します。optimizerの更新とscheduler.Step(opt)の後にだけ保存します。
 err = autograd.SaveTrainingCheckpoint("training.safetensors", &model.Module,
     opt, schedule, map[string]string{"sampler": string(sampleJSON)})
-// Handle err; model/optimizer/scheduler must already be constructed.
+// エラーを処理します。モデル、optimizer、スケジューラは先に構築しておきます。
 metadata, err := autograd.LoadTrainingCheckpoint("training.safetensors",
     &model.Module, opt, schedule)
-// Handle err; restore the stream before sampling another batch.
+// エラーを処理します。次のバッチをサンプリングする前にstreamを復元します。
 var state autograd.WindowSamplerState
 err = json.Unmarshal([]byte(metadata["sampler"]), &state)
-// Handle err.
+// エラーを処理します。
 err = sampler.LoadState(state)
-// Handle err; opt.Close() releases its own buffers at the end of training.
+// エラーを処理します。学習の終わりにopt.Close()が自身のバッファを解放します。
 ```
 
-Parameter order, names and shapes must match. Loading restores learning rate,
-decay, betas and epsilon rather than silently using new defaults. Model mode,
-dropout seeds, dataset identity and sampler state are the caller's responsibility;
-`speech-timing-train` records/validates these and uses completed steps for the
-deterministic dropout seed. `OneCycle` is serialized by the combined checkpoint;
-separate inference or optimizer files are not a full training checkpoint.
-For CUDA graphs, synchronize outstanding launches before saving and restore
-state before capturing a new graph. The optimizer snapshot reads the captured
-device counter rather than an outdated host step count.
+パラメータの順序、名前、形状は一致する必要があります。読込は学習率、decay、beta、epsilonを復元し、新しい既定を黙って使うことはありません。モデルのモード、dropoutのseed、データセットの同一性、samplerのstateは呼び出し側の責任です。アプリケーション側がこれらを記録・検証し、決定的なdropoutのseedには完了したステップ数を使います。`OneCycle`は統合checkpointが直列化し、推論用やoptimizer単体のファイルは完全な学習checkpointではありません。CUDAグラフでは、保存の前に未完了のlaunchを同期し、新しいグラフを記録する前にstateを復元します。optimizerのスナップショットは、古いホストのステップ数ではなく、記録したデバイス上のカウンタを読みます。
 
-## Experimental and compatibility limits
+## 互換性の注意
 
-- General autograd operators, CUDA graph capture, BF16 autocast, device buffer
-  pooling, and the op registry remain experimental. Device and dtype handling
-  is currently float32-first; BF16 uses optional shadow buffers.
-- The compatibility `NoGrad` scope is shared by unbound tensors. Use separate
-  explicit contexts and independent model state for concurrent CPU execution.
-  Unbound tensors use process-wide BF16/attention compatibility settings; do
-  not mutate those globals concurrently. Explicit contexts own these settings.
-  CUDA stream and capture state is now per OS thread, and the allocation pool and
-  buffers track their device, so goroutines holding separate `NewCUDAContextOn`
-  contexts keep independent implicit streams, captures and devices. Overlapping
-  independent streams inside one recorded step, multi-device execution contexts
-  and stream-keyed pooling are not implemented yet.
-- Combined checkpoints restore AdamW or SGD optimizer and OneCycle state. Old `nn`/`gputcn`
-  trainers still use their existing checkpoint paths. Sampling runs on the host;
-  the `data` package provides a separate general loader with optional prefetch.
-- Safetensors writes use a same-directory temporary file, sync and rename.
-  Loading rejects invalid/overflowing shapes, overlapping ranges and headers
-  above 16 MiB. The whole file is read into memory; there is no total file-size
-  limit. Device transfer failures can still interrupt an otherwise validated load.
-- The Go and PyTorch training runs use different random streams for sampling,
-  initialization, and dropout. Fixed initial weights and explicit dropout
-  masks are used for operation-level parity; full-run validation is compared
-  by measured quality rather than identical trajectories.
+- 一般のautogradの演算、CUDAグラフの記録、BF16 autocast、デバイスバッファのプール、opレジストリは実験的な位置づけです。deviceとdtypeの扱いはfloat32を中心に整えており、BF16は任意のシャドウバッファを使います。
+- 互換用の`NoGrad`スコープは、bindしていないテンソルが共有します。CPUで並行実行するには、別々の明示的コンテキストと独立したモデルstateを使います。bindしていないテンソルはプロセス共有のBF16・アテンション設定を使うため、このグローバル設定を並行して変更しないでください。明示的コンテキストはこれらの設定を持ちます。CUDAのstreamとcaptureの状態はOSスレッド単位で、割当プールとバッファはdeviceを持ちます。そのため`NewCUDAContextOn`のコンテキストを持つgoroutineは、独立した暗黙のstream、capture、deviceを保ちます。1回の記録の中での複数のstreamの重ね合わせ、複数deviceの実行コンテキスト、stream単位のプールの分離には対応していません。
+- 統合checkpointはAdamWまたはSGDのoptimizerとOneCycleのstateを復元します。旧`nn`/`gputcn`の学習器は、これまでどおりのcheckpointの経路を使います。サンプリングはホストで行い、`data`パッケージはprefetchを任意で備えた汎用のloaderを別に提供します。
+- safetensorsの書き込みは、同じディレクトリの一時ファイル、sync、renameを使います。読込は不正またはオーバーフローする形状、重複する範囲、16 MiBを超えるヘッダを拒否します。ファイル全体をメモリに読み込むため、ファイルサイズの上限はありません。deviceへの転送の失敗は、検証済みの読込を途中で止めることがあります。
+- GoとPyTorchの学習は、サンプリング、初期化、dropoutに別々の乱数ストリームを使います。演算ごとの照合には初期重みを固定し、明示的なdropoutマスクを使います。学習全体の検証は、同じ軌跡ではなく、測定した品質で比較します。
