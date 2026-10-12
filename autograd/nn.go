@@ -1,12 +1,14 @@
 package autograd
 
 import (
-	"github.com/yh2237/gograd/cuda"
-	"github.com/yh2237/gograd/kernels"
-	"github.com/yh2237/gograd/tensor"
+	"fmt"
 	"math"
 	"sync"
 	"unsafe"
+
+	"github.com/yh2237/gograd/cuda"
+	"github.com/yh2237/gograd/kernels"
+	"github.com/yh2237/gograd/tensor"
 )
 
 var lastNormGPU *cuda.Buffer
@@ -288,6 +290,8 @@ type AdamW struct {
 	mGPU, vGPU                         []*cuda.Buffer
 	unityGPU                           *cuda.Buffer
 	graphStep                          *cuda.Buffer
+	groups                             []ParameterGroup
+	groupOf                            []int
 	StepCount                          int
 }
 
@@ -325,8 +329,31 @@ func (o *AdamW) SyncGraphStepCount() error {
 	return nil
 }
 
+// NewAdamW keeps the flat-parameter entry point: every parameter shares one
+// implicit group named DefaultParameterGroupName with the given decay. Use
+// NewAdamWGroups for per-group learning-rate scales and weight decay.
 func NewAdamW(params []Parameter, lr, decay float32) *AdamW {
-	o := &AdamW{Params: params, LR: lr, WeightDecay: decay, Beta1: .9, Beta2: .999, Eps: 1e-8}
+	o, _ := newAdamW(params, lr, []ParameterGroupSpec{{Name: DefaultParameterGroupName, Params: params, WeightDecay: decay}})
+	return o
+}
+
+// NewAdamWGroups splits parameters into named groups. Specs must partition the
+// parameters exactly; each group carries its own weight decay and scales the
+// base learning rate, which schedulers still drive through LR.
+func NewAdamWGroups(params []Parameter, lr float32, specs []ParameterGroupSpec) (*AdamW, error) {
+	if len(specs) == 0 {
+		return nil, fmt.Errorf("autograd: NewAdamWGroups needs at least one parameter group")
+	}
+	return newAdamW(params, lr, specs)
+}
+
+func newAdamW(params []Parameter, lr float32, specs []ParameterGroupSpec) (*AdamW, error) {
+	groups, owner, err := resolveParameterGroups(params, specs)
+	if err != nil {
+		return nil, err
+	}
+	o := &AdamW{Params: params, LR: lr, Beta1: .9, Beta2: .999, Eps: 1e-8, groups: groups, groupOf: owner}
+	o.WeightDecay = groups[0].WeightDecay
 	if len(params) > 0 && params[0].Value.Device == tensor.CUDA {
 		o.unityGPU = mustAlloc(1)
 		setOne(o.unityGPU)
@@ -343,7 +370,14 @@ func NewAdamW(params []Parameter, lr, decay float32) *AdamW {
 			o.V = append(o.V, make([]float32, p.Value.Numel()))
 		}
 	}
-	return o
+	return o, nil
+}
+
+// groupDecay returns the group's effective step size and coupled decay.
+func (o *AdamW) groupScale(n int) (stepSize, decay float32) {
+	group := o.groups[o.groupOf[n]]
+	stepSize = o.LR * group.LRScale
+	return stepSize, stepSize * group.WeightDecay
 }
 func (o *AdamW) Step() {
 	if cuda.InCapture() {
@@ -356,9 +390,10 @@ func (o *AdamW) Step() {
 			if p.Value.gradBuf == nil {
 				continue
 			}
+			lr, decay := o.groupScale(i)
 			pp, gp, mp, vp := ptr(p.Value.buf), ptr(p.Value.gradBuf), ptr(o.mGPU[i]), ptr(o.vGPU[i])
 			n := int32(p.Value.Numel())
-			launch("graph_adamw", int(n), unsafe.Pointer(&pp), unsafe.Pointer(&gp), unsafe.Pointer(&mp), unsafe.Pointer(&vp), unsafe.Pointer(&step), unsafe.Pointer(&n), unsafe.Pointer(&o.Beta1), unsafe.Pointer(&o.Beta2), unsafe.Pointer(&o.LR), unsafe.Pointer(&o.WeightDecay), unsafe.Pointer(&o.Eps))
+			launch("graph_adamw", int(n), unsafe.Pointer(&pp), unsafe.Pointer(&gp), unsafe.Pointer(&mp), unsafe.Pointer(&vp), unsafe.Pointer(&step), unsafe.Pointer(&n), unsafe.Pointer(&o.Beta1), unsafe.Pointer(&o.Beta2), unsafe.Pointer(&lr), unsafe.Pointer(&decay), unsafe.Pointer(&o.Eps))
 		}
 		return
 	}
@@ -375,7 +410,8 @@ func (o *AdamW) Step() {
 			if p.Value.gradBuf == nil {
 				continue
 			}
-			if e := kernels.AdamWUpdate(p.Value.buf, p.Value.gradBuf, o.mGPU[n], o.vGPU[n], o.unityGPU, p.Value.Numel(), o.Beta1, o.Beta2, o.LR/bc1, bc2, o.LR*o.WeightDecay, o.Eps, math.MaxFloat32); e != nil {
+			stepSize, decay := o.groupScale(n)
+			if e := kernels.AdamWUpdate(p.Value.buf, p.Value.gradBuf, o.mGPU[n], o.vGPU[n], o.unityGPU, p.Value.Numel(), o.Beta1, o.Beta2, stepSize/bc1, bc2, decay, o.Eps, math.MaxFloat32); e != nil {
 				panic(e)
 			}
 			p.Value.invalidateBF16()
@@ -391,11 +427,12 @@ func (o *AdamW) Step() {
 		if len(p.Value.Grad) == 0 {
 			continue
 		}
+		stepSize, decay := o.groupScale(n)
 		for i, g := range p.Value.Grad {
 			o.M[n][i] = o.Beta1*o.M[n][i] + (1-o.Beta1)*g
 			o.V[n][i] = o.Beta2*o.V[n][i] + (1-o.Beta2)*g*g
-			p.Value.Data[i] *= 1 - o.LR*o.WeightDecay
-			p.Value.Data[i] -= o.LR * (o.M[n][i] / bc1) / (float32(math.Sqrt(float64(o.V[n][i]/bc2))) + o.Eps)
+			p.Value.Data[i] *= 1 - decay
+			p.Value.Data[i] -= stepSize * (o.M[n][i] / bc1) / (float32(math.Sqrt(float64(o.V[n][i]/bc2))) + o.Eps)
 		}
 		p.Value.storage.version.Add(1)
 	}

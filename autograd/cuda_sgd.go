@@ -94,6 +94,7 @@ func (o *SGD) stepGPU(captured bool) {
 		if o.options.Momentum > 0 {
 			bp, fp = ptr(o.bufferGPU[i]), ptr(o.initializedGPU[i])
 		}
+		lr, decay := o.groupScale(i)
 		n, nesterov, maximize := int32(v.Numel()), int32(0), int32(0)
 		if o.options.Nesterov {
 			nesterov = 1
@@ -102,7 +103,7 @@ func (o *SGD) stepGPU(captured bool) {
 			maximize = 1
 		}
 		launchSGD("sgd_update", v.Numel(), unsafe.Pointer(&pp), unsafe.Pointer(&gp), unsafe.Pointer(&bp), unsafe.Pointer(&fp), unsafe.Pointer(&n),
-			unsafe.Pointer(&o.LR), unsafe.Pointer(&o.options.Momentum), unsafe.Pointer(&o.options.Dampening), unsafe.Pointer(&o.options.WeightDecay), unsafe.Pointer(&nesterov), unsafe.Pointer(&maximize))
+			unsafe.Pointer(&lr), unsafe.Pointer(&o.options.Momentum), unsafe.Pointer(&o.options.Dampening), unsafe.Pointer(&decay), unsafe.Pointer(&nesterov), unsafe.Pointer(&maximize))
 		if o.options.Momentum > 0 {
 			launchSGD("sgd_mark", 1, unsafe.Pointer(&fp))
 		}

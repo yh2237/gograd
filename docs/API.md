@@ -24,6 +24,7 @@ use a separate `gograd-training-1` envelope.
 | `autograd` | `AdamW.State`, `LoadState`, `SaveSafeTensors`, `LoadSafeTensors`, `Close` | Named parameter shapes, moments, hyperparameters and step count on CPU/CUDA; release optimizer-owned buffers. |
 | `autograd` | `Optimizer`, `CheckpointOptimizer`, `OptimizerSnapshot`, `LearningRate`, `SetLearningRate` | Common eager update/reset/LR/lifetime API and typed AdamW/SGD checkpoint snapshots. OneCycle accepts Optimizer. |
 | `autograd` | `NewSGD`, `SGDOptions`, `SGD.State`, `SGDState`, `LoadState`, `SaveSafeTensors`, `LoadSafeTensors` | CPU/CUDA SGD, momentum/dampening, Nesterov, coupled decay, ascent and lazy momentum initialization/state resume. |
+| `autograd` | `ParameterGroupSpec`, `PartitionParameters`, `NewSGDGroups`, `NewAdamWGroups`, `OptimizerGroupState` | Named parameter groups with per-group learning-rate scale and weight decay for SGD/AdamW, plus recorded group membership in optimizer state. |
 | `autograd` | `SaveTrainingCheckpoint`, `LoadTrainingCheckpoint`, `TrainingCheckpointMetadata` | Atomic model/buffer + AdamW/SGD + OneCycle checkpoint with caller metadata. All names/shapes/state are validated before copying into live objects. |
 | `autograd` | `Module.Train`, `SetTraining` | Recursive train/eval propagation; `OnTrainingChange` connects stateful layers such as dropout to the module tree. |
 | `autograd` | `IndexLoader.State`, `LoadState`, `WindowSampler.Batch`, `State`, `LoadState` | Restorable epoch order or PCG random windows, including short-sequence padding/context-drop decisions. |
@@ -551,6 +552,58 @@ compare every parameter/buffer value, lazy-state roundtrips, checkpoint resume,
 legacy AdamW loading, saved-version checks and CUDA graph/BF16 cache behavior.
 Regenerate with `python tools/gen_sgd_fixture.py`.
 
+### Parameter groups
+
+`ParameterGroupSpec{Name, Params, LRScale, WeightDecay}` names one set of
+parameters sharing a learning-rate scale and a weight decay. `NewSGDGroups` and
+`NewAdamWGroups` take these specs; the flat `NewSGD`/`NewAdamW` constructors
+remain equivalent to one implicit group named `default`.
+
+```go
+specs, err := autograd.PartitionParameters(params, func(name string) string {
+    if strings.HasSuffix(name, ".bias") {
+        return "no_decay"
+    }
+    return "decay"
+})
+// Handle err.
+_ = err
+for i := range specs {
+    specs[i].WeightDecay = 1e-4
+}
+specs[0].WeightDecay = 0 // the bias group keeps the first label's zero decay
+optimizer, err := autograd.NewSGDGroups(params, options, specs)
+```
+
+- Specs must partition the parameters exactly: every parameter belongs to one
+  group, no parameter appears twice, names are unique and nonempty, and each
+  group is nonempty. Constructor-time violations return errors.
+- `LRScale` multiplies the optimizer base learning rate, so `OneCycle` and
+  `SetLearningRate` still drive every group from one rate. It must be finite and
+  nonnegative; zero selects the unscaled base rate. WeightDecay is the group's
+  own absolute decay. Both are recorded in `AdamWState.Groups`/`SGDState.Groups`
+  as ordered `OptimizerGroupState` entries with each group's parameter names.
+- `NewAdamWGroups(params, lr, specs)` takes no base decay. `NewSGDGroups(params,
+  options, specs)` keeps momentum/dampening/Nesterov/Maximize shared and rejects
+  a nonzero `options.WeightDecay`, so decay is always set per group. The exported
+  `AdamW.WeightDecay` field and the state's base `WeightDecay`/`Options.WeightDecay`
+  mirror the first group's decay.
+- Loading validates group count, names, membership, scale and decay before
+  touching live state. State written before groups existed has no group list and
+  only loads into an optimizer with one unscaled group, taking its decay from the
+  saved base hyperparameters. A grouped state is rejected by a flat optimizer and
+  vice versa, so checkpoints keep their training semantics.
+- CUDA applies each group's step size and decay in its own kernel arguments;
+  captured graphs bake the base rate and group scales at capture time, then diverge
+  from eager updates after a scheduler changes the base rate.
+
+Committed PyTorch parameter-group fixtures cover SGD and AdamW with two groups at
+different learning rates and decays, including absent and zero gradients. Go
+tests compare every parameter, momentum/moment value and group record on CPU and
+CUDA, plus state roundtrips, layout reuse, combined-checkpoint resume, scheduler
+scaling and CUDA graph replay. Regenerate with
+`python tools/gen_param_groups_fixture.py`.
+
 ## Generic host data and batching
 
 The `data` package has no tensor/backend dependency. `Dataset[T]` exposes
@@ -725,7 +778,11 @@ defaults to .005 for AdamW or .1 for SGD); `-momentum` defaults to .9 for SGD an
 `-nesterov` enables its Nesterov variant. Coupled/decoupled decay is .0001 in
 this example. Optimizer selection/rate/momentum/Nesterov are checkpoint identity;
 changing them on resume is rejected. Old MNIST AdamW metadata is recognized
-with its original .005 peak/default settings.
+with its original .005 peak/default settings. `-no-decay-suffix` (default `bias`,
+empty disables) moves matching parameters into a zero-decay group; it is
+checkpoint identity too, so resuming a checkpoint written with a different value
+is rejected. Checkpoints written before groups existed have no suffix recorded
+and require the empty value to resume.
 
 Training state includes model, AdamW moments or SGD momentum/options, OneCycle and loader
 state, plus full dataset fingerprints and effective subset sizes/seed/batch config.

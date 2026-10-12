@@ -21,6 +21,9 @@ type OptimizerState struct {
 	Names                              []string
 	Shapes                             [][]int
 	LR, WeightDecay, Beta1, Beta2, Eps float32
+	// Groups records the parameter groups. Legacy state written before groups
+	// existed leaves this empty and keeps a single ungrouped configuration.
+	Groups []OptimizerGroupState
 }
 
 const (
@@ -50,6 +53,7 @@ func (o *AdamW) State() (OptimizerState, error) {
 		state.Names = append(state.Names, p.Name)
 		state.Shapes = append(state.Shapes, slices.Clone(p.Value.Shape))
 	}
+	state.Groups = groupStates(o.groups, state.Names)
 	if len(o.mGPU) > 0 {
 		for i, p := range o.Params {
 			n := p.Value.Numel()
@@ -108,6 +112,11 @@ func (o *AdamW) LoadState(state OptimizerState) error {
 	}
 	o.StepCount = state.StepCount
 	o.LR, o.WeightDecay, o.Beta1, o.Beta2, o.Eps = state.LR, state.WeightDecay, state.Beta1, state.Beta2, state.Eps
+	groups, err := validateGroupStates(o.groups, parameterNames(o.Params), state.Groups, state.WeightDecay)
+	if err != nil {
+		return err
+	}
+	o.groups, o.groupOf, o.WeightDecay = groups, groupIndexOf(groups, len(o.Params)), groups[0].WeightDecay
 	if o.graphStep != nil {
 		step := int32(state.StepCount)
 		if err := o.graphStep.CopyFromHost(unsafe.Slice((*byte)(unsafe.Pointer(&step)), 4)); err != nil {
@@ -230,6 +239,9 @@ func (o *AdamW) validateState(state OptimizerState) error {
 	}
 	if state.LR < 0 || state.WeightDecay < 0 || state.Beta1 < 0 || state.Beta1 >= 1 || state.Beta2 < 0 || state.Beta2 >= 1 || state.Eps <= 0 {
 		return fmt.Errorf("autograd: invalid optimizer configuration")
+	}
+	if _, err := validateGroupStates(o.groups, parameterNames(o.Params), state.Groups, state.WeightDecay); err != nil {
+		return err
 	}
 	for i, p := range o.Params {
 		n := p.Value.Numel()

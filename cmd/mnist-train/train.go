@@ -55,6 +55,7 @@ type runIdentity struct {
 	Optimizer                                   string
 	MaxLR, Momentum                             float64
 	Nesterov                                    bool
+	NoDecaySuffix                               string
 }
 type checkpointState struct {
 	Identity runIdentity
@@ -178,13 +179,8 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 		return stats, err
 	}
 	defer loader.Close()
-	identity := runIdentity{Version: 1, Steps: c.Steps, Batch: c.Batch, TrainSize: trainData.Len(), ValidSize: validData.Len(), Seed: c.Seed, TrainFingerprint: trainHash, ValidFingerprint: validHash, Optimizer: c.Optimizer, MaxLR: c.MaxLR, Momentum: c.Momentum, Nesterov: c.Nesterov}
+	identity := runIdentity{Version: 1, Steps: c.Steps, Batch: c.Batch, TrainSize: trainData.Len(), ValidSize: validData.Len(), Seed: c.Seed, TrainFingerprint: trainHash, ValidFingerprint: validHash, Optimizer: c.Optimizer, MaxLR: c.MaxLR, Momentum: c.Momentum, Nesterov: c.Nesterov, NoDecaySuffix: c.NoDecaySuffix}
 	schedule := autograd.NewOneCycle(c.MaxLR, c.Steps, .3)
-	optimizer, err := newTrainingOptimizer(m.module.NamedParameters(), c, float32(schedule.LR()))
-	if err != nil {
-		return stats, err
-	}
-	defer optimizer.Close()
 	if c.Resume != "" {
 		metadata, err := autograd.TrainingCheckpointMetadata(c.Resume)
 		if err != nil {
@@ -197,6 +193,8 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 		if state.Identity.Version == 1 && state.Identity.Optimizer == "" {
 			state.Identity.Optimizer = "adamw"
 			state.Identity.MaxLR = .005
+			// Older checkpoints predate parameter groups.
+			state.Identity.NoDecaySuffix, c.NoDecaySuffix, identity.NoDecaySuffix = "", "", ""
 		}
 		if state.Identity != identity {
 			return stats, fmt.Errorf("checkpoint does not match data/configuration")
@@ -204,6 +202,13 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 		if err := loader.LoadState(state.Loader); err != nil {
 			return stats, err
 		}
+	}
+	optimizer, err := newTrainingOptimizer(m.module.NamedParameters(), c, float32(schedule.LR()))
+	if err != nil {
+		return stats, err
+	}
+	defer optimizer.Close()
+	if c.Resume != "" {
 		if _, err := autograd.LoadTrainingCheckpoint(c.Resume, &m.module, optimizer, schedule); err != nil {
 			return stats, err
 		}
@@ -321,10 +326,36 @@ func trainingStep(m *digitModel, execution *autograd.ExecutionContext, optimizer
 }
 
 func newTrainingOptimizer(params []autograd.Parameter, c trainConfig, lr float32) (autograd.CheckpointOptimizer, error) {
-	if c.Optimizer == "sgd" {
-		return autograd.NewSGD(params, autograd.SGDOptions{LR: lr, Momentum: float32(c.Momentum), Nesterov: c.Nesterov, WeightDecay: .0001})
+	decay := float32(.0001)
+	options := autograd.SGDOptions{LR: lr, Momentum: float32(c.Momentum), Nesterov: c.Nesterov}
+	if c.NoDecaySuffix != "" {
+		// Biases and similar parameters get their own group without decay, which
+		// is the common reason to need groups in the first place.
+		specs, err := autograd.PartitionParameters(params, func(name string) string {
+			if strings.HasSuffix(name, c.NoDecaySuffix) {
+				return "no_decay"
+			}
+			return "decay"
+		})
+		if err != nil {
+			return nil, err
+		}
+		for i := range specs {
+			if specs[i].Name == "no_decay" {
+				specs[i].WeightDecay = 0
+			} else {
+				specs[i].WeightDecay = decay
+			}
+		}
+		if c.Optimizer == "sgd" {
+			return autograd.NewSGDGroups(params, options, specs)
+		}
+		return autograd.NewAdamWGroups(params, lr, specs)
 	}
-	return autograd.NewAdamW(params, lr, .0001), nil
+	if c.Optimizer == "sgd" {
+		return autograd.NewSGD(params, autograd.SGDOptions{LR: lr, Momentum: float32(c.Momentum), Nesterov: c.Nesterov, WeightDecay: decay})
+	}
+	return autograd.NewAdamW(params, lr, decay), nil
 }
 func evaluate(ctx context.Context, m *digitModel, execution *autograd.ExecutionContext, dataset data.Dataset[data.FloatSample], batchSize, workers, prefetch int, device tensor.Device) (float64, float64, []float32, error) {
 	sampler, err := data.NewIndexSampler(dataset.Len(), data.SamplerOptions{})

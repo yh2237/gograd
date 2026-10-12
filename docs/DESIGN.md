@@ -345,6 +345,34 @@ host state readback; eager continuation synchronizes the step count. Eager
 mutations invalidate shared-storage versions/BF16 shadows. Capture/replay and
 state replacement follow existing allocation/thread/opaque-mutation contracts.
 
+Parameter groups reuse that structure instead of changing it. A spec partitions
+the flat parameter slice into named groups, each with a learning-rate scale and
+its own weight decay; resolution stores the group index per parameter, so Step
+looks up one group instead of a single global configuration. The base learning
+rate stays the single scheduler target, and group scales express relative rates,
+which keeps OneCycle/SetLearningRate working without group awareness. AdamW needs
+no extra state for this because its bias correction uses the shared step counter;
+CUDA passes the per-group step size and decay as kernel arguments, and captured
+graphs therefore bake the scales at capture time.
+
+Group membership is persisted as ordered parameter-name lists rather than raw
+indices. Restore compares group count, names and membership against the live
+optimizer before copying anything, so a checkpoint cannot silently move a
+parameter into a different group. State written before groups existed has no
+group list, and the legacy path accepts it only for one unscaled live group while
+taking the decay from the saved base hyperparameters; a grouped optimizer rejects
+it and vice versa. Group state lives in the same JSON configuration blob as the
+other hyperparameters, so standalone and combined checkpoints share one decode
+path.
+
+AdamW keeps one optimizer-level step counter, matching how its moments, scheduler
+and CUDA graph step already work. PyTorch instead advances a per-parameter step
+only when that parameter receives a gradient, so bias correction can differ when a
+gradient is absent. Committed AdamW parity fixtures therefore give every parameter
+a gradient each step; absent-gradient moments are still skipped exactly as
+PyTorch does. This difference is documented rather than hidden by relaxing
+tolerances.
+
 The MNIST loop selects AdamW or SGD through the common API and stores optimizer
 identity/options with loader metadata. Both paths have uninterrupted-vs-resumed
 weight, buffer, schedule and data-order tests. With the same 2,000 training/1,000
@@ -352,7 +380,10 @@ test examples, seed 7, batch 64 and 100 updates, SGD momentum .9 + Nesterov with
 OneCycle peak .1 reached 85.2% test accuracy and loss 0.479619 on CPU/CUDA. CPU
 stopped at 40 and resumed with different worker settings; reload-logit difference
 was zero on both. This is another training/state exercise, not an optimizer
-comparison benchmark.
+comparison benchmark. With `-no-decay-suffix bias` the same run puts the bias
+parameters in a zero-decay group, records the suffix as checkpoint identity, and
+again matched CPU/CUDA at 85.2% accuracy with 0.479656 loss; the legacy
+ungrouped checkpoint still resumes when the example is run with an empty suffix.
 
 ## Migration and phases
 

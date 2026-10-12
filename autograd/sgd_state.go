@@ -17,6 +17,9 @@ type SGDState struct {
 	Options     SGDOptions
 	Initialized []bool
 	Buffers     [][]float32
+	// Groups records the parameter groups. Legacy state written before groups
+	// existed leaves this empty and keeps a single ungrouped configuration.
+	Groups []OptimizerGroupState
 }
 
 const sgdStateFormat = "gograd-sgd"
@@ -59,6 +62,7 @@ func (o *SGD) State() (SGDState, error) {
 			}
 		}
 	}
+	s.Groups = groupStates(o.groups, s.Names)
 	return s, nil
 }
 func (o *SGD) validateState(s SGDState) error {
@@ -88,6 +92,9 @@ func (o *SGD) validateState(s SGDState) error {
 				return fmt.Errorf("autograd: non-finite SGD momentum")
 			}
 		}
+	}
+	if _, err := validateGroupStates(o.groups, parameterNames(o.Params), s.Groups, s.Options.WeightDecay); err != nil {
+		return err
 	}
 	return nil
 }
@@ -128,6 +135,12 @@ func (o *SGD) LoadState(s SGDState) error {
 	o.initialized = slices.Clone(s.Initialized)
 	o.options = s.Options
 	o.LR = s.Options.LR
+	groups, err := validateGroupStates(o.groups, parameterNames(o.Params), s.Groups, s.Options.WeightDecay)
+	if err != nil {
+		return err
+	}
+	o.groups, o.groupOf = groups, groupIndexOf(groups, len(o.Params))
+	o.options.WeightDecay = groups[0].WeightDecay
 	o.StepCount = s.StepCount
 	if o.graphStep != nil {
 		return o.PrepareGraph()

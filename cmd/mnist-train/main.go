@@ -19,6 +19,7 @@ type trainConfig struct {
 	MaxLR                                           float64
 	Momentum                                        float64
 	Nesterov                                        bool
+	NoDecaySuffix                                   string
 	Seed                                            uint64
 	Download                                        bool
 }
@@ -40,6 +41,7 @@ func main() {
 	flag.Float64Var(&c.MaxLR, "lr", 0, "OneCycle peak LR (0: .005 AdamW, .1 SGD)")
 	flag.Float64Var(&c.Momentum, "momentum", .9, "SGD momentum")
 	flag.BoolVar(&c.Nesterov, "nesterov", false, "SGD Nesterov momentum")
+	flag.StringVar(&c.NoDecaySuffix, "no-decay-suffix", "bias", "parameter-name suffix moved to a zero-decay group (\"\": off)")
 	flag.IntVar(&c.TrainLimit, "train-limit", 0, "first N training examples (0: all)")
 	flag.IntVar(&c.ValidLimit, "valid-limit", 0, "first N test examples for evaluation (0: all)")
 	flag.Uint64Var(&c.Seed, "seed", 7, "model and shuffle seed")

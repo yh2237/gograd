@@ -39,6 +39,8 @@ type SGD struct {
 	initialized               []bool
 	bufferGPU, initializedGPU []*cuda.Buffer
 	graphStep                 *cuda.Buffer
+	groups                    []ParameterGroup
+	groupOf                   []int
 	closed                    bool
 }
 
@@ -68,14 +70,45 @@ func validateSGDParameters(params []Parameter) error {
 	return nil
 }
 
+// NewSGD keeps the flat-parameter entry point: every parameter shares one
+// implicit group named DefaultParameterGroupName. Use NewSGDGroups for
+// per-group learning-rate scales and weight decay.
 func NewSGD(params []Parameter, options SGDOptions) (*SGD, error) {
+	return newSGD(params, options, nil)
+}
+
+// NewSGDGroups splits parameters into named groups. Specs must partition the
+// parameters exactly; each group carries its own weight decay and scales the
+// base learning rate. Momentum/dampening/Nesterov/ascent stay shared, so set the
+// decay on the groups rather than in options.WeightDecay.
+func NewSGDGroups(params []Parameter, options SGDOptions, specs []ParameterGroupSpec) (*SGD, error) {
+	if len(specs) == 0 {
+		return nil, fmt.Errorf("autograd: NewSGDGroups needs at least one parameter group")
+	}
+	if options.WeightDecay != 0 {
+		return nil, fmt.Errorf("autograd: set weight decay on the parameter groups, not SGDOptions")
+	}
+	return newSGD(params, options, specs)
+}
+
+func newSGD(params []Parameter, options SGDOptions, specs []ParameterGroupSpec) (*SGD, error) {
 	if err := options.validate(); err != nil {
 		return nil, err
 	}
 	if err := validateSGDParameters(params); err != nil {
 		return nil, err
 	}
-	o := &SGD{Params: slices.Clone(params), LR: options.LR, options: options, buffers: make([][]float32, len(params)), initialized: make([]bool, len(params))}
+	groups, owner, err := resolveParameterGroups(params, specs)
+	if err != nil {
+		return nil, err
+	}
+	if len(specs) == 0 {
+		groups[0].WeightDecay = options.WeightDecay
+	} else {
+		options.WeightDecay = groups[0].WeightDecay
+	}
+	o := &SGD{Params: slices.Clone(params), LR: options.LR, options: options, groups: groups, groupOf: owner,
+		buffers: make([][]float32, len(params)), initialized: make([]bool, len(params))}
 	if len(params) > 0 && params[0].Value.Device == tensor.CUDA && options.Momentum > 0 {
 		var err error
 		o.bufferGPU, o.initializedGPU, err = sgdDeviceStorage(params)
@@ -85,6 +118,12 @@ func NewSGD(params []Parameter, options SGDOptions) (*SGD, error) {
 		}
 	}
 	return o, nil
+}
+
+// groupScale returns one parameter's effective step size and coupled decay.
+func (o *SGD) groupScale(index int) (stepSize, decay float32) {
+	group := o.groups[o.groupOf[index]]
+	return o.LR * group.LRScale, group.WeightDecay
 }
 func (o *SGD) LearningRate() float32 { return o.LR }
 func (o *SGD) SetLearningRate(lr float32) {
@@ -103,6 +142,9 @@ func (o *SGD) validateOpen() error {
 	}
 	if len(o.buffers) != len(o.Params) || len(o.initialized) != len(o.Params) {
 		return fmt.Errorf("autograd: SGD parameter storage count changed")
+	}
+	if len(o.groups) == 0 || len(o.groupOf) != len(o.Params) {
+		return fmt.Errorf("autograd: SGD parameter group configuration is incomplete")
 	}
 	if len(o.Params) > 0 && o.Params[0].Value != nil && o.Params[0].Value.Device == tensor.CUDA && o.options.Momentum > 0 && (len(o.bufferGPU) != len(o.Params) || len(o.initializedGPU) != len(o.Params)) {
 		return fmt.Errorf("autograd: incomplete SGD device storage")
@@ -150,6 +192,7 @@ func (o *SGD) Step() {
 			continue
 		}
 		first := !o.initialized[index]
+		lr, decay := o.groupScale(index)
 		if o.options.Momentum > 0 && first {
 			o.buffers[index] = make([]float32, v.Numel())
 		}
@@ -157,7 +200,7 @@ func (o *SGD) Step() {
 			if o.options.Maximize {
 				g = -g
 			}
-			g += float32(o.options.WeightDecay * v.Data[i])
+			g += decay * v.Data[i]
 			if o.options.Momentum > 0 {
 				if first {
 					o.buffers[index][i] = g
@@ -170,7 +213,7 @@ func (o *SGD) Step() {
 					g = o.buffers[index][i]
 				}
 			}
-			v.Data[i] -= float32(o.LR * g)
+			v.Data[i] -= float32(lr * g)
 		}
 		if o.options.Momentum > 0 {
 			o.initialized[index] = true
