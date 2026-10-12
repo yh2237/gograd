@@ -1,600 +1,136 @@
-# General tensor and autograd design
+# テンソルと自動微分の設計
 
-## Contract and current slice
+## 対象範囲
 
-`autograd` is a define-by-run float32 graph. A tensor has a logical shape,
-strides, a storage offset, a device, data or a CUDA buffer, an optional
-accumulated gradient, and a backward closure. Reshape, transpose, permute,
-slice, and expand create shared-storage views; `Contiguous` materializes one
-when a kernel requires row-major data. CUDA graph values,
-gradients, optimizer moments and clipped gradients remain in device buffers.
-Training uploads inputs and reads the scalar loss. Parity tests and explicit
-state export also read tensors back for inspection.
+`autograd`はdefine-by-runのfloat32グラフです。テンソルは論理形状、stride、ストレージのオフセット、device、データまたはCUDAバッファ、任意の蓄積勾配、backwardのクロージャを持ちます。Reshape、transpose、permute、slice、expandは共有ストレージのviewを作り、カーネルがrow-majorのデータを必要とすると`Contiguous`が実体化します。CUDAのグラフの値、勾配、optimizerのモーメント、クリップした勾配はデバイスバッファに留まります。学習は入力をアップロードし、スカラーの損失を読み取ります。照合テストと明示的なstateの書き出しも、確認のためにテンソルを読み戻します。
 
-The public design uses `Tensor{Shape, Strides, DType, Device}` with CPU slices
-or CUDA buffers. `Backward` returns CUDA intermediates to the allocation
-pool; `ReleaseGraph` releases CPU intermediates for reuse and also frees
-unused CUDA inference graphs. Tensor/view allocations now have shared storage
-leases, and graph edges have independent dependency counts. A Close request is
-deferred internally while a child still needs a closed ancestor's values;
-ReleaseGraph defers reclaiming shared nodes until their last dependent is done.
-RetainData/RetainGrad can keep a view's allocation without keeping its base
-history. Chained views may still materialize their parent. Dtypes start with float32,
-then add float16 and bfloat16 compute with float32 accumulation and int64
-indices. Operators must reject mixed devices and unsupported dtype pairs.
-Operators accept non-contiguous inputs by materializing them before kernel
-dispatch. Views keep their base storage alive.
+公開する設計は`Tensor{Shape, Strides, DType, Device}`で、CPUのスライスかCUDAバッファを持ちます。`Backward`はCUDAの中間値を割当プールへ戻し、`ReleaseGraph`はCPUの中間値を再利用のために解放し、未使用のCUDAの推論グラフも解放します。テンソルとviewの割当は共有ストレージのleaseを持ち、グラフの辺は独立した依存数を持ちます。子がcloseした先祖の値をまだ必要とする間は、Closeの要求を内部で遅らせます。ReleaseGraphは共有ノードの回収を、最後の依存が終わるまで遅らせます。RetainData/RetainGradは、ベースの履歴を保たずにviewの割当を保てます。連鎖したviewは親を実体化することがあります。dtypeは現在float32で、演算はdeviceの混在と未対応のdtypeの組を拒否します。演算は非連続の入力を受け取り、カーネルへdispatchする前に実体化します。viewはベースのストレージを生かし続けます。
 
-## Graph and operators
+## グラフと演算
 
-Each op records its parents and a vector-Jacobian product when recording is
-enabled. Backward topologically traverses the graph in reverse, accumulating
-all contributions to leaves. Intermediate gradients are discarded unless
-`RetainGrad` is called. `Detach` returns data without history and preserves
-execution context identity. `ExecutionContext` isolates recording for bound
-tensors; `New`/`Zeros` on the context bind inputs, and `BindModule` binds every
-registered parameter/buffer before a forward. Operators and shared-storage
-views inherit the context, and reject combinations of distinct explicit
-contexts. NoGrad uses an atomic per-context scope depth, so nesting and panics
-restore correctly and separate contexts do not affect one another.
+各演算は、記録が有効なときに親とvector-Jacobian積を記録します。Backwardはグラフを逆順にたどり、末端への全ての寄与を蓄積します。中間の勾配は`RetainGrad`を呼ばない限り捨てます。`Detach`は履歴なしのデータを返し、実行コンテキストの同一性を保ちます。`ExecutionContext`はbindしたテンソルの記録を分離し、コンテキストの`New`/`Zeros`が入力をbindし、`BindModule`はforwardの前に登録済みの全パラメータとバッファをbindします。演算と共有ストレージのviewはコンテキストを継承し、異なる明示的コンテキストの組み合わせを拒否します。NoGradはコンテキストごとのアトミックなスコープ深さを使うため、入れ子とpanicが正しく復帰し、別々のコンテキストが互いに影響しません。
 
-ExecutionOptions adds context-local BF16 precision and attention selection.
-A context's zero value means FP32/auto, independent of the compatibility
-globals. Options are copied under a per-context mutex; SetOptions validates
-before changing state. Autocast temporarily changes precision and restores it
-after nesting/panics. CUDA GEMM nodes capture the option value in their backward
-closures, keeping operand preparation and backward dispatch consistent after
-a scope exits or policy changes. Attention selects its implementation in
-forward and retains that implementation's derivative closure. CUDA capture
-records the chosen kernels; replay does not resolve Go-side options again.
-Scopes affect the whole context, and a multi-op model forward is not an atomic
-policy transaction: configure between forwards and use separate contexts for
-independent workers.
+`ExecutionOptions`はコンテキストごとのBF16の精度とアテンションの選択を追加します。コンテキストのゼロ値は、互換用のグローバル設定とは関係なくFP32/autoです。オプションはコンテキストごとのmutexの下でコピーし、`SetOptions`は状態を変える前に検証します。`Autocast`は一時的に精度を変え、入れ子とpanicの後に復元します。CUDAのGEMMノードはbackwardのクロージャにオプションの値を記録するため、scopeを抜けた後や方針を変えた後も、オペランドの準備とbackwardのdispatchが一致します。アテンションはforwardで実装を選び、その実装の導関数のクロージャを保ちます。CUDAのcaptureは選んだカーネルを記録し、再生時にGo側のオプションを再度解決しません。scopeはコンテキスト全体に効き、複数演算のモデルのforwardはアトミックな方針のトランザクションではありません。forwardの合間に設定し、独立したworkerには別々のコンテキストを使います。
 
-The package-level API retains a shared default scope for unbound tensors.
-Fully isolated execution needs bound parameters too: a parameter-only
-subexpression such as an embedding or weight view must not enter the default
-scope before meeting a bound input. `cmd/cnn-train` exercises this migration.
-Inference results keep their lifetime parents for reclamation, but have no
-derivative callbacks. The context does not yet own storage or CUDA streams and
-does not synchronize mutation of shared tensors/optimizers. Storage versions
-now track CopyFrom and eager optimizer writes across aliases; backward checks
-operand/output snapshots before changing gradients. Raw CPU slice or CUDA
-buffer writes/captured replay do not update those host-side versions.
+パッケージのAPIは、bindしていないテンソル向けに共有の既定スコープを保ちます。完全に分離した実行にはパラメータのbindも必要で、embeddingや重みのviewのようなパラメータだけの部分式が、bindした入力と出会う前に既定スコープへ入ってはいけません。`cmd/cnn-train`がこの使い方を示します。推論の結果は回収のために寿命の親を保ちますが、導関数のコールバックを持ちません。コンテキストはストレージやCUDAのstream、割当プールをまだ所有せず、共有テンソルやoptimizerの変更を同期しません。ストレージのversionはCopyFromとeagerなoptimizerの書き込みを別名も含めて追跡し、backwardは勾配を変える前にオペランドと出力のスナップショットを検証します。CPUスライスへの直接の書き込みと、CUDAバッファへの書き込みや記録した再生は、このホスト側のversionを更新しません。
 
-Default backward consumes saved history. BackwardWithOptions can retain it for
-another loss/pass; intermediate adjoints are fresh each time and leaf gradients
-accumulate. Saved im2col, normalization statistics, masks/targets and index
-buffers outlive their source handles as needed. CUDA nodes being visited by
-backward are protected from disposal until their callbacks finish, so completed
-children can drop edges without reclaiming an ancestor still awaiting backward.
-Data retention and history retention are separate. Explicit graph release is
-still required for inference and retained histories; abandoned graphs are not
-automatically managed by Go GC.
+既定のbackwardは保存した履歴を消費します。`BackwardWithOptions`は別の損失や実行のために履歴を保てます。中間のadjointは毎回新しく、末端の勾配は蓄積します。保存したim2col、正規化の統計、マスクとtarget、indexバッファは、必要に応じて元のハンドルより長く生きます。backwardが訪れているCUDAノードは、コールバックが終わるまで破棄から守られます。そのため完了した子は辺を外しても、backwardを待っている先祖を回収しません。データの保持と履歴の保持は別です。推論とretainした履歴には明示的なグラフの解放が必要で、放棄したグラフはGoのGCでは管理されません。
 
-The operation registry names the CPU and CUDA implementation of every public
-differentiable operator and selects its backend. An AST test inventories these
-operators and requires a registry entry and a dispatch call in each public
-entry point. A mutation check confirmed the test fails when a dispatch is
-removed. The current table selects by operation and device; callable kernels
-keyed by dtype and layout remain future work. CPU uses blocked SGEMM with a
-runtime-selected AVX2/FMA 8x8 microkernel (4x8 with `GOGRAD_SGEMM_8X8=0`)
-and pure Go fallback; CPU elementwise
-ops and reductions use multiple cores, and size pools reuse buffers. CUDA
-Conv1d uses im2col/col2im plus cuBLAS SGEMM. Regular batched matmul and its
-gradients use cuBLAS strided-batched GEMM; broadcast weight gradients flatten
-the batch into one GEMM. Irregular batches retain a loop fallback. NVRTC kernels implement
-elementwise broadcasting, shape transforms, embedding, reductions,
-normalization, masked losses, softmax, cross-entropy, dropout, and clipping.
-CUDA N-D indexing supports ranks through six for broadcasting, reduction,
-and views. The CUDA driver context is tied to
-an OS thread, so callers hold `NewCUDAContext` through the training step.
-`NewCUDAContextOn` selects and validates a device; the context records the
-thread's previous device and restores it on `Close`, so a goroutine later
-scheduled onto the same OS thread does not inherit this run's device.
+opレジストリは、公開する微分可能な演算ごとにCPUとCUDAの実装を名付け、バックエンドを選びます。ASTのテストはこれらの演算を棚卸しし、公開の入口ごとにレジストリの項目とdispatchの呼び出しを要求します。dispatchを削るとテストが失敗することは、変更によって確認済みです。現在の表は演算とdeviceで選びます。CPUは、AVX2/FMAの8x8マイクロカーネル（`GOGRAD_SGEMM_8X8=0`で4x8）を実行時に選ぶブロックSGEMMと、純Goのフォールバックを使います。CPUの要素ごとの演算とreductionは複数のコアを使い、サイズごとのプールがバッファを再利用します。CUDAのConv1dはim2col/col2imとcuBLASのSGEMMを使います。通常のバッチmatmulとその勾配はcuBLASのstrided-batched GEMMを使い、ブロードキャストする重みの勾配はバッチを1つのGEMMへ平坦化します。不規則なバッチはループのフォールバックを保ちます。NVRTCのカーネルは、要素ごとのブロードキャスト、形状変換、embedding、reduction、正規化、マスク付き損失、softmax、cross-entropy、dropout、クリップを実装します。CUDAのN次元indexはrank 6までのブロードキャスト、reduction、viewに対応します。CUDAドライバのコンテキストはOSスレッドに紐づくため、呼び出し側は学習ステップの間`NewCUDAContext`を保持します。`NewCUDAContextOn`はdeviceを選んで検証し、そのスレッドの以前のdeviceを記録して`Close`で復元するため、後で同じOSスレッドに割り当てられたgoroutineがこの実行のdeviceを引き継ぎません。
 
-The implicit current stream and the capture flag are per OS thread rather than
-process-wide, matching how the driver scopes its own current context. Independent
-goroutines that each lock a thread therefore keep separate implicit streams and
-cannot corrupt each other's capture, and `Capture` rejects a nested capture on the
-same thread instead of silently re-entering. A capture records the current device
-without changing it, and graph replay re-selects that device around
-`cuGraphLaunch`. Captured graphs reserve their temporary pool allocations until
-`Graph.Close`, and cuBLAS is bound to the capture stream. Overlapping independent
-streams inside one training step remain unimplemented.
+暗黙のカレントstreamとcaptureのフラグは、プロセス共有ではなくOSスレッド単位です。これはドライバが自身のカレントコンテキストを扱う単位に合わせています。それぞれがスレッドを固定した独立のgoroutineは、別々の暗黙のstreamを保ち、互いのcaptureを壊しません。`Capture`は同じスレッドでの入れ子を、黙って再入するのではなく拒否します。captureは現在のdeviceを変更せずに記録し、グラフの再生は`cuGraphLaunch`の周囲でそのdeviceを再選択します。記録したグラフは一時的なプールの割当を`Graph.Close`まで予約し、cuBLASはcaptureのstreamに束ねます。1回の学習ステップの中で独立したstreamを重ねることは、現状では扱っていません。
 
-The CUDA pool rounds requests into size classes (256 B, 4 KiB,
-64 KiB or 1 MiB alignment by size), caches at most 2 GiB by default, and
-evicts least-recently-used cached buffers above that limit. `MemoryStats`
-reports active, cached and driver-reserved bytes and their peaks;
-`SetPoolCacheLimit` can lower the cap, and `ReleasePool` frees cached memory.
-Graph-reserved pointers are removed from the ordinary cache until graph close.
-Pool entries are keyed by device as well as size class, and `Buffer` records its
-own device, so copies, memset and free select the owning device and restore the
-caller's device instead of assuming device 0.
+CUDAのプールは要求をサイズクラス（256 B、4 KiB、64 KiB、または大きさに応じて1 MiBの区切り）へ丸め、既定で最大2 GiBをキャッシュし、それを超えると最も長く使われていないバッファを追い出します。`MemoryStats`は使用中、キャッシュ、ドライバが予約したバイト数とそれぞれのピークを返します。`SetPoolCacheLimit`は上限を下げ、`ReleasePool`はキャッシュを解放します。グラフが予約したポインタは、グラフをcloseするまで通常のキャッシュから外します。プールの項目はサイズクラスだけでなくdeviceでも分け、`Buffer`が自身のdeviceを記録するため、コピー、memset、freeはdevice 0を仮定せず、所有するdeviceを選んで呼び出し側のdeviceを復元します。
 
-Warp reductions fuse softmax forward and backward. The materialized attention path
-uses batched QK and PV GEMMs around fused masked scale/softmax forward and
-backward kernels. Layer norm has direct fused row kernels, and the encoder's
-feed-forward path fuses bias with GELU and residual addition on CUDA when
-dropout is zero. Optional tiled attention uses online softmax, stores only the
-output and row statistics, and recomputes scores in backward. It supports an
-additive mask and avoids the quadratic score buffer. The current CUDA tiles
-trade substantial time for memory; automatic selection uses the tiled path
-only when estimated score scratch reaches 1 GiB. BF16 autocast caches GEMM
-operands and carries BF16 shadows through eligible views and fused pointwise
-kernels. GEMMEx accumulates into FP32; weights and optimizer moments remain
-FP32. This mode and attention selection belong to ExecutionOptions for bound
-tensors; only the compatibility API uses process-wide switches. CPU, Conv2d
-and tiled flash attention currently stay FP32. Full BF16 tensor storage and
-dtype-aware dispatch remain future work.
+warpのreductionはsoftmaxのforwardとbackwardを融合します。実体化するアテンション経路は、融合したマスク付きscale/softmaxのforward・backwardカーネルの周囲で、バッチ化したQKとPVのGEMMを使います。layer normは行ごとの融合カーネルを持ち、encoderのfeed-forwardはdropoutが0のときCUDAでbias、GELU、残差加算を融合します。任意のtiledアテンションはonline softmaxを使い、出力と行ごとの統計だけを保存し、backwardでスコアを再計算します。加算的なマスクに対応し、二次のスコアバッファを避けます。現在のCUDAのタイルは、速度を大きく犠牲にしてメモリを節約します。自動選択は、スコアのscratchの見積もりが1 GiBに達したときだけtiled経路を使います。BF16 autocastはGEMMのオペランドをキャッシュし、対象になるviewと融合したpointwiseカーネルを通してBF16のシャドウを保ちます。GEMMExはFP32で累積し、重みとoptimizerのモーメントはFP32のままです。このモードとアテンションの選択は、bindしたテンソルでは`ExecutionOptions`に属し、互換APIだけがプロセス共有のスイッチを使います。CPU、Conv2d、tiled flash attentionはFP32のままです。
 
-Broadcasting aligns dimensions from the right. Each pair must match or one
-dimension must be 1. Backward sums over expanded dimensions. Matmul applies
-this to batch dimensions, with the last two dimensions as matrices. Reduction
-axes are explicit and removed from output shape; scalar output has shape
-`[]`. Concat and slice use zero-based axes and half-open slice bounds.
-Embedding backward scatter-adds repeated indices and can skip a padding row.
-`IndexBuffer` uploads fixed IDs once for captured training steps. Conv1d uses
-`[batch,time,channels]`, weights `[out,in,kernel]`, odd kernel, cross
-correlation, dilation and symmetric zero same-padding. GroupNorm computes
-statistics over time and channels per sample and group. LayerNorm computes
-statistics over the final dimension. Masked loss uses non-NaN target frames
-and divides by all valid frame/channel elements, matching the Acoustic
-reference. A zero-valid-element loss currently returns zero. Softmax and
-log-softmax are stable along any axis, and cross-entropy averages over targets
-other than the ignore index. Attention computes scaled QKᵀ, adds an optional
-broadcastable mask, applies softmax, and multiplies by V. `MultiheadAttention`
-uses PyTorch's packed projection layout; `TransformerEncoderLayer` is a
-batch-first pre-norm encoder with GELU and an adjustable feed-forward width.
-Dropout hashes `(seed, element index)` so CPU and CUDA reuse the same mask
-for backward; its random stream deliberately differs from PyTorch's.
+ブロードキャストは次元を右から揃えます。各組は一致するか、片方の次元が1である必要があります。backwardは広げた次元で和を取ります。matmulはこれをバッチの次元に適用し、最後の2次元を行列として扱います。reductionの軸は明示し、出力の形状から除きます。スカラーの出力の形状は`[]`です。concatとsliceは0始まりの軸と半開区間の境界を使います。embeddingのbackwardは繰り返すindexをscatter加算し、パディングの行を飛ばせます。`IndexBuffer`は記録した学習ステップのために固定のIDを一度だけアップロードします。Conv1dは`[batch,time,channels]`、重み`[out,in,kernel]`、奇数のカーネル、cross-correlation、dilation、対称なゼロsame-paddingを使います。GroupNormはサンプルとグループごとにtimeとchannelsの統計を計算します。LayerNormは最後の次元の統計を計算します。マスク付き損失は非NaNのtargetフレームを使い、有効なフレームとチャネルの全要素で割ります。有効要素が0の損失は0を返します。softmaxとlog-softmaxは任意の軸で安定し、cross-entropyはignore index以外のtargetで平均します。アテンションはscaleしたQKᵀを計算し、任意のブロードキャスト可能なマスクを加え、softmaxを適用し、Vを掛けます。`MultiheadAttention`はPyTorchのまとめた投影のレイアウトを使い、`TransformerEncoderLayer`はbatch-firstのpre-norm encoderで、GELUと調整可能なfeed-forward幅を持ちます。dropoutは`(seed, element index)`をハッシュするため、CPUとCUDAがbackwardで同じマスクを再利用します。この乱数ストリームはPyTorchとは意図的に異なります。
 
-## Modules and training
+## モジュールと学習
 
-`Acoustic` is the first graph-composed model. Its parameter names match the
-PyTorch reference, and the small fixture tests all of their gradients. The
-`Module` registers ordered named parameters, buffers and children and
-provides `StateDict`, `LoadStateDict`, `SaveSafeTensors`, and
-`LoadSafeTensors`. The F32 safetensors loader validates names, shapes,
-offsets, and byte lengths before changing weights. Train/eval propagation,
-device/dtype moves, atomic checkpoint writes, and optimizer state serialization
-remain.
-Reusable Embedding, Conv1d, LayerNorm, Linear, Dropout and GELU layers now
-compose `SpeechTiming` through a plain struct and child `Module` nodes.
-Its state names (`phone.weight`, `inp.weight`, `blocks.0.weight`,
-`norms.0.bias`, `out.weight`, and peers) and convolution weight layout match
-the UtauTTS PyTorch trainer and Go `speechtiming.LoadTCN`. `Train(false)`
-disables dropout for validation. Safetensors metadata carries UtauTTS's
-format, phones, context, kernel, dilations, mel count, license and best
-validation score. The separate feature-cache exporter writes I64 phone IDs
-and F32 continuous inputs and targets to safetensors; it records the Python
-validation shuffle for a comparable split. This is a task-specific cache
-bridge, not yet a general data-loader API.
+`Acoustic`はグラフで構成した最初のモデルです。パラメータ名はPyTorchの参照と一致し、小さなfixtureが全ての勾配を確認します。`Module`は順序付きの名前付きパラメータ、バッファ、子を登録し、`StateDict`、`LoadStateDict`、`SaveSafeTensors`、`LoadSafeTensors`を提供します。F32のsafetensorsのloaderは、重みを変える前に名前、形状、オフセット、バイト長を検証します。train/evalの伝播、deviceとdtypeの移動、checkpointの原子的な書き込み、optimizerのstateの直列化も備えます。再利用できるEmbedding、Conv1d、LayerNorm、Linear、Dropout、GELUの層は、通常のstructと子の`Module`ノードでモデルを構成します。`Train(false)`は検証のためにdropoutを無効にします。
 
-Parameters are graph leaves; nontrainable running statistics are buffers.
-Names are stable dotted paths and duplicate aliases are stored once.
+パラメータはグラフの末端で、学習しないrunning統計はバッファです。名前は安定したドット区切りのパスで、重複する別名は1度だけ保存します。
 
-AdamW uses decoupled weight decay, float32 moments and bias correction.
-Global norm clipping happens before optimizer step. The OneCycle schedule
-uses PyTorch's two phase cosine default: initial LR is max/25, final LR is
-initial/10000, and `pct_start` sets the warmup boundary. Future scheduler
-state must include step count. Data loading should separate dataset indexing,
-sampling, collation, pinned host buffers, worker prefetch and asynchronous
-device transfer. Batch seeds and sharding must be reproducible.
+AdamWはdecoupled weight decay、float32のモーメント、bias correctionを使います。グローバルノルムのクリップはoptimizerのstepの前に行います。OneCycleのスケジュールはPyTorchの2段cosineの既定を使い、初期の学習率はmax/25、最終の学習率はinitial/10000で、`pct_start`がwarmupの境界を決めます。
 
-Serialization uses safetensors-compatible tensor payloads and metadata:
-an 8-byte little-endian header length, JSON descriptors with dtype, shape and
-byte offsets, followed by contiguous payload. Put model architecture and
-optimizer/scheduler metadata in a separate versioned manifest. Validate
-shapes, ranges, duplicate names and size limits before allocation; write
-atomically. The current reader checks shapes and ranges but does not yet
-enforce a file-size cap, reject overlapping payloads, or write atomically.
-Existing `nn` JSON checkpoints remain readable during migration.
+直列化はsafetensors互換のテンソルpayloadとmetadataを使います。8バイトのlittle-endianのヘッダ長、dtype・形状・バイトオフセットを持つJSONの記述子、それに続く連続したpayloadです。読込は名前、形状、範囲、重複する範囲、大きすぎるヘッダを割当の前に検証し、書込は同じディレクトリの一時ファイル、sync、renameで原子的に行います。大きいcheckpointのために、`OpenSafeTensorFile`はindexを検証して1つずつテンソルを読み、`Module.LoadSafeTensorsStream`はコピーの前に全ての名前と形状を検証します。既存の`nn`のJSON checkpointも引き続き読めます。
 
-## General Conv2d
+## Conv2d
 
-`autograd.Conv2d` adds NCHW cross-correlation with PyTorch-compatible
-`[out,in/groups,kH,kW]` weights. Stride, symmetric padding and dilation are
-independent height/width pairs; groups includes depthwise output multipliers.
-The bias is optional. `Conv2dLayer` registers named parameters through the
-existing `Module` and safetensors APIs.
+`autograd.Conv2d`はNCHWのcross-correlationを、PyTorch互換の`[out,in/groups,kH,kW]`の重みで追加します。stride、対称なパディング、dilationはheight/widthの独立した組で、groupsはdepthwiseの出力multiplierを含みます。biasは任意です。`Conv2dLayer`は名前付きパラメータを、既存の`Module`とsafetensorsのAPIで登録します。
 
-Both backends lower one batch/group into depth-major spatial tiles and run
-GEMM. A tile contains at most 512 output positions and targets a 4 MiB budget
-for the im2col/output pair. Backward gathers an upstream tile, recomputes
-im2col for the weight gradient, and scatters the input gradient from
-`weight-transpose * upstream`. CPU accumulates per-tile weight contributions;
-CUDA adds them directly into the leaf gradient with cuBLAS beta=1 and uses
-atomic col2im scatter for input gradients. No full lowered matrix is retained
-by the graph, and inference releases all temporary device buffers before
-returning its output. The path is FP32, independent of optional BF16 shadows.
+どちらのバックエンドも、1バッチ1グループをdepth-majorの空間タイルへ展開し、GEMMを実行します。1タイルは最大512の出力位置で、im2colと出力の組に4 MiBの予算を目指します。backwardは上流のタイルを集め、重みの勾配のためにim2colを再計算し、`weight-transpose * upstream`から入力の勾配をscatterします。CPUはタイルごとの重みの寄与を蓄積し、CUDAはcuBLASのbeta=1で末端の勾配へ直接加算し、入力の勾配にはatomicなcol2imのscatterを使います。完全な展開行列はグラフが保持せず、推論は出力を返す前に一時的なデバイスバッファを全て解放します。この経路はFP32で、任意のBF16シャドウとは独立です。
 
-The operation is registered and covered by the source dispatch inventory.
-Committed checkpoint-free PyTorch fixtures exercise batched, grouped,
-depthwise, rectangular, even and strided/dilated cases on CPU/CUDA; finite
-differences independently check gradients. The `cmd/cnn-train` example verifies
-that two convolution blocks compose with reduction, classification loss,
-AdamW and checkpoint reload to learn a spatial classification task in pure Go.
+この演算はソースのdispatchの棚卸しに登録され、覆われています。checkpointを使わないコミット済みのPyTorch fixtureは、バッチ、grouped、depthwise、矩形、偶数、strideとdilationの各場合をCPU/CUDAで動かし、有限差分が勾配を独立に確認します。`cmd/cnn-train`の例は、2つの畳み込みブロックがreduction、分類損失、AdamW、checkpointの再読込と組み合わさり、純Goで空間分類を学習できることを確認します。
 
 ## NCHW pooling
 
-MaxPool2d, AvgPool2d and AdaptiveAvgPool2d share NCHW window geometry and
-separate CPU/CUDA implementations registered at their public entry points.
-Geometry is validated before materializing views or allocating outputs. Max
-pooling supports dilation and saves one selected index per output only for
-recorded graphs. Those indices belong to the derivative history, so retained
-backward and closing an ancestor cannot invalidate them prematurely. Average
-and adaptive-average derivatives need only the captured geometry/divisor.
+MaxPool2d、AvgPool2d、AdaptiveAvgPool2dはNCHWの窓の幾何を共有し、公開の入口で登録したCPU/CUDAの実装を持ちます。幾何はviewの実体化や出力の確保より前に検証します。max poolingはdilationに対応し、記録したグラフにだけ、出力ごとに選んだindexを1つ保存します。このindexは導関数の履歴に属するため、retainしたbackwardと先祖のcloseが早すぎる無効化を起こしません。averageとadaptive-averageの導関数は、記録した幾何と除数だけを必要とします。
 
-CPU forward partitions output positions. Backward partitions whole N*C planes
-using output size to choose worker count: overlapping windows accumulate
-serially within each plane, avoiding races on input gradients. CUDA runs one
-thread per output window and uses atomic scatter-add for backward. All values
-remain FP32; device kernels operate without host staging and can be captured
-and replayed. NoGrad max pooling avoids the saved-index allocation.
+CPUのforwardは出力位置を分割します。backwardはN*Cの面ごとに分け、出力サイズからworker数を選びます。重複する窓は各面の中で直列に蓄積し、入力の勾配の競合を避けます。CUDAは出力の窓ごとに1スレッドを動かし、backwardではatomicなscatter加算を使います。全ての値はFP32のままで、デバイスカーネルはホストへの転送なしで動き、記録と再生ができます。NoGradのmax poolingは保存するindexの割当を避けます。
 
-Ceil mode removes windows starting entirely in right/bottom padding. Average
-divisors distinguish explicit zero-padding from positions beyond that padding
-in a partial ceil window. Adaptive bins use floor/ceil boundaries and may
-overlap when input size is not divisible by output size. Fixtures compare all
-outputs and VJPs with PyTorch; independent finite differences, alias/retained
-history tests and CUDA capture exercise composition. The CNN example now
-includes max downsampling and adaptive global averaging before its classifier.
+ceil modeは右端または下端のパディングだけで始まる窓を除きます。averageの除数は、ceil modeの部分的な窓で、明示的なゼロパディングとそれを超える位置を区別します。adaptiveのbinはfloor/ceilの境界を使い、入力サイズが出力サイズで割り切れないときは重なり合います。fixtureは全ての出力とVJPをPyTorchと比較し、独立した有限差分、別名とretainした履歴のテスト、CUDAのcaptureが組み合わせを確認します。CNNの例は、分類器の前にmaxのダウンサンプリングとadaptive global average poolingを入れています。
 
-## Batch normalization and mutable state
+## BatchNormと可変state
 
-BatchNorm normalizes all non-channel dimensions of rank 2..6 tensors. A small
-outer/channel/inner descriptor supports both channels-first and channels-last
-layouts after view materialization. The functional operation accepts optional
-affine parameters and paired running buffers. BatchNormLayer registers weight,
-bias, running mean/variance and a batch counter through Module, and its mode
-callback participates in recursive Train propagation. NoGrad does not disable
-training-state updates.
+BatchNormはrank 2〜6のテンソルの、チャネル以外の全ての次元を正規化します。小さなouter/channel/innerの記述子が、viewの実体化の後にchannels-firstとchannels-lastの両方のレイアウトを扱います。関数版の演算は任意のaffineパラメータと、対になるrunningバッファを受け取ります。BatchNormLayerはweight、bias、running mean/variance、バッチカウンタをModuleで登録し、モードのコールバックが再帰的なTrainの伝播に加わります。NoGradは学習時のstateの更新を止めません。
 
-Training computes biased variance for normalization and uses the unbiased
-estimate for running variance. CPU and CUDA moment reductions accumulate in
-float64; each forward saves FP32 mean/inverse-standard-deviation values in an
-independent ephemeral Tensor. That Tensor is a saved lifetime/context dependency;
-running buffers themselves are not backward dependencies. Consequently, a later
-forward can update running state without invalidating an earlier graph, and
-evaluation backward survives closing the running buffers. Input/affine versions
-are still validated, and retained history keeps its saved statistics alive.
+学習は正規化に偏りのある分散を計算し、running varianceには不偏推定量を使います。CPUとCUDAのモーメントのreductionはfloat64で累積し、各forwardはFP32のmeanと逆標準偏差を独立した一時テンソルに保存します。このテンソルは保存された寿命とコンテキストの依存で、runningバッファ自体はbackwardの依存ではありません。そのため後のforwardがrunning stateを更新しても、以前のグラフは無効になりません。評価のbackwardは、runningバッファをcloseしても実行できます。入力とaffineのversionは通常どおり検証し、retainした履歴は保存した統計を生かし続けます。
 
-CUDA uses one reduction block per channel plus elementwise forward/input-VJP
-kernels. Weight/bias VJPs reduce per channel without atomic scatter. A separate
-counter kernel precedes statistics updates, so cumulative momentum reads the
-new device-side count without racing another channel's block. Capture/replay
-updates state on device, including the counter; no per-forward readback is
-required. The current Module state remains F32, so num_batches_tracked is an
-F32 scalar rather than I64 and integer precision is bounded by 2^24.
+CUDAはチャネルごとに1つのreductionブロックと、要素ごとのforwardと入力VJPのカーネルを使います。重みとbiasのVJPはチャネルごとにreduceし、atomicなscatterを使いません。統計の更新の前にはカウンタ専用のカーネルを置くため、累積momentumは別のチャネルのブロックと競合せずに新しいデバイス側の数を読みます。captureと再生はカウンタも含めてデバイス上でstateを更新し、forwardごとの読み戻しは不要です。現在のModuleのstateはF32のままで、`num_batches_tracked`はI64ではなくF32のスカラーで、整数の精度は`2^24`までです。
 
-Checkpoint reload tests reconstruct layer configuration and explicitly enter
-evaluation. The CNN example now trains Conv2d/BatchNorm/ReLU blocks, saves affine
-and running state, and verifies logits after reload on CPU/CUDA. PyTorch fixtures,
-numerical gradients, independent-worker race tests, history/lifetime tests and
-captured-vs-eager state comparisons cover the general operation and layer.
+checkpointの再読込のテストは、層の構成を作り直して明示的に評価へ入ります。CNNの例はConv2d/BatchNorm/ReLUのブロックを学習し、affineとrunningのstateを保存して、CPU/CUDAで再読込後のlogitsを確認します。PyTorchのfixture、数値勾配、独立workerのraceテスト、履歴と寿命のテスト、記録あり・なしのstateの比較が、一般の演算と層を覆います。
 
-## Host data pipeline
+## ホストのデータ処理
 
-The independent `data` package keeps sample access, index scheduling and collation
-separate from autograd/device allocation. Dataset and Loader are generic over
-sample/batch types. The synchronous path peeks at indices, obtains samples and
-collates a batch, then commits the sampler cursor only after successful callbacks
-and cancellation checks. Failed reads/collation can be retried without skipping
-training data. EOF from callbacks is distinguished from normal epoch termination.
+独立した`data`パッケージは、sampleの取得、indexのスケジューリング、collateを、autogradとdeviceの割当から分離します。DatasetとLoaderはsampleとbatchの型に対してジェネリックです。同期経路はindexをpeekし、sampleを取得してバッチをcollateし、コールバックとキャンセルの確認が成功した後にだけsamplerのカーソルを確定します。失敗した読込とcollateは、学習データを飛ばさずに再試行できます。コールバックのEOFは、通常のepochの終わりと区別します。
 
-IndexSampler owns a PCG stream, current permutation, cursor and epoch. State
-snapshots preserve partial epochs and future shuffle choices, while validation
-rejects mismatched size/seed/options, invalid permutations and RNG payloads before
-mutation. Loader checkpoints include batching configuration and an opaque
-StatefulSampler payload. Dataset content/split identity belongs to trainer
-metadata rather than an impossible generic content hash. Subsets copy index lists;
-RandomSplit produces deterministic disjoint partitions. Read-only datasets can be
-shared between independent loaders, but mutable samplers/loaders remain serial.
+`IndexSampler`はPCGストリーム、現在の順列、カーソル、epochを持ちます。stateのスナップショットは、途中のepochと将来のshuffleの選択を保ち、検証はサイズ、seed、オプションの不一致、不正な順列、乱数のpayloadを、変更の前に拒否します。Loaderのcheckpointはバッチ処理の構成と、不透明な`StatefulSampler`のpayloadを含みます。データセットの内容とsplitの同一性は、一般的な内容のハッシュにはできないため、学習側のmetadataに属します。Subsetはindexの一覧をコピーし、`RandomSplit`は決定的で重複しない分割を作ります。読み取り専用のデータセットは独立したloaderの間で共有できますが、変更可能なsamplerとloaderは逐次のままです。
 
-Float collation copies host values, with equal-shape stacking or explicit temporal
-padding/truncation and lengths/bool masks. Tensor creation/upload stays in the
-training loop's ExecutionContext. IDX data is retained as uint8, converted only
-for requested samples, and fingerprinted over decoded image/label files. Raw/gzip
-format validation does not allocate according to an unverified header count.
+floatのcollateはホストの値をコピーし、同じ形状のstackingか、明示的な時間方向のパディング・切り詰めとlengths/boolマスクを使います。テンソルの生成とアップロードは、学習ループの`ExecutionContext`に留まります。IDXのデータはuint8のまま保ち、要求されたsampleだけ変換し、復号した画像とラベルのファイルからfingerprintを取ります。raw/gzipの形式の検証は、確認していないヘッダの個数に従って割り当てません。
 
-The MNIST command uses this pipeline with a small MLP and existing combined
-model/AdamW/OneCycle checkpoints. Mid-epoch state and dataset fingerprints are
-caller metadata. CPU resume tests match weights/moments exactly; CUDA tests keep
-sampler/scheduler state exact and allow numeric differences from atomic bias VJPs.
-Tiny local IDX/HTTP fixtures keep tests offline and independent of Python.
+MNISTのコマンドは、この経路を小さなMLPと既存の統合checkpoint（model/AdamW/OneCycle）で使います。epoch途中のstateとデータセットのfingerprintは呼び出し側のmetadataです。CPUの再開テストは重みとモーメントを厳密に比較し、CUDAのテストはsamplerとスケジューラのstateを厳密に保ち、atomicなbias VJPによる数値の差を許します。小さなローカルのIDXとHTTPのfixtureが、テストをオフラインでPythonに依存しないように保ちます。
 
-A real-data check used the first 2,000 MNIST training examples and first 1,000 test
-examples, seed 7, batch 64 and 100 planned updates. CPU was stopped after 40 and
-resumed to 100; CUDA ran continuously. Both reached test accuracy 86.4%, test loss
-0.455661 and zero inference-reload logit difference. This is a small pipeline/resume
-exercise, not a full-MNIST quality benchmark. Generic augmentation/collation-state
-contracts are later extensions.
+実データの確認では、MNISTの学習の先頭2,000件とテストの先頭1,000件、seed 7、batch 64、計画100更新を使いました。CPUは40で止めて100まで再開し、CUDAは連続して実行しました。どちらもtest accuracy 86.4%、test loss 0.455661、推論の再読込のlogitsの差は0でした。これは小さな経路と再開の確認で、MNIST全体の品質を測るものではありません。
 
-Optional worker/prefetch loading now adds a bounded host pipeline. The consumer
-peeks a finite index window without moving the sampler and queues individual
-sample jobs to reader goroutines. Results identify their batch/sample positions;
-the consumer assembles them in sampler order. Collation runs only when Next
-delivers that batch, not in workers or speculative lookahead. Thus existing
-CUDA thread ownership and custom serial collation remain with the training loop.
+任意のworker/prefetchの読込は、上限付きのホストの経路を追加します。受け取る側は、samplerを動かさずに有限のindexの窓をpeekし、sampleごとのjobをreaderのgoroutineへ渡します。結果はバッチとsampleの位置を識別し、受け取る側がsamplerの順に並べます。collateは`Next`がそのバッチを渡すときにだけ動き、workerや先読みでは動きません。そのため既存のCUDAのスレッドの所有権と、直列の独自collateは学習ループに留まります。
 
-Cancellation/errors cancel and join readers and discard undelivered samples.
-Close and NextEpoch terminate old sessions. State pauses prefetch and serializes
-only delivered sampler position; LoadState stops old work before restoration.
-Worker/prefetch counts are performance settings rather than checkpoint identity,
-so synchronous/parallel loading and different counts can share the same logical
-checkpoint. Dataset.Get must be concurrently safe and cooperative with context;
-callback side effects/randomness still need application-managed reproducibility.
-Tests gate reads to verify ordering, bounded speculation, deterministic error
-selection, cleanup/retry and checkpoint restoration across worker settings.
+キャンセルとエラーはreaderをキャンセルしてjoinし、未配達のsampleを捨てます。`Close`と`NextEpoch`は古い作業を終わらせます。`State`はprefetchを止め、配達済みのsampler位置だけを直列化します。`LoadState`は復元の前に古い作業を止めます。workerとprefetchの数は性能の設定で、checkpointの同一性ではないため、同期と並列の読込、異なる数の間で同じ論理的なcheckpointを共有できます。`Dataset.Get`は並行に安全で、contextに協調する必要があります。コールバックの副作用と乱数には、アプリが管理する再現性が必要です。テストは読込を制御して、順序、先読みの上限、決定的なエラーの選択、後片付けと再試行、worker設定を変えたcheckpointの復元を確認します。
 
-The same real-MNIST check also passed with four readers/prefetch three, stopped
-at update 40 and resumed using two readers/prefetch two. CUDA used four readers
-and prefetch four. Both retained 86.4% test accuracy, loss 0.455661 and zero
-reload-logit difference. This checks pipeline equivalence, not a throughput claim.
+同じ実MNISTの確認は、reader 4とprefetch 3でも、更新40で止めてreader 2とprefetch 2で再開しても通りました。CUDAはreader 4とprefetch 4を使いました。どちらも86.4%のtest accuracy、loss 0.455661、再読込のlogitsの差0を保ちました。これは経路が等価であることの確認で、スループットの主張ではありません。
 
-Numeric CSV tables extend the same pipeline to non-image data. Parsing is strict
-about shape and finiteness because a NaN usually means an uncleaned file, and the
-error names the offending line/column. Regression samples carry a scalar target
-beside their feature vector, so the existing generic Loader, sampler and
-checkpoint machinery apply unchanged, and `StackRegression` keeps host collation
-in the consumer as before.
+数値のCSVテーブルは、同じ経路を画像以外のデータへ広げます。解析は形状と有限性に厳しく、NaNはたいてい洗浄していないファイルを意味するため、エラーは問題の行と列を示します。回帰のsampleは特徴量ベクトルの隣にスカラーのtargetを持つので、既存の汎用のLoader、sampler、checkpointの仕組みがそのまま使え、`StackRegression`はこれまでどおりホストのcollateを受け取る側に保ちます。
 
-Feature standardization is the piece that makes an application-level transform
-reproducible. The design keeps it deliberately outside the library's automatic
-differentiation: statistics are fitted on the training split only, applied to
-train and validation alike, and serialized as state. Fitting accumulates in
-float64 so the result does not depend on float32 summation order or worker counts,
-and a constant feature gets a unit scale instead of a division by zero. The
-tabular command stores that state, the loader order and a content fingerprint in
-the checkpoint and rejects a resume whose data, split, batching or model shape
-changed. Fitting on the validation split, or refitting after a resume, would
-quietly change the target function; the checkpoint contract prevents that.
+特徴量の標準化は、アプリ側の変換を再現可能にする部分です。設計ではこれをライブラリの自動微分の外に意図的に置きます。統計はtraining splitだけでfitし、学習と検証の両方に適用し、stateとして直列化します。fitはfloat64で累積するため、結果がfloat32の和の順序やworker数に依存せず、定数の特徴量は0除算ではなくスケール1になります。tabularのコマンドはそのstate、loaderの順序、内容のfingerprintをcheckpointに保存し、データ、分割、バッチ処理、モデルの形状が変わった再開を拒否します。検証の分割でfitしたり、再開の後にfitし直したりすると、targetの関数が静かに変わります。checkpointの約束がそれを防ぎます。
 
-The tabular command was checked on a generated four-feature dataset (4,000 rows,
-800 validation), seed 7, batch 64, 200 updates: CPU and CUDA both reached
-validation RMSE 12.164137 with zero inference-reload difference, and a run stopped
-at update 100 then resumed with different reader settings produced byte-identical
-inference weights (same SHA-256) and the same RMSE as the uninterrupted run. This
-is a reproducibility exercise, not a quality claim about the synthetic target.
+tabularのコマンドは、生成した4特徴量のデータセット（4,000行、800検証）、seed 7、batch 64、200更新で確認しました。CPUとCUDAはどちらもvalidation RMSE 12.164137、推論の再読込の差0で、更新100で止めてreader設定を変えて再開した実行は、未中断の実行と同じ推論の重み（同じSHA-256）と同じRMSEを生みました。これは再現性の確認で、合成のtargetの品質についての主張ではありません。
 
-Audio follows the same split: the `data` package decodes and encodes uncompressed
-RIFF WAV (integer PCM and IEEE float, including WAVE_FORMAT_EXTENSIBLE), while
-framing, windowing, augmentation and the model stay in the application. The
-augmentation design is the point. `cmd/audio-train` derives each window's noise
-from `(seed, window index)` through a private PCG stream instead of advancing one
-RNG while iterating, so the noisy input for a given window cannot depend on worker
-counts, prefetch depth, shuffle order or where a previous run stopped. The seed is
-part of the checkpoint identity, and the WAV content is fingerprinted, so both a
-changed audio file and a changed noise level are rejected on resume. The example
-also demonstrates an application-defined sample type and collate function fed to
-the generic dataset/sampler/loader pipeline, which keeps collation and CUDA thread
-ownership in the training loop.
+音声も同じ分け方です。`data`パッケージが非圧縮のRIFF WAV（整数PCMとIEEE float、`WAVE_FORMAT_EXTENSIBLE`を含む）を復号・符号化し、フレーム化、window、augmentation、モデルはアプリ側に留まります。要点はaugmentationの設計です。`cmd/audio-train`は、反復しながら1つの乱数を進めるのではなく、各windowのノイズを`(seed, window index)`から専用のPCGストリームで導くため、あるwindowのノイズの入力は、worker数、prefetchの深さ、shuffleの順序、前回どこで止まったかに依存しません。seedはcheckpointの同一性の一部で、WAVの内容もfingerprintを取るため、音声ファイルの変更もノイズの強さの変更も再開時に拒否します。この例は、アプリが定義したsampleの型とcollate関数を、汎用のdataset/sampler/loaderの経路に渡すことも示します。collateとCUDAのスレッドの所有権は学習ループに留まります。
 
-On a generated 8-second 16 kHz tone (2,000 windows total, 400 held out), seed 7,
-batch 64 and 300 updates, the denoiser improved validation SNR from 4.8665 dB for
-the noisy input to 15.0490 dB on CPU and CUDA, with zero inference-reload
-difference. A run stopped at update 150, then resumed with different reader
-settings, produced weights byte-identical to the uninterrupted run.
+生成した8秒16 kHzのトーン（windowは2,000、うち400を検証）、seed 7、batch 64、300更新で、denoiserは検証のSNRを、ノイズの入力の4.8665 dBからCPUとCUDAで15.0490 dBへ改善し、推論の再読込の差は0でした。更新150で止めてreader設定を変えて再開した実行は、未中断の実行とbyte単位で同じ重みを生みました。
 
-## Common optimizers and SGD state
+## OptimizerとSGDのstate
 
-Optimizer provides a common eager update/reset/LR/lifetime surface for AdamW and
-SGD, and OneCycle now targets this interface. CheckpointOptimizer wraps typed
-state in an algorithm-tagged snapshot while preserving the existing AdamW state
-API. The training-1 envelope carries optimizer_kind; an absent tag remains legacy
-AdamW. Decode and algorithm-specific validation precede live model/state copies.
-Standalone momentum snapshots use SGD-specific metadata rather than inventing
-Adam-style moments for another algorithm.
+`Optimizer`はAdamWとSGDに共通の、eagerな更新・リセット・学習率・寿命のAPIを提供し、OneCycleはこのインターフェースを対象にします。`CheckpointOptimizer`は型付きのstateをアルゴリズムのタグ付きスナップショットで包み、既存のAdamWのstateのAPIを保ちます。training-1の封筒は`optimizer_kind`を持ち、タグがない場合は従来のAdamWです。復号とアルゴリズムごとの検証は、liveのモデルとstateのコピーの前に済ませます。単体のmomentumのスナップショットは、他のアルゴリズムにAdam風のモーメントを当てはめず、SGD専用のmetadataを使います。
 
-SGD matches PyTorch's coupled decay and momentum rules, including an undampened
-first buffer, per-parameter lazy initialization, Nesterov and ascent. Eager
-gradient reset removes absent gradients on both backends, so unused parameters
-skip decay/state updates. CPU uses FP32 arithmetic; CUDA updates each parameter
-in one device kernel and marks initialized state in a subsequent kernel to avoid
-a flag-write/read race among threads. Snapshot export includes flags and only
-initialized momentum buffers; restore validates identities/configuration first.
+SGDはPyTorchのcoupled decayとmomentumの規則に一致します。dampeningなしの最初のバッファ、パラメータごとの遅延初期化、Nesterov、ascentを含みます。eagerな勾配のリセットは、どちらのバックエンドでも勾配のないパラメータを外すため、使われていないパラメータはdecayとstateの更新を飛ばします。CPUはFP32で計算し、CUDAはパラメータごとに1つのデバイスカーネルで更新し、その後のカーネルで初期化済みのstateを立てて、スレッド間のフラグの書き込みと読み取りの競合を避けます。スナップショットの書き出しはフラグと、初期化済みのmomentumバッファだけを含み、復元は先に同一性と構成を検証します。
 
-CUDA graph mode has a device step counter and stable per-parameter initialization
-flags. ZeroGrad preserves prepared graph buffers. Captured update/replay has no
-host state readback; eager continuation synchronizes the step count. Eager
-mutations invalidate shared-storage versions/BF16 shadows. Capture/replay and
-state replacement follow existing allocation/thread/opaque-mutation contracts.
+CUDAのグラフモードは、デバイス上のステップカウンタと、パラメータごとの安定した初期化フラグを持ちます。`ZeroGrad`は準備したグラフのバッファを保ちます。記録した更新と再生はホストのstateを読み戻さず、eagerの続きはステップ数を同期します。eagerの変更は共有ストレージのversionとBF16シャドウを無効にします。captureと再生、stateの置き換えは、既存の割当、スレッド、外部からの変更の約束に従います。
 
-Parameter groups reuse that structure instead of changing it. A spec partitions
-the flat parameter slice into named groups, each with a learning-rate scale and
-its own weight decay; resolution stores the group index per parameter, so Step
-looks up one group instead of a single global configuration. The base learning
-rate stays the single scheduler target, and group scales express relative rates,
-which keeps OneCycle/SetLearningRate working without group awareness. AdamW needs
-no extra state for this because its bias correction uses the shared step counter;
-CUDA passes the per-group step size and decay as kernel arguments, and captured
-graphs therefore bake the scales at capture time.
+パラメータグループはこの構造を変えずに再利用します。specは平坦なパラメータのスライスを名前付きのグループへ分け、各グループは学習率スケールと自身のweight decayを持ちます。解決の結果はパラメータごとのグループindexを保存するため、Stepは単一の全体設定ではなく1つのグループを参照します。基準の学習率はスケジューラの唯一の対象のままで、グループのスケールが相対的な学習率を表すため、OneCycleと`SetLearningRate`はグループを意識せずに動きます。AdamWはbias correctionが共有のステップカウンタを使うため、このための追加のstateを必要としません。CUDAはグループごとのステップサイズとdecayをカーネル引数として渡すため、記録したグラフは記録時にスケールを焼き込みます。
 
-Group membership is persisted as ordered parameter-name lists rather than raw
-indices. Restore compares group count, names and membership against the live
-optimizer before copying anything, so a checkpoint cannot silently move a
-parameter into a different group. State written before groups existed has no
-group list, and the legacy path accepts it only for one unscaled live group while
-taking the decay from the saved base hyperparameters; a grouped optimizer rejects
-it and vice versa. Group state lives in the same JSON configuration blob as the
-other hyperparameters, so standalone and combined checkpoints share one decode
-path.
+グループのmembershipは、生のindexではなく順序付きのパラメータ名の一覧として保存します。復元は、何かをコピーする前にグループ数、名前、membershipをliveのoptimizerと比較するため、checkpointがパラメータを別のグループへ黙って移すことはできません。グループ以前に書かれたstateはグループの一覧を持たず、従来の経路では、スケールを持たない1つのliveのグループにだけ受け入れ、decayは保存された基準のハイパーパラメータから取ります。グループ化したoptimizerはそれを拒否し、その逆も同じです。グループのstateは他のハイパーパラメータと同じJSONの構成に置くため、単体と統合のcheckpointが1つの復号の経路を共有します。
 
-AdamW keeps one optimizer-level step counter, matching how its moments, scheduler
-and CUDA graph step already work. PyTorch instead advances a per-parameter step
-only when that parameter receives a gradient, so bias correction can differ when a
-gradient is absent. Committed AdamW parity fixtures therefore give every parameter
-a gradient each step; absent-gradient moments are still skipped exactly as
-PyTorch does. This difference is documented rather than hidden by relaxing
-tolerances.
+AdamWはoptimizer単位のステップカウンタを1つ持ち、これはモーメント、スケジューラ、CUDAグラフのステップがすでにそう動くことに合わせています。PyTorchは代わりに、パラメータが勾配を受けたときにだけ、そのパラメータのステップを進めるため、勾配がないときはbias correctionが違い得ます。コミット済みのAdamWの照合fixtureは、そのため全てのパラメータに毎ステップ勾配を与えます。勾配がないときのモーメントは、PyTorchと同じく正しく飛ばします。この違いは、許容誤差を緩めて隠すのではなく文書に残します。
 
-The MNIST loop selects AdamW or SGD through the common API and stores optimizer
-identity/options with loader metadata. Both paths have uninterrupted-vs-resumed
-weight, buffer, schedule and data-order tests. With the same 2,000 training/1,000
-test examples, seed 7, batch 64 and 100 updates, SGD momentum .9 + Nesterov with
-OneCycle peak .1 reached 85.2% test accuracy and loss 0.479619 on CPU/CUDA. CPU
-stopped at 40 and resumed with different worker settings; reload-logit difference
-was zero on both. This is another training/state exercise, not an optimizer
-comparison benchmark. With `-no-decay-suffix bias` the same run puts the bias
-parameters in a zero-decay group, records the suffix as checkpoint identity, and
-again matched CPU/CUDA at 85.2% accuracy with 0.479656 loss; the legacy
-ungrouped checkpoint still resumes when the example is run with an empty suffix.
+MNISTのループは、共通のAPIでAdamWまたはSGDを選び、optimizerの同一性とオプションをloaderのmetadataと共に保存します。どちらの経路にも、中断なしと途中再開の重み、バッファ、スケジュール、データ順のテストがあります。同じ学習2,000件とテスト1,000件、seed 7、batch 64、100更新で、SGDのmomentum .9とNesterov、OneCycleのピーク.1は、CPU/CUDAでtest accuracy 85.2%、loss 0.479619に達しました。CPUは40で止まり、worker設定を変えて再開しました。再読込のlogitsの差はどちらも0でした。これは別の学習とstateの確認で、optimizerの比較ベンチマークではありません。`-no-decay-suffix bias`を付けた同じ実行は、biasのパラメータをdecayなしのグループに置き、suffixをcheckpointの同一性として記録し、CPU/CUDAで再びaccuracy 85.2%、loss 0.479656で一致しました。グループ以前のcheckpointも、空のsuffixで実行すると再開できます。
 
-## Migration and phases
+## 計測結果
 
-1. Extend the operation registry from backend selection to callable kernels
-   keyed by dtype and layout, and make views composable without intermediate
-   materialization. Tensor-bound execution contexts now isolate recording,
-   precision and attention selection, with shared-storage lifetime management;
-   extend isolation to CUDA streams/devices and allocation pools. Port
-   `nn.Linear` and `nn.Conv1d` to graph operators, then make their explicit
-   backward methods compatibility wrappers.
-2. Move `gputcn` layers and its sequence loss onto the same operators. Retain
-   its optimized CUDA graph path as a compiled execution plan. Add general
-   prefetching dataset loaders and continue trainer adoption. Resumable AdamW /
-   OneCycle / model checkpoints, restorable index/window samplers, and recursive
-   `Module.Train` propagation are implemented in v1.2.0. `speech-timing-train`
-   additionally retains the data split and best model for complete resume.
-3. Improve tiled attention occupancy and backward throughput, complete BF16
-   storage and dtype-aware kernels, and add FP16 loss scaling. Extend the
-   general CUDA graph capture API beyond fixed Acoustic and transformer
-   batches. Extend CPU SIMD beyond SGEMM while retaining pure Go fallbacks.
-   Validate against PyTorch on each dtype and shape family before removing
-   legacy paths.
+1回のセッションで、12 CPUスレッドを使い、gogradとPyTorchを対にして3回測った学習ステップ全体の中央値です。transformerはencoder 4層、モデル幅256、4ヘッド、feed-forward幅1024、batch 16、系列長256です。Acousticはhidden幅384、batch 24、400フレームです。BF16はPyTorchのautocastと、実際の値をFP32で保持するgogradのBF16シャドウ経路を使います。単位はmsです。
 
-## Measured status (2026-10-04)
-
-Median full training-step times from three paired gograd/PyTorch runs in one
-session, with 12 CPU threads. The transformer has four encoder layers,
-model width 256, four heads, feed-forward width 1024, batch 16 and sequence
-256. Acoustic has hidden width 384, batch 24 and 400 frames. BF16 uses PyTorch
-autocast and gograd's FP32-authoritative BF16 shadow path. Units are ms.
-
-| Model and runtime | CPU FP32 | CUDA FP32 eager | CUDA FP32 graph | CUDA BF16 eager | CUDA BF16 graph |
+| モデルと実行環境 | CPU FP32 | CUDA FP32 eager | CUDA FP32 graph | CUDA BF16 eager | CUDA BF16 graph |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Acoustic PyTorch | 2505.9 | 58.5 | 53.7 | 47.1 | 42.6 |
 | Acoustic gograd | 3876.4 | 82.3 | 82.0 | 63.8 | 64.1 |
 | Transformer PyTorch | 1291.6 | 25.9 | 23.9 | 13.5 | 12.0 |
 | Transformer gograd | 2276.1 | 27.2 | 27.8 | 22.4 | 23.2 |
 
-The transformer CPU ratio is 1.76x, meeting the 2.5x target. Acoustic CPU is
-1.55x, narrowly above its 1.5x target. Graph capture saves little on gograd
-for these GEMM-heavy workloads. Eager BF16 improves both models over gograd
-FP32 but still trails PyTorch BF16, especially on the transformer (1.66x).
-The default 8x8 SGEMM kernel won paired CPU trials against the 4x8 fallback:
-Acoustic medians were 3783.4 versus 4157.8 ms and transformer medians were
-2085.0 versus 2242.9 ms. CPU profile samples remain dominated by SGEMM
-(about 61% on Acoustic and 33% on transformer after the changes), followed by
-indexing and pointwise gradients. Profiles and benchmark commands are described
-in README.
+transformerのCPUの比は1.76倍で、2.5倍の目標を満たします。AcousticのCPUは1.55倍で、1.5倍の目標をわずかに上回ります。graphの記録は、これらのGEMMの多い処理ではgogradにほとんど効きません。eagerのBF16はgogradのFP32より両モデルで良くなりますが、PyTorchのBF16にはまだ届かず、特にtransformerで1.66倍です。既定の8x8のSGEMMカーネルは、対にしたCPUの試行で4x8のフォールバックに勝ちました。Acousticの中央値は3783.4対4157.8 ms、transformerの中央値は2085.0対2242.9 msでした。CPUプロファイルのsampleは、変更後にSGEMMが中心で（Acousticで約61%、transformerで33%）、続いてindexingと要素ごとの勾配の処理です。プロファイルとベンチマークのコマンドはREADMEにあります。
 
-For batch 1, four heads and head width 64, separate CUDA-event attention
-forward/backward medians and peak extra live buffer use were:
+batch 1、4ヘッド、head幅64について、CUDA eventで別に測ったアテンションのforward/backwardの中央値と、使用中バッファのピーク増分です。
 
-| Sequence | Materialized step | Tiled step | Materialized peak | Tiled peak |
+| 系列長 | 実体化ステップ | tiledステップ | 実体化のピーク | tiledのピーク |
 | ---: | ---: | ---: | ---: | ---: |
 | 256 | 0.366 ms | 0.766 ms | 3.50 MiB | 1.01 MiB |
 | 1024 | 1.601 ms | 9.606 ms | 50.00 MiB | 4.03 MiB |
 | 4096 | 18.916 ms | 127.889 ms | 776.00 MiB | 16.12 MiB |
 
-The tiled path passed forward and gradient parity at all three lengths. The
-large-sequence memory saving is real, but its current backward kernel needs
-more tiling and parallelism before it can replace the materialized fast path.
+tiled経路は3つの系列長すべてでforwardと勾配の一致を確認しました。長い系列でのメモリの削減は実際に大きく、現在のbackwardカーネルは実体化した高速な経路より遅いままです。
 
-## UtauTTS speech-timing adoption (2026-10-04)
+## 可変長系列のCUDAプール
 
-`SpeechTiming` composes the eight-block PyTorch Target on the float32 graph:
-three phone embeddings of width 32 plus 4 or 15 continuous inputs, 1x1 input
-convolution, dilated kernel-5 convolution/LayerNorm/exact GELU/dropout/residual
-blocks, and an 80-channel 1x1 output convolution. Forward, NaN-masked L1,
-all parameter gradients, clipping and an AdamW step pass a generated PyTorch
-fixture on CPU and CUDA. A separate OneCycle test checks the PyTorch schedule
-at six positions. The CUDA fixture asserts that forward output remains in a
-device buffer.
+フレーム長が変わる学習では、更新ごとにグラフと所有するテンソルを解放します。パディング後の長さが64通りある再現では、使用中のバッファは約11 MBのままでしたが、旧来の正確なサイズで上限のないキャッシュは6,154,440,208バイトまで増えました（予約は6,165,368,020バイト）。サイズクラスと上限付きのキャッシュでは、同じ64ステップがキャッシュ762,475,264バイト、予約773,425,152バイトで終わりました。200ステップの実行ではキャッシュはその水準に留まり、上限を256 MiBへ下げた後の別の64ステップは、キャッシュ265,028,352バイト、予約275,978,240バイトで終わりました。使用中のバッファは10,949,888バイトのままでした。`cudaMalloc`の失敗は、キャッシュしたブロックを解放して1度だけ再試行します。ホストへ転送するスライスは、DLLの呼び出しの間、生かし続けます。
 
-An exported v1 cache contained 700 utterances and 286,260 frames. The exporter
-recorded Python's seed-0 shuffle; both trainers used the same 30 validation
-utterances and ran 6,000 CUDA steps at batch 16 and 400 frames. Gograd's
-training-loop wall time was 66.477 s with best L1 0.285379 at step 4500.
-PyTorch's measured `train()` loop took 73.625 s with best L1 0.284177 at step
-3750. The quality difference is 0.42%, inside the 2% goal. Their initialization,
-sampling and dropout random streams differ, so this is comparable architecture
-and validation data rather than an identical optimization trace. A separate
-full PyTorch script invocation took 81.862 s and reported best L1 0.2844.
-
-The Go checkpoint loaded through the unchanged UtauTTS `speechtiming.LoadTCN`
-and produced a one-frame, 80-bin prediction. PyTorch's safetensors reader also
-accepted its metadata and 37 named tensors. The v2 context model can be built,
-but a context feature cache was unavailable for a full training run. Optimizer
-state, atomic checkpoint replacement and general-purpose data prefetch remain
-open before broader adoption. `docs/API.md` lists the proposed v0.1 API; no
-tag has been created.
-
-## Variable-length CUDA pool fix (2026-10-04)
-
-The UtauTTS frame-intonation trainer already releases its graph and owned
-tensors each update. A reproducer with 64 different padded lengths kept active
-buffers near 11 MB but grew the old exact-size, unlimited cache to
-6,154,440,208 bytes (6,165,368,020 bytes reserved). With size classes and
-bounded caching, the same 64 steps ended at 762,475,264 cached and
-773,425,152 reserved bytes. In a 200-step run the cache stayed at that level;
-after lowering the cap to 256 MiB, another 64 steps ended at 265,028,352
-cached and 275,978,240 reserved bytes. Active buffers stayed at 10,949,888
-bytes. A cudaMalloc allocation failure now releases cached blocks and retries
-once. Host transfer slices are kept alive through the DLL call.
-
-For fixed-shape Acoustic training, the final three paired CUDA runs measured
-medians of 77.3 ms before and 77.8 ms after, a 0.7% difference. Earlier pairs
-were slower for both binaries as device load changed. Remaining pool work includes
-multi-device isolation and an optional driver-level free/total memory query.
-
-## Irodori-TTS v4.1-Small inference inventory (2026-10-08)
-
-The read-only reference is `irodori_tts` in UtauTTS's Irodori checkout. Its
-v4.1-Small safetensors file has 714 F32 tensors and embeds both model and
-ModernBERT configuration JSON. The model is 12 DiT blocks at width 1280 with
-20 heads, a 32-dimensional latent, text and caption context width 512,
-speaker context width 768, speaker patch size 4, and AdaLN rank 192. The
-pretrained text and caption backbone is the 25-layer, width-768
-`sbintuitions/modernbert-ja-310m` (HF Transformers 5.12.1 configuration).
-The codec is a separate `weights.pth`, not safetensors. The following is the
-complete runtime path and the gap against gograd as of this inventory:
-
-| Stage | Reference behavior | gograd status / required work |
-| --- | --- | --- |
-| Text input | Ordered Japanese substitutions, bracket stripping, NFKC; HF fast tokenizer from `tokenizer.json`, BOS prepend, right padding/truncation to 256 text or 512 caption tokens | Normalization has a 12-case reference fixture; HF tokenizer JSON and token-ID fixtures remain open. The normalization function itself preserves ordinary whitespace. |
-| Text/caption encoding | ModernBERT shared backbone, alternating full and 128-token sliding attention, two RoPE theta values (160000 and 10000), GELU MLP, RMS/normalization details, residual MLP projectors | General attention, linear, embedding, GELU and layer norm exist; ModernBERT architecture, sliding mask, RoPE variants, and checkpoint naming are missing. |
-| Reference audio | WAV load, mono mix, resample to 48 kHz, AudioTools loudness normalization to -16 dB and peak limiting, deterministic DACVAE encode (encoder plus quantizer mean), patch/mask/clip/concat of up to eight reference clips | WAV/resampler/loudness parity and DACVAE encoder are missing. Latent reshape alone is straightforward. |
-| Speaker context | ReferenceLatentEncoder: projected 32-dim latents, 4-token speaker patches, transformer self-attention with RoPE, gated attention, SwiGLU and RMSNorm | Gograd attention is reusable conceptually, but gated attention, RMSNorm, RoPE and model module are absent from its graph. CPU standalone RMSNorm/RoPE primitives now have PyTorch fixtures. |
-| Duration | 14 text features, text token states, speaker/caption pooling/fusion, 3-layer token-sum dual AdaRN-zero duration predictor; `expm1` and frame-to-seconds clamp | Feature construction now has CPU fixture parity. Predictor, pooling, fusion and length parity are open. |
-| DiT | Timestep cosine/sine embedding (512), latent input/output projections, 12 blocks with joint self+text+speaker+caption attention; Q/K RMSNorm, RoPE on half the heads, gated projection, context KV cache, SwiGLU and Low-Rank AdaLN with three shift/scale/gate low-rank paths | Timestep embedding, RMSNorm, full-head RoPE and Low-Rank AdaLN standalone CPU primitives have fixtures. Half-head RoPE, multi-segment masks, cached KV, SwiGLU and complete blocks require implementation and layer-by-layer fixtures. Existing generic MHA does not have these exact semantics. |
-| RF sampler | Seeded PyTorch normal latent, 40-step Euler 0.999-to-0 grid (optional sway), independent/joint/alternating text/speaker/caption CFG in a time window, optional truncation, temporal score rescale and speaker KV scaling | Schedule and temporal score rescale have CPU fixture parity. PyTorch RNG equivalence, all CFG modes and the complete Euler loop are open. |
-| Decoder/output | Unpatch latents, optional flat-tail trim, DACVAE decoder with deterministic message path and disabled codec watermark branch, trim to target sample count, SilentCipher `IRDTS` watermark, WAV write | DACVAE decoder and `.pth` loading, tail trim, watermark model, and audio parity are open. A generated WAV must not be called a drop-in reference output until SilentCipher is handled. |
-
-`autograd.OpenSafeTensorFile` now validates a safetensors F32 index and reads
-one named tensor at a time; `Module.LoadSafeTensorsStream` validates all state
-names/shapes before copying. This avoids the existing all-file host read for
-the multi-GB checkpoint. A small tensor from the real 714-tensor file was
-dumped with `tools/gen_irodori_checkpoint_fixture.py` for exact byte/value
-parity. The model modules are not yet built, so the full state dict cannot be
-loaded into a runnable graph. CUDA work must stay below about 2 GB until the
-other batch-generation job releases the 8 GB device.
-
-Parity fixtures are generated with `tools/gen_irodori_fixture.py` from the
-read-only Python implementation; this script needs no checkpoint. The current
-CPU primitives and checkpoint indexing are foundations for a future Go-only
-runtime, not a working TTS synthesizer. Whole-model numerical parity, a Go
-inference CLI, real WAV output, and CPU/CUDA throughput comparison remain open.
-
-Measured CPU fixture errors: RMSNorm and three duration-feature rows have
-zero max-absolute error; full-head RoPE and sway schedule each have
-`1.1920929e-7`; timestep embedding and temporal score rescale each have
-`5.96046448e-8`; Low-Rank AdaLN output and gate have `2.38418579e-7` and
-`5.96046448e-8`; linear schedule has zero error. The selected real checkpoint
-tensor has zero max-absolute and relative error. A 256x1024 RMSNorm microbenchmark
-on the i5-12400 measured 504,573 ns/op for Go (100 iterations) and a
-285,800 ns/op median for PyTorch (100 iterations, one thread). These are
-separate microbenchmarks, not a full-model speed comparison; no CUDA benchmark
-was run while the device was occupied.
+固定形状のAcousticの学習では、最後の3対のCUDAの実行の中央値が、変更前77.3 ms、変更後77.8 msで、差は0.7%でした。それより前の対は、デバイスの負荷が変わってどちらのバイナリも遅くなりました。
