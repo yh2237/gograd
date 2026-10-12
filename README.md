@@ -138,6 +138,7 @@ PyTorchのfixtureを作り直すには`torch`が必要です。
 ```
 python tools/gen_fixture.py
 python tools/gen_nn_fixture.py
+python tools/gen_losses_fixture.py
 ```
 
 `cuda`のテストは、CUDAランタイムとcuBLASのDLLを読み込めるときだけ実行します。WindowsではCUDAの`bin\x64`ディレクトリを`PATH`に通します。例を示します。

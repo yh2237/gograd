@@ -17,6 +17,7 @@ gogradの学習で使う公開APIの一覧です。学習checkpointは`safetenso
 | `autograd` | `MaxPool2d`、`AvgPool2d`、`AdaptiveAvgPool2d`、各オプションと層 | CPU/CUDAのNCHW pooling。重複する窓の勾配、ceil mode、明示的な平均の除数を持ちます。 |
 | `autograd` | `BatchNorm`、`BatchNormOptions`、`NewBatchNormLayer`、`BatchNormLayerOptions`、`BatchNormLayer` | rank 2〜6のチャネル正規化、CPU/CUDAの学習・評価の勾配、名前付きのaffineパラメータとrunning state。 |
 | `autograd` | `Module.StateDict`、`LoadStateDict`、`SaveSafeTensors`、`SaveSafeTensorsMetadata`、`LoadSafeTensors` | 名前付きのfloat32 state。metadataの値は文字列です。 |
+| `autograd` | `MSELoss`、`L1Loss`、`BCEWithLogitsLoss`、`LossOptions`、`Reduction` | 予測とtargetからスカラーを返す汎用の損失。mean/sumのreductionと要素ごとの重みを持ち、重み付き平均の除数はPyTorchの各損失に合わせます。 |
 | `autograd` | `MaskedLoss(pred,target,false)`、`ClipGradNorm`、`NewAdamW`、`NewOneCycle` | NaNフレームをマスクしたL1、クリップ、AdamW、PyTorchの2段cosineのOneCycle LR。 |
 | `autograd` | `AdamW.State`、`LoadState`、`SaveSafeTensors`、`LoadSafeTensors`、`Close` | CPU/CUDAの名前付きパラメータ形状、モーメント、ハイパーパラメータ、ステップ数。optimizerが持つバッファを解放します。 |
 | `autograd` | `Optimizer`、`CheckpointOptimizer`、`OptimizerSnapshot`、`LearningRate`、`SetLearningRate` | 共通の更新・リセット・学習率・寿命のAPIと、AdamW/SGDの型付きcheckpointスナップショット。OneCycleはOptimizerを受け取ります。 |
@@ -293,6 +294,27 @@ err = root.SaveSafeTensors("norm.safetensors")
 - CPUとCUDAは、BF16 autocastの下でもFP32の出力と勾配を計算します。モーメントのreductionはfloat64で累積し、FP32の統計を保存します。CUDAのrunning更新とバッチ数の計上はデバイス上に留まり、累積平均も含めてグラフの再生に対応します。通常どおりモデルをbindし、`NewCUDAContext`を保持します。stateの確認や書き出しにだけ、明示的なホストへの読み戻しが必要です。
 
 PyTorchのfixtureは、forward、入力とaffineの全てのVJP、偏りあり・なしの分散、channels-first/lastのレイアウト、rank 2〜6、サンプルが1つの評価、reductionの端を確認します。複数ステップの列では、固定・累積の更新、NoGradの学習、追跡を無効にした評価を追加で比較します。Goだけのテストは、有限差分、選択的な勾配、共有・retainした履歴、closeした先祖、独立したCPU worker、stateの再読込、CUDAのcaptureとメモリ回収を確認します。作り直すには`python tools/gen_batchnorm_fixture.py`を使います。
+
+## 汎用の損失
+
+`MSELoss`、`L1Loss`、`BCEWithLogitsLoss`は、同じ形状と同じdeviceの予測とtargetを受け取り、スカラーを返します。既存の要素演算とreductionを組み合わせて実装しているため、CPUとCUDAで同じ契約です。
+
+```go
+loss := autograd.MSELoss(prediction, target, autograd.LossOptions{})
+// 要素ごとの重みで、0の重みの要素を平均から外します。
+loss = autograd.L1Loss(prediction, target, autograd.LossOptions{Weight: weights})
+// 二値分類のlogitsは、数値的に安定なこちらを使います。
+loss = autograd.BCEWithLogitsLoss(logits, target, autograd.LossOptions{Reduction: autograd.ReductionSum})
+```
+
+- `LossOptions.Reduction`は`ReductionMean`（ゼロ値）と`ReductionSum`です。reduceしない`none`はありません。損失がスカラーで、`Backward`がスカラーを要求するためです。要素ごとの値が必要な場合は要素演算を組み合わせます。
+- `LossOptions.Weight`は予測と同じ形状とdeviceの任意のテンソルで、勾配は持ちません。要素をスケールし、`ReductionMean`では0の重みがその要素を平均から外します。
+- 重み付き平均の除数は、PyTorchの損失ごとの実装に合わせます。`MSELoss`と`L1Loss`は重みの和で割り、`BCEWithLogitsLoss`は要素数で割ります。そのためBCEの平均では、0の重みは除数から要素を外しません。外したいときは`ReductionSum`を使い、除数を自分で指定します。
+- `BCEWithLogitsLoss`は`max(x,0) - x*y + log(1+exp(-|x|))`の形で計算するため、logitの絶対値が大きくても有限です。targetは`[0,1]`の確率です。確率そのものを渡すBCEは対数のclampが必要になるため提供しません。
+- `MaskedLoss`はrank 3のNaNフレームマスク専用として残ります。無効なフレームをNaNで表す既存の用途はそちらを使います。
+- 形状が一致しない場合、deviceが混在する場合、未知のreductionはpanicします。損失は`ToHost`で読み、`Backward`の後は通常どおり`ReleaseGraph`で解放します。
+
+`testdata/losses.json`（`tools/gen_losses_fixture.py`が生成）は、3つの損失×mean/sum×重みあり/なしの12ケースで、損失値と予測勾配をPyTorchとCPU/CUDAで照合します。ゼロ重みのマスク、未知のreduction、形状とdeviceの不一致、スカラー入力はGoのテストで確認します。`cmd/tabular-train`と`cmd/audio-train`は、手で組んだ平均二乗誤差ではなく`MSELoss`を使います。
 
 ## OptimizerとSGD
 
