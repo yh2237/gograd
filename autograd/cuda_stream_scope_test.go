@@ -232,6 +232,156 @@ func cudaStreamRun(t *testing.T, seed int64, stream *cuda.Stream, steps int) (fu
 	}, nil
 }
 
+// splitStepRun trains two independent branches of one model, optionally running
+// each branch's forward on its own stream and joining them with an event, and
+// returns the parameters followed by their gradients.
+func splitStepRun(t *testing.T, left, right *cuda.Stream) ([]float32, []float32, error) {
+	t.Helper()
+	execution := NewExecutionContext()
+	rng := rand.New(rand.NewSource(19))
+	first, err := NewLinearLayer(4, 3, tensor.CUDA, rng)
+	if err != nil {
+		return nil, nil, err
+	}
+	second, err := NewLinearLayer(4, 3, tensor.CUDA, rng)
+	if err != nil {
+		return nil, nil, err
+	}
+	root := &Module{Children: []NamedModule{
+		{Name: "first", Module: first.StateModule()},
+		{Name: "second", Module: second.StateModule()},
+	}}
+	for _, p := range root.NamedParameters() {
+		defer p.Value.Close()
+	}
+	if err := execution.BindModule(root); err != nil {
+		return nil, nil, err
+	}
+	inputsA := []float32{.5, -.25, 1.5, .75}
+	inputsB := []float32{-1, .25, .5, -.75}
+	targets := []float32{.25, -.75, .5}
+	xa, err := execution.New(inputsA, []int{1, 4}, tensor.CUDA, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer xa.Close()
+	xb, err := execution.New(inputsB, []int{1, 4}, tensor.CUDA, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer xb.Close()
+	target, err := execution.New(targets, []int{1, 3}, tensor.CUDA, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer target.Close()
+	var ya, yb *Tensor
+	if left == nil || right == nil {
+		ya = first.Forward(xa)
+		yb = second.Forward(xb)
+	} else {
+		if err := cuda.WithStream(left, func() error { ya = first.Forward(xa); return nil }); err != nil {
+			return nil, nil, err
+		}
+		if err := cuda.WithStream(right, func() error { yb = second.Forward(xb); return nil }); err != nil {
+			return nil, nil, err
+		}
+		// The consumer stream must not read the other branch before it is done.
+		event, err := cuda.NewEvent(false)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer event.Destroy()
+		if err := event.Record(right); err != nil {
+			return nil, nil, err
+		}
+		if err := left.WaitEvent(event); err != nil {
+			return nil, nil, err
+		}
+	}
+	// Join, loss and backward run on the caller's stream (or on left when split).
+	run := func() error {
+		sum := Add(ya, yb)
+		difference := Sub(sum, target)
+		loss := Mean(Mul(difference, difference), 0, 1)
+		if err := loss.Backward(); err != nil {
+			loss.ReleaseGraph()
+			return err
+		}
+		loss.ReleaseGraph()
+		return nil
+	}
+	if left == nil {
+		if err := run(); err != nil {
+			return nil, nil, err
+		}
+	} else if err := cuda.WithStream(left, run); err != nil {
+		return nil, nil, err
+	}
+	var values, gradients []float32
+	for _, p := range root.NamedParameters() {
+		host, err := p.Value.ToHost()
+		if err != nil {
+			return nil, nil, err
+		}
+		values = append(values, host...)
+		grad, err := p.Value.GradToHost()
+		if err != nil {
+			return nil, nil, err
+		}
+		gradients = append(gradients, grad...)
+	}
+	return values, gradients, nil
+}
+
+// TestSplitStepAcrossStreams splits one step's two branch forwards onto two
+// streams, joins them with an event, and checks the parameters and gradients
+// against a single-stream run of the same step.
+func TestSplitStepAcrossStreams(t *testing.T) {
+	if !cuda.Available() {
+		t.Skip("CUDA unavailable")
+	}
+	context, err := NewCUDAContext()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer context.Close()
+	wantValues, wantGradients, err := splitStepRun(t, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left, err := cuda.NewStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer left.Destroy()
+	right, err := cuda.NewStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer right.Destroy()
+	gotValues, gotGradients, err := splitStepRun(t, left, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compare := func(name string, got, want []float32) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("%s has %d values, want %d", name, len(got), len(want))
+		}
+		for i := range got {
+			if math.IsNaN(float64(got[i])) || math.Abs(float64(got[i]-want[i])) > 1e-5 {
+				t.Fatalf("%s[%d] = %v, single-stream run gave %v", name, i, got[i], want[i])
+			}
+		}
+	}
+	compare("parameter", gotValues, wantValues)
+	compare("gradient", gotGradients, wantGradients)
+	if cuda.CurrentStream() != nil {
+		t.Fatal("stream leaked out of the split step")
+	}
+}
+
 // TestTwoStreamsInOneThread interleaves two independent training runs on two
 // streams from one OS thread and checks both against runs made on the default
 // stream. The stream-keyed pool and the stream-following cuBLAS handle make the

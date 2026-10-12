@@ -137,6 +137,9 @@ func NewEvent(timing bool) (*Event, error) { return nil, ErrUnavailable }
 // Record returns ErrUnavailable.
 func (e *Event) Record(stream *Stream) error { return ErrUnavailable }
 
+// WaitEvent returns ErrUnavailable.
+func (s *Stream) WaitEvent(event *Event) error { return ErrUnavailable }
+
 // Synchronize returns ErrUnavailable.
 func (e *Event) Synchronize() error { return ErrUnavailable }
 

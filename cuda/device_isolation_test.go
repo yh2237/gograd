@@ -227,6 +227,115 @@ func TestCaptureRejectsNestingAndNilStream(t *testing.T) {
 	}
 }
 
+func TestWaitEventOrdersStreams(t *testing.T) {
+	if !Available() {
+		t.Skip("cuda unavailable:", loadErrorText())
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := SetDevice(0); err != nil {
+		t.Fatal(err)
+	}
+	kernel, err := LoadKernel(graphKernelSource, "add_arrays")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kernel.Close()
+	producer, err := NewStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer producer.Destroy()
+	consumer, err := NewStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer consumer.Destroy()
+	const n = 16
+	ones := make([]float32, n)
+	for i := range ones {
+		ones[i] = 1
+	}
+	// The producer adds on its stream; the consumer adds again after waiting.
+	// Without the wait the consumer could read the buffer before the producer's
+	// add, so the expected values pin the ordering down.
+	for iteration := 0; iteration < 25; iteration++ {
+		source, err := Alloc(n * 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		one, err := Alloc(n * 4)
+		if err != nil {
+			source.Free()
+			t.Fatal(err)
+		}
+		result, err := Alloc(n * 4)
+		if err != nil {
+			source.Free()
+			one.Free()
+			t.Fatal(err)
+		}
+		values := make([]float32, n)
+		for i := range values {
+			values[i] = float32(iteration + i)
+		}
+		if err := source.CopyFromHost(floatsToBytes(values)); err != nil {
+			t.Fatal(err)
+		}
+		if err := one.CopyFromHost(floatsToBytes(ones)); err != nil {
+			t.Fatal(err)
+		}
+		if err := result.CopyFromHost(floatsToBytes(make([]float32, n))); err != nil {
+			t.Fatal(err)
+		}
+		event, err := NewEvent(false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := WithStream(producer, func() error {
+			launchAdd(t, kernel, source, one, source, n)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := event.Record(producer); err != nil {
+			t.Fatal(err)
+		}
+		if err := consumer.WaitEvent(event); err != nil {
+			t.Fatal(err)
+		}
+		if err := WithStream(consumer, func() error {
+			launchAdd(t, kernel, source, one, result, n)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := consumer.Synchronize(); err != nil {
+			t.Fatal(err)
+		}
+		got := download(t, result, n)
+		for i := range got {
+			if want := values[i] + 2; got[i] != want {
+				t.Fatalf("iteration %d value %d = %v, want %v", iteration, i, got[i], want)
+			}
+		}
+		event.Destroy()
+		source.Free()
+		one.Free()
+		result.Free()
+	}
+	if err := consumer.WaitEvent(nil); err == nil {
+		t.Fatal("nil event accepted")
+	}
+	if err := (*Stream)(nil).WaitEvent(nil); err == nil {
+		t.Fatal("nil stream accepted")
+	}
+	var dead Event
+	if err := consumer.WaitEvent(&dead); err == nil {
+		t.Fatal("destroyed event accepted")
+	}
+}
+
 func TestWithStreamRestoresSelection(t *testing.T) {
 	if !Available() {
 		t.Skip("cuda unavailable:", loadErrorText())

@@ -750,8 +750,13 @@ func NewEvent(timing bool) (*Event, error) {
 	return &Event{handle: handle}, nil
 }
 
-// Record marks the event on the stream.
+// Record marks the event on the stream, or on the calling thread's implicit
+// stream when stream is nil. A later WaitEvent on another stream then orders its
+// work after everything recorded before this point.
 func (e *Event) Record(stream *Stream) error {
+	if e == nil || e.handle == 0 {
+		return fmt.Errorf("cuda: record needs a live event")
+	}
 	a, err := load()
 	if err != nil {
 		return err
@@ -762,6 +767,24 @@ func (e *Event) Record(stream *Stream) error {
 	}
 	code, _, _ := a.eventRecord.Call(e.handle, streamHandle)
 	return runtimeError("cudaEventRecord", code)
+}
+
+// WaitEvent makes everything the caller enqueues on this stream afterwards wait
+// for event. It is how one stream consumes a value produced on another stream:
+// record an event on the producer, then wait on it before enqueuing consumers.
+func (s *Stream) WaitEvent(event *Event) error {
+	if s == nil || s.handle == 0 {
+		return fmt.Errorf("cuda: wait needs a live stream")
+	}
+	if event == nil || event.handle == 0 {
+		return fmt.Errorf("cuda: wait needs a live event")
+	}
+	a, err := load()
+	if err != nil {
+		return err
+	}
+	code, _, _ := a.streamWaitEvent.Call(s.handle, event.handle, 0)
+	return runtimeError("cudaStreamWaitEvent", code)
 }
 
 // Synchronize waits for the event.
