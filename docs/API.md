@@ -25,8 +25,9 @@ gogradの学習で使う公開APIの一覧です。学習checkpointは`safetenso
 | `autograd` | `SaveTrainingCheckpoint`、`LoadTrainingCheckpoint`、`TrainingCheckpointMetadata` | model/bufferとAdamW/SGDとOneCycleを、呼び出し側のmetadataと共に1つのファイルへ原子的に保存するcheckpoint。名前・形状・stateはlive objectへコピーする前に検証します。 |
 | `autograd` | `Module.Train`、`SetTraining` | train/evalモードの再帰的な伝播。`OnTrainingChange`はdropoutなどのstatefulな層をモジュールツリーへ接続します。 |
 | `autograd` | `IndexLoader.State`、`LoadState`、`WindowSampler.Batch`、`State`、`LoadState` | 再開できるepoch順またはPCGのランダムwindow。短い系列のパディングとcontextの破棄の判断を含みます。 |
+| `autograd` | `StreamBranch`、`RunBranches` | 1つの記録の中の独立した分岐をそれぞれのstreamでenqueueし、呼び出したスレッドのカレントstreamへeventで合流させます。分岐の切り方は呼び出し側が指定します。 |
 | `cuda` | `SetCurrentStream`、`CurrentStream`、`CurrentStreamHandle`、`WithStream` | 呼び出したOSスレッドの暗黙のstreamの選択と照会。`WithStream`はスコープの終了時に前の選択へ戻します。 |
-| `cuda` | `Event`、`NewEvent`、`Event.Record`、`Stream.WaitEvent`、`Event.Synchronize`、`ElapsedTime` | stream間の順序付けと計時。あるstreamの完了をeventとして記録し、別のstreamがそれを待ってから読み取ります。 |
+| `cuda` | `Event`、`NewEvent`、`Event.Record`、`Stream.WaitEvent`、`Event.WaitOn`、`ElapsedTime` | stream間の順序付けと計時。あるstreamの完了をeventとして記録し、別のstreamがそれを待ってから読み取ります。`Event.WaitOn`は待たせる側をstreamの値または既定のstreamで指定します。 |
 | `cuda` | `MemoryStats`、`ResetAllocationPeak`、`SetPoolCacheLimit`、`ReleasePool` | 使用中・キャッシュ・予約バイトの照会。再利用するCUDA割当の上限設定と解放。 |
 | `data` | `Dataset[T]`、`SliceDataset`、`NewSubset`、`RandomSplit` | ホスト側のランダムアクセスsample、index view、決定的で重複しない分割。 |
 | `data` | `Sampler`、`StatefulSampler`、`NewIndexSampler`、`IndexSamplerState` | トランザクション的なindex選択、seed付きの順列、epoch途中と将来のepochの再開。 |
@@ -40,24 +41,28 @@ gogradの学習で使う公開APIの一覧です。学習checkpointは`safetenso
 
 CUDAのdevice、stream、captureの状態は、それを使うOSスレッドに属します。`SetDevice`と`CurrentDevice`でdeviceを選び、`autograd.NewCUDAContextOn`はgoroutineを検証済みのdeviceに固定し、`Close`でそのスレッドの以前のdeviceを復元します。`Buffer.Device()`は割当が属するdeviceを返します。再利用するプールの項目はdeviceとstreamとサイズクラスをキーにします。解放したブロックは同じstreamにだけ返すため、あるstreamがまだ読み取り中のブロックを別のstreamが再利用することはありません。`CopyFromHost`、`CopyToHost`、`Memset`/`MemsetAsync`、`Free`はバッファ自身のdeviceを選んで呼び出し側のdeviceを復元するため、複数deviceのコードは周囲のdeviceに依存しません。`SetCurrentStream`と`CurrentStreamHandle`は、呼び出したスレッドでカーネル起動とevent記録が使う暗黙のstreamを選びます。何も選ばないときは既定のstreamを使います。`CurrentStream`は選択中のstreamを返し、`WithStream(stream, fn)`はスコープの終了時（panic時も含む）に前の選択へ戻します。cuBLASのハンドルもこの暗黙のstreamに追従するため、NVRTCカーネル、memset、コピー、GEMMが同じstreamに乗ります。
 
-1つの記録の中で処理を複数のstreamへ分けるには、`Event.Record`と`Stream.WaitEvent`で依存を明示します。あるstreamの結果を別のstreamが読むには、作り手のstreamでeventを記録し、読み手のstreamがそれを待ってから続きをenqueueします。割当プールはstreamごとに分かれているため、片方のstreamが解放したバッファをもう片方が再利用することはありません。
+1つの記録の中で処理を複数のstreamへ分けるには、`RunBranches`が使えます。分岐ごとにstreamと処理を渡すと、ライブラリが各分岐をそのstreamへenqueueし、呼び出したスレッドのカレントstreamが全分岐を待つようにeventを記録します。合流後は、結果を呼び出し側のstreamでそのまま消費できます。分岐の切り方は呼び出し側が決め、自動で分割はしません。
 
 ```go
-// leftとrightは呼び出し側が用意した別々のstreamです。
-// 分岐Aをleft、分岐Bをrightでenqueueします。
-cuda.WithStream(left, func() error { ya = branchA(x); return nil })
-cuda.WithStream(right, func() error { yb = branchB(x); return nil })
+// leftとrightは呼び出し側が用意したstreamです。
+err := autograd.RunBranches([]autograd.StreamBranch{
+    {Stream: left, Run: func() error { ya = branchA(x); return nil }},
+    {Stream: right, Run: func() error { yb = branchB(x); return nil }},
+})
+// エラーを処理します。この時点でカレントstreamは両方の分岐を待ちます。
+// yaとybを合流させ、Backwardとoptimizer.Step()まで通常どおり実行します。
+```
+
+`Event.Record`と`Stream.WaitEvent`／`Event.WaitOn`を使えば、合流点を自分で書くこともできます。あるstreamの結果を別のstreamが読むときは、作り手のstreamでeventを記録し、読み手のstreamが待ってから続きをenqueueします。割当プールはstreamごとに分かれているため、片方のstreamが解放したバッファをもう片方が再利用することはありません。
+
+```go
 // rightの完了をeventに記録し、leftがそれを待ってから合流します。
 event, err := cuda.NewEvent(false)
 // エラーを処理します。終わったらevent.Destroy()を呼びます。
 _ = err
 err = event.Record(right)
-err = left.WaitEvent(event)
-err = cuda.WithStream(left, func() error {
-    // yaとybを合流させ、Backwardとoptimizer.Step()まで通常どおり実行します。
-    return nil
-})
-// エラーを処理します。
+err = event.WaitOn(left)
+// エラーを処理します。以降のleftの処理はrightの完了後に実行されます。
 ````Capture`は明示的なstreamを必要とし、現在のdeviceを変更せずに記録し、同じスレッドでの入れ子のcaptureを拒否し、記録したdeviceでグラフを再生します。したがって独立したスレッドは、それぞれ別の暗黙のstreamとcaptureの状態を保ちます。
 
 ## 実行コンテキストと勾配の記録
