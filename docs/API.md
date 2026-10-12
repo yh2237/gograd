@@ -10,7 +10,7 @@ gogradの学習で使う公開APIの一覧です。学習checkpointは`safetenso
 | `autograd` | `NewCUDAContext`、`NewCUDAContextOn`、`CUDAContext.Device`、`CUDAContext.Close` | 学習ステップの間、呼び出したOSスレッドにCUDAコンテキストを保持します。deviceを選んで検証し、`Close`でそのスレッドの以前のdeviceを復元できます。 |
 | `autograd` | `New`、`Tensor.ToHost`、`Tensor.Backward`、`Tensor.ReleaseGraph`、`Tensor.Close` | float32テンソル、明示的な読み戻し、寿命の管理。 |
 | `autograd` | `RetainData`、`RetainGrad`、`BackwardWithOptions`、`BackwardOptions` | 共有ストレージの寿命、forward値と勾配の保持、複数回のbackwardのための履歴保持。 |
-| `autograd` | `NewExecutionContext`、`ExecutionContext.New`、`Zeros`、`Bind`、`BindModule`、`NoGrad`、`Recording`、`Tensor.ExecutionContext` | テンソルとviewが伝える明示的な記録スコープ。独立したCPUモデルは別々のコンテキストで学習と推論を並行できます。 |
+| `autograd` | `NewExecutionContext`、`ExecutionContext.New`、`Zeros`、`Bind`、`BindModule`、`NoGrad`、`Recording`、`SetCUDA`、`CUDA`、`WithCUDA`、`Tensor.ExecutionContext` | テンソルとviewが伝える明示的な記録スコープ。独立したCPUモデルは別々のコンテキストで学習と推論を並行できます。`SetCUDA`でdeviceとstreamを記録し、`WithCUDA`が呼び出したOSスレッドの選択を一時的に切り替えて元に戻します。 |
 | `autograd` | `ExecutionOptions`、`ExecutionContext.SetOptions`、`Options`、`Autocast` | コンテキストごとのBF16とアテンションの方針、スコープ付きの精度、backwardに渡すforward方針のスナップショット。 |
 | `autograd` | `NewEmbeddingLayer`、`NewConv1dLayer`、`NewLayerNormLayer`、`NewLinearLayer`、`DropoutLayer`、`GELULayer`、`Sequential` | 再利用できるグラフモジュール。畳み込みの活性化は`[batch,time,channels]`、重みは`[out,in,kernel]`です。 |
 | `autograd` | `Conv2d`、`Conv2dOptions`、`NewConv2dLayer`、`Conv2dLayer` | NCHWの活性化、`[out,in/groups,kH,kW]`の重み、任意のbias、grouped/depthwise畳み込み、CPU/CUDAの勾配。 |
@@ -25,6 +25,7 @@ gogradの学習で使う公開APIの一覧です。学習checkpointは`safetenso
 | `autograd` | `SaveTrainingCheckpoint`、`LoadTrainingCheckpoint`、`TrainingCheckpointMetadata` | model/bufferとAdamW/SGDとOneCycleを、呼び出し側のmetadataと共に1つのファイルへ原子的に保存するcheckpoint。名前・形状・stateはlive objectへコピーする前に検証します。 |
 | `autograd` | `Module.Train`、`SetTraining` | train/evalモードの再帰的な伝播。`OnTrainingChange`はdropoutなどのstatefulな層をモジュールツリーへ接続します。 |
 | `autograd` | `IndexLoader.State`、`LoadState`、`WindowSampler.Batch`、`State`、`LoadState` | 再開できるepoch順またはPCGのランダムwindow。短い系列のパディングとcontextの破棄の判断を含みます。 |
+| `cuda` | `SetCurrentStream`、`CurrentStream`、`CurrentStreamHandle`、`WithStream` | 呼び出したOSスレッドの暗黙のstreamの選択と照会。`WithStream`はスコープの終了時に前の選択へ戻します。 |
 | `cuda` | `MemoryStats`、`ResetAllocationPeak`、`SetPoolCacheLimit`、`ReleasePool` | 使用中・キャッシュ・予約バイトの照会。再利用するCUDA割当の上限設定と解放。 |
 | `data` | `Dataset[T]`、`SliceDataset`、`NewSubset`、`RandomSplit` | ホスト側のランダムアクセスsample、index view、決定的で重複しない分割。 |
 | `data` | `Sampler`、`StatefulSampler`、`NewIndexSampler`、`IndexSamplerState` | トランザクション的なindex選択、seed付きの順列、epoch途中と将来のepochの再開。 |
@@ -36,7 +37,7 @@ gogradの学習で使う公開APIの一覧です。学習checkpointは`safetenso
 
 `cuda.MemoryStats()`は、gogradのCUDAアロケータが持つ物理バイト数を返します。`LiveBytes`、`CachedBytes`、`ReservedBytes`、`PeakLiveBytes`、`PeakReservedBytes`、`CachedBuffers`、`CacheLimitBytes`です。既定のキャッシュ上限は2 GiBです。`SetPoolCacheLimit`は上限を下げたときに、最も長く使われていないキャッシュをすぐに解放します。使用中のテンソルと、記録したグラフが予約している割当は解放しません。`ResetAllocationPeak`はピークの値を現在の値に戻します。この値には、gogradのプールを通さずCUDAライブラリが直接確保した分は含まれません。`Buffer.Size()`は、物理的なサイズクラスが大きくても、要求した論理バイト数を返します。
 
-CUDAのdevice、stream、captureの状態は、それを使うOSスレッドに属します。`SetDevice`と`CurrentDevice`でdeviceを選び、`autograd.NewCUDAContextOn`はgoroutineを検証済みのdeviceに固定し、`Close`でそのスレッドの以前のdeviceを復元します。`Buffer.Device()`は割当が属するdeviceを返します。再利用するプールの項目はdeviceとstreamとサイズクラスをキーにします。解放したブロックは同じstreamにだけ返すため、あるstreamがまだ読み取り中のブロックを別のstreamが再利用することはありません。`CopyFromHost`、`CopyToHost`、`Memset`/`MemsetAsync`、`Free`はバッファ自身のdeviceを選んで呼び出し側のdeviceを復元するため、複数deviceのコードは周囲のdeviceに依存しません。`SetCurrentStream`と`CurrentStreamHandle`は、呼び出したスレッドでカーネル起動とevent記録が使う暗黙のstreamを選びます。何も選ばないときは既定のstreamを使います。`Capture`は明示的なstreamを必要とし、現在のdeviceを変更せずに記録し、同じスレッドでの入れ子のcaptureを拒否し、記録したdeviceでグラフを再生します。したがって独立したスレッドは、それぞれ別の暗黙のstreamとcaptureの状態を保ちます。
+CUDAのdevice、stream、captureの状態は、それを使うOSスレッドに属します。`SetDevice`と`CurrentDevice`でdeviceを選び、`autograd.NewCUDAContextOn`はgoroutineを検証済みのdeviceに固定し、`Close`でそのスレッドの以前のdeviceを復元します。`Buffer.Device()`は割当が属するdeviceを返します。再利用するプールの項目はdeviceとstreamとサイズクラスをキーにします。解放したブロックは同じstreamにだけ返すため、あるstreamがまだ読み取り中のブロックを別のstreamが再利用することはありません。`CopyFromHost`、`CopyToHost`、`Memset`/`MemsetAsync`、`Free`はバッファ自身のdeviceを選んで呼び出し側のdeviceを復元するため、複数deviceのコードは周囲のdeviceに依存しません。`SetCurrentStream`と`CurrentStreamHandle`は、呼び出したスレッドでカーネル起動とevent記録が使う暗黙のstreamを選びます。何も選ばないときは既定のstreamを使います。`CurrentStream`は選択中のstreamを返し、`WithStream(stream, fn)`はスコープの終了時（panic時も含む）に前の選択へ戻します。cuBLASのハンドルもこの暗黙のstreamに追従するため、NVRTCカーネル、memset、コピー、GEMMが同じstreamに乗ります。`Capture`は明示的なstreamを必要とし、現在のdeviceを変更せずに記録し、同じスレッドでの入れ子のcaptureを拒否し、記録したdeviceでグラフを再生します。したがって独立したスレッドは、それぞれ別の暗黙のstreamとcaptureの状態を保ちます。
 
 ## 実行コンテキストと勾配の記録
 
@@ -73,7 +74,19 @@ execution.NoGrad(func() {
 - NoGradはコンテキスト全体を制御し、1つのgoroutineだけを対象にしません。並行して動かすworkerごとに、コンテキストと独立したモデルstateを用意します。共有するモデルでは、テンソルの値、勾配、optimizerのstate、train/evalの切り替えを並行して変更できません。bind自体は初期化の手順です。
 - 推論の結果は寿命の親を保ち、`ReleaseGraph`がCPUの中間値とCUDAの補助バッファを回収できるようにします。導関数のコールバックは保ちません。グラフの回収後も値が必要な場合はretainしたハンドルを使います。`Detach`は独立したストレージを作り、履歴を切り、非連続なviewも含めてコンテキストの同一性を保ちます。
 
-このコンテキストが分離するのは、勾配の記録、BF16モード、アテンションの選択です。CUDAのstreamやcapture、割当プールは持ちません。CUDAを使う呼び出し側は、これまでどおり呼び出したOSスレッドで`NewCUDAContext`を保持します。`NewCUDAContextOn`はdeviceを選び、`Close`でそのスレッドの以前のdeviceを復元します。`cuda`パッケージは暗黙のstreamとcaptureの可否をOSスレッド単位で持つため、別々のコンテキストを持つgoroutineが互いのstreamを上書きしません。1回の記録の中で独立したstreamを重ねる使い方は、このAPIの対象外です。`cmd/cnn-train`は明示的コンテキストのAPIを使います。
+このコンテキストが分離するのは、勾配の記録、BF16モード、アテンションの選択です。CUDAのstreamやcapture、割当プールの寿命は持ちませんが、`SetCUDA(device, stream)`で使うdeviceとstreamを記録できます。記録した組は`WithCUDA(fn)`が呼び出したOSスレッドに適用し、`fn`の終了時（panic時も含む）に以前の選択へ戻します。CUDAを使う呼び出し側は、これまでどおり呼び出したOSスレッドで`NewCUDAContext`を保持します。`NewCUDAContextOn`はdeviceを選び、`Close`でそのスレッドの以前のdeviceを復元します。`cuda`パッケージは暗黙のstreamとcaptureの可否をOSスレッド単位で持つため、別々のコンテキストを持つgoroutineが互いのstreamを上書きしません。1回の記録の中で複数のstreamを重ねて並行に走らせることは、まだ対象外です。`cmd/cnn-train`は明示的コンテキストのAPIを使います。
+
+```go
+stream, err := cuda.NewStream() // 呼び出し側が寿命を管理します
+// エラーを処理します。終わったらstream.Destroy()を呼びます。
+execution.SetCUDA(0, stream)
+err = execution.WithCUDA(func() error {
+    // このスコープのkernel、cuBLAS、コピーはstreamに乗ります。
+    // forward、Backward、optimizer.Step()を通常どおり実行します。
+    return nil
+})
+// エラーを処理します。スレッドのdeviceとstreamは前の選択に戻っています。
+```
 
 ### 精度とアテンションの方針
 
