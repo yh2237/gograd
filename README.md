@@ -1,208 +1,56 @@
 # gograd
 
-A small reverse-mode autograd library and a frame-level intonation TCN, written
-in Go. The reference engine computes in CPU float64; the general `tensor` and
-`nn` path trains in float32 on CPU or CUDA.
+Goで書いた逆伝播の自動微分ライブラリです。参照エンジンはCPUのfloat64で計算し、汎用の`tensor`と`nn`はCPUまたはCUDAでfloat32を扱います。cgoやCコンパイラ、Pythonは必要ありません。WindowsではCUDAランタイム、cuBLAS、NVRTCのDLLをシステムローダー経由で呼び出します。他のプラットフォームではCUDAの操作は`ErrUnavailable`を返し、`MemoryStats`は0を返します。
 
-## Status
+## 概要
 
-The engine is a CPU reference implementation in float64. It covers exactly the
-operations the TCN and its loss need:
+参照エンジンはCPUのfloat64で実装し、TCNとその損失に必要な演算を持ちます。
 
-- `Linear`, `tanh`, elementwise add/sub/scale, `clamp`
-- symmetric zero-padded dilated `Conv1d` (kernel 3, per-layer dilation)
-- transpose and reshape, adjacent-frame difference
-- mask gather, per-row median centering, Smooth L1 loss
-- AdamW with decoupled weight decay and global gradient-norm clipping
-- export of the `frame_pitch` JSON consumed by the Go runtime
+- `Linear`、`tanh`、要素ごとの加算・減算・スケール、`clamp`
+- 対称ゼロパディングのdilated `Conv1d`（カーネル3、層ごとのdilation）
+- transposeとreshape、隣接フレームの差分
+- マスク付きgather、行ごとのメディアン中心化、Smooth L1損失
+- decoupled weight decayとグローバル勾配ノルムクリップ付きのAdamW
+- Goランタイムが読む`frame_pitch` JSONの出力
 
-The `cuda` package binds the CUDA runtime, cuBLAS and NVRTC DLLs on Windows
-through the system loader, so no cgo or C compiler is needed. It provides device
-queries, device buffers with explicit `Free`, streams, events, a row-major
-`SgemmRowMajor` wrapper, an im2col + SGEMM `Conv1dForward`, and NVRTC-compiled
-kernels loaded through the CUDA driver. It can capture a sequence of work into
-a `Graph` and replay it with one launch. Freed buffers are reused from a
-size-class pool capped at 2 GiB by default, so variable sequence lengths do
-not retain every exact allocation size. `cuda.MemoryStats` reports live,
-cached, reserved and peak bytes; `SetPoolCacheLimit` changes the cap, and
-`ReleasePool` returns cached memory to the driver. Device, implicit stream and
-capture state belong to the calling OS thread; pool entries and `Buffer` values
-record their device, and copies, memset and free select it, so goroutines that
-hold separate `autograd.NewCUDAContextOn` contexts keep independent streams,
-captures and devices. On other platforms CUDA
-operations report `ErrUnavailable` and `MemoryStats` returns zero counters.
+`cuda`パッケージは、デバイスの照会、明示的な`Free`を持つデバイスバッファ、stream、event、row-majorの`SgemmRowMajor`、im2colとSGEMMによる`Conv1dForward`、CUDAドライバ経由で読み込むNVRTCカーネルを提供します。連続した処理を`Graph`に記録し、1回のlaunchで再生できます。解放したバッファはサイズクラスごとのプールから再利用します。既定の上限は2 GiBで、系列長が変わっても割当サイズごとに保持しません。`cuda.MemoryStats`は使用中・キャッシュ・予約・ピークのバイト数を返し、`SetPoolCacheLimit`は上限を変更し、`ReleasePool`はキャッシュをドライバへ返します。device、暗黙のstream、capture状態は呼び出したOSスレッドに属します。プールの項目と`Buffer`は自分のdeviceを記録し、コピー・memset・freeはそのdeviceを選ぶため、`autograd.NewCUDAContextOn`で別々のコンテキストを持つgoroutineは独立したstream、capture、deviceを保ちます。
 
-The `autograd` package is a define-by-run float32 graph with rank-six views,
-N-D broadcasting and reductions, batched matmul, embedding with padding,
-Conv1d, general grouped/depthwise NCHW Conv2d, normalization, softmax,
-max/average/adaptive-average pooling, log-softmax, cross-entropy, deterministic
-dropout, scaled attention, masked losses, clipping, AdamW, and OneCycle LR.
-General BatchNorm supports channels-first/last layouts, train/eval statistics,
-affine parameters and named running state on CPU/CUDA.
-AdamW and SGD share an Optimizer interface and OneCycle scheduling. SGD includes
-momentum/dampening, Nesterov, coupled decay and ascent, with CPU/CUDA state resume.
-Both accept named parameter groups with per-group learning-rate scales and weight
-decay, recorded in optimizer state and training checkpoints.
-The op registry lists the CPU and CUDA implementation for each public
-differentiable tensor operation and selects its device backend; a source-level
-test rejects an operation that bypasses dispatch. Pre-norm
-`TransformerEncoderLayer` and batch-first `MultiheadAttention` compose these
-ops. `Module` supports named state and F32 safetensors files compatible with
-PyTorch exports.
-Reusable `EmbeddingLayer`, `Conv1dLayer`, `LayerNormLayer`, `LinearLayer`,
-`DropoutLayer`, and `GELULayer` modules compose the UtauTTS speech-timing
-`Target` as `autograd.SpeechTiming`. Its checkpoint names and weight layouts
-match PyTorch and UtauTTS's `speechtiming.LoadTCN`. The
-`cmd/speech-timing-train` command trains from an exported safetensors feature
-cache and saves the best validation weights with UtauTTS metadata. In v1.2.0,
-it also saves a resumable training checkpoint containing current/best weights,
-AdamW moments and hyperparameters, OneCycle state, split, and PCG sampler state.
-`Module.Train` recursively propagates train/eval mode to registered children;
-`WindowSampler` and `IndexLoader` expose restorable sampling state. See
-[`docs/API.md`](docs/API.md) for the training surface.
+`autograd`パッケージはdefine-by-runのfloat32グラフで、rank 6までのview、N次元のブロードキャストとreduction、バッチmatmul、パディング付きembedding、Conv1d、groups/depthwiseのNCHW Conv2d、正規化、softmax、max/average/adaptive-average pooling、log-softmax、cross-entropy、決定的dropout、scaled attention、マスク付き損失、クリップ、AdamW、OneCycle LRを持ちます。BatchNormはchannels-first/last、学習時と評価時の統計、affineパラメータ、名前付きrunning stateをCPU/CUDAで扱います。AdamWとSGDはOptimizerインターフェースとOneCycleのスケジューリングを共有します。SGDはmomentum/dampening、Nesterov、coupled decay、ascentに対応し、状態の保存と再開をCPU/CUDAで行います。両者は名前付きのパラメータグループを持て、グループごとの学習率スケールとweight decayをoptimizer stateと学習checkpointに記録します。opレジストリは公開する微分可能なテンソル演算ごとにCPUとCUDAの実装を並べ、deviceのバックエンドを選びます。dispatchを迂回した演算はソースレベルのテストで検出します。pre-normの`TransformerEncoderLayer`とbatch-firstの`MultiheadAttention`はこれらの演算を組み合わせます。`Module`は名前付きstateと、PyTorchの出力と互換なF32 safetensorsファイルを扱います。再利用できる`EmbeddingLayer`、`Conv1dLayer`、`LayerNormLayer`、`LinearLayer`、`DropoutLayer`、`GELULayer`を組み合わせてモデルを構成できます。`Module.Train`は登録した子へtrain/evalモードを再帰的に伝え、`WindowSampler`と`IndexLoader`は再開できるサンプリング状態を公開します。学習APIの詳細は[`docs/API.md`](docs/API.md)にあります。
 
-`ExecutionContext` associates inputs and module state with an explicit
-gradient-recording scope. Its NoGrad nests and restores after panics; separate
-CPU models can train and infer concurrently without switching off one
-another's graphs. `cmd/cnn-train` demonstrates bound parameters/inputs and
-checkpoint reload. Each context also owns `ExecutionOptions` for BF16 autocast
-and attention selection, with FP32/`auto` defaults. `execution.Autocast` scopes
-precision locally; backward keeps the policy selected during forward even
-after the scope exits or options change.
+`ExecutionContext`は入力とモジュールのstateを明示的な勾配記録スコープに関連付けます。NoGradは入れ子になり、panic後も復帰します。独立したCPUモデルは、互いのグラフを止めずに学習と推論を並行して実行できます。`cmd/cnn-train`はパラメータと入力のバインド、checkpointの再読込を示します。各コンテキストはBF16 autocastとアテンション選択の`ExecutionOptions`を持ち、既定はFP32と`auto`です。`execution.Autocast`は精度を局所的に切り替え、backwardはforward時に選んだ方針をscopeの終了後やオプション変更後も保ちます。
 
-The `data` package separates generic datasets, index sampling and host collation.
-Loaders support seeded shuffle, subsets/splits, padded sequences, validity masks
-and mid-epoch checkpoint state. Optional readers and bounded prefetch preserve
-batch order and checkpoint only delivered samples; zero workers stays synchronous.
-Numeric CSV tables and a serializable feature standardizer cover regression data.
-Uncompressed WAV decoding/encoding covers audio, and the examples keep framing and
-augmentation in the application with deterministic per-sample noise.
-`cmd/mnist-train` reads raw/gzip
-MNIST IDX files, trains an MLP on CPU/CUDA, evaluates, saves inference weights,
-and resumes model/AdamW/OneCycle plus data order without Python.
-`cmd/tabular-train` reads a numeric CSV (or generates one), standardizes features
-with training statistics, and resumes the same state for regression.
-`cmd/audio-train` reads a WAV (or generates one), augments windows with
-index-derived noise, and resumes the denoising model with identical weights.
+`data`パッケージは、汎用のDataset、indexのサンプリング、ホスト側のcollateを分離します。Loaderはseed付きshuffle、subset/split、パディング付き系列、有効値マスク、epoch途中のcheckpoint状態に対応します。任意のworkerと上限付きprefetchはバッチ順を保ち、checkpointには受け渡し済みのサンプルだけを記録します。worker 0では同期読込になります。数値のCSVテーブルと直列化できる特徴量標準化で回帰のデータを扱います。非圧縮WAVの読み書きは音声を扱い、例ではフレーム化とaugmentationをアプリ側に置き、サンプルごとに決まるノイズを使います。`cmd/mnist-train`はraw/gzipのMNIST IDXを読み、MLPをCPU/CUDAで学習・評価し、推論用の重みを保存し、model/AdamW/OneCycleとデータ順をPythonなしで再開します。`cmd/tabular-train`は数値CSVを読み（または生成し）、学習データの統計で特徴量を標準化し、同じ状態で再開します。`cmd/audio-train`はWAVを読み（または生成し）、indexから決まるノイズでwindowをaugmentし、denoiseモデルを同じ重みで再開します。
 
-Tensor/view storage is shared through allocation leases. Closing a base or
-releasing one graph branch preserves values still needed by another dependent.
-`RetainData` pins values, while `BackwardWithOptions` explicitly retains history
-for multiple losses; saved state is returned to pools when that history ends.
-Managed input/parameter mutations are version-checked before backward.
+テンソルとviewのストレージはallocation leaseで共有します。ベースをcloseしたり、あるグラフの枝をreleaseしても、別の依存がまだ必要とする値は保持します。`RetainData`は値を固定し、`BackwardWithOptions`は複数の損失のために履歴を明示的に保持します。履歴が終わると保存したstateはプールへ戻ります。inputとパラメータの管理された変更はbackwardの前にversionを検証します。
 
-CUDA batched matmul uses one strided cuBLAS call for regular and broadcast
-batches. Attention combines batched GEMMs with fused masked softmax kernels.
-An optional tiled CUDA path uses online softmax, recomputes scores in backward,
-and never stores a full score matrix; it supports an additive broadcast mask.
-The GEMM path remains the automatic choice when its scratch estimate is below
-1 GiB, because it is faster at the tested sequence lengths. CUDA layer norm
-and the encoder feed-forward bias/GELU/residual use fused kernels. Warp softmax
-handles arbitrary axes. Optional `-bf16` caches BF16 GEMM operands on device,
-carries BF16 shadows through views, and fuses BF16 output writes into pointwise
-kernels. GEMMEx uses FP32 accumulation; gradients and master weights remain
-FP32. The default remains FP32.
-The `dsp` package holds the signal-processing primitives the Irodori reference
-needs and that are not specific to it: a power-of-two complex FFT, the periodic
-Hann window, the magnitude/phase STFT and its inverse, and a polyphase
-resampler generalized from the one used for the reference audio. The FFT
-accumulates in float64 and rounds on the way out, so it matches PyTorch's float32
-pocketfft to about one ulp. `torchrng` reproduces `torch.Generator(device="cpu")`
-bit for bit, including the cephes polynomial approximations PyTorch's AVX2
-kernels use for float32 log, sin and cos, so a sampler no longer needs a
-Python-seeded noise fixture. `Conditioner.SampleSeeded` draws the initial latent
-noise with it.
+CUDAのバッチmatmulは、通常とブロードキャストのバッチを1回のstrided cuBLAS呼び出しで処理します。アテンションはバッチGEMMと融合したマスク付きsoftmaxカーネルを組み合わせます。任意のtiled CUDA経路はonline softmaxを使い、backwardでスコアを再計算し、完全なスコア行列を保持しません。加算的なブロードキャストマスクに対応します。GEMM経路はscratchの見積もりが1 GiB未満のとき自動的に選ばれます。計測した系列長ではこちらが速いためです。CUDAのlayer normとencoderのfeed-forwardではbias/GELU/residualを融合カーネルで処理します。warp softmaxは任意の軸を扱います。任意の`-bf16`はBF16のGEMMオペランドをデバイスにキャッシュし、viewを通してBF16シャドウを保ち、pointwiseカーネルへのBF16出力書き込みを融合します。GEMMExはFP32で累積し、勾配とmaster weightはFP32のままです。既定はFP32です。
 
-`autograd.Acoustic` composes the reference acoustic model and is checked
-against a PyTorch training-step fixture on CPU and CUDA. CUDA tensors and
-gradients now live in device buffers; graph operators use cuBLAS and NVRTC
-kernels, and clipping and AdamW stay on device. CUDA callers pin an OS thread
-with `autograd.NewCUDAContext` for the driver context. CPU Conv1d uses blocked
-SGEMM with an AVX2/FMA 8x8 microkernel and a pure Go fallback; batched matmul uses
-the same implementation. The Acoustic step can be captured into a CUDA graph
-with fixed device indices and a device AdamW step counter. See
-[`docs/DESIGN.md`](docs/DESIGN.md) for the architecture and migration plan.
+`dsp`パッケージは、2の冪の複素FFT、周期Hann窓、magnitude/phaseのSTFTとその逆変換、polyphaseリサンプラを提供します。FFTはfloat64で累積し、出力時に丸めるため、PyTorchのfloat32 pocketfftと約1 ulpで一致します。`torchrng`は`torch.Generator(device="cpu")`をbit単位で再現します。float32のlog、sin、cosにPyTorchのAVX2カーネルが使うcephes多項式近似も含むため、Pythonでseedしたノイズfixtureが不要になります。
 
-The `tensor` and `nn` packages are the earlier general float32 path. Select
-`tensor.CPU` or `tensor.CUDA` at construction with `NewOn`, `FromHostOn`,
-`NewLinearOn`, and `NewConv1dOn`. The original constructors still select CUDA.
-CPU matrix multiplication uses multithreaded blocked SGEMM with AVX2/FMA
-when available and a pure Go fallback. Modules
-support `[batch,time,channels]`: Linear, same-padded dilated Conv1d, ReLU,
-LeakyReLU, tanh-approximation GELU, Tanh, Sequential, and Residual. The two
-masked losses accept a `[batch,time]` frame weight (zero for padding) and
-optional channel weights. Each divides by the sum of element weights, and
-returns a loss and output gradient. AdamW clips the global gradient norm and
-uses decoupled weight decay on either device.
+`autograd.Acoustic`は音響モデルを構成し、PyTorchの学習ステップfixtureとCPU/CUDAで照合しています。CUDAのテンソルと勾配はデバイスバッファ上にあり、グラフの演算はcuBLASとNVRTCカーネルを使い、クリップとAdamWはデバイス上で動きます。CUDAを使う呼び出し側は`autograd.NewCUDAContext`でOSスレッドを固定します。CPUのConv1dはAVX2/FMAの8x8マイクロカーネルを持つブロックSGEMMと純Goのフォールバックを使い、バッチmatmulも同じ実装です。Acousticのステップは、固定したデバイスindexとデバイス上のAdamWステップカウンタでCUDAグラフに記録できます。設計の説明は[`docs/DESIGN.md`](docs/DESIGN.md)にあります。
 
-General CUDA Conv1d uses im2col/col2im kernels and cuBLAS for both passes.
-Activations, residual additions, masked losses, and AdamW run on the device.
-The trainer keeps fixed loss weights on the device and downloads only the
-requested scalar loss during each step.
+`tensor`と`nn`は先にあった汎用のfloat32経路です。`NewOn`、`FromHostOn`、`NewLinearOn`、`NewConv1dOn`で構築時に`tensor.CPU`または`tensor.CUDA`を選びます。元のコンストラクタはCUDAを選びます。CPUの行列積は、AVX2/FMAが使えるときはマルチスレッドのブロックSGEMM、それ以外は純Goのフォールバックを使います。モジュールは`[batch,time,channels]`を扱い、Linear、same-paddingのdilated Conv1d、ReLU、LeakyReLU、tanh近似のGELU、Tanh、Sequential、Residualを含みます。2つのマスク付き損失は`[batch,time]`のフレーム重み（パディングは0）と任意のチャネル重みを受け取り、要素重みの合計で割って損失と出力勾配を返します。AdamWはグローバル勾配ノルムをクリップし、どちらのデバイスでもdecoupled weight decayを使います。
 
-The `gputcn` package runs the TCN forward and backward passes on the GPU in
-float32. The forward output matches the PyTorch float64 reference to about
-5e-08 and the parameter gradients to about 1e-05. The loss and AdamW, including
-the global norm clip, run on the GPU. `SequenceLossGrad` reproduces the CPU
-`SequenceLoss` (per-row median centering, clamped target, Smooth L1 and the
-delta term) with one block per row, and is checked against `LossGrad`. A GPU
-training loop reduces the synthetic loss.
+汎用のCUDA Conv1dはim2col/col2imカーネルとcuBLASでforwardとbackwardを行います。活性化、残差加算、マスク付き損失、AdamWはデバイス上で動きます。学習ループは損失の重みをデバイスに置いたまま、各ステップで必要なスカラー損失だけをダウンロードします。
 
-## Verification
+`gputcn`パッケージはTCNのforwardとbackwardをGPUのfloat32で実行します。forwardの出力はPyTorchのfloat64参照と約5e-08、パラメータ勾配は約1e-05で一致します。損失とAdamW（グローバルノルムクリップを含む）はGPU上で動きます。`SequenceLossGrad`はCPUの`SequenceLoss`（行ごとのメディアン中心化、clampしたtarget、Smooth L1、delta項）を行ごとに1ブロックで再現し、`LossGrad`と照合します。GPUの学習ループで合成データの損失が下がります。
 
-The reference engine is checked against PyTorch, which remains the comparison
-baseline:
+## 検証
 
-- One forward, loss, backward, gradient clipping and one AdamW step match a
-  PyTorch fixture (`testdata/tcn_step.json`) to about 1e-16 for the forward and
-  gradients in float64.
-- The median follows `torch.median`: the lower middle value for an even count,
-  with its gradient shared equally among elements equal to the median.
-- Gradients are also checked against central finite differences, independently
-  of PyTorch.
-- The general float32 modules and masked losses have CPU finite-difference
-  checks. `testdata/nn_conv_step.json`, generated by `tools/gen_nn_fixture.py`,
-  checks forward, masked loss, backward and one AdamW update against PyTorch
-  on CPU and on CUDA when available.
-- `testdata/acoustic_step.json`, generated by `tools/gen_acoustic_fixture.py`,
-  checks the Acoustic output, loss, every parameter gradient, clipping norm,
-  and one AdamW step on both devices.
-- `tools/gen_transformer_fixture.py` generates PyTorch values in a temporary
-  directory during tests. Softmax, log-softmax, cross-entropy, dropout,
-  layer norm, broadcast batched matmul, attention, padding embedding, and a
-  two-layer transformer stack are checked for outputs and gradients on both
-  devices; the stack also checks one AdamW update. CUDA tests assert kernel
-  launches. A PyTorch-produced safetensors file loads in Go and round-trips
-  back to PyTorch. A CUDA graph test compares two Acoustic replays with eager
-  steps, including updated optimizer weights.
-- The registry inventory test checks every public differentiable operation
-  for a registry entry and a dispatch call. Removing one dispatch was verified
-  to make the test fail. Tiled attention checks masked output and gradients,
-  including sequence lengths 256, 1024 and 4096, against the materialized
-  CUDA path. CUDA residency tests assert device kernel launches; BF16 graph
-  tests check captured training steps.
-- `tools/gen_speech_timing_fixture.py` compares the full 8-block Target with
-  PyTorch on CPU and CUDA: forward, NaN-masked L1, every parameter gradient,
-  clipping norm, and one AdamW step. CUDA output residency is asserted.
-- `testdata/conv2d.json`, generated by `tools/gen_conv2d_fixture.py`, checks
-  Conv2d output and every input/weight/bias gradient on CPU and CUDA, including
-  grouped and depthwise multiplier cases, rectangular/even kernels, striding,
-  dilation, no bias and a partial final tile. Separate tests cover numerical
-  gradients, non-contiguous views, shared-parameter accumulation and frozen
-  parameters. A pure-Go CNN example learns spatial patterns and verifies
-  safetensors checkpoint reload on both backends.
-- `testdata/pool2d.json`, generated by `tools/gen_pool2d_fixture.py`, checks
-  MaxPool2d, AvgPool2d and AdaptiveAvgPool2d outputs and gradients on CPU/CUDA.
-  Tests cover ceil-mode borders, padding divisors, dilation, overlapping bins,
-  views, retained graphs and CUDA replay. `cmd/cnn-train` combines convolution
-  with max pooling and adaptive global average pooling.
-- `testdata/batchnorm.json`, generated by `tools/gen_batchnorm_fixture.py`, checks
-  BatchNorm output/VJPs in 17 cases and running state in three multi-step sequences.
-  Fixed/cumulative momentum, tracking-disabled evaluation, NoGrad training,
-  state reload, view/retained history and CUDA replay are covered. The CNN
-  example includes BatchNorm and verifies evaluation after state reload.
+参照エンジンはPyTorchと照合します。PyTorchは比較の基準です。
 
-## Commands
+- forward、損失、backward、勾配クリップ、AdamW 1ステップがPyTorchのfixture（`testdata/tcn_step.json`）と一致します。float64のforwardと勾配で約1e-16です。
+- メディアンは`torch.median`に従います。要素数が偶数のときは下側の中央値をとり、メディアンと等しい要素へ勾配を等分します。
+- 勾配はPyTorchとは別に、中心差分でも確認します。
+- 汎用のfloat32モジュールとマスク付き損失はCPUの差分チェックを持ちます。`tools/gen_nn_fixture.py`が生成する`testdata/nn_conv_step.json`で、forward、マスク付き損失、backward、AdamW 1更新をCPUと、CUDAが使える環境ではCUDAで照合します。
+- `tools/gen_acoustic_fixture.py`が生成する`testdata/acoustic_step.json`で、Acousticの出力、損失、全パラメータ勾配、クリップノルム、AdamW 1ステップを両デバイスで照合します。
+- `tools/gen_transformer_fixture.py`はテスト中に一時ディレクトリへPyTorchの値を生成します。softmax、log-softmax、cross-entropy、dropout、layer norm、ブロードキャストのバッチmatmul、アテンション、パディング付きembedding、2層のtransformerスタックを出力と勾配の両方で両デバイスで照合し、スタックではAdamW 1更新も確認します。CUDAのテストはカーネルの起動を確認します。PyTorchが作ったsafetensorsファイルをGoで読み込み、PyTorchへ戻して往復します。CUDAグラフのテストは、optimizerの重み更新を含めて2回のAcoustic再生とeagerステップを比較します。
+- レジストリの棚卸しテストは、公開する微分可能な演算ごとにレジストリ項目とdispatch呼び出しを確認します。dispatchを1つ削除するとテストが失敗することも確認済みです。tiledアテンションは、系列長256、1024、4096を含めてマスク付きの出力と勾配を、実体化したCUDA経路と比較します。CUDAのresidencyテストはデバイスカーネルの起動を確認し、BF16のグラフテストは記録した学習ステップを確認します。
+- `testdata/conv2d.json`（`tools/gen_conv2d_fixture.py`が生成）は、groupedとdepthwise multiplier、矩形・偶数のカーネル、stride、dilation、biasなし、最後の部分タイルを含めて、Conv2dの出力と全input/weight/bias勾配をCPU/CUDAで確認します。別のテストで数値勾配、非連続のview、パラメータ共有による加算、凍結パラメータを扱います。純GoのCNN例は空間パターンを学習し、両バックエンドでsafetensorsの再読込を確認します。
+- `testdata/pool2d.json`（`tools/gen_pool2d_fixture.py`が生成）はMaxPool2d、AvgPool2d、AdaptiveAvgPool2dの出力と勾配をCPU/CUDAで確認します。ceil modeの境界、パディングの除数、dilation、重複する窓、view、履歴を保持したグラフ、CUDAの再生を扱います。`cmd/cnn-train`は畳み込みにmax poolingとadaptive global average poolingを組み合わせます。
+- `testdata/batchnorm.json`（`tools/gen_batchnorm_fixture.py`が生成）はBatchNormの出力とVJPを17ケース、running stateを3つの複数ステップ列で確認します。固定momentumと累積平均、trackingを無効にした評価、NoGrad学習、stateの再読込、viewと保持した履歴、CUDAの再生を扱います。CNN例はBatchNormを含み、state再読込後の評価を確認します。
+
+## コマンド
 
 ```
 go test ./...
@@ -236,241 +84,114 @@ python tools/bench_transformer.py --device cuda --threads 12 --warmup 1
 python tools/bench_transformer.py --device cuda --warmup 2 --graph --bf16
 go run ./cmd/attention-bench -seq 4096 -algorithm materialized
 go run ./cmd/attention-bench -seq 4096 -algorithm flash
-python tools/export_speech_timing_features.py --input D:/project/UtauTTS/out/speech-timing-target/features.pt --output $env:TEMP/gograd-speech-timing/features.safetensors
-go run ./cmd/speech-timing-train -cache $env:TEMP/gograd-speech-timing/features.safetensors -steps 6000 -device cuda -out $env:TEMP/gograd-speech-timing/model.safetensors
 ```
 
-`tcn-train` fits a tiny synthetic corpus on the CPU and writes
-`out/synthetic-tcn.json`. `gputcn-train` does the same with the GPU forward and
-backward passes, prints per-phase timings, and writes `out/gputcn-synthetic.json`.
-Passing `-graph` captures the whole step with `cuda.Capture` and replays it, and
-`-profile N` reports GPU time per phase using CUDA events. Both are
-demonstrations of the engine, not real training recipes.
+`tcn-train`は小さな合成データをCPUで学習し、`out/synthetic-tcn.json`を書き出します。`gputcn-train`は同じ内容をGPUのforwardとbackwardで行い、段階ごとの時間を表示して`out/gputcn-synthetic.json`を書き出します。`-graph`を付けると`cuda.Capture`でステップ全体を記録して再生し、`-profile N`はCUDA eventで段階ごとのGPU時間を表示します。どちらもエンジンの動作確認用で、実際の学習手順ではありません。
 
-`nn-conv-train` trains a six-block residual Conv1d network on padded synthetic
-sequences (input 74, output 72, dilations 1,2,4,1,2,4), prints full training
-step times, and accepts `-device cuda` when CUDA is available. It defaults to
-masked L1 loss; `-loss mse` selects masked MSE. Set `GOMAXPROCS=12` for the
-12-thread benchmark and use `-cpuprofile` to write a Go CPU profile.
+`nn-conv-train`はパディング付きの合成系列（入力74、出力72、dilation 1,2,4,1,2,4）で6ブロックのresidual Conv1dネットワークを学習し、学習ステップ全体の時間を表示します。CUDAがある環境では`-device cuda`を受け付けます。既定の損失はマスク付きL1で、`-loss mse`でマスク付きMSEを選びます。12スレッドのベンチマークでは`GOMAXPROCS=12`を設定し、`-cpuprofile`でGoのCPUプロファイルを書き出します。
 
-Medians of three paired, warmed full training steps on the RTX 3060 Ti and
-12 CPU threads (`GOMAXPROCS=12` for Go, `torch.set_num_threads(12)`):
+RTX 3060 Tiと12 CPUスレッド（Goは`GOMAXPROCS=12`、PyTorchは`torch.set_num_threads(12)`）で、温めた学習ステップ全体を3回、対で測った中央値です。
 
-| Model and runtime | CPU FP32 | CUDA FP32 eager | CUDA FP32 graph | CUDA BF16 eager | CUDA BF16 graph |
+| モデルと実行環境 | CPU FP32 | CUDA FP32 eager | CUDA FP32 graph | CUDA BF16 eager | CUDA BF16 graph |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Acoustic, PyTorch | 2,506 ms | 58.5 ms | 53.7 ms | 47.1 ms | 42.6 ms |
 | Acoustic, gograd | 3,876 ms | 82.3 ms | 82.0 ms | 63.8 ms | 64.1 ms |
 | Transformer, PyTorch | 1,292 ms | 25.9 ms | 23.9 ms | 13.5 ms | 12.0 ms |
 | Transformer, gograd | 2,276 ms | 27.2 ms | 27.8 ms | 22.4 ms | 23.2 ms |
 
-Acoustic is hidden 384, batch 24, 400 frames, 10 blocks. Transformer is four
-pre-norm layers with model width 256, four heads, feed-forward width 1024,
-batch 16, sequence 256. Steps include forward, backward, global-norm clip,
-and AdamW. Acoustic graph replay includes a scalar loss readback; its device
-step counter updates AdamW bias correction each launch. CPU timings varied
-substantially during measurement, so these medians are more useful than a
-single step but should not be treated as stable throughput. BF16 values use
-PyTorch autocast and gograd's FP32-authoritative BF16 shadow path; their scope
-still differs. The
-implementations use different seeded random values and are comparable by
-architecture and dimensions, not identical loss values.
+Acousticはhidden 384、batch 24、400フレーム、10ブロックです。Transformerはpre-normの4層で、モデル幅256、4ヘッド、feed-forward幅1024、batch 16、系列長256です。ステップにはforward、backward、グローバルノルムのクリップ、AdamWを含みます。Acousticのgraph再生はスカラー損失の読み戻しを含み、デバイス上のステップカウンタがlaunchごとにAdamWのbias correctionを更新します。CPUの計測値は測定中に大きく変動したため、これらの中央値は1ステップより有用ですが、安定したスループットとして扱うべきではありません。BF16の値はPyTorchのautocastと、実際の値をFP32で保持するgogradのBF16シャドウ経路を使っていますが、対象範囲はまだ異なります。実装は異なるseedの乱数を使うため、比較できるのはアーキテクチャと次元であり、損失値そのものではありません。
 
-Transformer CPU is 1.76x PyTorch, meeting the 2.5x target; Acoustic CPU is
-1.55x, narrowly missing its 1.5x target. Transformer CUDA FP32 eager is
-1.05x PyTorch. BF16 eager is 1.66x PyTorch for the transformer and 1.35x for
-Acoustic. Graph replay is similar to eager for gograd; device work dominates
-the launch cost. Profiling adds synchronization and should not be compared
-to the table.
+TransformerのCPUはPyTorchの1.76倍で、2.5倍の目標を満たします。AcousticのCPUは1.55倍で、1.5倍の目標にはわずかに届きません。TransformerのCUDA FP32 eagerはPyTorchの1.05倍です。BF16 eagerはtransformerでPyTorchの1.66倍、Acousticで1.35倍です。graph再生はgogradではeagerと同程度で、デバイス側の処理がlaunchのコストを上回っています。プロファイリングは同期を加えるため、表と比較しないでください。
 
-CUDA event medians for a separate attention forward/backward benchmark
-(batch 1, four heads, head dimension 64; three runs):
+別のアテンションのforward/backwardベンチマーク（batch 1、4ヘッド、head次元64、3回）のCUDA event中央値です。
 
-| Sequence | Materialized step | Tiled step | Materialized peak extra | Tiled peak extra |
+| 系列長 | 実体化ステップ | tiledステップ | 実体化のピーク増分 | tiledのピーク増分 |
 | ---: | ---: | ---: | ---: | ---: |
 | 256 | 0.366 ms | 0.766 ms | 3.50 MiB | 1.01 MiB |
 | 1024 | 1.601 ms | 9.606 ms | 50.00 MiB | 4.03 MiB |
 | 4096 | 18.916 ms | 127.889 ms | 776.00 MiB | 16.12 MiB |
 
-Peak extra is the maximum live CUDA buffer increase above the input baseline,
-including loss and gradient buffers. Tiled attention trades speed for much
-lower scratch use at long sequences. Output and gradient parity against the
-materialized path passes at all three lengths; a separate test covers an
-additive broadcast mask and its gradient.
+ピーク増分は、損失と勾配のバッファを含めて、入力の基準値から増えた使用中CUDAバッファの最大値です。tiledアテンションは速度を犠牲にして、長い系列でscratchの使用量を大きく下げます。出力と勾配は3つの系列長すべてで実体化経路と一致し、加算的なブロードキャストマスクとその勾配は別のテストで扱います。
 
-### UtauTTS speech-timing target
+### 可変長系列のCUDAメモリ
 
-The v1 feature cache contains 700 utterances and 286,260 frames. The exporter
-stores the Python seed-0 shuffle in its safetensors metadata, so the Go and
-PyTorch trainers use the same 30-utterance validation split. Both ran 6,000
-steps with batch 16, 400-frame windows, AdamW, OneCycle, clip 1.0 and CUDA.
+64ステップ、batch 8でフレーム長が変わる学習を再現したところ、使用中の割当バイト数はほぼ一定でしたが、旧来の正確なサイズごとのプールは6.15 GBを保持しました。サイズクラスを持つ上限付きのプールは、同じ処理のキャッシュを0.76 GBに減らしました（以下は10進のバイト数）。200ステップのテストは既定の上限を確認し、256 MiBの上限でも学習を繰り返します。
 
-| Trainer | Best validation L1 | Best step | Training-loop wall time |
+| 64ステップ後のアロケータ | 使用中バイト | キャッシュバイト | 予約バイト |
 | --- | ---: | ---: | ---: |
-| UtauTTS PyTorch | 0.284177 | 3750 | 73.625 s |
-| gograd | 0.285379 | 4500 | 66.477 s |
+| 旧 | 10,927,812 | 6,154,440,208 | 6,165,368,020 |
+| 現行 | 10,949,888 | 762,475,264 | 773,425,152 |
 
-These measurements used the v0.1 trainer/sampler. The Go checkpoint is 0.42% above the measured PyTorch L1 and loads with
-UtauTTS's `speechtiming.LoadTCN`; its `Predict` returned one 80-bin frame in
-the read-only integration check. PyTorch's complete script, including cache
-loading, export and startup, took 81.862 s in a separate run and reached
-0.2844. Different initialization, sampling and dropout streams mean the
-training trajectories are not identical. The 15-feature context path is
-implemented but had no context cache available for a full run.
+固定形状のAcousticのCUDAステップは、最後の3対で前が77.3 ms、後が77.8 msでした。それより前の対は、デバイスの負荷が変わってどちらのバイナリも遅くなりました。記録したグラフの割当は`Graph.Close`まで予約されたままで、グラフが生きている間はキャッシュの上限から除きます。
 
-### Resumable speech-timing training (v1.2.0)
-
-`--steps` is the complete OneCycle schedule, not the number of additional
-updates after resuming. Use a fresh `--out` path on each invocation; the best
-inference weights are retained inside the training checkpoint and re-exported.
-
-```sh
-go run ./cmd/speech-timing-train --cache features.safetensors \
-  --steps 6000 --valid 30 --seed 0 --device cpu \
-  --out out/best-first.safetensors --checkpoint out/training.safetensors \
-  --checkpoint-every 250 --stop-after 2000
-
-go run ./cmd/speech-timing-train --cache features.safetensors \
-  --steps 6000 --valid 30 --seed 0 --device cpu \
-  --out out/best-resumed.safetensors --checkpoint out/training.safetensors \
-  --resume out/training.safetensors
-```
-
-Ctrl+C requests a stop after the current update and writes the training
-checkpoint. A forced termination can only resume from the last periodic save.
-Keep cache contents, seed, validation count, context mode, total steps,
-batch/window size and evaluation interval unchanged. Inference weights alone
-are not resumable checkpoints. CPU resume tests compare final files byte for
-byte; CUDA tests check all tensors within `1e-6` absolute error and exact
-sampler/scheduler state because atomic gradient reductions can reorder sums.
-
-The window sampler now uses a restorable PCG stream and includes the final
-complete window. A fresh v1.2.0 run does not reproduce the old Go RNG trajectory.
-This command's resumable state is new; legacy `nn`/`gputcn` trainers are unchanged.
-
-### Variable-length CUDA memory
-
-In a 64-step, batch-8 speech-timing training reproduction with changing frame
-lengths, active allocation bytes stayed nearly constant while the old
-exact-size pool retained 6.15 GB. The size-class, bounded pool reduced the
-same workload's cache to 0.76 GB (decimal bytes below). A 200-step test checks
-the default cap and also repeats training with a 256 MiB cap.
-
-| Allocator after 64 steps | Live bytes | Cached bytes | Reserved bytes |
-| --- | ---: | ---: | ---: |
-| Previous | 10,927,812 | 6,154,440,208 | 6,165,368,020 |
-| Current | 10,949,888 | 762,475,264 | 773,425,152 |
-
-The fixed-shape Acoustic CUDA step had paired median times of 77.3 ms before
-and 77.8 ms after in the final three-pair check. Earlier pairs were slower
-for both binaries as device load changed. Captured graph
-allocations stay reserved until `Graph.Close` and are excluded from the cache
-limit while the graph is live.
-
-`gputcn-fit` trains on a prepared dataset (frame features, targets and mask)
-instead of the synthetic corpus:
+`gputcn-fit`は合成データの代わりに、用意したデータセット（フレームの特徴量、target、mask）で学習します。
 
 ```
 go run ./cmd/gputcn-fit -write-synthetic out/prepared.json
 go run ./cmd/gputcn-fit -dataset out/prepared.json -epochs 30
 ```
 
-The dataset is JSON with `feature_names` and records that store sparse features
-as `rows`, `cols` and `vals`, plus `targets` (cents) and a `mask`. Records are
-split into train and validation by a hash of the id.
+データセットは`feature_names`と、疎な特徴量を`rows`、`cols`、`vals`で持つレコード、`targets`（cent）、`mask`を持つJSONです。レコードはidのハッシュで学習と検証に分かれます。
 
-To regenerate the PyTorch fixture (requires `torch`):
+PyTorchのfixtureを作り直すには`torch`が必要です。
 
 ```
 python tools/gen_fixture.py
 python tools/gen_nn_fixture.py
 ```
 
-The `cuda` tests run only when the CUDA runtime and cuBLAS DLLs are loadable.
-On Windows, put the CUDA `bin\x64` directory on `PATH`, for example:
+`cuda`のテストは、CUDAランタイムとcuBLASのDLLを読み込めるときだけ実行します。WindowsではCUDAの`bin\x64`ディレクトリを`PATH`に通します。例を示します。
 
 ```
 $env:PATH = "$env:CUDA_PATH\bin\x64;$env:PATH"
 go test ./cuda/
 ```
 
-## Layout
+## ディレクトリ構成
 
-- `autograd/layers.go`, `autograd/speech_timing.go` — reusable modules and the
-  UtauTTS speech-timing Target composition
-- `cmd/speech-timing-train`, `tools/export_speech_timing_features.py`,
-  `tools/gen_speech_timing_fixture.py` — feature bridge, trainer, and parity
-- `docs/API.md` — proposed v0.1 API and experimental boundaries
-- `autograd/cpu_binary.go`, `autograd/cuda_flash_attention.go`,
-  `autograd/cuda_autocast.go` — optimized CPU gradients, tiled attention,
-  and cached BF16 device buffers
-- `cmd/attention-bench` — CUDA attention time and live buffer comparison
-- `autograd/views.go`, `autograd/registry.go`, `autograd/transformer*.go`,
-  `autograd/safetensors.go` — views, elementwise dispatch, transformer ops and modules, checkpoints
-- `cmd/transformer-bench`, `tools/bench_transformer.py` — four-layer encoder timings
-- `tools/gen_transformer_fixture.py`, `tools/safetensors_fixture.py` — PyTorch parity references
+- `autograd/layers.go`：再利用できるモジュール
+- `docs/API.md`：公開APIと現状の制約
+- `autograd/cpu_binary.go`、`autograd/cuda_flash_attention.go`、`autograd/cuda_autocast.go`：最適化したCPU勾配、tiledアテンション、キャッシュしたBF16デバイスバッファ
+- `cmd/attention-bench`：CUDAアテンションの時間と使用中バッファの比較
+- `autograd/views.go`、`autograd/registry.go`、`autograd/transformer*.go`、`autograd/safetensors.go`：view、要素ごとのdispatch、transformerの演算とモジュール、checkpoint
+- `cmd/transformer-bench`、`tools/bench_transformer.py`：4層encoderの時間
+- `tools/gen_transformer_fixture.py`、`tools/safetensors_fixture.py`：PyTorchとの照合に使う参照
+- `tensor.go`、`ops.go`、`conv.go`、`loss.go`：自動微分エンジン
+- `model.go`：`FrameIntonationTCN`
+- `optim.go`：AdamWと勾配クリップ
+- `export.go`：ランタイム用JSONの形式
+- `cuda/`：CUDAランタイム、cuBLAS、NVRTCのバインディング、stream、グラフ記録
+- `kernels/`：`cuda`の上に載る独自GPUカーネル（活性化、畳み込み、損失、AdamW）
+- `dsp/`：FFT、Hann窓、STFT/iSTFT、リサンプリング。torchとtorchaudioに対応します
+- `torchrng/`：float32とfloat64の`torch.Generator(device="cpu")`をbit単位で再現
+- `tensor/`：形状を扱うfloat32のCPU/CUDAテンソルと、ブロック化したCPU SGEMM
+- `autograd/`：define-by-runグラフ、演算、Acousticモデル
+- `data/`、`cmd/mnist-train`：任意の上限付きホストprefetchを持つ汎用バッチ処理、再開できるサンプリング、raw/gzip IDXの読み込み、Pythonなしの実データ学習と再開の例
+- `autograd/conv2d*.go`、`autograd/cuda_conv2d.go`、`cmd/cnn-train`：tiledなCPU/CUDA Conv2dとbackward、名前付き層、PythonなしのCNN学習例
+- `nn/`：CPU/CUDAのモジュール、マスク付き損失、AdamW、JSONのcheckpoint
+- `gputcn/`：GPU float32のTCN forward、backward、AdamW
+- `cmd/tcn-train`：CPUの合成データ学習例
+- `cmd/gputcn-train`：GPUの合成データ学習例。段階ごとの時間を表示します
+- `cmd/gputcn-fit`：用意したデータセットでの学習
+- `cmd/nn-conv-train`：residual Conv1dのfloat32合成データ学習例
+- `tools/gen_fixture.py`、`tools/gen_nn_fixture.py`：PyTorchのfixture生成
+- `tools/gen_acoustic_fixture.py`、`tools/bench_acoustic.py`：Acousticの照合と時間計測
+- `docs/DESIGN.md`：設計の説明
+- `testdata/`：リポジトリに含めたfixture
 
-- `tensor.go`, `ops.go`, `conv.go`, `loss.go` — the autograd engine
-- `model.go` — `FrameIntonationTCN`
-- `optim.go` — AdamW and gradient clipping
-- `export.go` — runtime JSON layout
-- `cuda/` — CUDA runtime, cuBLAS and NVRTC binding, streams and graph capture
-- `kernels/` — custom GPU kernels (activation, convolution, loss, AdamW) on top of `cuda`
-- `dsp/` — FFT, Hann window, STFT/iSTFT and resampling, mirroring torch and torchaudio
-- `torchrng/` — bit-exact `torch.Generator(device="cpu")` for float32 and float64 streams
-- `tensor/` — shape-aware float32 CPU/CUDA tensor and blocked CPU SGEMM
-- `autograd/` — define-by-run graph, operators, and Acoustic model
-- `data/`, `cmd/mnist-train` — generic batching with optional bounded host prefetch, restorable sampling,
-  raw/gzip IDX reader and a Go-only real-data training/resume example
-- `autograd/conv2d*.go`, `autograd/cuda_conv2d.go`, `cmd/cnn-train` — tiled
-  CPU/CUDA Conv2d with backward, named layers and a Python-free CNN training example
-- `nn/` — CPU/CUDA modules, masked losses, AdamW, and JSON checkpoints
-- `gputcn/` — GPU float32 TCN forward, backward and AdamW
-- `cmd/tcn-train` — synthetic CPU training example
-- `cmd/gputcn-train` — synthetic GPU training example with timings
-- `cmd/gputcn-fit` — trains on a prepared dataset
-- `cmd/nn-conv-train` — residual Conv1d float32 synthetic training example
-- `tools/gen_fixture.py`, `tools/gen_nn_fixture.py` — PyTorch fixture generators
-- `tools/gen_acoustic_fixture.py`, `tools/bench_acoustic.py` — Acoustic parity and timing
-- `docs/DESIGN.md` — architecture and migration roadmap
-- `testdata/` — committed fixtures
+## モデルのJSON形式
 
-## General model JSON
+`nn.Save(writer, model)`はバージョン付きのJSONオブジェクトを書き出し、`nn.Load(reader, model)`は読み込む前に層の構成、パラメータ名、形状を確認します。`layers`はforwardの順に並んだリストです。各項目は`name`、`type`（`linear`、`conv1d`、`activation`、`residual`のいずれか）、`in_channels`、`out_channels`を持ち、必要に応じて`kernel`、`dilation`、`activation`、`slope`を持ちます。residualの`layers`リストは内側の系列を表します。`parameters`は`{name,shape,values}`の順序付き配列で、row-majorのfloat32値を持ちます。Linearの重みは`[out,in]`、biasは`[out]`です。Conv1dの重みはcross-correlationの順で`[out,in,kernel]`、biasは`[out]`です。フレームは`[batch,time,channels]`で、ゼロsame-paddingは両側へ`dilation*(kernel-1)/2`だけ広げます。名前は`model.1.inner.0.weight`のような安定したパスです。optimizerの状態は含みません。
 
-`nn.Save(writer, model)` writes a versioned JSON object; `nn.Load(reader,
-model)` checks the layer configuration, parameter names, and shapes before
-loading. `layers` is the ordered forward list. Each entry has `name`, `type`
-(`linear`, `conv1d`, `activation`, or `residual`), `in_channels`,
-`out_channels`, and where applicable `kernel`, `dilation`, `activation`, and
-`slope`. A residual's `layers` list describes its inner sequence. `parameters`
-is an ordered array of `{name,shape,values}` with row-major float32 values.
-Linear weights are `[out,in]`, biases `[out]`; Conv1d weights are
-`[out,in,kernel]` in cross-correlation order and biases are `[out]`. Frames
-are `[batch,time,channels]` and zero same-padding extends by
-`dilation*(kernel-1)/2` on each side. Names are stable paths such as
-`model.1.inner.0.weight`. Optimizer state is not included.
+## 現状の制約
 
-## Not present in this code
+- グラフは多くのfloat32の連続結果を実体化します。BF16は任意で、実際の値はFP32のまま保持します。FP16、loss scaling、dtypeとlayoutをキーにしたカーネル登録はありません。
+- 特徴量キャッシュの読み込みとwindowのサンプリングはホストで行います。`data`パッケージは同期または並列のホスト読込と上限付きprefetchに対応し、CUDAテンソルの生成は読み込む側のスレッドに留まります。
+- レジストリはCPUとCUDAの実装を選びますが、実行時にカーネルを追加する仕組みはありません。
+- 互換用のNoGradスコープとBF16・アテンションの設定はプロセス共有です。明示的な実行コンテキストは記録・精度・アテンション選択を分離します。CUDAのdevice、暗黙のstream、capture状態はOSスレッド単位で、プールはdeviceごとに分けています。stream単位のプール分離と、1回の記録の中での複数streamの重ね合わせには対応していません。
+- tiledアテンションはhead次元128までで、計測した系列長では実体化したGEMM経路より遅くなります。GPUで推論する場合は、不要になったグラフを`ReleaseGraph`で解放してください。
+- 旧`nn`経路はモジュールごとの明示的なbackwardを使います。
 
-The graph still materializes many contiguous FP32 results. BF16 is optional
-and keeps FP32 authoritative storage; FP16, loss scaling, a dtype/layout keyed
-kernel registry are not present. The
-speech-timing trainer reads an exported feature cache and samples windows on
-the host. The separate `data` package supports synchronous or parallel host loading
-with bounded prefetch; CUDA tensor construction stays in the consumer thread.
-The registry selects CPU or CUDA implementations but does not yet
-support runtime kernel plugins. The
-compatibility NoGrad scope and BF16/attention settings are shared.
-Explicit execution contexts isolate recording, precision and attention selection;
-CUDA device, implicit-stream and capture state is per OS thread and the pool is
-keyed by device, while stream-keyed pooling and overlapping streams inside one
-recorded step are still being generalized. Tiled
-attention currently supports head dimensions up to 128 and is slower than the
-materialized GEMM path at the measured sequence lengths. GPU inference callers
-should release unused graphs with `ReleaseGraph`. The older `nn` path still
-uses explicit module backward methods. The watermark's message decoder and a
-WAV writer are not ported, and the remaining Irodori gates are listed in
-[`docs/ROADMAP.md`](docs/ROADMAP.md).
+## ライセンス
 
-## License
-
-MIT. See `LICENSE`.
+MITです。`LICENSE`を参照してください。
