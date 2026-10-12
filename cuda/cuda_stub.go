@@ -68,6 +68,9 @@ func SetPoolCacheLimit(bytes int) error { return ErrUnavailable }
 // SetCurrentStream does nothing on this platform.
 func SetCurrentStream(s *Stream) {}
 
+// CurrentStreamHandle always reports the default stream here.
+func CurrentStreamHandle() uintptr { return 0 }
+
 // InCapture always reports false on this platform.
 func InCapture() bool { return false }
 
@@ -85,6 +88,9 @@ func (g *Graph) Close() error { return ErrUnavailable }
 
 // Pointer returns the raw device address.
 func (b *Buffer) Pointer() uintptr { return 0 }
+
+// Device returns the device index; there is no device here.
+func (b *Buffer) Device() int { return 0 }
 
 // Size returns the allocation size in bytes.
 func (b *Buffer) Size() int { return 0 }

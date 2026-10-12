@@ -321,23 +321,51 @@ type Buffer struct {
 	pointer  uintptr
 	size     int // requested size
 	capacity int // physical allocation and pool class
+	device   int // device the allocation belongs to
 	freed    bool
 }
 
 type cachedPointer struct {
 	pointer uintptr
 	size    int
+	device  int
+}
+
+// poolKey keeps cached blocks separate per device: a pointer allocated on one
+// device is not valid as a current-device allocation on another.
+type poolKey struct {
+	device int
+	size   int
+}
+
+// withDevice runs fn with device current and restores the previous device of the
+// calling thread, so buffer operations never depend on ambient device state.
+func withDevice(device int, fn func() error) error {
+	previous, err := CurrentDevice()
+	if err != nil {
+		return err
+	}
+	if previous == device {
+		return fn()
+	}
+	if err := SetDevice(device); err != nil {
+		return err
+	}
+	runErr := fn()
+	if err := SetDevice(previous); err != nil {
+		return err
+	}
+	return runErr
 }
 
 const defaultPoolCacheLimit = 2 << 30
 
 var (
 	poolMu                           sync.Mutex
-	poolTable                        = map[int][]uintptr{}
+	poolTable                        = map[poolKey][]uintptr{}
 	poolLRU                          list.List
 	poolNodes                        = map[uintptr]*list.Element{}
 	cachedBytes, poolCacheLimit      = 0, defaultPoolCacheLimit
-	captureTouched                   map[uintptr]int
 	liveBytes, peakLiveBytes         int
 	reservedBytes, peakReservedBytes int
 )
@@ -389,9 +417,10 @@ func poolSizeClass(size int) int {
 	return (size + quantum - 1) / quantum * quantum
 }
 
-func cachePointerLocked(pointer uintptr, size int) {
-	poolTable[size] = append(poolTable[size], pointer)
-	poolNodes[pointer] = poolLRU.PushBack(cachedPointer{pointer, size})
+func cachePointerLocked(pointer uintptr, size, device int) {
+	key := poolKey{device: device, size: size}
+	poolTable[key] = append(poolTable[key], pointer)
+	poolNodes[pointer] = poolLRU.PushBack(cachedPointer{pointer, size, device})
 	cachedBytes += size
 }
 func uncacheAccountingLocked(pointer uintptr, size int) {
@@ -402,7 +431,7 @@ func uncacheAccountingLocked(pointer uintptr, size int) {
 	}
 }
 func trimPoolLocked() []cachedPointer {
-	if capturing {
+	if InCapture() {
 		return nil
 	} // A captured graph may still reference these pointers.
 	var victims []cachedPointer
@@ -411,22 +440,23 @@ func trimPoolLocked() []cachedPointer {
 		if oldest == nil {
 			break
 		}
-		v := oldest.Value.(cachedPointer)
-		list := poolTable[v.size]
+		victim := oldest.Value.(cachedPointer)
+		key := poolKey{device: victim.device, size: victim.size}
+		list := poolTable[key]
 		for i, pointer := range list {
-			if pointer == v.pointer {
+			if pointer == victim.pointer {
 				list[i] = list[len(list)-1]
 				list = list[:len(list)-1]
 				break
 			}
 		}
 		if len(list) == 0 {
-			delete(poolTable, v.size)
+			delete(poolTable, key)
 		} else {
-			poolTable[v.size] = list
+			poolTable[key] = list
 		}
-		uncacheAccountingLocked(v.pointer, v.size)
-		victims = append(victims, v)
+		uncacheAccountingLocked(victim.pointer, victim.size)
+		victims = append(victims, victim)
 	}
 	return victims
 }
@@ -438,13 +468,15 @@ func freeCachedPointers(victims []cachedPointer) error {
 	if err != nil {
 		return err
 	}
-	for _, v := range victims {
-		code, _, _ := a.free.Call(v.pointer)
-		if err := runtimeError("cudaFree", code); err != nil {
+	for _, victim := range victims {
+		if err := withDevice(victim.device, func() error {
+			code, _, _ := a.free.Call(victim.pointer)
+			return runtimeError("cudaFree", code)
+		}); err != nil {
 			return err
 		}
 		poolMu.Lock()
-		reservedBytes -= v.size
+		reservedBytes -= victim.size
 		poolMu.Unlock()
 	}
 	return nil
@@ -457,7 +489,7 @@ func SetPoolCacheLimit(bytes int) error {
 		return fmt.Errorf("cuda: negative pool cache limit")
 	}
 	poolMu.Lock()
-	if capturing {
+	if InCapture() {
 		poolMu.Unlock()
 		return fmt.Errorf("cuda: cannot trim pool during capture")
 	}
@@ -468,8 +500,8 @@ func SetPoolCacheLimit(bytes int) error {
 }
 
 // Alloc reserves size bytes on the current device. Freed buffers of the same
-// size are reused from an internal pool, which avoids the cost of repeated
-// cudaMalloc/cudaFree pairs.
+// size on the same device are reused from an internal pool, which avoids the
+// cost of repeated cudaMalloc/cudaFree pairs.
 func Alloc(size int) (*Buffer, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("cuda: negative allocation size %d", size)
@@ -479,38 +511,47 @@ func Alloc(size int) (*Buffer, error) {
 	if err != nil {
 		return nil, err
 	}
+	device, err := CurrentDevice()
+	if err != nil {
+		return nil, err
+	}
+	key := poolKey{device: device, size: capacity}
 	poolMu.Lock()
-	list := poolTable[capacity]
+	list := poolTable[key]
 	if len(list) > 0 {
 		pointer := list[len(list)-1]
 		if len(list) == 1 {
-			delete(poolTable, capacity)
+			delete(poolTable, key)
 		} else {
-			poolTable[capacity] = list[:len(list)-1]
+			poolTable[key] = list[:len(list)-1]
 		}
 		uncacheAccountingLocked(pointer, capacity)
-		if capturing && captureTouched != nil {
-			captureTouched[pointer] = capacity
+		if state := launchStateForThread(); state.capturing && state.touched != nil {
+			state.touched[pointer] = capacity
 		}
 		addLiveBytes(capacity)
 		poolMu.Unlock()
-		return &Buffer{pointer: pointer, size: size, capacity: capacity}, nil
+		return &Buffer{pointer: pointer, size: size, capacity: capacity, device: device}, nil
 	}
 	poolMu.Unlock()
 	var pointer uintptr
 	code, _, _ := a.malloc.Call(uintptr(unsafe.Pointer(&pointer)), uintptr(capacity))
-	if code == 2 && !capturing { // cudaErrorMemoryAllocation: cached blocks may be reclaimable.
+	if code == 2 && !InCapture() { // cudaErrorMemoryAllocation: cached blocks may be reclaimable.
 		if releaseErr := ReleasePool(); releaseErr == nil {
+			if setErr := SetDevice(device); setErr != nil {
+				return nil, setErr
+			}
 			code, _, _ = a.malloc.Call(uintptr(unsafe.Pointer(&pointer)), uintptr(capacity))
 		}
 	}
 	if err := runtimeError("cudaMalloc", code); err != nil {
 		return nil, err
 	}
-	if capturing {
+	if InCapture() {
+		state := launchStateForThread()
 		poolMu.Lock()
-		if captureTouched != nil {
-			captureTouched[pointer] = capacity
+		if state.touched != nil {
+			state.touched[pointer] = capacity
 		}
 		poolMu.Unlock()
 	}
@@ -521,11 +562,11 @@ func Alloc(size int) (*Buffer, error) {
 	}
 	addLiveBytes(capacity)
 	poolMu.Unlock()
-	return &Buffer{pointer: pointer, size: size, capacity: capacity}, nil
+	return &Buffer{pointer: pointer, size: size, capacity: capacity, device: device}, nil
 }
 
-// Free returns the allocation to the internal pool. It is safe to call more
-// than once. Use ReleasePool to release pooled memory to the driver.
+// Free returns the allocation to the internal pool on its own device. It is safe
+// to call more than once. Use ReleasePool to release pooled memory to the driver.
 func (b *Buffer) Free() error {
 	if b == nil || b.freed {
 		return nil
@@ -533,17 +574,18 @@ func (b *Buffer) Free() error {
 	b.freed = true
 	poolMu.Lock()
 	liveBytes -= b.capacity
-	if capturing && captureTouched != nil {
-		captureTouched[b.pointer] = b.capacity
+	if state := launchStateForThread(); state.capturing && state.touched != nil {
+		state.touched[b.pointer] = b.capacity
 	}
-	cachePointerLocked(b.pointer, b.capacity)
+	cachePointerLocked(b.pointer, b.capacity, b.device)
 	victims := trimPoolLocked()
 	poolMu.Unlock()
 	b.pointer = 0
 	return freeCachedPointers(victims)
 }
 
-// ReleasePool frees every buffer currently held by the internal pool.
+// ReleasePool frees every buffer currently held by the internal pool, freeing
+// each block on the device it was allocated on.
 func ReleasePool() error {
 	a, err := load()
 	if err != nil {
@@ -551,16 +593,18 @@ func ReleasePool() error {
 	}
 	poolMu.Lock()
 	defer poolMu.Unlock()
-	for size, list := range poolTable {
+	for key, list := range poolTable {
 		for _, pointer := range list {
-			code, _, _ := a.free.Call(pointer)
-			if err := runtimeError("cudaFree", code); err != nil {
+			if err := withDevice(key.device, func() error {
+				code, _, _ := a.free.Call(pointer)
+				return runtimeError("cudaFree", code)
+			}); err != nil {
 				return err
 			}
-			reservedBytes -= size
+			reservedBytes -= key.size
 		}
 	}
-	poolTable = map[int][]uintptr{}
+	poolTable = map[poolKey][]uintptr{}
 	poolLRU.Init()
 	poolNodes = map[uintptr]*list.Element{}
 	cachedBytes = 0
@@ -572,6 +616,9 @@ func (b *Buffer) Pointer() uintptr { return b.pointer }
 
 // Size returns the allocation size in bytes.
 func (b *Buffer) Size() int { return b.size }
+
+// Device returns the device index the allocation belongs to.
+func (b *Buffer) Device() int { return b.device }
 
 // CopyFromHost uploads len(data) bytes to the start of the buffer.
 func (b *Buffer) CopyFromHost(data []byte) error {
@@ -602,28 +649,26 @@ func (b *Buffer) copy(kind int, data []byte, offset int) error {
 	if kind == 2 {
 		destination, source = uintptr(unsafe.Pointer(&data[0])), b.pointer+uintptr(offset)
 	}
-	code, _, _ := a.memcpy.Call(destination, source, uintptr(len(data)), uintptr(kind))
-	runtime.KeepAlive(data)
-	return runtimeError("cudaMemcpy", code)
+	return withDevice(b.device, func() error {
+		code, _, _ := a.memcpy.Call(destination, source, uintptr(len(data)), uintptr(kind))
+		runtime.KeepAlive(data)
+		return runtimeError("cudaMemcpy", code)
+	})
 }
 
 // Memset fills the first size bytes with a byte value on the current stream.
 // It uses the asynchronous form so it is also valid during graph capture.
 func (b *Buffer) Memset(value byte, size int) error {
-	if size < 0 || size > b.size {
-		return fmt.Errorf("cuda: memset size %d exceeds buffer size %d", size, b.size)
-	}
-	a, err := load()
-	if err != nil {
-		return err
-	}
-	code, _, _ := a.memsetAsync.Call(b.pointer, uintptr(value), uintptr(size), currentStream)
-	return runtimeError("cudaMemsetAsync", code)
+	return b.memsetAsync(value, size)
 }
 
 // MemsetAsync fills the first size bytes with a byte value on the current
 // stream without blocking the host. It is safe to use during graph capture.
 func (b *Buffer) MemsetAsync(value byte, size int) error {
+	return b.memsetAsync(value, size)
+}
+
+func (b *Buffer) memsetAsync(value byte, size int) error {
 	if size < 0 || size > b.size {
 		return fmt.Errorf("cuda: memset size %d exceeds buffer size %d", size, b.size)
 	}
@@ -631,8 +676,11 @@ func (b *Buffer) MemsetAsync(value byte, size int) error {
 	if err != nil {
 		return err
 	}
-	code, _, _ := a.memsetAsync.Call(b.pointer, uintptr(value), uintptr(size), currentStream)
-	return runtimeError("cudaMemsetAsync", code)
+	stream := currentStreamHandle()
+	return withDevice(b.device, func() error {
+		code, _, _ := a.memsetAsync.Call(b.pointer, uintptr(value), uintptr(size), stream)
+		return runtimeError("cudaMemsetAsync", code)
+	})
 }
 
 // Stream is a non-default CUDA stream.
@@ -704,7 +752,7 @@ func (e *Event) Record(stream *Stream) error {
 	if err != nil {
 		return err
 	}
-	streamHandle := currentStream
+	streamHandle := currentStreamHandle()
 	if stream != nil {
 		streamHandle = stream.handle
 	}

@@ -25,7 +25,11 @@ a `Graph` and replay it with one launch. Freed buffers are reused from a
 size-class pool capped at 2 GiB by default, so variable sequence lengths do
 not retain every exact allocation size. `cuda.MemoryStats` reports live,
 cached, reserved and peak bytes; `SetPoolCacheLimit` changes the cap, and
-`ReleasePool` returns cached memory to the driver. On other platforms CUDA
+`ReleasePool` returns cached memory to the driver. Device, implicit stream and
+capture state belong to the calling OS thread; pool entries and `Buffer` values
+record their device, and copies, memset and free select it, so goroutines that
+hold separate `autograd.NewCUDAContextOn` contexts keep independent streams,
+captures and devices. On other platforms CUDA
 operations report `ErrUnavailable` and `MemoryStats` returns zero counters.
 
 The `autograd` package is a define-by-run float32 graph with rank-six views,
@@ -457,7 +461,9 @@ The registry selects CPU or CUDA implementations but does not yet
 support runtime kernel plugins. The
 compatibility NoGrad scope and BF16/attention settings are shared.
 Explicit execution contexts isolate recording, precision and attention selection;
-CUDA stream/capture and allocation-pool isolation are still being generalized. Tiled
+CUDA device, implicit-stream and capture state is per OS thread and the pool is
+keyed by device, while stream-keyed pooling and overlapping streams inside one
+recorded step are still being generalized. Tiled
 attention currently supports head dimensions up to 128 and is slower than the
 materialized GEMM path at the measured sequence lengths. GPU inference callers
 should release unused graphs with `ReleaseGraph`. The older `nn` path still

@@ -268,14 +268,15 @@ func programLog(a *kernelAPI, program uintptr) string {
 }
 
 // Launch runs the kernel. grid and block are {x,y,z}. args holds one pointer
-// per parameter, each pointing at the argument value. stream may be nil for
-// the default stream.
+// per parameter, each pointing at the argument value. stream may be nil to use
+// the current thread's implicit stream (see SetCurrentStream), which is the
+// default stream unless a scope selected another one.
 func (k *Kernel) Launch(grid, block [3]int, sharedMemory int, stream *Stream, args []unsafe.Pointer) error {
 	a, err := loadKernelAPI()
 	if err != nil {
 		return err
 	}
-	streamHandle := currentStream
+	streamHandle := currentStreamHandle()
 	if stream != nil {
 		streamHandle = stream.handle
 	}

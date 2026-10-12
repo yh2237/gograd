@@ -3,35 +3,88 @@
 package cuda
 
 import (
+	"fmt"
 	"runtime"
+	"sync"
+	"syscall"
 	"unsafe"
 )
 
-// currentStream holds a stream that kernel launches use when they are not
-// given one. Graph capture routes all work through a single stream this way.
-var currentStream uintptr
+// CUDA's notion of a current device and a current stream is per host thread, and
+// this package follows the same rule instead of sharing one process-wide setting.
+// A goroutine that uses CUDA locks its OS thread (see NewCUDAContext), so
+// keying this state by the OS thread id keeps independent training runs from
+// overwriting each other's stream or capture state.
+var currentThreadIDProc = syscall.NewLazyDLL("kernel32.dll").NewProc("GetCurrentThreadId")
 
-// capturing reports whether a graph capture is in progress. Callers must avoid
-// driver calls that capture forbids, such as setting the device.
-var capturing bool
-
-// InCapture reports whether a graph capture is in progress.
-func InCapture() bool { return capturing }
-
-// SetCurrentStream routes kernel launches that do not name a stream to s. Pass
-// nil to use the default stream.
-func SetCurrentStream(s *Stream) {
-	if s == nil {
-		currentStream = 0
-	} else {
-		currentStream = s.handle
-	}
+func currentThreadID() uintptr {
+	id, _, _ := currentThreadIDProc.Call()
+	return id
 }
+
+// launchState is the implicit CUDA state of one OS thread.
+type launchState struct {
+	stream    uintptr
+	capturing bool
+	// touched marks pool pointers used while this thread captures a graph. It
+	// stays per thread so two concurrent captures cannot clobber each other.
+	touched map[uintptr]int
+}
+
+var launchStates sync.Map // uintptr -> *launchState
+
+func launchStateForThread() *launchState {
+	id := currentThreadID()
+	if value, ok := launchStates.Load(id); ok {
+		return value.(*launchState)
+	}
+	state := &launchState{}
+	actual, _ := launchStates.LoadOrStore(id, state)
+	return actual.(*launchState)
+}
+
+// releaseIdleThreadState drops the entry for a thread with no active stream or
+// capture. Go reuses OS threads, so leaving stale entries would grow the map for
+// the life of the process.
+func (s *launchState) releaseIfIdle() {
+	if s.stream != 0 || s.capturing {
+		return
+	}
+	launchStates.CompareAndDelete(currentThreadID(), s)
+}
+
+// currentStreamHandle returns the stream implicit launches should use on this
+// thread. Zero selects the default stream.
+func currentStreamHandle() uintptr {
+	return launchStateForThread().stream
+}
+
+// InCapture reports whether a graph capture is in progress on this thread.
+// Driver calls that capture forbids, such as setting the device, must be avoided
+// while it is true.
+func InCapture() bool { return launchStateForThread().capturing }
+
+// SetCurrentStream routes kernel launches that do not name a stream to s on the
+// calling OS thread. Pass nil to use the default stream.
+func SetCurrentStream(s *Stream) {
+	state := launchStateForThread()
+	if s == nil {
+		state.stream = 0
+		state.releaseIfIdle()
+		return
+	}
+	state.stream = s.handle
+}
+
+// CurrentStreamHandle reports the stream handle implicit launches use on this
+// thread. Zero means the default stream.
+func CurrentStreamHandle() uintptr { return currentStreamHandle() }
 
 // Graph is a captured sequence of GPU work that replays with one launch.
 type Graph struct {
 	exec     uintptr
 	stream   *Stream
+	device   int
 	reserved map[uintptr]int
 }
 
@@ -39,24 +92,37 @@ type Graph struct {
 // not perform synchronous copies or first-time kernel compilation: compile the
 // kernels and create handles before calling. The captured work keeps referring
 // to the same device buffers, so the caller must keep them allocated.
+//
+// Capture owns the calling OS thread for its duration, records the current
+// device without changing it, and rejects a nested capture on the same thread
+// instead of silently corrupting the outer one.
 func Capture(stream *Stream, fn func() error) (*Graph, error) {
+	if stream == nil {
+		return nil, fmt.Errorf("cuda: capture requires an explicit stream")
+	}
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	if err := SetDevice(0); err != nil {
+	state := launchStateForThread()
+	if state.capturing {
+		return nil, fmt.Errorf("cuda: nested graph capture on one OS thread is not supported")
+	}
+	device, err := CurrentDevice()
+	if err != nil {
 		return nil, err
 	}
-	previous := currentStream
-	currentStream = stream.handle
-	capturing = true
+	previous := state.stream
+	state.stream = stream.handle
+	state.capturing = true
 	poolMu.Lock()
-	captureTouched = map[uintptr]int{}
+	state.touched = map[uintptr]int{}
 	poolMu.Unlock()
 	defer func() {
-		currentStream = previous
-		capturing = false
+		state.stream = previous
+		state.capturing = false
 		poolMu.Lock()
-		captureTouched = nil
+		state.touched = nil
 		poolMu.Unlock()
+		state.releaseIfIdle()
 	}()
 	a, err := loadKernelAPI()
 	if err != nil {
@@ -89,35 +155,36 @@ func Capture(stream *Stream, fn func() error) (*Graph, error) {
 	a.graphDestroy.Call(graph)
 	reserved := map[uintptr]int{}
 	poolMu.Lock()
-	for size, list := range poolTable {
+	for key, list := range poolTable {
 		kept := list[:0]
 		for _, pointer := range list {
-			if _, used := captureTouched[pointer]; used {
-				reserved[pointer] = size
-				uncacheAccountingLocked(pointer, size)
+			if _, used := state.touched[pointer]; used {
+				reserved[pointer] = key.size
+				uncacheAccountingLocked(pointer, key.size)
 			} else {
 				kept = append(kept, pointer)
 			}
 		}
-		poolTable[size] = kept
+		poolTable[key] = kept
 	}
 	poolMu.Unlock()
-	return &Graph{exec: exec, stream: stream, reserved: reserved}, nil
+	return &Graph{exec: exec, stream: stream, device: device, reserved: reserved}, nil
 }
 
-// Launch replays the graph.
+// Launch replays the graph on the device it was captured on.
 func (g *Graph) Launch() error {
 	a, err := loadKernelAPI()
 	if err != nil {
 		return err
 	}
-	if code, _, _ := a.graphLaunch.Call(g.exec, g.stream.handle); code != 0 {
+	return withDevice(g.device, func() error {
+		code, _, _ := a.graphLaunch.Call(g.exec, g.stream.handle)
 		return driverError("cuGraphLaunch", code)
-	}
-	return nil
+	})
 }
 
-// Close releases the instantiated graph.
+// Close releases the instantiated graph and returns its reserved allocations to
+// the pool on the device they belong to.
 func (g *Graph) Close() error {
 	if g.exec == 0 {
 		return nil
@@ -133,7 +200,7 @@ func (g *Graph) Close() error {
 	g.exec = 0
 	poolMu.Lock()
 	for pointer, size := range g.reserved {
-		cachePointerLocked(pointer, size)
+		cachePointerLocked(pointer, size, g.device)
 	}
 	g.reserved = nil
 	victims := trimPoolLocked()

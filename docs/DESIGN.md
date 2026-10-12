@@ -89,16 +89,29 @@ normalization, masked losses, softmax, cross-entropy, dropout, and clipping.
 CUDA N-D indexing supports ranks through six for broadcasting, reduction,
 and views. The CUDA driver context is tied to
 an OS thread, so callers hold `NewCUDAContext` through the training step.
-The graph currently uses one stream. Captured graphs reserve their temporary
-pool allocations until `Graph.Close`, and cuBLAS is bound to the capture
-stream. This does not yet support overlapping independent streams or concurrent
-captures. The CUDA pool now rounds requests into size classes (256 B, 4 KiB,
+`NewCUDAContextOn` selects and validates a device; the context records the
+thread's previous device and restores it on `Close`, so a goroutine later
+scheduled onto the same OS thread does not inherit this run's device.
+
+The implicit current stream and the capture flag are per OS thread rather than
+process-wide, matching how the driver scopes its own current context. Independent
+goroutines that each lock a thread therefore keep separate implicit streams and
+cannot corrupt each other's capture, and `Capture` rejects a nested capture on the
+same thread instead of silently re-entering. A capture records the current device
+without changing it, and graph replay re-selects that device around
+`cuGraphLaunch`. Captured graphs reserve their temporary pool allocations until
+`Graph.Close`, and cuBLAS is bound to the capture stream. Overlapping independent
+streams inside one training step remain unimplemented.
+
+The CUDA pool rounds requests into size classes (256 B, 4 KiB,
 64 KiB or 1 MiB alignment by size), caches at most 2 GiB by default, and
 evicts least-recently-used cached buffers above that limit. `MemoryStats`
 reports active, cached and driver-reserved bytes and their peaks;
 `SetPoolCacheLimit` can lower the cap, and `ReleasePool` frees cached memory.
 Graph-reserved pointers are removed from the ordinary cache until graph close.
-The pool is still global rather than keyed by device and stream.
+Pool entries are keyed by device as well as size class, and `Buffer` records its
+own device, so copies, memset and free select the owning device and restore the
+caller's device instead of assuming device 0.
 
 Warp reductions fuse softmax forward and backward. The materialized attention path
 uses batched QK and PV GEMMs around fused masked scale/softmax forward and

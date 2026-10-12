@@ -9,7 +9,7 @@ use a separate `gograd-training-1` envelope.
 | Package | API | Contract |
 | --- | --- | --- |
 | `tensor` | `Device`, `CPU`, `CUDA` | Select the backend when constructing tensors and models. |
-| `autograd` | `NewCUDAContext`, `CUDAContext.Close` | Hold a CUDA context on the calling OS thread for the training step. |
+| `autograd` | `NewCUDAContext`, `NewCUDAContextOn`, `CUDAContext.Device`, `CUDAContext.Close` | Hold a CUDA context on the calling OS thread for the training step, optionally selecting and validating a device and restoring the thread's previous device on close. |
 | `autograd` | `New`, `Tensor.ToHost`, `Tensor.Backward`, `Tensor.ReleaseGraph`, `Tensor.Close` | Float32 tensors, explicit readback and lifetime control. |
 | `autograd` | `RetainData`, `RetainGrad`, `BackwardWithOptions`, `BackwardOptions` | Shared-storage lifetimes, retained forward values/gradients and explicit derivative-history retention for multiple backward passes. |
 | `autograd` | `NewExecutionContext`, `ExecutionContext.New`, `Zeros`, `Bind`, `BindModule`, `NoGrad`, `Recording`, `Tensor.ExecutionContext` | Explicit recording scope propagated by tensors and views. Independent CPU models can train/infer concurrently using separate contexts. |
@@ -62,6 +62,20 @@ captured graph remain allocated. `ResetAllocationPeak` resets peak counters
 to the current levels. The counters do not include allocations made directly
 by CUDA libraries outside gograd's pool. `Buffer.Size()` remains the requested
 logical byte count even when its physical size class is larger.
+
+CUDA device, stream and capture state belongs to the OS thread that uses it.
+`SetDevice`/`CurrentDevice` select the device, `autograd.NewCUDAContextOn` pins a
+goroutine to one validated device and restores the thread's previous device on
+`Close`, and `Buffer.Device()` reports the device an allocation belongs to.
+Reusable pool entries are keyed by device and size class, and `CopyFromHost`,
+`CopyToHost`, `Memset`/`MemsetAsync` and `Free` select the buffer's own device and
+restore the caller's, so multi-device code no longer depends on the ambient
+device. `SetCurrentStream`/`CurrentStreamHandle` select the implicit stream for
+kernel launches and event records on the calling thread; the default stream is
+used when none is selected. `Capture` requires an explicit stream, records the
+current device without changing it, rejects a nested capture on the same thread,
+and replays the graph on its capture device. Independent threads therefore keep
+separate implicit streams and capture state.
 
 ## Execution contexts and gradient recording
 
@@ -120,9 +134,12 @@ execution.NoGrad(func() {
 
 This context isolates gradient recording, BF16 mode and attention selection.
 It does not own CUDA streams/capture or allocation pools. CUDA
-callers still hold `NewCUDAContext` on the calling OS thread, and independent
-concurrent CUDA execution is not covered by this API. `cmd/cnn-train` uses the
-explicit context API.
+callers still hold `NewCUDAContext` on the calling OS thread. `NewCUDAContextOn`
+selects a device and restores the thread's previous device on `Close`; the CUDA
+package keeps its implicit stream and capture flag per OS thread, so goroutines
+that hold separate contexts do not overwrite each other's stream. Overlapping
+independent streams inside one recorded step are still not covered by this API.
+`cmd/cnn-train` uses the explicit context API.
 
 ### Precision and attention policy
 
@@ -905,7 +922,11 @@ device counter rather than an outdated host step count.
   explicit contexts and independent model state for concurrent CPU execution.
   Unbound tensors use process-wide BF16/attention compatibility settings; do
   not mutate those globals concurrently. Explicit contexts own these settings.
-  CUDA stream/capture isolation is not yet implemented.
+  CUDA stream and capture state is now per OS thread, and the allocation pool and
+  buffers track their device, so goroutines holding separate `NewCUDAContextOn`
+  contexts keep independent implicit streams, captures and devices. Overlapping
+  independent streams inside one recorded step, multi-device execution contexts
+  and stream-keyed pooling are not implemented yet.
 - Combined checkpoints restore AdamW or SGD optimizer and OneCycle state. Old `nn`/`gputcn`
   trainers still use their existing checkpoint paths. Sampling runs on the host;
   the `data` package provides a separate general loader with optional prefetch.

@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/yh2237/gograd/cuda"
@@ -107,6 +108,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "cuda unavailable")
 		os.Exit(1)
 	}
+	// Implicit stream and capture state follow the OS thread, so pin the main
+	// goroutine to one thread before selecting a stream below.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	rng := rand.New(rand.NewSource(*seed))
 	values, targets, mask := syntheticData(rng, *batch, *inputs, *maxTime)
 	input, target, maskBatch, length := padBatch(values, targets, mask, *inputs)
