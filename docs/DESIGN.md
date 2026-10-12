@@ -346,6 +346,25 @@ at update 100 then resumed with different reader settings produced byte-identica
 inference weights (same SHA-256) and the same RMSE as the uninterrupted run. This
 is a reproducibility exercise, not a quality claim about the synthetic target.
 
+Audio follows the same split: the `data` package decodes and encodes uncompressed
+RIFF WAV (integer PCM and IEEE float, including WAVE_FORMAT_EXTENSIBLE), while
+framing, windowing, augmentation and the model stay in the application. The
+augmentation design is the point. `cmd/audio-train` derives each window's noise
+from `(seed, window index)` through a private PCG stream instead of advancing one
+RNG while iterating, so the noisy input for a given window cannot depend on worker
+counts, prefetch depth, shuffle order or where a previous run stopped. The seed is
+part of the checkpoint identity, and the WAV content is fingerprinted, so both a
+changed audio file and a changed noise level are rejected on resume. The example
+also demonstrates an application-defined sample type and collate function fed to
+the generic dataset/sampler/loader pipeline, which keeps collation and CUDA thread
+ownership in the training loop.
+
+On a generated 8-second 16 kHz tone (2,000 windows total, 400 held out), seed 7,
+batch 64 and 300 updates, the denoiser improved validation SNR from 4.8665 dB for
+the noisy input to 15.0490 dB on CPU and CUDA, with zero inference-reload
+difference. A run stopped at update 150, then resumed with different reader
+settings, produced weights byte-identical to the uninterrupted run.
+
 ## Common optimizers and SGD state
 
 Optimizer provides a common eager update/reset/LR/lifetime surface for AdamW and

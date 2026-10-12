@@ -26,6 +26,7 @@ use a separate `gograd-training-1` envelope.
 | `autograd` | `NewSGD`, `SGDOptions`, `SGD.State`, `SGDState`, `LoadState`, `SaveSafeTensors`, `LoadSafeTensors` | CPU/CUDA SGD, momentum/dampening, Nesterov, coupled decay, ascent and lazy momentum initialization/state resume. |
 | `data` | `ParseNumericCSV`, `ParseOptions`, `NumericTable`, `RegressionSamples`, `RegressionSample`, `RegressionBatch`, `StackRegression` | Numeric CSV/TSV tables and regression rows; finite values, header/comment handling, explicit feature/target columns and equal-length stacking. |
 | `data` | `Standardizer`, `FitStandardizer`, `StandardizerState`, `Apply`, `ApplyBatch`, `State`, `LoadState` | Deterministic per-feature centering/scaling fitted on the training split and serializable so training, validation and inference share one transform. |
+| `data` | `ReadWAV`, `ReadWAVFile`, `ReadWAVMono`, `WAV`, `Mono`, `WriteWAV`, `WAVEncoding` | Uncompressed PCM/float RIFF audio including WAVE_FORMAT_EXTENSIBLE, channel-averaged mono access and matching encoders for self-contained examples. |
 | `autograd` | `ParameterGroupSpec`, `PartitionParameters`, `NewSGDGroups`, `NewAdamWGroups`, `OptimizerGroupState` | Named parameter groups with per-group learning-rate scale and weight decay for SGD/AdamW, plus recorded group membership in optimizer state. |
 | `autograd` | `SaveTrainingCheckpoint`, `LoadTrainingCheckpoint`, `TrainingCheckpointMetadata` | Atomic model/buffer + AdamW/SGD + OneCycle checkpoint with caller metadata. All names/shapes/state are validated before copying into live objects. |
 | `autograd` | `Module.Train`, `SetTraining` | Recursive train/eval propagation; `OnTrainingChange` connects stateful layers such as dropout to the module tree. |
@@ -709,6 +710,38 @@ small MLP with mean squared error. It saves the standardizer state, loader order
 and dataset fingerprint with the AdamW/SGD and OneCycle state, so a stopped run
 resumes exactly; changing the data, split, batch, steps, seed, hidden size or
 optimizer is rejected before loading. Timestamps are not identity.
+
+### WAV audio and augmentation
+
+`ReadWAV(r)` decodes uncompressed RIFF audio: 8/16/24/32-bit integer PCM (8-bit
+unsigned, as the format requires) and 32/64-bit IEEE float, including
+`WAVE_FORMAT_EXTENSIBLE` fmt chunks. Integer samples are divided by `2^(bits-1)`
+and float samples are kept as written, matching the usual PyTorch loading
+convention. The result exposes `SampleRate`, `Channels`, `Bits`, `Float`,
+`Samples` (interleaved) and `Mono()`. `ReadWAVFile`/`ReadWAVMono` cover the file
+and channel-averaged cases. Compressed codecs, unknown layouts and data sizes that
+are not a whole number of frames are rejected rather than guessed at.
+
+`WriteWAV(w, samples, WAVEncoding{Channels, SampleRate, Bits, Float})` writes the
+same layouts. Integer output clamps to the representable range and rounds to the
+nearest step; float output rejects non-finite samples. A round trip is therefore
+within one and a half least-significant steps for integer PCM and exact for float.
+
+```go
+wav, err := data.ReadWAVFile("tone.wav")
+// Handle err.
+mono := wav.Mono()
+file, err := os.Create("copy.wav") // then WriteWAV(file, wav.Samples, data.WAVEncoding{...})
+```
+
+`cmd/audio-train` is the audio example. It frames a mono signal into fixed
+windows and augments each window with Gaussian noise derived from
+`(seed, window index)` through a private PCG stream, never from iteration order.
+That is the application-side augmentation contract: workers, prefetch and resume
+cannot change the inputs, and the seed is checkpoint identity, so a stopped run
+reproduces the same noisy inputs and the same weights. The example trains an MLP
+denoiser with mean squared error, reports input/output SNR in dB, and checkpoints
+the model, optimizer, schedule, loader order and WAV fingerprint together.
 
 ### Data checkpoints
 
