@@ -36,7 +36,7 @@ gogradの学習で使う公開APIの一覧です。学習checkpointは`safetenso
 
 `cuda.MemoryStats()`は、gogradのCUDAアロケータが持つ物理バイト数を返します。`LiveBytes`、`CachedBytes`、`ReservedBytes`、`PeakLiveBytes`、`PeakReservedBytes`、`CachedBuffers`、`CacheLimitBytes`です。既定のキャッシュ上限は2 GiBです。`SetPoolCacheLimit`は上限を下げたときに、最も長く使われていないキャッシュをすぐに解放します。使用中のテンソルと、記録したグラフが予約している割当は解放しません。`ResetAllocationPeak`はピークの値を現在の値に戻します。この値には、gogradのプールを通さずCUDAライブラリが直接確保した分は含まれません。`Buffer.Size()`は、物理的なサイズクラスが大きくても、要求した論理バイト数を返します。
 
-CUDAのdevice、stream、captureの状態は、それを使うOSスレッドに属します。`SetDevice`と`CurrentDevice`でdeviceを選び、`autograd.NewCUDAContextOn`はgoroutineを検証済みのdeviceに固定し、`Close`でそのスレッドの以前のdeviceを復元します。`Buffer.Device()`は割当が属するdeviceを返します。再利用するプールの項目はdeviceとサイズクラスをキーにし、`CopyFromHost`、`CopyToHost`、`Memset`/`MemsetAsync`、`Free`はバッファ自身のdeviceを選んで呼び出し側のdeviceを復元するため、複数deviceのコードは周囲のdeviceに依存しません。`SetCurrentStream`と`CurrentStreamHandle`は、呼び出したスレッドでカーネル起動とevent記録が使う暗黙のstreamを選びます。何も選ばないときは既定のstreamを使います。`Capture`は明示的なstreamを必要とし、現在のdeviceを変更せずに記録し、同じスレッドでの入れ子のcaptureを拒否し、記録したdeviceでグラフを再生します。したがって独立したスレッドは、それぞれ別の暗黙のstreamとcaptureの状態を保ちます。
+CUDAのdevice、stream、captureの状態は、それを使うOSスレッドに属します。`SetDevice`と`CurrentDevice`でdeviceを選び、`autograd.NewCUDAContextOn`はgoroutineを検証済みのdeviceに固定し、`Close`でそのスレッドの以前のdeviceを復元します。`Buffer.Device()`は割当が属するdeviceを返します。再利用するプールの項目はdeviceとstreamとサイズクラスをキーにします。解放したブロックは同じstreamにだけ返すため、あるstreamがまだ読み取り中のブロックを別のstreamが再利用することはありません。`CopyFromHost`、`CopyToHost`、`Memset`/`MemsetAsync`、`Free`はバッファ自身のdeviceを選んで呼び出し側のdeviceを復元するため、複数deviceのコードは周囲のdeviceに依存しません。`SetCurrentStream`と`CurrentStreamHandle`は、呼び出したスレッドでカーネル起動とevent記録が使う暗黙のstreamを選びます。何も選ばないときは既定のstreamを使います。`Capture`は明示的なstreamを必要とし、現在のdeviceを変更せずに記録し、同じスレッドでの入れ子のcaptureを拒否し、記録したdeviceでグラフを再生します。したがって独立したスレッドは、それぞれ別の暗黙のstreamとcaptureの状態を保ちます。
 
 ## 実行コンテキストと勾配の記録
 
@@ -467,7 +467,7 @@ err = sampler.LoadState(state)
 ## 互換性の注意
 
 - 一般のautogradの演算、CUDAグラフの記録、BF16 autocast、デバイスバッファのプール、opレジストリは実験的な位置づけです。deviceとdtypeの扱いはfloat32を中心に整えており、BF16は任意のシャドウバッファを使います。
-- 互換用の`NoGrad`スコープは、bindしていないテンソルが共有します。CPUで並行実行するには、別々の明示的コンテキストと独立したモデルstateを使います。bindしていないテンソルはプロセス共有のBF16・アテンション設定を使うため、このグローバル設定を並行して変更しないでください。明示的コンテキストはこれらの設定を持ちます。CUDAのstreamとcaptureの状態はOSスレッド単位で、割当プールとバッファはdeviceを持ちます。そのため`NewCUDAContextOn`のコンテキストを持つgoroutineは、独立した暗黙のstream、capture、deviceを保ちます。1回の記録の中での複数のstreamの重ね合わせ、複数deviceの実行コンテキスト、stream単位のプールの分離には対応していません。
+- 互換用の`NoGrad`スコープは、bindしていないテンソルが共有します。CPUで並行実行するには、別々の明示的コンテキストと独立したモデルstateを使います。bindしていないテンソルはプロセス共有のBF16・アテンション設定を使うため、このグローバル設定を並行して変更しないでください。明示的コンテキストはこれらの設定を持ちます。CUDAのstreamとcaptureの状態はOSスレッド単位で、各スレッドは自分のcuBLASハンドル、勾配クリップのプラン、プールのキャッシュを持ちます。割当プールはdeviceとstreamをキーにするため、`NewCUDAContextOn`のコンテキストを持つ独立したgoroutineは、暗黙のstream、capture、device、再利用するバッファを互いに共有しません。1回の記録の中での複数のstreamの重ね合わせと、複数deviceを1つの実行コンテキストで扱うことには対応していません。
 - 統合checkpointはAdamWまたはSGDのoptimizerとOneCycleのstateを復元します。旧`nn`/`gputcn`の学習器は、これまでどおりのcheckpointの経路を使います。サンプリングはホストで行い、`data`パッケージはprefetchを任意で備えた汎用のloaderを別に提供します。
 - safetensorsの書き込みは、同じディレクトリの一時ファイル、sync、renameを使います。読込は不正またはオーバーフローする形状、重複する範囲、16 MiBを超えるヘッダを拒否します。ファイル全体をメモリに読み込むため、ファイルサイズの上限はありません。deviceへの転送の失敗は、検証済みの読込を途中で止めることがあります。
 - GoとPyTorchの学習は、サンプリング、初期化、dropoutに別々の乱数ストリームを使います。演算ごとの照合には初期重みを固定し、明示的なdropoutマスクを使います。学習全体の検証は、同じ軌跡ではなく、測定した品質で比較します。
