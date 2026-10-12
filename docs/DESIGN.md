@@ -321,6 +321,31 @@ at update 40 and resumed using two readers/prefetch two. CUDA used four readers
 and prefetch four. Both retained 86.4% test accuracy, loss 0.455661 and zero
 reload-logit difference. This checks pipeline equivalence, not a throughput claim.
 
+Numeric CSV tables extend the same pipeline to non-image data. Parsing is strict
+about shape and finiteness because a NaN usually means an uncleaned file, and the
+error names the offending line/column. Regression samples carry a scalar target
+beside their feature vector, so the existing generic Loader, sampler and
+checkpoint machinery apply unchanged, and `StackRegression` keeps host collation
+in the consumer as before.
+
+Feature standardization is the piece that makes an application-level transform
+reproducible. The design keeps it deliberately outside the library's automatic
+differentiation: statistics are fitted on the training split only, applied to
+train and validation alike, and serialized as state. Fitting accumulates in
+float64 so the result does not depend on float32 summation order or worker counts,
+and a constant feature gets a unit scale instead of a division by zero. The
+tabular command stores that state, the loader order and a content fingerprint in
+the checkpoint and rejects a resume whose data, split, batching or model shape
+changed. Fitting on the validation split, or refitting after a resume, would
+quietly change the target function; the checkpoint contract prevents that.
+
+The tabular command was checked on a generated four-feature dataset (4,000 rows,
+800 validation), seed 7, batch 64, 200 updates: CPU and CUDA both reached
+validation RMSE 12.164137 with zero inference-reload difference, and a run stopped
+at update 100 then resumed with different reader settings produced byte-identical
+inference weights (same SHA-256) and the same RMSE as the uninterrupted run. This
+is a reproducibility exercise, not a quality claim about the synthetic target.
+
 ## Common optimizers and SGD state
 
 Optimizer provides a common eager update/reset/LR/lifetime surface for AdamW and

@@ -24,6 +24,8 @@ use a separate `gograd-training-1` envelope.
 | `autograd` | `AdamW.State`, `LoadState`, `SaveSafeTensors`, `LoadSafeTensors`, `Close` | Named parameter shapes, moments, hyperparameters and step count on CPU/CUDA; release optimizer-owned buffers. |
 | `autograd` | `Optimizer`, `CheckpointOptimizer`, `OptimizerSnapshot`, `LearningRate`, `SetLearningRate` | Common eager update/reset/LR/lifetime API and typed AdamW/SGD checkpoint snapshots. OneCycle accepts Optimizer. |
 | `autograd` | `NewSGD`, `SGDOptions`, `SGD.State`, `SGDState`, `LoadState`, `SaveSafeTensors`, `LoadSafeTensors` | CPU/CUDA SGD, momentum/dampening, Nesterov, coupled decay, ascent and lazy momentum initialization/state resume. |
+| `data` | `ParseNumericCSV`, `ParseOptions`, `NumericTable`, `RegressionSamples`, `RegressionSample`, `RegressionBatch`, `StackRegression` | Numeric CSV/TSV tables and regression rows; finite values, header/comment handling, explicit feature/target columns and equal-length stacking. |
+| `data` | `Standardizer`, `FitStandardizer`, `StandardizerState`, `Apply`, `ApplyBatch`, `State`, `LoadState` | Deterministic per-feature centering/scaling fitted on the training split and serializable so training, validation and inference share one transform. |
 | `autograd` | `ParameterGroupSpec`, `PartitionParameters`, `NewSGDGroups`, `NewAdamWGroups`, `OptimizerGroupState` | Named parameter groups with per-group learning-rate scale and weight decay for SGD/AdamW, plus recorded group membership in optimizer state. |
 | `autograd` | `SaveTrainingCheckpoint`, `LoadTrainingCheckpoint`, `TrainingCheckpointMetadata` | Atomic model/buffer + AdamW/SGD + OneCycle checkpoint with caller metadata. All names/shapes/state are validated before copying into live objects. |
 | `autograd` | `Module.Train`, `SetTraining` | Recursive train/eval propagation; `OnTrainingChange` connects stateful layers such as dropout to the module tree. |
@@ -670,6 +672,43 @@ err = loader.NextEpoch() // resets indices; shuffled order changes deterministic
   dataset storage, and custom collates must not mutate borrowed samples.
   Convert/upload batches on the caller's ExecutionContext; integer labels/bool
   masks remain host data until the application chooses their tensor representation.
+
+### Numeric CSV tables and regression samples
+
+`ParseNumericCSV(r, ParseOptions)` reads a rectangular numeric CSV/TSV table with
+optional comment lines and header. Fields are space-trimmed and must be finite;
+the first malformed row reports its 1-based line. `NumericTable.RegressionSamples`
+splits rows into `RegressionSample{Features, Target}`, defaulting to every column
+except the last as features (`targetColumn` of -1 selects the last).
+`StackRegression` collates equal-length samples into a `RegressionBatch` with
+`Values`/`Shape` `[batch,features]` and scalar `Targets`; it drops into the same
+generic `Loader` as `Stack`.
+
+```go
+file, err := os.Open("data.csv")
+// Handle err; close the file.
+table, err := data.ParseNumericCSV(file, data.ParseOptions{})
+samples, err := table.RegressionSamples(nil, -1)
+batch, err := data.StackRegression(samples[:16])
+```
+
+`Standardizer` is a deterministic per-feature centering/scaling transform.
+`FitStandardizer` accumulates mean and population variance in float64 over the
+training split so the statistics do not depend on float32 summation order; a
+constant feature gets a unit scale and becomes exactly zero after `Apply`.
+`Apply` returns a copy and `ApplyBatch` standardizes a collated batch in place.
+`State`/`LoadState` round-trip the statistics through JSON, which is the contract
+that makes a run reproducible: fit on the training split, store the state in the
+training checkpoint, and reuse it for validation and inference. `LoadState`
+rejects wrong versions, mismatched sizes and non-finite or non-positive scales.
+
+`cmd/tabular-train` is a Go-only regression example that reads such a table
+(`-generate` writes a deterministic synthetic dataset), splits train/validation
+with `RandomSplit`, fits the standardizer on the training rows only, and trains a
+small MLP with mean squared error. It saves the standardizer state, loader order
+and dataset fingerprint with the AdamW/SGD and OneCycle state, so a stopped run
+resumes exactly; changing the data, split, batch, steps, seed, hidden size or
+optimizer is rejected before loading. Timestamps are not identity.
 
 ### Data checkpoints
 

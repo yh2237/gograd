@@ -70,9 +70,12 @@ The `data` package separates generic datasets, index sampling and host collation
 Loaders support seeded shuffle, subsets/splits, padded sequences, validity masks
 and mid-epoch checkpoint state. Optional readers and bounded prefetch preserve
 batch order and checkpoint only delivered samples; zero workers stays synchronous.
+Numeric CSV tables and a serializable feature standardizer cover regression data.
 `cmd/mnist-train` reads raw/gzip
 MNIST IDX files, trains an MLP on CPU/CUDA, evaluates, saves inference weights,
 and resumes model/AdamW/OneCycle plus data order without Python.
+`cmd/tabular-train` reads a numeric CSV (or generates one), standardizes features
+with training statistics, and resumes the same state for regression.
 
 Tensor/view storage is shared through allocation leases. Closing a base or
 releasing one graph branch preserves values still needed by another dependent.
@@ -204,6 +207,8 @@ go run ./cmd/mnist-train -device cuda -steps 100 -train-limit 2000 -valid-limit 
 go run ./cmd/mnist-train -device cpu -workers 4 -prefetch 3 -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-prefetch.safetensors
 go run ./cmd/mnist-train -device cpu -optimizer sgd -momentum .9 -nesterov -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-sgd.safetensors
 go run ./cmd/mnist-train -device cpu -optimizer sgd -momentum .9 -nesterov -no-decay-suffix bias -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-sgd-groups.safetensors
+go run ./cmd/tabular-train -generate -device cpu -steps 400 -out out/tabular.safetensors
+go run ./cmd/tabular-train -data out/tabular.csv -device cuda -steps 400 -out out/tabular-cuda.safetensors
 go run ./cmd/gputcn-train
 go run ./cmd/nn-conv-train -device cpu -hidden 128 -kernel 5 -steps 3
 go run ./cmd/nn-conv-train -device cpu -hidden 128 -kernel 5 -steps 5 -cpuprofile "$env:TEMP/gograd-nn-cpu.pprof"
