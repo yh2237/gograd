@@ -3,6 +3,7 @@
 package cuda
 
 import (
+	"fmt"
 	"runtime"
 	"testing"
 	"unsafe"
@@ -223,6 +224,62 @@ func TestCaptureRejectsNestingAndNilStream(t *testing.T) {
 	}
 	if InCapture() {
 		t.Fatal("capture state leaked after Capture returned")
+	}
+}
+
+func TestWithStreamRestoresSelection(t *testing.T) {
+	if !Available() {
+		t.Skip("cuda unavailable:", loadErrorText())
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := SetDevice(0); err != nil {
+		t.Fatal(err)
+	}
+	outer, err := NewStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outer.Destroy()
+	inner, err := NewStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Destroy()
+	if CurrentStream() != nil {
+		t.Fatal("thread started with a selected stream")
+	}
+	if err := WithStream(outer, func() error {
+		if CurrentStream() != outer || CurrentStreamHandle() != outer.handle {
+			return fmt.Errorf("outer stream not selected")
+		}
+		if err := WithStream(inner, func() error {
+			if CurrentStream() != inner {
+				return fmt.Errorf("inner stream not selected")
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if CurrentStream() != outer {
+			return fmt.Errorf("inner scope did not restore the outer stream")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if CurrentStream() != nil {
+		t.Fatal("WithStream did not restore the default stream")
+	}
+	// The selection is restored even when the callback fails.
+	if err := WithStream(outer, func() error { return fmt.Errorf("boom") }); err == nil {
+		t.Fatal("WithStream hid the callback error")
+	}
+	if CurrentStream() != nil {
+		t.Fatal("WithStream leaked a stream after an error")
+	}
+	if err := WithStream(outer, nil); err == nil {
+		t.Fatal("nil callback accepted")
 	}
 }
 

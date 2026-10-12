@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/yh2237/gograd/cuda"
 	"github.com/yh2237/gograd/tensor"
 )
 
@@ -15,11 +16,16 @@ import (
 // The zero value records gradients. Do not copy a context after first use.
 // NoGrad affects every operation on this context until the callback returns;
 // use separate contexts (and separate model state) for independent execution.
-// This does not manage CUDA threads/streams or make shared Tensor mutation safe.
+// The context can also record a CUDA device and stream that WithCUDA applies to
+// the calling OS thread; ordinary operations still follow that thread's current
+// stream. It does not make shared Tensor mutation safe.
 type ExecutionContext struct {
 	noGradDepth atomic.Int64
 	optionsMu   sync.RWMutex
 	options     ExecutionOptions
+	cudaMu      sync.RWMutex
+	cudaDevice  int
+	cudaStream  *cuda.Stream
 }
 
 func NewExecutionContext() *ExecutionContext { return &ExecutionContext{} }
@@ -141,6 +147,71 @@ func (c *ExecutionContext) BindModule(m *Module) error {
 // ExecutionContext returns this tensor's explicit scope, or nil for tensors
 // using the compatibility API. Detach preserves the context but drops history.
 func (t *Tensor) ExecutionContext() *ExecutionContext { return t.execution }
+
+// SetCUDA records the CUDA device and stream this context's work should use.
+// A negative device keeps the calling thread's current device; a nil stream
+// keeps its current implicit stream. An out-of-range device is rejected without
+// changing the context.
+func (c *ExecutionContext) SetCUDA(device int, stream *cuda.Stream) error {
+	if c == nil {
+		return fmt.Errorf("autograd: nil execution context")
+	}
+	if device >= 0 {
+		count, err := cuda.DeviceCount()
+		if err != nil {
+			return err
+		}
+		if device >= count {
+			return fmt.Errorf("autograd: CUDA device %d is out of range for %d device(s)", device, count)
+		}
+	}
+	c.cudaMu.Lock()
+	c.cudaDevice, c.cudaStream = device, stream
+	c.cudaMu.Unlock()
+	return nil
+}
+
+// CUDA reports the recorded device and stream. A negative device or nil stream
+// means "keep the calling thread's current selection".
+func (c *ExecutionContext) CUDA() (device int, stream *cuda.Stream) {
+	if c == nil {
+		return -1, nil
+	}
+	c.cudaMu.RLock()
+	defer c.cudaMu.RUnlock()
+	return c.cudaDevice, c.cudaStream
+}
+
+// WithCUDA runs fn with this context's recorded device and stream selected on
+// the calling OS thread, and restores the previous selections afterwards,
+// including when fn panics. It is where a caller binds a context's device and
+// stream around a forward, backward or optimizer update. An unset device or
+// stream leaves that part of the thread state alone.
+func (c *ExecutionContext) WithCUDA(fn func() error) error {
+	if c == nil {
+		return fmt.Errorf("autograd: nil execution context")
+	}
+	if fn == nil {
+		return fmt.Errorf("autograd: nil CUDA callback")
+	}
+	device, stream := c.CUDA()
+	if device >= 0 {
+		previousDevice, err := cuda.CurrentDevice()
+		if err != nil {
+			return err
+		}
+		if err := cuda.SetDevice(device); err != nil {
+			return err
+		}
+		defer func() { _ = cuda.SetDevice(previousDevice) }()
+	}
+	if stream != nil {
+		previousStream := cuda.CurrentStream()
+		cuda.SetCurrentStream(stream)
+		defer cuda.SetCurrentStream(previousStream)
+	}
+	return fn()
+}
 
 // Unbound tensors retain the old single-scope API. Explicit contexts never
 // consult this default, so legacy NoGrad cannot switch off a bound model.

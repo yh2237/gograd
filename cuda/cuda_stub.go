@@ -71,6 +71,12 @@ func SetCurrentStream(s *Stream) {}
 // CurrentStreamHandle always reports the default stream here.
 func CurrentStreamHandle() uintptr { return 0 }
 
+// CurrentStream reports no stream on this platform.
+func CurrentStream() *Stream { return nil }
+
+// WithStream returns ErrUnavailable.
+func WithStream(stream *Stream, fn func() error) error { return ErrUnavailable }
+
 // ThreadID reports 0 on this platform; there is no CUDA thread state.
 func ThreadID() uintptr { return 0 }
 

@@ -30,6 +30,7 @@ func ThreadID() uintptr { return currentThreadID() }
 // launchState is the implicit CUDA state of one OS thread.
 type launchState struct {
 	stream    uintptr
+	streamRef *Stream
 	capturing bool
 	// touched marks pool pointers used while this thread captures a graph. It
 	// stays per thread so two concurrent captures cannot clobber each other.
@@ -74,11 +75,30 @@ func InCapture() bool { return launchStateForThread().capturing }
 func SetCurrentStream(s *Stream) {
 	state := launchStateForThread()
 	if s == nil {
-		state.stream = 0
+		state.stream, state.streamRef = 0, nil
 		state.releaseIfIdle()
 		return
 	}
-	state.stream = s.handle
+	state.stream, state.streamRef = s.handle, s
+}
+
+// CurrentStream returns the stream selected for the calling OS thread, or nil
+// for the default stream. Callers that bind thread-owned driver objects, such as
+// a cuBLAS handle, use it to follow the implicit launch stream.
+func CurrentStream() *Stream { return launchStateForThread().streamRef }
+
+// WithStream runs fn with stream selected as the calling OS thread's implicit
+// stream and restores the previous selection afterwards, including when fn
+// panics. Kernel launches, cuBLAS calls that follow the implicit stream, and
+// buffer operations inside fn use stream.
+func WithStream(stream *Stream, fn func() error) error {
+	if fn == nil {
+		return fmt.Errorf("cuda: nil stream callback")
+	}
+	previous := CurrentStream()
+	SetCurrentStream(stream)
+	defer SetCurrentStream(previous)
+	return fn()
 }
 
 // CurrentStreamHandle reports the stream handle implicit launches use on this
@@ -115,14 +135,14 @@ func Capture(stream *Stream, fn func() error) (*Graph, error) {
 	if err != nil {
 		return nil, err
 	}
-	previous := state.stream
-	state.stream = stream.handle
+	previous, previousRef := state.stream, state.streamRef
+	state.stream, state.streamRef = stream.handle, stream
 	state.capturing = true
 	poolMu.Lock()
 	state.touched = map[uintptr]int{}
 	poolMu.Unlock()
 	defer func() {
-		state.stream = previous
+		state.stream, state.streamRef = previous, previousRef
 		state.capturing = false
 		poolMu.Lock()
 		state.touched = nil

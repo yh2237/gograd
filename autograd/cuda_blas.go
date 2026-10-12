@@ -10,9 +10,14 @@ import (
 // scopes the current context per thread. Keep one handle per OS thread and
 // device instead of one process-wide handle, so independent CUDA training runs
 // do not serialize on or corrupt a shared handle.
+//
+// The handle follows the calling thread's implicit stream: kernels, memset and
+// copies already do, so a GEMM issued without naming a stream must land on the
+// same stream. The selected stream is cached to avoid a driver call per GEMM.
 type threadBLAS struct {
 	handle *cuda.Blas
 	device int
+	stream *cuda.Stream
 }
 
 var blasHandles sync.Map // uintptr -> *threadBLAS
@@ -22,27 +27,50 @@ func blas() *cuda.Blas {
 	if err != nil {
 		panic(err)
 	}
+	stream := cuda.CurrentStream()
 	id := cuda.ThreadID()
 	if value, ok := blasHandles.Load(id); ok {
 		entry := value.(*threadBLAS)
-		if entry.device == device {
+		if entry.device != device {
+			// The Go runtime reuses OS threads. A thread that now drives another
+			// device must not keep a handle bound to the previous context.
+			_ = entry.handle.Destroy()
+		} else if entry.stream == stream {
+			return entry.handle
+		} else {
+			if err := entry.handle.SetStream(stream); err != nil {
+				panic(err)
+			}
+			entry.stream = stream
 			return entry.handle
 		}
-		// The Go runtime reuses OS threads. A thread that now drives another
-		// device must not keep a handle bound to the previous context.
-		_ = entry.handle.Destroy()
 	}
 	handle, err := cuda.NewBlas()
 	if err != nil {
 		panic(err)
 	}
-	blasHandles.Store(id, &threadBLAS{handle: handle, device: device})
+	if stream != nil {
+		if err := handle.SetStream(stream); err != nil {
+			panic(err)
+		}
+	}
+	blasHandles.Store(id, &threadBLAS{handle: handle, device: device, stream: stream})
 	return handle
 }
 
-// SetBLASStream routes autograd's cuBLAS handle during CUDA graph capture.
-// Passing nil restores the default stream.
-func SetBLASStream(stream *cuda.Stream) error { return blas().SetStream(stream) }
+// SetBLASStream binds autograd's cuBLAS handle to stream. It is kept for callers
+// that prepare a capture explicitly; ordinary calls follow the thread's current
+// stream already.
+func SetBLASStream(stream *cuda.Stream) error {
+	handle := blas()
+	if err := handle.SetStream(stream); err != nil {
+		return err
+	}
+	if value, ok := blasHandles.Load(cuda.ThreadID()); ok {
+		value.(*threadBLAS).stream = stream
+	}
+	return nil
+}
 func matrixBatchStride(shape, batch []int, matrixSize int) (int64, bool) {
 	if numel(shape) == 1 {
 		return 0, true
