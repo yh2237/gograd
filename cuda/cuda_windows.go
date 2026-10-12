@@ -769,6 +769,25 @@ func (e *Event) Record(stream *Stream) error {
 	return runtimeError("cudaEventRecord", code)
 }
 
+// WaitOn makes stream wait for this event, or the default stream when stream is
+// nil. WaitEvent on a Stream is the object form of the same call; the
+// package-level nil form exists because the default stream has no Stream value.
+func (e *Event) WaitOn(stream *Stream) error {
+	if e == nil || e.handle == 0 {
+		return fmt.Errorf("cuda: wait needs a live event")
+	}
+	streamHandle := uintptr(0)
+	if stream != nil {
+		streamHandle = stream.handle
+	}
+	a, err := load()
+	if err != nil {
+		return err
+	}
+	code, _, _ := a.streamWaitEvent.Call(streamHandle, e.handle, 0)
+	return runtimeError("cudaStreamWaitEvent", code)
+}
+
 // WaitEvent makes everything the caller enqueues on this stream afterwards wait
 // for event. It is how one stream consumes a value produced on another stream:
 // record an event on the producer, then wait on it before enqueuing consumers.
@@ -776,15 +795,7 @@ func (s *Stream) WaitEvent(event *Event) error {
 	if s == nil || s.handle == 0 {
 		return fmt.Errorf("cuda: wait needs a live stream")
 	}
-	if event == nil || event.handle == 0 {
-		return fmt.Errorf("cuda: wait needs a live event")
-	}
-	a, err := load()
-	if err != nil {
-		return err
-	}
-	code, _, _ := a.streamWaitEvent.Call(s.handle, event.handle, 0)
-	return runtimeError("cudaStreamWaitEvent", code)
+	return event.WaitOn(s)
 }
 
 // Synchronize waits for the event.
