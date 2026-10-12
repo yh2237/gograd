@@ -26,6 +26,7 @@ gogradの学習で使う公開APIの一覧です。学習checkpointは`safetenso
 | `autograd` | `Module.Train`、`SetTraining` | train/evalモードの再帰的な伝播。`OnTrainingChange`はdropoutなどのstatefulな層をモジュールツリーへ接続します。 |
 | `autograd` | `IndexLoader.State`、`LoadState`、`WindowSampler.Batch`、`State`、`LoadState` | 再開できるepoch順またはPCGのランダムwindow。短い系列のパディングとcontextの破棄の判断を含みます。 |
 | `cuda` | `SetCurrentStream`、`CurrentStream`、`CurrentStreamHandle`、`WithStream` | 呼び出したOSスレッドの暗黙のstreamの選択と照会。`WithStream`はスコープの終了時に前の選択へ戻します。 |
+| `cuda` | `Event`、`NewEvent`、`Event.Record`、`Stream.WaitEvent`、`Event.Synchronize`、`ElapsedTime` | stream間の順序付けと計時。あるstreamの完了をeventとして記録し、別のstreamがそれを待ってから読み取ります。 |
 | `cuda` | `MemoryStats`、`ResetAllocationPeak`、`SetPoolCacheLimit`、`ReleasePool` | 使用中・キャッシュ・予約バイトの照会。再利用するCUDA割当の上限設定と解放。 |
 | `data` | `Dataset[T]`、`SliceDataset`、`NewSubset`、`RandomSplit` | ホスト側のランダムアクセスsample、index view、決定的で重複しない分割。 |
 | `data` | `Sampler`、`StatefulSampler`、`NewIndexSampler`、`IndexSamplerState` | トランザクション的なindex選択、seed付きの順列、epoch途中と将来のepochの再開。 |
@@ -37,7 +38,27 @@ gogradの学習で使う公開APIの一覧です。学習checkpointは`safetenso
 
 `cuda.MemoryStats()`は、gogradのCUDAアロケータが持つ物理バイト数を返します。`LiveBytes`、`CachedBytes`、`ReservedBytes`、`PeakLiveBytes`、`PeakReservedBytes`、`CachedBuffers`、`CacheLimitBytes`です。既定のキャッシュ上限は2 GiBです。`SetPoolCacheLimit`は上限を下げたときに、最も長く使われていないキャッシュをすぐに解放します。使用中のテンソルと、記録したグラフが予約している割当は解放しません。`ResetAllocationPeak`はピークの値を現在の値に戻します。この値には、gogradのプールを通さずCUDAライブラリが直接確保した分は含まれません。`Buffer.Size()`は、物理的なサイズクラスが大きくても、要求した論理バイト数を返します。
 
-CUDAのdevice、stream、captureの状態は、それを使うOSスレッドに属します。`SetDevice`と`CurrentDevice`でdeviceを選び、`autograd.NewCUDAContextOn`はgoroutineを検証済みのdeviceに固定し、`Close`でそのスレッドの以前のdeviceを復元します。`Buffer.Device()`は割当が属するdeviceを返します。再利用するプールの項目はdeviceとstreamとサイズクラスをキーにします。解放したブロックは同じstreamにだけ返すため、あるstreamがまだ読み取り中のブロックを別のstreamが再利用することはありません。`CopyFromHost`、`CopyToHost`、`Memset`/`MemsetAsync`、`Free`はバッファ自身のdeviceを選んで呼び出し側のdeviceを復元するため、複数deviceのコードは周囲のdeviceに依存しません。`SetCurrentStream`と`CurrentStreamHandle`は、呼び出したスレッドでカーネル起動とevent記録が使う暗黙のstreamを選びます。何も選ばないときは既定のstreamを使います。`CurrentStream`は選択中のstreamを返し、`WithStream(stream, fn)`はスコープの終了時（panic時も含む）に前の選択へ戻します。cuBLASのハンドルもこの暗黙のstreamに追従するため、NVRTCカーネル、memset、コピー、GEMMが同じstreamに乗ります。`Capture`は明示的なstreamを必要とし、現在のdeviceを変更せずに記録し、同じスレッドでの入れ子のcaptureを拒否し、記録したdeviceでグラフを再生します。したがって独立したスレッドは、それぞれ別の暗黙のstreamとcaptureの状態を保ちます。
+CUDAのdevice、stream、captureの状態は、それを使うOSスレッドに属します。`SetDevice`と`CurrentDevice`でdeviceを選び、`autograd.NewCUDAContextOn`はgoroutineを検証済みのdeviceに固定し、`Close`でそのスレッドの以前のdeviceを復元します。`Buffer.Device()`は割当が属するdeviceを返します。再利用するプールの項目はdeviceとstreamとサイズクラスをキーにします。解放したブロックは同じstreamにだけ返すため、あるstreamがまだ読み取り中のブロックを別のstreamが再利用することはありません。`CopyFromHost`、`CopyToHost`、`Memset`/`MemsetAsync`、`Free`はバッファ自身のdeviceを選んで呼び出し側のdeviceを復元するため、複数deviceのコードは周囲のdeviceに依存しません。`SetCurrentStream`と`CurrentStreamHandle`は、呼び出したスレッドでカーネル起動とevent記録が使う暗黙のstreamを選びます。何も選ばないときは既定のstreamを使います。`CurrentStream`は選択中のstreamを返し、`WithStream(stream, fn)`はスコープの終了時（panic時も含む）に前の選択へ戻します。cuBLASのハンドルもこの暗黙のstreamに追従するため、NVRTCカーネル、memset、コピー、GEMMが同じstreamに乗ります。
+
+1つの記録の中で処理を複数のstreamへ分けるには、`Event.Record`と`Stream.WaitEvent`で依存を明示します。あるstreamの結果を別のstreamが読むには、作り手のstreamでeventを記録し、読み手のstreamがそれを待ってから続きをenqueueします。割当プールはstreamごとに分かれているため、片方のstreamが解放したバッファをもう片方が再利用することはありません。
+
+```go
+// leftとrightは呼び出し側が用意した別々のstreamです。
+// 分岐Aをleft、分岐Bをrightでenqueueします。
+cuda.WithStream(left, func() error { ya = branchA(x); return nil })
+cuda.WithStream(right, func() error { yb = branchB(x); return nil })
+// rightの完了をeventに記録し、leftがそれを待ってから合流します。
+event, err := cuda.NewEvent(false)
+// エラーを処理します。終わったらevent.Destroy()を呼びます。
+_ = err
+err = event.Record(right)
+err = left.WaitEvent(event)
+err = cuda.WithStream(left, func() error {
+    // yaとybを合流させ、Backwardとoptimizer.Step()まで通常どおり実行します。
+    return nil
+})
+// エラーを処理します。
+````Capture`は明示的なstreamを必要とし、現在のdeviceを変更せずに記録し、同じスレッドでの入れ子のcaptureを拒否し、記録したdeviceでグラフを再生します。したがって独立したスレッドは、それぞれ別の暗黙のstreamとcaptureの状態を保ちます。
 
 ## 実行コンテキストと勾配の記録
 
@@ -74,7 +95,7 @@ execution.NoGrad(func() {
 - NoGradはコンテキスト全体を制御し、1つのgoroutineだけを対象にしません。並行して動かすworkerごとに、コンテキストと独立したモデルstateを用意します。共有するモデルでは、テンソルの値、勾配、optimizerのstate、train/evalの切り替えを並行して変更できません。bind自体は初期化の手順です。
 - 推論の結果は寿命の親を保ち、`ReleaseGraph`がCPUの中間値とCUDAの補助バッファを回収できるようにします。導関数のコールバックは保ちません。グラフの回収後も値が必要な場合はretainしたハンドルを使います。`Detach`は独立したストレージを作り、履歴を切り、非連続なviewも含めてコンテキストの同一性を保ちます。
 
-このコンテキストが分離するのは、勾配の記録、BF16モード、アテンションの選択です。CUDAのstreamやcapture、割当プールの寿命は持ちませんが、`SetCUDA(device, stream)`で使うdeviceとstreamを記録できます。記録した組は`WithCUDA(fn)`が呼び出したOSスレッドに適用し、`fn`の終了時（panic時も含む）に以前の選択へ戻します。CUDAを使う呼び出し側は、これまでどおり呼び出したOSスレッドで`NewCUDAContext`を保持します。`NewCUDAContextOn`はdeviceを選び、`Close`でそのスレッドの以前のdeviceを復元します。`cuda`パッケージは暗黙のstreamとcaptureの可否をOSスレッド単位で持つため、別々のコンテキストを持つgoroutineが互いのstreamを上書きしません。1回の記録の中で複数のstreamを重ねて並行に走らせることは、まだ対象外です。`cmd/cnn-train`は明示的コンテキストのAPIを使います。
+このコンテキストが分離するのは、勾配の記録、BF16モード、アテンションの選択です。CUDAのstreamやcapture、割当プールの寿命は持ちませんが、`SetCUDA(device, stream)`で使うdeviceとstreamを記録できます。記録した組は`WithCUDA(fn)`が呼び出したOSスレッドに適用し、`fn`の終了時（panic時も含む）に以前の選択へ戻します。CUDAを使う呼び出し側は、これまでどおり呼び出したOSスレッドで`NewCUDAContext`を保持します。`NewCUDAContextOn`はdeviceを選び、`Close`でそのスレッドの以前のdeviceを復元します。`cuda`パッケージは暗黙のstreamとcaptureの可否をOSスレッド単位で持つため、別々のコンテキストを持つgoroutineが互いのstreamを上書きしません。1回の記録の中で処理を複数のstreamへ分けることもできますが、分け方と`Event`を使った合流は呼び出し側が指定します。フレームワークが記録を自動で複数のstreamへ分割することはありません。`cmd/cnn-train`は明示的コンテキストのAPIを使います。
 
 ```go
 stream, err := cuda.NewStream() // 呼び出し側が寿命を管理します
