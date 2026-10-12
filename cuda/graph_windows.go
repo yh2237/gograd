@@ -22,6 +22,11 @@ func currentThreadID() uintptr {
 	return id
 }
 
+// ThreadID identifies the calling OS thread. CUDA scopes its current device,
+// current stream and capture state per host thread, so a caller that keeps
+// thread-owned driver objects can key them by this value.
+func ThreadID() uintptr { return currentThreadID() }
+
 // launchState is the implicit CUDA state of one OS thread.
 type launchState struct {
 	stream    uintptr
@@ -200,7 +205,7 @@ func (g *Graph) Close() error {
 	g.exec = 0
 	poolMu.Lock()
 	for pointer, size := range g.reserved {
-		cachePointerLocked(pointer, size, g.device)
+		cachePointerLocked(pointer, size, g.device, g.stream.handle)
 	}
 	g.reserved = nil
 	victims := trimPoolLocked()

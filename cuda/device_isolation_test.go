@@ -226,6 +226,75 @@ func TestCaptureRejectsNestingAndNilStream(t *testing.T) {
 	}
 }
 
+func TestPoolSeparatesStreams(t *testing.T) {
+	if !Available() {
+		t.Skip("cuda unavailable:", loadErrorText())
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := SetDevice(0); err != nil {
+		t.Fatal(err)
+	}
+	first, err := NewStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Destroy()
+	second, err := NewStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Destroy()
+	defer ReleasePool()
+	SetCurrentStream(first)
+	defer SetCurrentStream(nil)
+
+	const size = 512
+	buffer, err := Alloc(size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pointer := buffer.Pointer()
+	if err := buffer.Free(); err != nil {
+		t.Fatal(err)
+	}
+	// The same stream reuses its own block, which its ordering makes safe.
+	reused, err := Alloc(size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused.Pointer() != pointer {
+		t.Fatalf("same stream did not reuse %#x (got %#x)", pointer, reused.Pointer())
+	}
+	if err := reused.Free(); err != nil {
+		t.Fatal(err)
+	}
+	// A different stream must not receive that block: it could still be reading.
+	SetCurrentStream(second)
+	other, err := Alloc(size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.Pointer() == pointer {
+		t.Fatal("pool handed a block to a stream that did not free it")
+	}
+	if err := other.Free(); err != nil {
+		t.Fatal(err)
+	}
+	// The block remains available to its own stream.
+	SetCurrentStream(first)
+	again, err := Alloc(size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Pointer() != pointer {
+		t.Fatalf("owning stream lost its block %#x (got %#x)", pointer, again.Pointer())
+	}
+	if err := again.Free(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestConcurrentCapturesShareThePoolSafely(t *testing.T) {
 	if !Available() {
 		t.Skip("cuda unavailable:", loadErrorText())

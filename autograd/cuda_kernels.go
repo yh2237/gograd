@@ -3,6 +3,7 @@ package autograd
 import (
 	"github.com/yh2237/gograd/cuda"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -12,16 +13,26 @@ type OpTiming struct {
 	Duration time.Duration
 }
 
-var gpuProfiling bool
-var gpuTimings = map[string]OpTiming{}
+var gpuProfiling atomic.Bool
+
+// gpuTimings is a process-wide diagnostic profile, so its map is guarded: two OS
+// threads can drive independent CUDA work while profiling is enabled.
+var (
+	gpuTimingsMu sync.Mutex
+	gpuTimings   = map[string]OpTiming{}
+)
 
 func EnableGPUProfile(enabled bool) {
-	gpuProfiling = enabled
+	gpuProfiling.Store(enabled)
 	if enabled {
+		gpuTimingsMu.Lock()
 		gpuTimings = map[string]OpTiming{}
+		gpuTimingsMu.Unlock()
 	}
 }
 func GPUProfile() map[string]OpTiming {
+	gpuTimingsMu.Lock()
+	defer gpuTimingsMu.Unlock()
 	out := map[string]OpTiming{}
 	for k, v := range gpuTimings {
 		out[k] = v
@@ -29,7 +40,7 @@ func GPUProfile() map[string]OpTiming {
 	return out
 }
 func timedGPU(name string, fn func() error) {
-	if !gpuProfiling {
+	if !gpuProfiling.Load() {
 		if e := fn(); e != nil {
 			panic(e)
 		}
@@ -61,10 +72,13 @@ func timedGPU(name string, fn func() error) {
 	if e != nil {
 		panic(e)
 	}
-	v := gpuTimings[name]
+	v := OpTiming{}
+	gpuTimingsMu.Lock()
+	v = gpuTimings[name]
 	v.Count++
 	v.Duration += time.Duration(float64(ms) * float64(time.Millisecond))
 	gpuTimings[name] = v
+	gpuTimingsMu.Unlock()
 }
 
 const graphSource = `

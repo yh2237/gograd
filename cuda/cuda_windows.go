@@ -329,12 +329,16 @@ type cachedPointer struct {
 	pointer uintptr
 	size    int
 	device  int
+	stream  uintptr
 }
 
-// poolKey keeps cached blocks separate per device: a pointer allocated on one
-// device is not valid as a current-device allocation on another.
+// poolKey keeps cached blocks separate per device and per stream. A block freed
+// while its stream may still be reading it must not be reused by work on another
+// stream, because only the owning stream orders the later write after that read.
+// The default stream (0) is ordered process-wide, so it is a safe shared key.
 type poolKey struct {
 	device int
+	stream uintptr
 	size   int
 }
 
@@ -417,10 +421,10 @@ func poolSizeClass(size int) int {
 	return (size + quantum - 1) / quantum * quantum
 }
 
-func cachePointerLocked(pointer uintptr, size, device int) {
-	key := poolKey{device: device, size: size}
+func cachePointerLocked(pointer uintptr, size, device int, stream uintptr) {
+	key := poolKey{device: device, stream: stream, size: size}
 	poolTable[key] = append(poolTable[key], pointer)
-	poolNodes[pointer] = poolLRU.PushBack(cachedPointer{pointer, size, device})
+	poolNodes[pointer] = poolLRU.PushBack(cachedPointer{pointer, size, device, stream})
 	cachedBytes += size
 }
 func uncacheAccountingLocked(pointer uintptr, size int) {
@@ -441,7 +445,7 @@ func trimPoolLocked() []cachedPointer {
 			break
 		}
 		victim := oldest.Value.(cachedPointer)
-		key := poolKey{device: victim.device, size: victim.size}
+		key := poolKey{device: victim.device, stream: victim.stream, size: victim.size}
 		list := poolTable[key]
 		for i, pointer := range list {
 			if pointer == victim.pointer {
@@ -515,7 +519,7 @@ func Alloc(size int) (*Buffer, error) {
 	if err != nil {
 		return nil, err
 	}
-	key := poolKey{device: device, size: capacity}
+	key := poolKey{device: device, stream: currentStreamHandle(), size: capacity}
 	poolMu.Lock()
 	list := poolTable[key]
 	if len(list) > 0 {
@@ -577,7 +581,7 @@ func (b *Buffer) Free() error {
 	if state := launchStateForThread(); state.capturing && state.touched != nil {
 		state.touched[b.pointer] = b.capacity
 	}
-	cachePointerLocked(b.pointer, b.capacity, b.device)
+	cachePointerLocked(b.pointer, b.capacity, b.device, currentStreamHandle())
 	victims := trimPoolLocked()
 	poolMu.Unlock()
 	b.pointer = 0

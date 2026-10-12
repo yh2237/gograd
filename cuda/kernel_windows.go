@@ -155,6 +155,11 @@ func (p *Program) Close() error {
 }
 
 func compileModule(source string) (uintptr, error) {
+	// The runtime's context is per OS thread, and nvrtc compilation is long
+	// enough for the goroutine to migrate. Pin the thread for the whole
+	// compile so the context created below is still current at module load.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	a, err := loadKernelAPI()
 	if err != nil {
 		return 0, err

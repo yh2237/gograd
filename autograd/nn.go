@@ -11,15 +11,15 @@ import (
 	"github.com/yh2237/gograd/tensor"
 )
 
-var lastNormGPU *cuda.Buffer
-
-// GradientNormToHost is a diagnostic readback for tests and profiling.
+// GradientNormToHost is a diagnostic readback of the last CUDA gradient norm on
+// the calling OS thread.
 func GradientNormToHost() float32 {
-	if lastNormGPU == nil {
+	state := currentClipState()
+	if state == nil || state.norm == nil {
 		return 0
 	}
 	v := []float32{0}
-	if e := lastNormGPU.CopyToHost(floatBytes(v)); e != nil {
+	if e := state.norm.CopyToHost(floatBytes(v)); e != nil {
 		panic(e)
 	}
 	return v[0]

@@ -6,16 +6,38 @@ import (
 	"sync"
 )
 
-var blasOnce sync.Once
-var blasHandle *cuda.Blas
-var blasErr error
+// cuBLAS handles are not safe to share between host threads, and the driver
+// scopes the current context per thread. Keep one handle per OS thread and
+// device instead of one process-wide handle, so independent CUDA training runs
+// do not serialize on or corrupt a shared handle.
+type threadBLAS struct {
+	handle *cuda.Blas
+	device int
+}
+
+var blasHandles sync.Map // uintptr -> *threadBLAS
 
 func blas() *cuda.Blas {
-	blasOnce.Do(func() { blasHandle, blasErr = cuda.NewBlas() })
-	if blasErr != nil {
-		panic(blasErr)
+	device, err := cuda.CurrentDevice()
+	if err != nil {
+		panic(err)
 	}
-	return blasHandle
+	id := cuda.ThreadID()
+	if value, ok := blasHandles.Load(id); ok {
+		entry := value.(*threadBLAS)
+		if entry.device == device {
+			return entry.handle
+		}
+		// The Go runtime reuses OS threads. A thread that now drives another
+		// device must not keep a handle bound to the previous context.
+		_ = entry.handle.Destroy()
+	}
+	handle, err := cuda.NewBlas()
+	if err != nil {
+		panic(err)
+	}
+	blasHandles.Store(id, &threadBLAS{handle: handle, device: device})
+	return handle
 }
 
 // SetBLASStream routes autograd's cuBLAS handle during CUDA graph capture.

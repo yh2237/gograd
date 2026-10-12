@@ -71,6 +71,9 @@ func SetCurrentStream(s *Stream) {}
 // CurrentStreamHandle always reports the default stream here.
 func CurrentStreamHandle() uintptr { return 0 }
 
+// ThreadID reports 0 on this platform; there is no CUDA thread state.
+func ThreadID() uintptr { return 0 }
+
 // InCapture always reports false on this platform.
 func InCapture() bool { return false }
 
