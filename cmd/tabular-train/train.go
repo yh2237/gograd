@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -315,48 +314,35 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 		end = c.StopAfter
 	}
 	model.module.Train(true)
-	for schedule.StepCount < end {
-		batch, err := loader.Next(ctx)
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			break
-		}
-		if err == io.EOF {
-			if err := loader.NextEpoch(); err != nil {
-				return stats, err
+	loop := autograd.TrainingLoop[data.RegressionBatch]{
+		Reader: loader, Sampler: sampler, Optimizer: optimizer, Schedule: schedule,
+		Updates: end, Applied: schedule.StepCount,
+		Step: trainingStep(model, execution, device),
+		Report: func(update int, loss float64) {
+			stats.TrainLoss = loss
+			fmt.Fprintf(log, "device=%s step=%d train_mse=%.6f epoch=%d\n", device, update, loss, sampler.State().Epoch)
+		},
+		Save: func([]byte) error {
+			loaderState, err := loader.State()
+			if err != nil {
+				return err
 			}
-			continue
-		}
-		if err != nil {
-			return stats, err
-		}
-		loss, err := trainingStep(model, execution, optimizer, schedule, batch, device)
-		if err != nil {
-			return stats, err
-		}
-		stats.TrainLoss = float64(loss)
-		if schedule.StepCount == 1 || schedule.StepCount%25 == 0 || schedule.StepCount == end {
-			fmt.Fprintf(log, "device=%s step=%d train_mse=%.6f epoch=%d\n", device, schedule.StepCount, loss, sampler.State().Epoch)
-		}
+			payload, err := json.Marshal(checkpointState{Identity: identity, Loader: loaderState, Standardizer: standardizer.State()})
+			if err != nil {
+				return err
+			}
+			if err := outputParent(c.Checkpoint); err != nil {
+				return err
+			}
+			return autograd.SaveTrainingCheckpoint(c.Checkpoint, &model.module, optimizer, schedule, map[string]string{"data_state": string(payload), "model": "tabular-regression-1"})
+		},
 	}
+	// The loop saves the checkpoint of the last completed update, including when
+	// the context ends the run.
+	stopErr := loop.Run(ctx)
 	stats.Steps = schedule.StepCount
-	if c.Checkpoint != "" {
-		loaderState, err := loader.State()
-		if err != nil {
-			return stats, err
-		}
-		payload, err := json.Marshal(checkpointState{Identity: identity, Loader: loaderState, Standardizer: standardizer.State()})
-		if err != nil {
-			return stats, err
-		}
-		if err := outputParent(c.Checkpoint); err != nil {
-			return stats, err
-		}
-		if err := autograd.SaveTrainingCheckpoint(c.Checkpoint, &model.module, optimizer, schedule, map[string]string{"data_state": string(payload), "model": "tabular-regression-1"}); err != nil {
-			return stats, err
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return stats, err
+	if stopErr != nil {
+		return stats, stopErr
 	}
 	model.module.Train(false)
 	validRMSE, predictions, err := evaluate(ctx, model, execution, validData, c.Batch, c.Workers, c.Prefetch, device)
@@ -399,30 +385,37 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 	return stats, nil
 }
 
-func trainingStep(m *regressionModel, execution *autograd.ExecutionContext, optimizer autograd.Optimizer, schedule *autograd.OneCycle, batch data.RegressionBatch, device tensor.Device) (float32, error) {
-	x, err := execution.New(batch.Values, batch.Shape, device, false)
-	if err != nil {
-		return 0, err
+// trainingStep returns the loop's step for the regression MLP: it builds the
+// graph, back-propagates the loss through the loop's accumulator and reports the
+// loss value with the update completion flag. It owns the tensors it creates.
+func trainingStep(m *regressionModel, execution *autograd.ExecutionContext, device tensor.Device) func(context.Context, data.RegressionBatch, *autograd.GradAccumulator) (float64, bool, error) {
+	return func(ctx context.Context, batch data.RegressionBatch, accumulator *autograd.GradAccumulator) (float64, bool, error) {
+		if err := ctx.Err(); err != nil {
+			return 0, false, err
+		}
+		x, err := execution.New(batch.Values, batch.Shape, device, false)
+		if err != nil {
+			return 0, false, err
+		}
+		defer x.Close()
+		target, err := execution.New(batch.Targets, []int{batch.Shape[0], 1}, device, false)
+		if err != nil {
+			return 0, false, err
+		}
+		defer target.Close()
+		loss := autograd.MSELoss(m.forward(x), target, autograd.LossOptions{})
+		values, err := loss.ToHost()
+		if err != nil {
+			loss.ReleaseGraph()
+			return 0, false, err
+		}
+		complete, err := accumulator.Backward(loss)
+		loss.ReleaseGraph()
+		if err != nil {
+			return 0, false, err
+		}
+		return float64(values[0]), complete, nil
 	}
-	defer x.Close()
-	target, err := execution.New(batch.Targets, []int{batch.Shape[0], 1}, device, false)
-	if err != nil {
-		return 0, err
-	}
-	defer target.Close()
-	optimizer.ZeroGrad()
-	loss := autograd.MSELoss(m.forward(x), target, autograd.LossOptions{})
-	defer loss.ReleaseGraph()
-	values, err := loss.ToHost()
-	if err != nil {
-		return 0, err
-	}
-	if err := loss.Backward(); err != nil {
-		return 0, err
-	}
-	optimizer.Step()
-	schedule.Step(optimizer)
-	return values[0], nil
 }
 
 // evaluate returns the validation RMSE and every prediction, so training can

@@ -38,6 +38,8 @@ AdamWはdecoupled weight decay、float32のモーメント、bias correctionを�
 
 `metrics`はテンソルやCUDAに依存せず、読み戻したホスト配列を集計します。平均損失は有効件数、回帰誤差は要素数で重み付けし、バッチの長さが違っても同じ分母を使います。回帰の差分と和はfloat64です。更新は入力検証と計算に成功してから集計へ反映し、エラー時には以前の値を保ちます。
 
+`TrainingLoop`は更新の境界を持ちます。勾配のゼロ化、更新ごとの`Optimizer.Step`と`UpdateSchedule.Step`、報告の間隔、停止時の保存をloopが行い、呼び出し側は1つのmicro-batchのグラフを作る`Step`を書きます。readerが`io.EOF`を返すとepochを進め、readerや`Step`のエラーでは保存せずにそのエラーを返します。contextがrunを終えたときは、未完了の蓄積groupの勾配を捨て、`PositionSampler`をgroupの先頭へ戻してから`Save`を呼ぶため、再開時にそのgroupのデータを読み直します。modelとoptimizerは最後に完了した更新を保ちます。`Applied`は再開時に復元したスケジューラの更新数から始めます。
+
 MNIST例は勾配蓄積のgroupの先頭でsamplerの状態を保持します。この取得はprefetchを止めません。途中でキャンセルされた場合は勾配を消し、readerを停止・joinしてから、保存するデータ位置をgroupの先頭へ戻します。モデルとoptimizerは完了済みの更新を保つため、未更新のデータだけを再読込できます。数値回帰と音声の例も、contextのエラーを返す前にcheckpointを保存します。
 
 ## Conv2d

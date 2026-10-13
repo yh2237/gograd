@@ -233,51 +233,38 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 		end = c.StopAfter
 	}
 	m.module.Train(true)
-	accumulator, err := autograd.NewGradAccumulator(c.Accum)
-	if err != nil {
-		return stats, err
-	}
-	loop := digitUpdateLoop{
-		loader: loader, sampler: sampler, optimizer: optimizer, schedule: schedule, accumulator: accumulator,
-		backward: func(batch data.FloatBatch) (float32, bool, error) {
-			return trainingStep(m, execution, accumulator, batch, device)
+	loop := autograd.TrainingLoop[data.FloatBatch]{
+		Reader: loader, Sampler: sampler, Optimizer: optimizer, Schedule: schedule,
+		Updates: end, Applied: schedule.StepCount, Accumulate: c.Accum,
+		Step: trainingStep(m, execution, device),
+		Report: func(update int, loss float64) {
+			stats.TrainLoss = float32(loss)
+			fmt.Fprintf(log, "device=%s step=%d train_loss=%.6f epoch=%d\n", device, update, loss, sampler.State().Epoch)
 		},
-		report: func(loss float32) {
-			stats.TrainLoss = loss
-			if schedule.StepCount == 1 || schedule.StepCount%25 == 0 || schedule.StepCount == end {
-				fmt.Fprintf(log, "device=%s step=%d train_loss=%.6f epoch=%d\n", device, schedule.StepCount, loss, sampler.State().Epoch)
-			}
-		},
-	}
-	rollback, stopErr := loop.run(ctx, end)
-	if stopErr != nil && !errors.Is(stopErr, context.Canceled) && !errors.Is(stopErr, context.DeadlineExceeded) {
-		return stats, stopErr
-	}
-	stats.Steps = schedule.StepCount
-	if c.Checkpoint != "" {
-		state, err := loader.State()
-		if err != nil {
-			return stats, err
-		}
-		if rollback != nil {
-			// State joins readers first. Rewind only the persisted data cursor;
-			// the model/optimizer/scheduler still describe the preceding update.
-			state.Sampler, err = json.Marshal(rollback)
+		Save: func(savepoint []byte) error {
+			state, err := loader.State()
 			if err != nil {
-				return stats, err
+				return err
 			}
-		}
-		payload, err := json.Marshal(checkpointState{identity, state})
-		if err != nil {
-			return stats, err
-		}
-		if err := outputParent(c.Checkpoint); err != nil {
-			return stats, err
-		}
-		if err := autograd.SaveTrainingCheckpoint(c.Checkpoint, &m.module, optimizer, schedule, map[string]string{"data_state": string(payload), "model": "mnist-mlp-1"}); err != nil {
-			return stats, err
-		}
+			if savepoint != nil {
+				// A partially accumulated group is replayed on resume, so the
+				// checkpoint must not record micro-batches it did not consume.
+				state.Sampler = savepoint
+			}
+			payload, err := json.Marshal(checkpointState{identity, state})
+			if err != nil {
+				return err
+			}
+			if err := outputParent(c.Checkpoint); err != nil {
+				return err
+			}
+			return autograd.SaveTrainingCheckpoint(c.Checkpoint, &m.module, optimizer, schedule, map[string]string{"data_state": string(payload), "model": "mnist-mlp-1"})
+		},
 	}
+	// The loop saves the checkpoint of the last completed update, including when
+	// the context ends the run.
+	stopErr := loop.Run(ctx)
+	stats.Steps = schedule.StepCount
 	if err := errors.Join(stopErr, ctx.Err()); err != nil {
 		return stats, err
 	}
@@ -322,83 +309,32 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 	return stats, nil
 }
 
-type digitBatchLoader interface {
-	Next(context.Context) (data.FloatBatch, error)
-	NextEpoch() error
-}
-
-// digitUpdateLoop keeps a sampler savepoint for an unfinished accumulation
-// group. Snapshotting the sampler does not stop the loader's prefetch readers.
-// This MLP has no mutable forward buffers or random state to rewind.
-type digitUpdateLoop struct {
-	loader      digitBatchLoader
-	sampler     *data.IndexSampler
-	optimizer   autograd.Optimizer
-	schedule    *autograd.OneCycle
-	accumulator *autograd.GradAccumulator
-	backward    func(data.FloatBatch) (float32, bool, error)
-	report      func(float32)
-}
-
-func (l *digitUpdateLoop) run(ctx context.Context, end int) (*data.IndexSamplerState, error) {
-	var start data.IndexSamplerState
-	for l.schedule.StepCount < end {
-		if l.accumulator.Pending() == 0 {
-			// Only accumulation can leave delivered batches without an update.
-			if l.accumulator.Groups() > 1 {
-				start = l.sampler.State()
-			}
-			l.optimizer.ZeroGrad()
+// trainingStep returns the loop's micro-batch step for the MNIST MLP: it builds
+// the graph, back-propagates the loss through the loop's accumulator and reports
+// the loss value with the update completion flag. It owns the tensors it creates.
+func trainingStep(m *digitModel, execution *autograd.ExecutionContext, device tensor.Device) func(context.Context, data.FloatBatch, *autograd.GradAccumulator) (float64, bool, error) {
+	return func(ctx context.Context, batch data.FloatBatch, accumulator *autograd.GradAccumulator) (float64, bool, error) {
+		if err := ctx.Err(); err != nil {
+			return 0, false, err
 		}
-		batch, err := l.loader.Next(ctx)
-		if err == io.EOF {
-			if err := l.loader.NextEpoch(); err != nil {
-				return nil, err
-			}
-			continue
-		}
+		x, err := execution.New(batch.Values, batch.Shape, device, false)
 		if err != nil {
-			if l.accumulator.Pending() != 0 {
-				l.optimizer.ZeroGrad()
-				l.accumulator.Reset()
-				return &start, err
-			}
-			return nil, err
+			return 0, false, err
 		}
-		loss, complete, err := l.backward(batch)
+		defer x.Close()
+		loss := autograd.CrossEntropy(m.forward(x), batch.Labels, -1)
+		values, err := loss.ToHost()
 		if err != nil {
-			return nil, err
+			loss.ReleaseGraph()
+			return 0, false, err
 		}
-		if complete {
-			l.optimizer.Step()
-			l.schedule.Step(l.optimizer)
-			l.report(loss)
-		}
-	}
-	return nil, nil
-}
-
-// trainingStep builds one micro-batch loss and adds its scaled gradient to the
-// accumulator. It reports whether the call completed an optimizer update; the
-// caller owns ZeroGrad, Step and the scheduler.
-func trainingStep(m *digitModel, execution *autograd.ExecutionContext, accumulator *autograd.GradAccumulator, batch data.FloatBatch, device tensor.Device) (float32, bool, error) {
-	x, err := execution.New(batch.Values, batch.Shape, device, false)
-	if err != nil {
-		return 0, false, err
-	}
-	defer x.Close()
-	loss := autograd.CrossEntropy(m.forward(x), batch.Labels, -1)
-	values, err := loss.ToHost()
-	if err != nil {
+		complete, err := accumulator.Backward(loss)
 		loss.ReleaseGraph()
-		return 0, false, err
+		if err != nil {
+			return 0, false, err
+		}
+		return float64(values[0]), complete, nil
 	}
-	complete, err := accumulator.Backward(loss)
-	loss.ReleaseGraph()
-	if err != nil {
-		return 0, false, err
-	}
-	return values[0], complete, nil
 }
 
 func newTrainingOptimizer(params []autograd.Parameter, c trainConfig, lr float32) (autograd.CheckpointOptimizer, error) {

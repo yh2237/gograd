@@ -17,6 +17,7 @@ gogradの学習で使う公開APIの一覧です。学習checkpointは`safetenso
 | `autograd` | `MaxPool2d`、`AvgPool2d`、`AdaptiveAvgPool2d`、各オプションと層 | CPU/CUDAのNCHW pooling。重複する窓の勾配、ceil mode、明示的な平均の除数を持ちます。 |
 | `autograd` | `BatchNorm`、`BatchNormOptions`、`NewBatchNormLayer`、`BatchNormLayerOptions`、`BatchNormLayer` | rank 2〜6のチャネル正規化、CPU/CUDAの学習・評価の勾配、名前付きのaffineパラメータとrunning state。 |
 | `autograd` | `Module.StateDict`、`LoadStateDict`、`SaveSafeTensors`、`SaveSafeTensorsMetadata`、`LoadSafeTensors` | 名前付きのfloat32 state。metadataの値は文字列です。 |
+| `autograd` | `TrainingLoop[B]`、`BatchReader[B]`、`PositionSampler`、`UpdateSchedule`、`OneCycle.Updates` | optimizer更新の境界を共通化する学習ループ。勾配のゼロ化、更新ごとの`Step`、一定間隔の報告、停止時の状態保存を持ちます。 |
 | `autograd` | `GradAccumulator`、`NewGradAccumulator`、`GradAccumulator.Backward`、`Pending`、`Reset`、`Groups` | 1回のoptimizer更新を複数のmicro-batchへ分ける勾配蓄積。損失を1/groupsにスケールしてBackwardし、group完了を報告します。 |
 | `autograd` | `MSELoss`、`L1Loss`、`BCEWithLogitsLoss`、`LossOptions`、`Reduction` | 予測とtargetからスカラーを返す汎用の損失。mean/sumのreductionと要素ごとの重みを持ち、重み付き平均の除数はPyTorchの各損失に合わせます。 |
 | `autograd` | `MaskedLoss(pred,target,false)`、`ClipGradNorm`、`NewAdamW`、`NewOneCycle` | NaNフレームをマスクしたL1、クリップ、AdamW、PyTorchの2段cosineのOneCycle LR。 |
@@ -318,7 +319,35 @@ loss = autograd.BCEWithLogitsLoss(logits, target, autograd.LossOptions{Reduction
 
 `testdata/losses.json`（`tools/gen_losses_fixture.py`が生成）は、3つの損失×mean/sum×重みあり/なしの12ケースで、損失値と予測勾配をPyTorchとCPU/CUDAで照合します。ゼロ重みのマスク、未知のreduction、形状とdeviceの不一致、スカラー入力はGoのテストで確認します。`cmd/tabular-train`と`cmd/audio-train`は、手で組んだ平均二乗誤差ではなく`MSELoss`を使います。
 
-### 勾配蓄積
+### 学習ループ
+
+`TrainingLoop`はoptimizer更新の境界を共通化します。readerからバッチを読み、更新（または蓄積のgroup）の先頭で勾配をゼロにし、更新ごとに1回だけ`Optimizer.Step`とスケジューラの`Step`を呼び、損失を一定の間隔で報告します。呼び出し側は`Step`で1つのmicro-batchのグラフを作り、`GradAccumulator.Backward`へ渡します。
+
+```go
+loop := autograd.TrainingLoop[data.FloatBatch]{
+    Reader: loader, Sampler: sampler, Optimizer: optimizer, Schedule: schedule,
+    Updates: 100, Applied: schedule.StepCount, Accumulate: 4, LogEvery: 25,
+    Step: func(ctx context.Context, batch data.FloatBatch, accumulator *autograd.GradAccumulator) (float64, bool, error) {
+        // 入力を作り、損失を組み立て、accumulator.Backward(loss)を呼びます。
+        // 作ったテンソルの寿命はこの関数が持ちます。
+        return loss, complete, nil
+    },
+    Report: func(update int, loss float64) { fmt.Printf("step=%d loss=%f\n", update, loss) },
+    Save:   func(savepoint []byte) error { return autograd.SaveTrainingCheckpoint(path, model, optimizer, schedule, nil) },
+}
+err := loop.Run(ctx)
+// エラーを処理します。
+```
+
+- `Reader`は`*data.Loader[T, B]`、`Sampler`は`*data.IndexSampler`、`Schedule`は`*OneCycle`がそのまま満たします。readerが`io.EOF`を返すとepochを進めて学習を続けます。
+- `Report`は最初の更新、`LogEvery`間隔、最後の更新で呼ばれます。報告する損失はその更新の最後のmicro-batchの値です。
+- `Save`は、計画した更新まで到達したときと、contextがrunを終えたときに1回だけ呼ばれます。readerや`Step`のエラーでrunが終わったときは呼ばれません。
+- `Accumulate`が2以上のときは`Sampler`が必要です。groupの途中でcontextが終わると、未完了の勾配を捨ててsamplerをgroupの先頭へ戻し、そのpayloadを`Save`へ渡します。model、optimizer、スケジューラは最後に完了した更新を保つため、再開時にそのgroupのデータを読み直します。
+- 巻くのはsamplerだけです。forwardで変わるrunning統計やカウンタは、呼び出し側が元に戻す必要があります。
+
+MNIST、数値回帰、音声の例はこのloopで学習ループを組み、`data.Stack`/`StackRegression`/collate関数と`autograd.TrainingLoop`の組だけが例ごとに違います。テストでは、更新数と報告の間隔、epochをまたぐ読込、蓄積の途中と完了直後の中断で`Save`が受け取るsavepoint、readerのエラー時に`Save`が呼ばれないことを確認します。
+
+## 勾配蓄積
 
 `GradAccumulator`は、1回のoptimizer更新を複数のmicro-batchに分けます。損失を`1/groups`にスケールしてからBackwardし、蓄積した勾配がgroup内のmicro-batchの平均になるようにします。
 
@@ -369,9 +398,9 @@ MNIST例は`Mean`と`Accuracy`、数値回帰の例は`Regression`を使いま�
 
 ## 中断時の保存
 
-MNIST・数値回帰・音声の学習例は、学習ループのキャンセルや期限切れを検出すると、最後に完了した更新のcheckpointを保存してからcontextのエラーを返します。中断時には評価や推論用の重みの書き出しは行いません。更新前に中断した場合も、初期状態のcheckpointから再開できます。
+3つの学習例は、`TrainingLoop.Save`へcheckpointの保存を渡します。loopは計画した更新まで到達したときと、contextがrunを終えたときにSaveを1回だけ呼ぶため、キャンセルや期限切れを検出する処理を各例が書かなくても、最後に完了した更新の状態が残ります。中断時には評価や推論用の重みの書き出しは行いません。更新前に中断した場合も、初期状態のcheckpointから再開できます。
 
-MNIST例の蓄積はepochをまたいで続き、短いバッチも1個のmicro-batchとして数えます。蓄積途中で中断した場合は未完了の勾配を捨て、保存するsamplerの状態をそのgroupの先頭へ戻します。再開後は未完了だったgroupのデータを再読込します。このMLPには変更されるrunning統計やdropoutの乱数状態がありません。別のモデルで同じ方式を使う場合は、forwardで変更したバッファや乱数状態も戻す必要があります。
+蓄積はepochをまたいで続き、短いバッチも1個のmicro-batchとして数えます。蓄積途中で中断した場合は未完了の勾配を捨て、保存するsamplerの状態をそのgroupの先頭へ戻します。再開後は未完了だったgroupのデータを再読込します。これらの例のモデルには変更されるrunning統計やdropoutの乱数状態がありません。別のモデルで同じ方式を使う場合は、forwardで変更したバッファや乱数状態も戻す必要があります。
 
 テストでは、蓄積の途中とepochをまたいだ途中での中断から再開し、モデル・optimizer・スケジューラ・データ順を中断なしの結果と比較します。CPUでは厳密一致、CUDAでは既存の許容誤差内の一致を確認します。数値回帰と音声は更新後のキャンセルと更新前の期限切れから再開し、CPUのcheckpoint全体がバイト単位で一致します。
 

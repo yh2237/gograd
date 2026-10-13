@@ -309,26 +309,36 @@ func TestMNISTCanceledAccumulationResume(t *testing.T) {
 							t.Fatal(err)
 						}
 						defer optimizer.Close()
-						accumulator, err := autograd.NewGradAccumulator(base.Accum)
-						if err != nil {
-							t.Fatal(err)
-						}
 						ctx, cancel := context.WithCancel(context.Background())
 						defer cancel()
 						micro := 0
-						loop := digitUpdateLoop{loader: loader, sampler: sampler, optimizer: optimizer, schedule: schedule, accumulator: accumulator,
-							backward: func(batch data.FloatBatch) (float32, bool, error) {
-								loss, complete, err := trainingStep(model, execution, accumulator, batch, device)
+						var savepoint []byte
+						step := trainingStep(model, execution, device)
+						loop := autograd.TrainingLoop[data.FloatBatch]{
+							Reader: loader, Sampler: sampler, Optimizer: optimizer, Schedule: schedule,
+							Updates: base.Steps, Applied: schedule.StepCount, Accumulate: base.Accum,
+							Step: func(ctx context.Context, batch data.FloatBatch, accumulator *autograd.GradAccumulator) (float64, bool, error) {
+								loss, complete, err := step(ctx, batch, accumulator)
+								if err != nil {
+									return 0, false, err
+								}
 								micro++
 								if micro == after {
 									cancel()
 								}
-								return loss, complete, err
-							}, report: func(float32) {},
+								return loss, complete, nil
+							},
+							Save: func(rewound []byte) error {
+								savepoint = append([]byte(nil), rewound...)
+								return nil
+							},
 						}
-						rollback, err := loop.run(ctx, base.Steps)
-						if !errors.Is(err, context.Canceled) || rollback == nil || accumulator.Pending() != 0 || schedule.StepCount != after/base.Accum {
-							t.Fatalf("stop rollback=%+v pending=%d steps=%d err=%v", rollback, accumulator.Pending(), schedule.StepCount, err)
+						if err := loop.Run(ctx); !errors.Is(err, context.Canceled) || savepoint == nil || schedule.StepCount != after/base.Accum {
+							t.Fatalf("stop savepoint=%q steps=%d err=%v", savepoint, schedule.StepCount, err)
+						}
+						var rollback data.IndexSamplerState
+						if err := json.Unmarshal(savepoint, &rollback); err != nil {
+							t.Fatal(err)
 						}
 						if after == 5 && (rollback.Epoch != 0 || rollback.Position != 12 || sampler.State().Epoch != 1) {
 							t.Fatal("test did not rewind across epoch boundary")
@@ -337,10 +347,7 @@ func TestMNISTCanceledAccumulationResume(t *testing.T) {
 						if err != nil {
 							t.Fatal(err)
 						}
-						state.Sampler, err = json.Marshal(rollback)
-						if err != nil {
-							t.Fatal(err)
-						}
+						state.Sampler = savepoint
 						metadata, err := autograd.TrainingCheckpointMetadata(full.Out + ".training.safetensors")
 						if err != nil {
 							t.Fatal(err)
