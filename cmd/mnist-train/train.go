@@ -56,6 +56,7 @@ type runIdentity struct {
 	MaxLR, Momentum                             float64
 	Nesterov                                    bool
 	NoDecaySuffix                               string
+	Accum                                       int
 }
 type checkpointState struct {
 	Identity runIdentity
@@ -125,6 +126,12 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 	if ctx == nil || c.Steps < 2 || c.Batch < 1 || c.StopAfter < 0 || c.StopAfter > c.Steps || c.TrainLimit < 0 || c.ValidLimit < 0 || c.Workers < 0 || c.Prefetch < 0 || c.Workers == 0 && c.Prefetch != 0 || (device != tensor.CPU && device != tensor.CUDA) {
 		return stats, fmt.Errorf("invalid training configuration")
 	}
+	if c.Accum == 0 {
+		c.Accum = 1
+	}
+	if c.Accum < 1 {
+		return stats, fmt.Errorf("accumulation needs at least one micro-batch")
+	}
 	if c.Checkpoint == "" && c.Out != "" {
 		c.Checkpoint = c.Out + ".training.safetensors"
 	}
@@ -179,7 +186,7 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 		return stats, err
 	}
 	defer loader.Close()
-	identity := runIdentity{Version: 1, Steps: c.Steps, Batch: c.Batch, TrainSize: trainData.Len(), ValidSize: validData.Len(), Seed: c.Seed, TrainFingerprint: trainHash, ValidFingerprint: validHash, Optimizer: c.Optimizer, MaxLR: c.MaxLR, Momentum: c.Momentum, Nesterov: c.Nesterov, NoDecaySuffix: c.NoDecaySuffix}
+	identity := runIdentity{Version: 1, Steps: c.Steps, Batch: c.Batch, TrainSize: trainData.Len(), ValidSize: validData.Len(), Seed: c.Seed, TrainFingerprint: trainHash, ValidFingerprint: validHash, Optimizer: c.Optimizer, MaxLR: c.MaxLR, Momentum: c.Momentum, Nesterov: c.Nesterov, NoDecaySuffix: c.NoDecaySuffix, Accum: c.Accum}
 	schedule := autograd.NewOneCycle(c.MaxLR, c.Steps, .3)
 	if c.Resume != "" {
 		metadata, err := autograd.TrainingCheckpointMetadata(c.Resume)
@@ -221,6 +228,10 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 		end = c.StopAfter
 	}
 	m.module.Train(true)
+	accumulator, err := autograd.NewGradAccumulator(c.Accum)
+	if err != nil {
+		return stats, err
+	}
 	for schedule.StepCount < end {
 		batch, err := loader.Next(ctx)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -235,11 +246,19 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 		if err != nil {
 			return stats, err
 		}
-		loss, err := trainingStep(m, execution, optimizer, schedule, batch, device)
+		if accumulator.Pending() == 0 {
+			optimizer.ZeroGrad()
+		}
+		loss, complete, err := trainingStep(m, execution, accumulator, batch, device)
 		if err != nil {
 			return stats, err
 		}
 		stats.TrainLoss = loss
+		if !complete {
+			continue
+		}
+		optimizer.Step()
+		schedule.Step(optimizer)
 		if schedule.StepCount == 1 || schedule.StepCount%25 == 0 || schedule.StepCount == end {
 			fmt.Fprintf(log, "device=%s step=%d train_loss=%.6f epoch=%d\n", device, schedule.StepCount, loss, sampler.State().Epoch)
 		}
@@ -304,25 +323,28 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 	}
 	return stats, nil
 }
-func trainingStep(m *digitModel, execution *autograd.ExecutionContext, optimizer autograd.Optimizer, schedule *autograd.OneCycle, batch data.FloatBatch, device tensor.Device) (float32, error) {
+
+// trainingStep builds one micro-batch loss and adds its scaled gradient to the
+// accumulator. It reports whether the call completed an optimizer update; the
+// caller owns ZeroGrad, Step and the scheduler.
+func trainingStep(m *digitModel, execution *autograd.ExecutionContext, accumulator *autograd.GradAccumulator, batch data.FloatBatch, device tensor.Device) (float32, bool, error) {
 	x, err := execution.New(batch.Values, batch.Shape, device, false)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	defer x.Close()
-	optimizer.ZeroGrad()
 	loss := autograd.CrossEntropy(m.forward(x), batch.Labels, -1)
-	defer loss.ReleaseGraph()
 	values, err := loss.ToHost()
 	if err != nil {
-		return 0, err
+		loss.ReleaseGraph()
+		return 0, false, err
 	}
-	if err := loss.Backward(); err != nil {
-		return 0, err
+	complete, err := accumulator.Backward(loss)
+	loss.ReleaseGraph()
+	if err != nil {
+		return 0, false, err
 	}
-	optimizer.Step()
-	schedule.Step(optimizer)
-	return values[0], nil
+	return values[0], complete, nil
 }
 
 func newTrainingOptimizer(params []autograd.Parameter, c trainConfig, lr float32) (autograd.CheckpointOptimizer, error) {

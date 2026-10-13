@@ -15,6 +15,7 @@ type trainConfig struct {
 	DataDir, Device, Out, Checkpoint, Resume        string
 	Steps, StopAfter, Batch, TrainLimit, ValidLimit int
 	Workers, Prefetch                               int
+	Accum                                           int
 	Optimizer                                       string
 	MaxLR                                           float64
 	Momentum                                        float64
@@ -37,6 +38,7 @@ func main() {
 	flag.IntVar(&c.Batch, "batch-size", 64, "examples per update")
 	flag.IntVar(&c.Workers, "workers", 0, "parallel host readers (0: synchronous)")
 	flag.IntVar(&c.Prefetch, "prefetch", 0, "pending batches including current (0: two with workers)")
+	flag.IntVar(&c.Accum, "accum", 1, "micro-batches per optimizer update")
 	flag.StringVar(&c.Optimizer, "optimizer", "adamw", "adamw or sgd")
 	flag.Float64Var(&c.MaxLR, "lr", 0, "OneCycle peak LR (0: .005 AdamW, .1 SGD)")
 	flag.Float64Var(&c.Momentum, "momentum", .9, "SGD momentum")
