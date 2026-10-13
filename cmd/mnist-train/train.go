@@ -204,6 +204,10 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 			// Older checkpoints predate parameter groups.
 			state.Identity.NoDecaySuffix, c.NoDecaySuffix, identity.NoDecaySuffix = "", "", ""
 		}
+		// Checkpoints written before accumulation used one batch per update.
+		if state.Identity.Version == 1 && state.Identity.Accum == 0 {
+			state.Identity.Accum = 1
+		}
 		if state.Identity != identity {
 			return stats, fmt.Errorf("checkpoint does not match data/configuration")
 		}
@@ -233,42 +237,35 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 	if err != nil {
 		return stats, err
 	}
-	for schedule.StepCount < end {
-		batch, err := loader.Next(ctx)
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			break
-		}
-		if err == io.EOF {
-			if err := loader.NextEpoch(); err != nil {
-				return stats, err
+	loop := digitUpdateLoop{
+		loader: loader, sampler: sampler, optimizer: optimizer, schedule: schedule, accumulator: accumulator,
+		backward: func(batch data.FloatBatch) (float32, bool, error) {
+			return trainingStep(m, execution, accumulator, batch, device)
+		},
+		report: func(loss float32) {
+			stats.TrainLoss = loss
+			if schedule.StepCount == 1 || schedule.StepCount%25 == 0 || schedule.StepCount == end {
+				fmt.Fprintf(log, "device=%s step=%d train_loss=%.6f epoch=%d\n", device, schedule.StepCount, loss, sampler.State().Epoch)
 			}
-			continue
-		}
-		if err != nil {
-			return stats, err
-		}
-		if accumulator.Pending() == 0 {
-			optimizer.ZeroGrad()
-		}
-		loss, complete, err := trainingStep(m, execution, accumulator, batch, device)
-		if err != nil {
-			return stats, err
-		}
-		stats.TrainLoss = loss
-		if !complete {
-			continue
-		}
-		optimizer.Step()
-		schedule.Step(optimizer)
-		if schedule.StepCount == 1 || schedule.StepCount%25 == 0 || schedule.StepCount == end {
-			fmt.Fprintf(log, "device=%s step=%d train_loss=%.6f epoch=%d\n", device, schedule.StepCount, loss, sampler.State().Epoch)
-		}
+		},
+	}
+	rollback, stopErr := loop.run(ctx, end)
+	if stopErr != nil && !errors.Is(stopErr, context.Canceled) && !errors.Is(stopErr, context.DeadlineExceeded) {
+		return stats, stopErr
 	}
 	stats.Steps = schedule.StepCount
 	if c.Checkpoint != "" {
 		state, err := loader.State()
 		if err != nil {
 			return stats, err
+		}
+		if rollback != nil {
+			// State joins readers first. Rewind only the persisted data cursor;
+			// the model/optimizer/scheduler still describe the preceding update.
+			state.Sampler, err = json.Marshal(rollback)
+			if err != nil {
+				return stats, err
+			}
 		}
 		payload, err := json.Marshal(checkpointState{identity, state})
 		if err != nil {
@@ -281,7 +278,7 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 			return stats, err
 		}
 	}
-	if err := ctx.Err(); err != nil {
+	if err := errors.Join(stopErr, ctx.Err()); err != nil {
 		return stats, err
 	}
 	m.module.Train(false)
@@ -323,6 +320,62 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 		fmt.Fprintf(log, "saved=%s checkpoint=%s reload_max_abs=%.9g\n", c.Out, c.Checkpoint, stats.ReloadMaxAbs)
 	}
 	return stats, nil
+}
+
+type digitBatchLoader interface {
+	Next(context.Context) (data.FloatBatch, error)
+	NextEpoch() error
+}
+
+// digitUpdateLoop keeps a sampler savepoint for an unfinished accumulation
+// group. Snapshotting the sampler does not stop the loader's prefetch readers.
+// This MLP has no mutable forward buffers or random state to rewind.
+type digitUpdateLoop struct {
+	loader      digitBatchLoader
+	sampler     *data.IndexSampler
+	optimizer   autograd.Optimizer
+	schedule    *autograd.OneCycle
+	accumulator *autograd.GradAccumulator
+	backward    func(data.FloatBatch) (float32, bool, error)
+	report      func(float32)
+}
+
+func (l *digitUpdateLoop) run(ctx context.Context, end int) (*data.IndexSamplerState, error) {
+	var start data.IndexSamplerState
+	for l.schedule.StepCount < end {
+		if l.accumulator.Pending() == 0 {
+			// Only accumulation can leave delivered batches without an update.
+			if l.accumulator.Groups() > 1 {
+				start = l.sampler.State()
+			}
+			l.optimizer.ZeroGrad()
+		}
+		batch, err := l.loader.Next(ctx)
+		if err == io.EOF {
+			if err := l.loader.NextEpoch(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if err != nil {
+			if l.accumulator.Pending() != 0 {
+				l.optimizer.ZeroGrad()
+				l.accumulator.Reset()
+				return &start, err
+			}
+			return nil, err
+		}
+		loss, complete, err := l.backward(batch)
+		if err != nil {
+			return nil, err
+		}
+		if complete {
+			l.optimizer.Step()
+			l.schedule.Step(l.optimizer)
+			l.report(loss)
+		}
+	}
+	return nil, nil
 }
 
 // trainingStep builds one micro-batch loss and adds its scaled gradient to the

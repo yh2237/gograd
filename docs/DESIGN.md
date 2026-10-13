@@ -38,6 +38,8 @@ AdamWはdecoupled weight decay、float32のモーメント、bias correctionを�
 
 `metrics`はテンソルやCUDAに依存せず、読み戻したホスト配列を集計します。平均損失は有効件数、回帰誤差は要素数で重み付けし、バッチの長さが違っても同じ分母を使います。回帰の差分と和はfloat64です。更新は入力検証と計算に成功してから集計へ反映し、エラー時には以前の値を保ちます。
 
+MNIST例は勾配蓄積のgroupの先頭でsamplerの状態を保持します。この取得はprefetchを止めません。途中でキャンセルされた場合は勾配を消し、readerを停止・joinしてから、保存するデータ位置をgroupの先頭へ戻します。モデルとoptimizerは完了済みの更新を保つため、未更新のデータだけを再読込できます。数値回帰と音声の例も、contextのエラーを返す前にcheckpointを保存します。
+
 ## Conv2d
 
 `autograd.Conv2d`はNCHWのcross-correlationを、PyTorch互換の`[out,in/groups,kH,kW]`の重みで追加します。stride、対称なパディング、dilationはheight/widthの独立した組で、groupsはdepthwiseの出力multiplierを含みます。biasは任意です。`Conv2dLayer`は名前付きパラメータを、既存の`Module`とsafetensorsのAPIで登録します。

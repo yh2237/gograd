@@ -339,9 +339,6 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 		}
 	}
 	stats.Steps = schedule.StepCount
-	if err := ctx.Err(); err != nil {
-		return stats, err
-	}
 	if c.Checkpoint != "" {
 		loaderState, err := loader.State()
 		if err != nil {
@@ -357,6 +354,9 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 		if err := autograd.SaveTrainingCheckpoint(c.Checkpoint, &model.module, optimizer, schedule, map[string]string{"data_state": string(payload), "model": "tabular-regression-1"}); err != nil {
 			return stats, err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return stats, err
 	}
 	model.module.Train(false)
 	validRMSE, predictions, err := evaluate(ctx, model, execution, validData, c.Batch, c.Workers, c.Prefetch, device)

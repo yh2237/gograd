@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeDataset(t *testing.T, dir string, rows, features int, seed uint64) string {
@@ -171,5 +173,60 @@ func TestTabularValidation(t *testing.T) {
 	}
 	if _, err := train(nil, valid, io.Discard); err == nil {
 		t.Fatal("nil context accepted")
+	}
+}
+
+type cancelOnProgress struct{ cancel context.CancelFunc }
+
+func (w cancelOnProgress) Write(p []byte) (int, error) {
+	w.cancel()
+	return len(p), nil
+}
+
+func TestTabularCancelSavesCheckpoint(t *testing.T) {
+	for _, beforeUpdate := range []bool{false, true} {
+		t.Run(map[bool]string{false: "after-update", true: "deadline-before-update"}[beforeUpdate], func(t *testing.T) {
+			dir := t.TempDir()
+			base := trainConfig{Data: writeDataset(t, dir, 100, 3, 5), Device: "cpu", Steps: 6, Batch: 8, Hidden: 4, Seed: 3}
+			full := base
+			full.Out = filepath.Join(dir, "full.safetensors")
+			if _, err := train(context.Background(), full, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			part := base
+			part.Out = filepath.Join(dir, "part.safetensors")
+			part.Workers, part.Prefetch = 2, 3
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			wantErr, wantSteps := context.Canceled, 1
+			if beforeUpdate {
+				ctx, cancel = context.WithDeadline(context.Background(), time.Unix(0, 0))
+				defer cancel()
+				wantErr, wantSteps = context.DeadlineExceeded, 0
+			}
+			stats, err := train(ctx, part, cancelOnProgress{cancel})
+			if !errors.Is(err, wantErr) || stats.Steps != wantSteps {
+				t.Fatalf("stop stats=%+v err=%v", stats, err)
+			}
+			if _, err := os.Stat(part.Out); !os.IsNotExist(err) {
+				t.Fatal("cancellation wrote inference weights")
+			}
+			resume := base
+			resume.Out, resume.Resume = part.Out, part.Out+".training.safetensors"
+			if _, err := train(context.Background(), resume, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			left, err := os.ReadFile(full.Out + ".training.safetensors")
+			if err != nil {
+				t.Fatal(err)
+			}
+			right, err := os.ReadFile(resume.Out + ".training.safetensors")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(left, right) {
+				t.Fatal("resumed model/optimizer/scheduler/data state changed")
+			}
+		})
 	}
 }
