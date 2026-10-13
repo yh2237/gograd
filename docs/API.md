@@ -38,6 +38,7 @@ gogradの学習で使う公開APIの一覧です。学習checkpointは`safetenso
 | `data` | `ParseNumericCSV`、`ParseOptions`、`NumericTable`、`RegressionSamples`、`RegressionSample`、`RegressionBatch`、`StackRegression` | 数値のCSV/TSVテーブルと回帰の行。有限値、ヘッダとコメントの処理、特徴量とtarget列の指定、同じ長さのstacking。 |
 | `data` | `Standardizer`、`FitStandardizer`、`StandardizerState`、`Apply`、`ApplyBatch`、`State`、`LoadState` | training splitでfitする決定的な特徴量の中心化とスケール。直列化でき、学習・検証・推論で同じ変換を共有します。 |
 | `data` | `ReadWAV`、`ReadWAVFile`、`ReadWAVMono`、`WAV`、`Mono`、`WriteWAV`、`WAVEncoding` | 非圧縮のPCM/float RIFF音声（`WAVE_FORMAT_EXTENSIBLE`を含む）、チャネル平均のmono、例で使う書き出し。 |
+| `metrics` | `Mean.Add`、`Value`、`Accuracy.UpdateLogits`、`Correct`、`Regression.Update`、`MSE`、`RMSE`、`MAE`、各型の`Count`と`Reset` | ホスト側で集計する損失の平均、分類の正解率、回帰の誤差。テンソルやバックエンドには依存しません。 |
 
 `cuda.MemoryStats()`は、gogradのCUDAアロケータが持つ物理バイト数を返します。`LiveBytes`、`CachedBytes`、`ReservedBytes`、`PeakLiveBytes`、`PeakReservedBytes`、`CachedBuffers`、`CacheLimitBytes`です。既定のキャッシュ上限は2 GiBです。`SetPoolCacheLimit`は上限を下げたときに、最も長く使われていないキャッシュをすぐに解放します。使用中のテンソルと、記録したグラフが予約している割当は解放しません。`ResetAllocationPeak`はピークの値を現在の値に戻します。この値には、gogradのプールを通さずCUDAライブラリが直接確保した分は含まれません。`Buffer.Size()`は、物理的なサイズクラスが大きくても、要求した論理バイト数を返します。
 
@@ -345,6 +346,25 @@ for {
 - 端数になった最後のgroupは`1/groups`のスケールを保つため、実効バッチが小さくなります。途中で更新することにした場合は`Reset()`を呼びます。
 - checkpointは完了したgroupの後で取ります。未完了の勾配はパラメータの勾配バッファにあり、checkpointには含まれません。
 - `autograd`のテストは、8件のバッチを4つのmicro-batchに分けて蓄積した勾配が、1回のBackwardの勾配とCPU/CUDAで一致することを確認します。端数になったgroupのスケール、`Pending`/`Reset`、`groups`が1未満の拒否も確認します。
+
+## 評価指標
+
+`metrics`の各型はゼロ値から使えます。空の集計結果は0で、観測の有無は`Count()`で区別します。`Reset()`で集計を消せます。同じ集計への並行書込には対応していません。
+
+- `Mean.Add(value, weight)`は、バッチの平均値と、その平均の対象になった件数を受け取ります。最後のバッチが短くても、バッチ数で割るのではなく件数で重み付けします。マスク付き損失では有効件数を渡します。
+- `Accuracy.UpdateLogits(scores, labels, classes, ignoreIndex)`は、行優先の`[len(labels), classes]`のスコアから正解率を集計します。同点では小さいクラス番号を選びます。`ignoreIndex`のラベルは分母・分子の両方から除き、`Correct()`は正解件数、`Count()`は有効件数を返します。
+- `Regression.Update(prediction, target)`は、同じ長さのfloat32配列からMSE、RMSE、MAEを集計します。差分と和はfloat64で計算します。複数出力の回帰でも、`Count()`と平均の分母はサンプル数ではなく要素数です。
+
+更新メソッドは形状の不一致、NaN/Inf、不正な件数やoverflowを拒否し、エラー時には集計を変えません。無視する分類行のスコアも有限値である必要があります。
+
+```go
+var errorMetric metrics.Regression
+err := errorMetric.Update(predictions, targets)
+// エラーを処理します。
+fmt.Printf("count=%d rmse=%g mae=%g\n", errorMetric.Count(), errorMetric.RMSE(), errorMetric.MAE())
+```
+
+MNIST例は`Mean`と`Accuracy`、数値回帰の例は`Regression`を使います。テストでは長さの異なるバッチ、同点、無視ラベル、空の入力、不正な入力での集計保持を確認します。
 
 ## OptimizerとSGD
 

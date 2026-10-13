@@ -36,6 +36,8 @@ AdamWはdecoupled weight decay、float32のモーメント、bias correctionを�
 
 直列化はsafetensors互換のテンソルpayloadとmetadataを使います。8バイトのlittle-endianのヘッダ長、dtype・形状・バイトオフセットを持つJSONの記述子、それに続く連続したpayloadです。読込は名前、形状、範囲、重複する範囲、大きすぎるヘッダを割当の前に検証し、書込は同じディレクトリの一時ファイル、sync、renameで原子的に行います。大きいcheckpointのために、`OpenSafeTensorFile`はindexを検証して1つずつテンソルを読み、`Module.LoadSafeTensorsStream`はコピーの前に全ての名前と形状を検証します。既存の`nn`のJSON checkpointも引き続き読めます。
 
+`metrics`はテンソルやCUDAに依存せず、読み戻したホスト配列を集計します。平均損失は有効件数、回帰誤差は要素数で重み付けし、バッチの長さが違っても同じ分母を使います。回帰の差分と和はfloat64です。更新は入力検証と計算に成功してから集計へ反映し、エラー時には以前の値を保ちます。
+
 ## Conv2d
 
 `autograd.Conv2d`はNCHWのcross-correlationを、PyTorch互換の`[out,in/groups,kH,kW]`の重みで追加します。stride、対称なパディング、dilationはheight/widthの独立した組で、groupsはdepthwiseの出力multiplierを含みます。biasは任意です。`Conv2dLayer`は名前付きパラメータを、既存の`Module`とsafetensorsのAPIで登録します。

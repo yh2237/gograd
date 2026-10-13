@@ -14,6 +14,7 @@ import (
 
 	"github.com/yh2237/gograd/autograd"
 	"github.com/yh2237/gograd/data"
+	"github.com/yh2237/gograd/metrics"
 	"github.com/yh2237/gograd/tensor"
 )
 
@@ -389,8 +390,8 @@ func evaluate(ctx context.Context, m *digitModel, execution *autograd.ExecutionC
 		return 0, 0, nil, err
 	}
 	defer loader.Close()
-	var total float64
-	var correct, count int
+	var mean metrics.Mean
+	var accuracy metrics.Accuracy
 	var all []float32
 	for {
 		batch, err := loader.Next(ctx)
@@ -418,20 +419,16 @@ func evaluate(ctx context.Context, m *digitModel, execution *autograd.ExecutionC
 		if err != nil {
 			return 0, 0, nil, err
 		}
-		total += float64(lossValue[0]) * float64(len(batch.Labels))
-		count += len(batch.Labels)
-		all = append(all, values...)
-		for i, label := range batch.Labels {
-			best := 0
-			for class := 1; class < 10; class++ {
-				if values[i*10+class] > values[i*10+best] {
-					best = class
-				}
-			}
-			if best == label {
-				correct++
-			}
+		if err := mean.Add(float64(lossValue[0]), len(batch.Labels)); err != nil {
+			return 0, 0, nil, err
 		}
+		if err := accuracy.UpdateLogits(values, batch.Labels, 10, -1); err != nil {
+			return 0, 0, nil, err
+		}
+		all = append(all, values...)
 	}
-	return total / float64(count), float64(correct) / float64(count), all, nil
+	if mean.Count() == 0 {
+		return 0, 0, nil, fmt.Errorf("no validation samples")
+	}
+	return mean.Value(), accuracy.Value(), all, nil
 }

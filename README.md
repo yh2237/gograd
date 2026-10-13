@@ -35,6 +35,8 @@ CUDAのバッチmatmulは、通常とブロードキャストのバッチを1回
 
 `gputcn`パッケージはTCNのforwardとbackwardをGPUのfloat32で実行します。forwardの出力はPyTorchのfloat64参照と約5e-08、パラメータ勾配は約1e-05で一致します。損失とAdamW（グローバルノルムクリップを含む）はGPU上で動きます。`SequenceLossGrad`はCPUの`SequenceLoss`（行ごとのメディアン中心化、clampしたtarget、Smooth L1、delta項）を行ごとに1ブロックで再現し、`LossGrad`と照合します。GPUの学習ループで合成データの損失が下がります。
 
+`metrics`パッケージはホスト側で損失の平均、分類の正解率、回帰のMSE/RMSE/MAEを集計します。長さの異なるバッチも件数で重み付けし、NaN/Infや形状の不一致は集計を変えずに拒否します。MNISTと数値回帰の例で使っています。
+
 ## 検証
 
 参照エンジンはPyTorchと照合します。PyTorchは比較の基準です。

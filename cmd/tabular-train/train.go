@@ -19,6 +19,7 @@ import (
 
 	"github.com/yh2237/gograd/autograd"
 	"github.com/yh2237/gograd/data"
+	"github.com/yh2237/gograd/metrics"
 	"github.com/yh2237/gograd/tensor"
 )
 
@@ -436,7 +437,7 @@ func evaluate(ctx context.Context, m *regressionModel, execution *autograd.Execu
 		return 0, nil, err
 	}
 	defer loader.Close()
-	var total float64
+	var regression metrics.Regression
 	predictions := make([]float32, 0, dataset.Len())
 	for {
 		batch, err := loader.Next(ctx)
@@ -458,17 +459,13 @@ func evaluate(ctx context.Context, m *regressionModel, execution *autograd.Execu
 		if err != nil {
 			return 0, nil, err
 		}
-		if len(values) != len(batch.Targets) {
-			return 0, nil, fmt.Errorf("prediction/target length mismatch")
-		}
-		for i, value := range values {
-			difference := float64(value) - float64(batch.Targets[i])
-			total += difference * difference
+		if err := regression.Update(values, batch.Targets); err != nil {
+			return 0, nil, err
 		}
 		predictions = append(predictions, values...)
 	}
 	if len(predictions) == 0 {
 		return 0, nil, fmt.Errorf("no validation rows")
 	}
-	return math.Sqrt(total / float64(len(predictions))), predictions, nil
+	return regression.RMSE(), predictions, nil
 }
