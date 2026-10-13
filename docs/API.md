@@ -17,6 +17,7 @@ gogradの学習で使う公開APIの一覧です。学習checkpointは`safetenso
 | `autograd` | `MaxPool2d`、`AvgPool2d`、`AdaptiveAvgPool2d`、各オプションと層 | CPU/CUDAのNCHW pooling。重複する窓の勾配、ceil mode、明示的な平均の除数を持ちます。 |
 | `autograd` | `BatchNorm`、`BatchNormOptions`、`NewBatchNormLayer`、`BatchNormLayerOptions`、`BatchNormLayer` | rank 2〜6のチャネル正規化、CPU/CUDAの学習・評価の勾配、名前付きのaffineパラメータとrunning state。 |
 | `autograd` | `Module.StateDict`、`LoadStateDict`、`SaveSafeTensors`、`SaveSafeTensorsMetadata`、`LoadSafeTensors` | 名前付きのfloat32 state。metadataの値は文字列です。 |
+| `autograd` | `GradAccumulator`、`NewGradAccumulator`、`GradAccumulator.Backward`、`Pending`、`Reset`、`Groups` | 1回のoptimizer更新を複数のmicro-batchへ分ける勾配蓄積。損失を1/groupsにスケールしてBackwardし、group完了を報告します。 |
 | `autograd` | `MSELoss`、`L1Loss`、`BCEWithLogitsLoss`、`LossOptions`、`Reduction` | 予測とtargetからスカラーを返す汎用の損失。mean/sumのreductionと要素ごとの重みを持ち、重み付き平均の除数はPyTorchの各損失に合わせます。 |
 | `autograd` | `MaskedLoss(pred,target,false)`、`ClipGradNorm`、`NewAdamW`、`NewOneCycle` | NaNフレームをマスクしたL1、クリップ、AdamW、PyTorchの2段cosineのOneCycle LR。 |
 | `autograd` | `AdamW.State`、`LoadState`、`SaveSafeTensors`、`LoadSafeTensors`、`Close` | CPU/CUDAの名前付きパラメータ形状、モーメント、ハイパーパラメータ、ステップ数。optimizerが持つバッファを解放します。 |
@@ -316,6 +317,35 @@ loss = autograd.BCEWithLogitsLoss(logits, target, autograd.LossOptions{Reduction
 
 `testdata/losses.json`（`tools/gen_losses_fixture.py`が生成）は、3つの損失×mean/sum×重みあり/なしの12ケースで、損失値と予測勾配をPyTorchとCPU/CUDAで照合します。ゼロ重みのマスク、未知のreduction、形状とdeviceの不一致、スカラー入力はGoのテストで確認します。`cmd/tabular-train`と`cmd/audio-train`は、手で組んだ平均二乗誤差ではなく`MSELoss`を使います。
 
+### 勾配蓄積
+
+`GradAccumulator`は、1回のoptimizer更新を複数のmicro-batchに分けます。損失を`1/groups`にスケールしてからBackwardし、蓄積した勾配がgroup内のmicro-batchの平均になるようにします。
+
+```go
+accumulator, err := autograd.NewGradAccumulator(4)
+// エラーを処理します。
+for {
+    if accumulator.Pending() == 0 {
+        optimizer.ZeroGrad()
+    }
+    loss := autograd.CrossEntropy(model.Forward(batch.Values), batch.Labels, -1)
+    complete, err := accumulator.Backward(loss)
+    loss.ReleaseGraph()
+    // エラーを処理します。
+    if !complete {
+        continue
+    }
+    autograd.ClipGradNorm(params, 1)
+    optimizer.Step()
+    schedule.Step(optimizer)
+}
+```
+
+- 勾配のゼロ化、クリップ、`Step`、スケジューラは呼び出し側が持ちます。蓄積した勾配に対してクリップしたいので、`Backward`がgroup完了を返した時点でクリップと`Step`を行います。
+- 端数になった最後のgroupは`1/groups`のスケールを保つため、実効バッチが小さくなります。途中で更新することにした場合は`Reset()`を呼びます。
+- checkpointは完了したgroupの後で取ります。未完了の勾配はパラメータの勾配バッファにあり、checkpointには含まれません。
+- `autograd`のテストは、8件のバッチを4つのmicro-batchに分けて蓄積した勾配が、1回のBackwardの勾配とCPU/CUDAで一致することを確認します。端数になったgroupのスケール、`Pending`/`Reset`、`groups`が1未満の拒否も確認します。
+
 ## OptimizerとSGD
 
 `Optimizer`は`Step()`、`ZeroGrad()`、`LearningRate() float32`、`SetLearningRate(float32)`、`Close()`を公開します。AdamWとSGDがこれを実装し、`OneCycle.Step(optimizer)`はスケジュールを進めて次の更新の学習率をインターフェース経由で設定します。AdamWの学習率フィールドや直接の呼び出しはこれまでどおり使えます。`SetLearningRate`は有限で非負の値を受け取り、不正な入力ではpanicします。`CheckpointOptimizer`は`Snapshot`、`ValidateSnapshot`、`LoadSnapshot`を追加し、`adamw`または`sgd`のタグを持つバージョン付きの`OptimizerSnapshot`を扱います。AdamWの型付きのState/LoadStateはそのまま残ります。独自の更新を実装する場合もOptimizerとOneCycleを組み合わせられますが、現在のcheckpointのエンコーダは組み込みの2つに対応します。
@@ -495,9 +525,9 @@ go run ./cmd/mnist-train -device cpu -workers 4 -prefetch 3 -steps 100 -train-li
 go run ./cmd/mnist-train -device cpu -optimizer sgd -momentum .9 -nesterov -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-sgd.safetensors
 ```
 
-データの既定のディレクトリは`out/mnist`、出力は`out/mnist.safetensors`、batchサイズは64、seedは7です。ディレクトリは必要に応じて作ります。`TrainLimit`/`ValidLimit`は、それぞれの公式の分割の先頭からN件を選びます（0は全て）。`StopAfter`は完了した更新の絶対数で、`Steps`は計画したスケジュール全体を表し、再開時に変えてはいけません。checkpointの既定は出力に`.training.safetensors`を付けたもので、推論と学習のパスは別にする必要があります。`-workers`と`-prefetch`は学習と評価の両方の読込を制御し、既定は0（同期）です。checkpointは配達済みのデータ順だけを記録するため、再開時に変えられます。コマンドのloaderは、完了時もエラー時もcloseします。
+データの既定のディレクトリは`out/mnist`、出力は`out/mnist.safetensors`、batchサイズは64、seedは7です。ディレクトリは必要に応じて作ります。`TrainLimit`/`ValidLimit`は、それぞれの公式の分割の先頭からN件を選びます（0は全て）。`StopAfter`は完了した更新の絶対数で、`Steps`は計画したスケジュール全体を表し、再開時に変えてはいけません。checkpointの既定は出力に`.training.safetensors`を付けたもので、推論と学習のパスは別にする必要があります。`-workers`と`-prefetch`は学習と評価の両方の読込を制御し、既定は0（同期）です。`-accum N`は1回のoptimizer更新をN個のmicro-batchに分けます（既定1）。損失はNで割られ、N個を蓄積してから1回だけ更新します。checkpointは配達済みのデータ順だけを記録するため、再開時に変えられます。コマンドのloaderは、完了時もエラー時もcloseします。
 
-`-optimizer adamw|sgd`は更新を選びます。`-lr`はOneCycleのピークを選び（0ならAdamWは.005、SGDは.1が既定）、`-momentum`はSGDで.9が既定、`-nesterov`はNesterov版を有効にします。この例のcoupled/decoupled decayは.0001です。optimizerの選択、学習率、momentum、Nesterovはcheckpointの同一性で、再開時の変更は拒否します。古いMNISTのAdamWのmetadataは、元の.005のピークと既定の設定として認識します。`-no-decay-suffix`（既定は`bias`、空で無効）は、一致するパラメータをdecayなしのグループへ移します。これもcheckpointの同一性で、別の値で書かれたcheckpointの再開は拒否します。グループ以前に書かれたcheckpointはsuffixを記録していないため、再開には空の値が必要です。
+`-optimizer adamw|sgd`は更新を選びます。`-lr`はOneCycleのピークを選び（0ならAdamWは.005、SGDは.1が既定）、`-momentum`はSGDで.9が既定、`-nesterov`はNesterov版を有効にします。この例のcoupled/decoupled decayは.0001です。optimizerの選択、学習率、momentum、Nesterov、micro-batch数はcheckpointの同一性で、再開時の変更は拒否します。古いMNISTのAdamWのmetadataは、元の.005のピークと既定の設定として認識します。`-no-decay-suffix`（既定は`bias`、空で無効）は、一致するパラメータをdecayなしのグループへ移します。これもcheckpointの同一性で、別の値で書かれたcheckpointの再開は拒否します。グループ以前に書かれたcheckpointはsuffixを記録していないため、再開には空の値が必要です。
 
 学習のstateには、モデル、AdamWのモーメントまたはSGDのmomentumとオプション、OneCycleとloaderのstate、データセット全体のfingerprint、実効のsubsetサイズ、seed、batchの構成を含みます。これらの同一性の変更は、liveのモデルstateを読み込む前に拒否します。中断は、キャンセルを返す前に最後に完了した更新のcheckpointを保存します。テストは、中断なしの場合とepoch途中で再開した場合の重み、モーメント、スケジュール、データ順を比較します。CPUの値は厳密に一致し、CUDAの浮動小数点は、既存のbias勾配のカーネルがatomic加算を使うため、数値として比較します。
 

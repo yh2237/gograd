@@ -61,6 +61,7 @@ go run ./cmd/cnn-train -device cuda -steps 60 -out out/cnn-cuda.safetensors
 go run ./cmd/mnist-train -download -device cpu -steps 100 -train-limit 2000 -valid-limit 1000
 go run ./cmd/mnist-train -device cuda -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-cuda.safetensors
 go run ./cmd/mnist-train -device cpu -workers 4 -prefetch 3 -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-prefetch.safetensors
+go run ./cmd/mnist-train -device cpu -batch-size 16 -accum 4 -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-accum.safetensors
 go run ./cmd/mnist-train -device cpu -optimizer sgd -momentum .9 -nesterov -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-sgd.safetensors
 go run ./cmd/mnist-train -device cpu -optimizer sgd -momentum .9 -nesterov -no-decay-suffix bias -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-sgd-groups.safetensors
 go run ./cmd/tabular-train -generate -device cpu -steps 400 -out out/tabular.safetensors
