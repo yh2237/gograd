@@ -187,10 +187,34 @@ func validateConfig(c *trainConfig) error {
 }
 
 func newTrainingOptimizer(params []autograd.Parameter, c trainConfig, lr float32) (autograd.CheckpointOptimizer, error) {
+	decay := float32(.0001)
+	options := autograd.SGDOptions{LR: lr, Momentum: float32(c.Momentum)}
+	if c.NoDecaySuffix != "" {
+		specs, err := autograd.PartitionParameters(params, func(name string) string {
+			if strings.HasSuffix(name, c.NoDecaySuffix) {
+				return "no_decay"
+			}
+			return "decay"
+		})
+		if err != nil {
+			return nil, err
+		}
+		for i := range specs {
+			if specs[i].Name == "no_decay" {
+				specs[i].WeightDecay = 0
+			} else {
+				specs[i].WeightDecay = decay
+			}
+		}
+		if c.Optimizer == "sgd" {
+			return autograd.NewSGDGroups(params, options, specs)
+		}
+		return autograd.NewAdamWGroups(params, lr, specs)
+	}
 	if c.Optimizer == "sgd" {
 		return autograd.NewSGD(params, autograd.SGDOptions{LR: lr, Momentum: float32(c.Momentum)})
 	}
-	return autograd.NewAdamW(params, lr, .0001), nil
+	return autograd.NewAdamW(params, lr, decay), nil
 }
 
 func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, error) {

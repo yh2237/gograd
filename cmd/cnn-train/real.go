@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/yh2237/gograd/autograd"
 	"github.com/yh2237/gograd/data"
@@ -81,7 +82,7 @@ func trainReal(device tensor.Device, steps, trainLimit, validLimit int, imagesPa
 		return stats, err
 	}
 	m.module.Train(true)
-	opt := autograd.NewAdamW(m.module.NamedParameters(), .01, .001)
+	opt := newCNNTrainingOptimizer(m.module.NamedParameters(), "bias")
 	defer opt.Close()
 	trainDS := sliceDataset{samples: trainSamples}
 	sampler, err := data.NewIndexSampler(trainDS.Len(), data.SamplerOptions{Shuffle: true, Seed: 7})
@@ -230,4 +231,29 @@ func trainReal(device tensor.Device, steps, trainLimit, validLimit int, imagesPa
 	fmt.Fprintf(log, "initial_loss=%.6f final_loss=%.6f accuracy=%.1f%% classes=%d samples=train%d/valid%d\n",
 		stats.initialLoss, stats.finalLoss, 100*stats.accuracy, nClasses, trainN, validN)
 	return stats, nil
+}
+
+func newCNNTrainingOptimizer(params []autograd.Parameter, suffix string) autograd.CheckpointOptimizer {
+	decay := float32(.001)
+	if suffix != "" {
+		specs, err := autograd.PartitionParameters(params, func(name string) string {
+			if strings.HasSuffix(name, suffix) {
+				return "no_decay"
+			}
+			return "decay"
+		})
+		if err == nil {
+			for i := range specs {
+				if specs[i].Name == "no_decay" {
+					specs[i].WeightDecay = 0
+				} else {
+					specs[i].WeightDecay = decay
+				}
+			}
+			if opt, err := autograd.NewAdamWGroups(params, .01, specs); err == nil {
+				return opt
+			}
+		}
+	}
+	return autograd.NewAdamW(params, .01, .001)
 }

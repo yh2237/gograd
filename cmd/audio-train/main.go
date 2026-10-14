@@ -17,6 +17,7 @@ type trainConfig struct {
 	Workers, Prefetch                    int
 	SampleRate                           int
 	Optimizer                            string
+	NoDecaySuffix                        string
 	Noise, LearningRate, Momentum        float64
 	Seed                                 uint64
 	Generate                             bool
@@ -42,6 +43,7 @@ func main() {
 	flag.IntVar(&c.Workers, "workers", 0, "parallel host readers (0: synchronous)")
 	flag.IntVar(&c.Prefetch, "prefetch", 0, "pending batches including current (0: two with workers)")
 	flag.StringVar(&c.Optimizer, "optimizer", "adamw", "adamw or sgd")
+	flag.StringVar(&c.NoDecaySuffix, "no-decay-suffix", "", "optional name suffix whose parameters use no weight decay")
 	flag.Float64Var(&c.Noise, "noise", .15, "augmentation noise standard deviation")
 	flag.Float64Var(&c.LearningRate, "lr", 0, "OneCycle peak LR (0: .005 AdamW, .02 SGD)")
 	flag.Float64Var(&c.Momentum, "momentum", .9, "SGD momentum")
