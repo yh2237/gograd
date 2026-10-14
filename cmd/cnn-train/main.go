@@ -22,12 +22,12 @@ type classifier struct {
 	head          *autograd.LinearLayer
 }
 
-func newClassifier(device tensor.Device) (*classifier, error) {
+func newClassifier(device tensor.Device, classes int, channels int) (*classifier, error) {
 	m := &classifier{}
 	rng := rand.New(rand.NewSource(7))
 	opts := autograd.Conv2dOptions{Padding: [2]int{1, 1}}
 	var err error
-	if m.first, err = autograd.NewConv2dLayer(1, 8, [2]int{3, 3}, opts, true, device, rng); err != nil {
+	if m.first, err = autograd.NewConv2dLayer(channels, 8, [2]int{3, 3}, opts, true, device, rng); err != nil {
 		return nil, err
 	}
 	m.module.Children = append(m.module.Children, autograd.NamedModule{Name: "conv1", Module: m.first.StateModule()})
@@ -46,7 +46,7 @@ func newClassifier(device tensor.Device) (*classifier, error) {
 		return nil, err
 	}
 	m.module.Children = append(m.module.Children, autograd.NamedModule{Name: "norm2", Module: m.norm2.StateModule()})
-	if m.head, err = autograd.NewLinearLayer(8, 2, device, rng); err != nil {
+	if m.head, err = autograd.NewLinearLayer(8, classes, device, rng); err != nil {
 		m.close()
 		return nil, err
 	}
@@ -113,7 +113,7 @@ func train(device tensor.Device, steps int, output string, log io.Writer) (train
 		}
 		defer ctx.Close()
 	}
-	m, err := newClassifier(device)
+	m, err := newClassifier(device, 2, 1)
 	if err != nil {
 		return stats, err
 	}
@@ -186,7 +186,7 @@ func train(device tensor.Device, steps int, output string, log io.Writer) (train
 		if err := m.module.SaveSafeTensors(output); err != nil {
 			return stats, err
 		}
-		loaded, err := newClassifier(device)
+		loaded, err := newClassifier(device, 2, 1)
 		if err != nil {
 			return stats, err
 		}
@@ -235,7 +235,18 @@ func main() {
 	device := flag.String("device", "cpu", "cpu or cuda")
 	steps := flag.Int("steps", 60, "training updates")
 	out := flag.String("out", "", "optional safetensors checkpoint (existing parent directory)")
+	images := flag.String("images", "", "optional IDX images for real image training")
+	labels := flag.String("labels", "", "optional IDX labels for real image training")
+	trainLimit := flag.Int("train-limit", 2000, "training subset for real image data")
+	validLimit := flag.Int("valid-limit", 1000, "validation subset for real image data")
 	flag.Parse()
+	if *images != "" || *labels != "" {
+		if _, err := trainReal(tensor.Device(*device), *steps, *trainLimit, *validLimit, *images, *labels, *out, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if _, err := train(tensor.Device(*device), *steps, *out, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
