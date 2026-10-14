@@ -18,7 +18,7 @@ func (d sliceDataset) Get(ctx context.Context, index int) (data.FloatSample, err
 	return d.samples[index], nil
 }
 
-func trainReal(device tensor.Device, steps, trainLimit, validLimit int, imagesPath, labelsPath, output string, log io.Writer) (trainingStats, error) {
+func trainReal(device tensor.Device, steps, trainLimit, validLimit int, imagesPath, labelsPath, output string, log io.Writer, augment bool) (trainingStats, error) {
 	stats := trainingStats{}
 	if steps < 1 || (device != tensor.CPU && device != tensor.CUDA) {
 		return stats, fmt.Errorf("cnn-train: positive steps and cpu/cuda device required")
@@ -84,7 +84,15 @@ func trainReal(device tensor.Device, steps, trainLimit, validLimit int, imagesPa
 	m.module.Train(true)
 	opt := newCNNTrainingOptimizer(m.module.NamedParameters(), "bias")
 	defer opt.Close()
-	trainDS := sliceDataset{samples: trainSamples}
+	baseDS := sliceDataset{samples: trainSamples}
+	trainDS := data.TransformDataset[data.FloatSample]{Base: baseDS, Seed: 7, Apply: func(index int, seed uint64, sample data.FloatSample) (data.FloatSample, error) {
+		if !augment {
+			return sample, nil
+		}
+		out := data.FloatSample{Values: append([]float32(nil), sample.Values...), Label: sample.Label, Shape: sample.Shape}
+		data.FlipEarly(out.Values, 1, h, w, int(seed), index, .5)
+		return out, nil
+	}}
 	sampler, err := data.NewIndexSampler(trainDS.Len(), data.SamplerOptions{Shuffle: true, Seed: 7})
 	if err != nil {
 		return stats, err

@@ -239,9 +239,10 @@ func main() {
 	labels := flag.String("labels", "", "optional IDX labels for real image training")
 	trainLimit := flag.Int("train-limit", 2000, "training subset for real image data")
 	validLimit := flag.Int("valid-limit", 1000, "validation subset for real image data")
+	augment := flag.Bool("augment", false, "apply deterministic horizontal flips during training")
 	flag.Parse()
 	if *images != "" || *labels != "" {
-		if _, err := trainReal(tensor.Device(*device), *steps, *trainLimit, *validLimit, *images, *labels, *out, os.Stdout); err != nil {
+		if _, err := trainReal(tensor.Device(*device), *steps, *trainLimit, *validLimit, *images, *labels, *out, os.Stdout, *augment); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
