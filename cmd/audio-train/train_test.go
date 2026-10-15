@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	randv2 "math/rand/v2"
 	"os"
 	"path/filepath"
 	"testing"
@@ -42,13 +43,27 @@ func TestNoisyWindowsAreOrderIndependent(t *testing.T) {
 	if !equalFloat32(first.Target, clean[7]) || equalFloat32(first.Input, first.Target) {
 		t.Fatal("augmentation did not keep the clean target")
 	}
+	// Preserve the exact formula used before extracting the common helper.
+	rng := randv2.New(randv2.NewPCG(dataset.seed, uint64(7)+0x9e3779b97f4a7c15))
+	for i, value := range clean[7] {
+		want := value + float32(rng.NormFloat64())*dataset.noise
+		if first.Input[i] != want {
+			t.Fatalf("shared helper changed input[%d]: %g != %g", i, first.Input[i], want)
+		}
+	}
+	// Returned inputs and targets must not alias the stored clean frame.
+	first.Input[0], first.Target[0] = 99, 99
+	again, err := dataset.Get(context.Background(), 7)
+	if err != nil || !equalFloat32(again.Input, second.Input) || !equalFloat32(again.Target, second.Target) {
+		t.Fatal("caller mutation changed future augmentation", err)
+	}
 	// A different seed (checkpoint identity) changes the noise.
 	other := &noisyWindows{clean: clean, noise: .2, seed: 6}
 	third, err := other.Get(context.Background(), 7)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if equalFloat32(first.Input, third.Input) {
+	if equalFloat32(second.Input, third.Input) {
 		t.Fatal("seed did not change the noise")
 	}
 	if _, err := dataset.Get(nil, 0); err == nil {

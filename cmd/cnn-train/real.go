@@ -89,8 +89,10 @@ func trainReal(device tensor.Device, steps, trainLimit, validLimit int, imagesPa
 		if !augment {
 			return sample, nil
 		}
-		out := data.FloatSample{Values: append([]float32(nil), sample.Values...), Label: sample.Label, Shape: sample.Shape}
-		data.FlipEarly(out.Values, 1, h, w, int(seed), index, .5)
+		out := data.FloatSample{Values: append([]float32(nil), sample.Values...), Label: sample.Label, Shape: append([]int(nil), sample.Shape...)}
+		if err := data.RandomHorizontalFlipFloat32(out.Values, 1, h, w, seed, index, .5); err != nil {
+			return data.FloatSample{}, err
+		}
 		return out, nil
 	}}
 	sampler, err := data.NewIndexSampler(trainDS.Len(), data.SamplerOptions{Shuffle: true, Seed: 7})

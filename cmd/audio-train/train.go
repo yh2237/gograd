@@ -102,10 +102,9 @@ func (d *noisyWindows) Get(ctx context.Context, index int) (windowSample, error)
 		return zero, fmt.Errorf("audio: window index %d out of range", index)
 	}
 	target := d.clean[index]
-	input := make([]float32, len(target))
-	rng := randv2.New(randv2.NewPCG(d.seed, uint64(index)+0x9e3779b97f4a7c15))
-	for i, value := range target {
-		input[i] = value + float32(rng.NormFloat64())*d.noise
+	input := append([]float32(nil), target...)
+	if err := data.AddGaussianNoiseFloat32(input, d.seed, index, d.noise); err != nil {
+		return zero, err
 	}
 	return windowSample{Input: input, Target: append([]float32(nil), target...)}, nil
 }
