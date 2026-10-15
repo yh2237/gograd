@@ -43,6 +43,47 @@ func flipHorizontally(values []float32, channels, height, width int) {
 	}
 }
 
+// flipVertically swaps rows in each channel plane. values is in
+// [channels,height,width] order.
+func flipVertically(values []float32, channels, height, width int) {
+	for c := 0; c < channels; c++ {
+		for y := 0; y < height/2; y++ {
+			top := c*height*width + y*width
+			bottom := c*height*width + (height-1-y)*width
+			for x := 0; x < width; x++ {
+				values[top+x], values[bottom+x] = values[bottom+x], values[top+x]
+			}
+		}
+	}
+}
+
+// FlipsVerticallyFloat32 swaps rows in each channel plane. Invalid shapes leave
+// values unchanged.
+func FlipsVerticallyFloat32(values []float32, channels, height, width int) error {
+	if err := validateImageShape(values, channels, height, width); err != nil {
+		return err
+	}
+	flipVertically(values, channels, height, width)
+	return nil
+}
+
+// RandomVerticalFlipFloat32 flips rows with the given probability using only
+// seed/index. All validation runs even when probability is zero; errors do not
+// mutate values.
+func RandomVerticalFlipFloat32(values []float32, channels, height, width int, seed uint64, index int, probability float64) error {
+	if err := validateImageShape(values, channels, height, width); err != nil {
+		return err
+	}
+	if index < 0 || probability < 0 || probability > 1 || math.IsNaN(probability) || math.IsInf(probability, 0) {
+		return fmt.Errorf("data: invalid flip index or probability")
+	}
+	rng := randv2.New(randv2.NewPCG(seed, uint64(index)*2+0x9e3779b97f4a7c15))
+	if rng.Float64() < probability {
+		flipVertically(values, channels, height, width)
+	}
+	return nil
+}
+
 // AddGaussianNoiseFloat32 adds deterministic Gaussian noise to values in place.
 // The RNG is seeded from seed and index, so worker/collate/order changes reproduce
 // the exact same numbers and resuming keeps the same samples. Index must be

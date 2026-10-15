@@ -36,7 +36,7 @@ gogradの学習で使う公開APIの一覧です。学習checkpointは`safetenso
 | `data` | `Sampler`、`StatefulSampler`、`NewIndexSampler`、`IndexSamplerState` | トランザクション的なindex選択、seed付きの順列、epoch途中と将来のepochの再開。 |
 | `data` | `NewLoader[T,B]`、`LoaderOptions`、`LoaderState`、`CollateFunc`、`Loader.Close` | contextを考慮したバッチ処理、任意の順序付きホストprefetch、drop-last、不透明なsampler checkpoint payload。 |
 | `data` | `FloatSample`、`FloatBatch`、`Stack`、`PadSequences`、`PaddingOptions`、`OpenIDX` | 所有権を持つfloat32のホストバッチ、系列長とboolマスク、raw/gzipのbyte画像・ラベルデータセット。 |
-| `data` | `TransformDataset[T]`、`RandomHorizontalFlipFloat32`、`FlipsHorizontallyFloat32`、`AddGaussianNoiseFloat32` | indexとseedに基づくホスト側のaugmentation。画像の水平反転とガウスノイズの加算。 |
+| `data` | `TransformDataset[T]`、`RandomHorizontalFlipFloat32`、`FlipsHorizontallyFloat32`、`RandomVerticalFlipFloat32`、`FlipsVerticallyFloat32`、`AddGaussianNoiseFloat32` | indexとseedに基づくホスト側のaugmentation。画像の水平/垂直反転とガウスノイズの加算。 |
 | `data` | `ParseNumericCSV`、`ParseOptions`、`NumericTable`、`RegressionSamples`、`RegressionSample`、`RegressionBatch`、`StackRegression` | 数値のCSV/TSVテーブルと回帰の行。有限値、ヘッダとコメントの処理、特徴量とtarget列の指定、同じ長さのstacking。 |
 | `data` | `Standardizer`、`FitStandardizer`、`StandardizerState`、`Apply`、`ApplyBatch`、`State`、`LoadState` | training splitでfitする決定的な特徴量の中心化とスケール。直列化でき、学習・検証・推論で同じ変換を共有します。 |
 | `data` | `ReadWAV`、`ReadWAVFile`、`ReadWAVMono`、`WAV`、`Mono`、`WriteWAV`、`WAVEncoding` | 非圧縮のPCM/float RIFF音声（`WAVE_FORMAT_EXTENSIBLE`を含む）、チャネル平均のmono、例で使う書き出し。 |
@@ -544,21 +544,32 @@ augmented := data.TransformDataset[data.FloatSample]{
         if len(out.Shape) != 3 {
             return data.FloatSample{}, fmt.Errorf("CHW画像が必要です")
         }
-        err := data.RandomHorizontalFlipFloat32(out.Values, out.Shape[0], out.Shape[1], out.Shape[2], seed, index, .5)
-        return out, err
+        // 横反転・縦反転・ガウスノイズを index/seed により決定的に適用。
+        if err := data.RandomHorizontalFlipFloat32(out.Values, out.Shape[0], out.Shape[1], out.Shape[2], seed, index, .5); err != nil {
+            return data.FloatSample{}, err
+        }
+        if err := data.RandomVerticalFlipFloat32(out.Values, out.Shape[0], out.Shape[1], out.Shape[2], seed, index, .3); err != nil {
+            return data.FloatSample{}, err
+        }
+        if err := data.AddGaussianNoiseFloat32(out.Values, seed, index, .02); err != nil {
+            return data.FloatSample{}, err
+        }
+        return out, nil
     },
 }
 ```
 
 wrapperはsampleをコピーしません。借用したスライスを変更する場合は、例のようにcallbackでコピーしてください。workerを使う場合、`Base.Get`と`Apply`は並行呼出しに対応する必要があります。先読みしたsampleは破棄・再取得されるため、共有の乱数や呼出し回数に依存せず、同じseed・index・入力から同じ結果を返してください。
 
-`RandomHorizontalFlipFloat32`はCHW順のスライスを指定確率で水平反転します。各次元は正、スライスの長さは次元の積と一致する必要があります。確率は有限の`[0,1]`、indexは0以上です。確率0でも入力を検証し、不正な入力では変更せずにエラーを返します。`FlipsHorizontallyFloat32`は同じshape検証を行い、常に反転します。`FlipEarly`は旧int-seed APIとして残しています。32-bit環境でseedを切り詰めないよう、新しいコードではuint64を受け取る`RandomHorizontalFlipFloat32`を使ってください。これらの関数とノイズ関数は`error`を返すため、呼出し側で確認してください。
+`RandomHorizontalFlipFloat32`はCHW順のスライスを指定確率で水平反転します。各次元は正、スライスの長さは次元の積と一致する必要があります。確率は有限の`[0,1]`、indexは0以上です。確率0でも入力を検証し、不正な入力では変更せずにエラーを返します。`FlipsHorizontallyFloat32`は同じshape検証を行い、常に反転します。
+
+`RandomVerticalFlipFloat32`はCHW順のスライスを指定確率で行を上下反転します。`FlipsVerticallyFloat32`は同じshape検証を行い、常に反転します。`FlipEarly`は旧int-seed APIとして残しています。32-bit環境でseedを切り詰めないよう、新しいコードではuint64を受け取る`RandomHorizontalFlipFloat32`/`RandomVerticalFlipFloat32`を使ってください。これらの関数とノイズ関数は`error`を返すため、呼出し側で確認してください。
 
 `AddGaussianNoiseFloat32(values, seed, index, std)`は値をその場で更新します。indexは0以上、標準偏差は有限かつ0以上、入力値は全て有限である必要があります。標準偏差0は入力を変えません。空のスライスも受け付けます。検証失敗やfloat32のoverflowでは入力を変更しません。出力の範囲はclipしません。
 
 組込み変換の乱数はseedとindexだけから作るため、epochが変わっても同じsampleの変換は同じです。元データのindexを分割後も使うには、変換したdatasetを`NewSubset`へ渡します。逆順に包むと、変換のindexはsubset内の位置になります。wrapperはfingerprintや変換の状態を保存しません。元データ、分割、seed、変換の種類・version・設定はアプリ側のcheckpoint metadataで照合してください。
 
-`cmd/cnn-train`のIDX経路は`-augment`指定時だけ、学習画像に確率.5の水平反転を適用します。検証画像は変更しません。水平反転がラベルの意味を保つかはデータによるため、この設定は認識精度の改善を保証するものではありません。`cmd/audio-train`は共通のノイズ関数を使い、従来と同じPCGのseedとfloat32の式で入力を作ります。テストでは、worker数を変えた再開、epochをまたぐ読込、callback失敗後の再試行、元データが変わらないことを厳密に比較します。
+`cmd/cnn-train`のIDX経路は`-augment`指定時だけ、学習画像に横反転（確率.5）・縦反転（確率.3）・ガウスノイズ（std .02）の合成変換を適用します。検証画像は変更しません。反転がラベルの意味を保つかはデータによるため、この設定は認識精度の改善を保証するものではありません。`cmd/audio-train`は共通のノイズ関数を使い、従来と同じPCGのseedとfloat32の式で入力を作ります。テストでは、worker数を変えた再開、epochをまたぐ読込、callback失敗後の再試行、元データが変わらないことを厳密に比較します。
 
 ### WAV音声とaugmentation
 

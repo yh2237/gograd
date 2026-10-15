@@ -236,10 +236,12 @@ CUDA streamや自動GCによるグラフ管理まで完了した扱いにはし�
   CSVの標準化・回帰例とWAVのdenoise例も実装済み。大規模な実データでの品質・メモリ検証は別途必要。
 - [x] seed/index固定の基本augmentationとworker・再開での再現性検証。
   `TransformDataset`の借用メモリ・並行呼出し・subset index・metadataの責任を文書化。
-  水平反転のshape/確率検証とuint64 seed API、ノイズの有限性/overflow検証を追加。
+  水平反転・垂直反転のshape/確率検証とuint64 seed API、ノイズの有限性/overflow検証を追加。
+  `TransformDataset`へ横反転・縦反転・ガウスノイズの合成変換をcnn-train real経路（`-augment`）で適用。
   音声例も共通ノイズ関数へ移し、元の式との厳密一致をテストする。
   2026-10-16: 全packageのCGO_ENABLED=0 build/testとvet、data/audio/cnnのLinux race・386を通過。
   音声300更新のCPU基準値4.8665→15.0490 dBとreload差分0を維持。
+  複数変換の合成をworker・再開下で厳密再現性検証済み。
   epochごとの変換変更や、複数変換の独立した乱数系列の指定は未実装。
 - [ ] Optimizer共通API、parameter groups、SGD/momentumなどAdamW以外の選択肢。
   共通API、SGD/momentum、parameter groups は実装済み。次のoptimizer拡張は必要になった時点で追加する。

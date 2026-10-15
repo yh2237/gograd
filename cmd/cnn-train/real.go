@@ -90,7 +90,15 @@ func trainReal(device tensor.Device, steps, trainLimit, validLimit int, imagesPa
 			return sample, nil
 		}
 		out := data.FloatSample{Values: append([]float32(nil), sample.Values...), Label: sample.Label, Shape: append([]int(nil), sample.Shape...)}
+		// 学習画像だけに変換を適用。横反転・縦反転・ガウスノイズを index/seed に
+		// より決定的に適用し、worker 数や読込順に依存させない。
 		if err := data.RandomHorizontalFlipFloat32(out.Values, 1, h, w, seed, index, .5); err != nil {
+			return data.FloatSample{}, err
+		}
+		if err := data.RandomVerticalFlipFloat32(out.Values, 1, h, w, seed, index, .3); err != nil {
+			return data.FloatSample{}, err
+		}
+		if err := data.AddGaussianNoiseFloat32(out.Values, seed, index, .02); err != nil {
 			return data.FloatSample{}, err
 		}
 		return out, nil

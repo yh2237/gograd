@@ -322,3 +322,179 @@ func TestTransformBeforeSubsetPreservesOriginalIndex(t *testing.T) {
 		}
 	}
 }
+
+func TestVerticalFlipPlanes(t *testing.T) {
+	// 2 channels x 2 height x 3 width.
+	values := []float32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	want := []float32{4, 5, 6, 1, 2, 3, 10, 11, 12, 7, 8, 9}
+	if err := FlipsVerticallyFloat32(values, 2, 2, 3); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(values, want) {
+		t.Fatalf("flipped %v, want %v", values, want)
+	}
+	// Double flip restores.
+	if err := FlipsVerticallyFloat32(values, 2, 2, 3); err != nil {
+		t.Fatal(err)
+	}
+	original := []float32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	if !slices.Equal(values, original) {
+		t.Fatal("double flip changed image")
+	}
+	// Height-one flip is a no-op.
+	one := []float32{1, 2, 3}
+	if err := FlipsVerticallyFloat32(one, 1, 1, 3); err != nil || !slices.Equal(one, []float32{1, 2, 3}) {
+		t.Fatal("height-one flip changed image", err)
+	}
+	// 1 channel x 2 height x 3 width.
+	two := []float32{1, 2, 3, 4, 5, 6}
+	if err := FlipsVerticallyFloat32(two, 1, 2, 3); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(two, []float32{4, 5, 6, 1, 2, 3}) {
+		t.Fatal("height-two flip incorrect")
+	}
+}
+
+func TestRandomVerticalFlipUsesFullSeed(t *testing.T) {
+	original := []float32{1, 2, 3, 4}
+	seed := uint64(1)<<63 | 23
+	for _, probability := range []float64{0, .5, 1} {
+		for index := 0; index < 20; index++ {
+			values := slices.Clone(original)
+			want := slices.Clone(original)
+			rng := randv2.New(randv2.NewPCG(seed, uint64(index)*2+0x9e3779b97f4a7c15))
+			if rng.Float64() < probability {
+				want = []float32{3, 4, 1, 2}
+			}
+			if err := RandomVerticalFlipFloat32(values, 1, 2, 2, seed, index, probability); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(values, want) {
+				t.Fatalf("seed=%d index=%d p=%g: %v != %v", seed, index, probability, values, want)
+			}
+		}
+	}
+	// Horizontal and vertical flips must not interfere.
+	hv := slices.Clone(original)
+	if err := RandomHorizontalFlipFloat32(hv, 1, 2, 2, seed, 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := RandomVerticalFlipFloat32(hv, 1, 2, 2, seed, 0, 1); err != nil || !slices.Equal(hv, []float32{4, 3, 2, 1}) {
+		t.Fatal("combined horizontal+vertical flip incorrect", hv)
+	}
+}
+
+func TestMultiTransformChainRejectsInvalidInputs(t *testing.T) {
+	// Invalid shapes/std are rejected without mutating input.
+	badFlip := []float32{1, 2, 3}
+	wantFlip := slices.Clone(badFlip)
+	if err := RandomHorizontalFlipFloat32(badFlip, 1, 2, 1, 7, 0, .5); err == nil || !slices.Equal(badFlip, wantFlip) {
+		t.Fatal("invalid flip shape accepted or mutated", err)
+	}
+	badNoise := []float32{1, 2, 3}
+	wantNoise := slices.Clone(badNoise)
+	if err := AddGaussianNoiseFloat32(badNoise, 7, 0, -.1); err == nil || !slices.Equal(badNoise, wantNoise) {
+		t.Fatal("negative noise std accepted or mutated", err)
+	}
+	// TransformDataset propagates Apply errors.
+	dataset := TransformDataset[FloatSample]{Base: SliceDataset[FloatSample]{{Values: []float32{1, 2, 3}, Shape: []int{1, 1, 3}, Label: 0}}, Seed: 7, Apply: func(index int, seed uint64, sample FloatSample) (FloatSample, error) {
+		out := FloatSample{Values: slices.Clone(sample.Values), Shape: slices.Clone(sample.Shape), Label: sample.Label}
+		if err := RandomHorizontalFlipFloat32(out.Values, 1, 2, 1, seed, index, .5); err != nil {
+			return out, err
+		}
+		return out, nil
+	}}
+	if _, err := dataset.Get(context.Background(), 0); err == nil {
+		t.Fatal("invalid transform accepted")
+	}
+}
+
+func TestMultiTransformWorkerResumeDeterminism(t *testing.T) {
+	base := make(SliceDataset[FloatSample], 13)
+	for i := range base {
+		base[i] = FloatSample{Values: []float32{float32(i), float32(i + 1), float32(i + 2)}, Shape: []int{1, 1, 3}, Label: i % 2}
+	}
+	original := make(SliceDataset[FloatSample], len(base))
+	for i, sample := range base {
+		original[i] = FloatSample{Values: slices.Clone(sample.Values), Shape: slices.Clone(sample.Shape), Label: sample.Label}
+	}
+	seed := uint64(1)<<63 | 11
+	dataset := TransformDataset[FloatSample]{Base: base, Seed: seed, Apply: func(index int, seed uint64, sample FloatSample) (FloatSample, error) {
+		out := FloatSample{Values: slices.Clone(sample.Values), Shape: slices.Clone(sample.Shape), Label: sample.Label}
+		if err := RandomHorizontalFlipFloat32(out.Values, 1, 1, 3, seed, index, .5); err != nil {
+			return FloatSample{}, err
+		}
+		if err := RandomVerticalFlipFloat32(out.Values, 1, 1, 3, seed, index, .3); err != nil {
+			return FloatSample{}, err
+		}
+		if err := AddGaussianNoiseFloat32(out.Values, seed, index, .05); err != nil {
+			return FloatSample{}, err
+		}
+		return out, nil
+	}}
+	newLoader := func(t *testing.T, workers int) *Loader[FloatSample, FloatBatch] {
+		t.Helper()
+		sampler, err := NewIndexSampler(len(base), SamplerOptions{Shuffle: true, Seed: 19})
+		if err != nil {
+			t.Fatal(err)
+		}
+		loader, err := NewLoader[FloatSample, FloatBatch](dataset, sampler, Stack, LoaderOptions{BatchSize: 3, Workers: workers})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { loader.Close() })
+		return loader
+	}
+	ctx := context.Background()
+	for _, workers := range []int{0, 2} {
+		t.Run(fmt.Sprint(workers), func(t *testing.T) {
+			baseline := newLoader(t, 0)
+			interrupted := newLoader(t, workers)
+			// Two batches from baseline and interrupted must match exactly.
+			for i := 0; i < 2; i++ {
+				want, err := baseline.Next(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := interrupted.Next(ctx)
+				if err != nil || !reflect.DeepEqual(want, got) {
+					t.Fatal("worker count changed multi-transform batch", err)
+				}
+			}
+			state, err := interrupted.State()
+			if err != nil {
+				t.Fatal(err)
+			}
+			restored := newLoader(t, (workers+1)%3)
+			if err := restored.LoadState(state); err != nil {
+				t.Fatal(err)
+			}
+			// Resume reproduces baseline exactly across an epoch boundary.
+			for epoch := 0; epoch < 2; epoch++ {
+				for {
+					want, e1 := baseline.Next(ctx)
+					got, e2 := restored.Next(ctx)
+					if !errors.Is(e1, e2) || !reflect.DeepEqual(want, got) {
+						t.Fatal("resume changed multi-transform augmentation/order", e1, e2)
+					}
+					if e1 == io.EOF {
+						break
+					}
+					if e1 != nil {
+						t.Fatal(e1)
+					}
+				}
+				if err := baseline.NextEpoch(); err != nil {
+					t.Fatal(err)
+				}
+				if err := restored.NextEpoch(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+	if !reflect.DeepEqual(base, original) {
+		t.Fatal("multi-transform augmentation mutated borrowed dataset memory")
+	}
+}
