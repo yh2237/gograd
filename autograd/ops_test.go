@@ -102,3 +102,16 @@ func TestModuleStateDict(t *testing.T) {
 		t.Fatal("expected state mismatch")
 	}
 }
+
+func closeValues(t *testing.T, name string, got, want []float32, tol float64) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s length %d != %d", name, len(got), len(want))
+	}
+	for i := range got {
+		d := math.Abs(float64(got[i] - want[i]))
+		if d > tol+tol*math.Abs(float64(want[i])) {
+			t.Fatalf("%s[%d]: got %.9g want %.9g", name, i, got[i], want[i])
+		}
+	}
+}

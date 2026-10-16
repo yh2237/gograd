@@ -216,7 +216,10 @@ CUDA streamや自動GCによるグラフ管理まで完了した扱いにはし�
 - [ ] ConvTranspose、1D/2Dのgrouped convolutionなどを汎用自動微分経路に揃える。
 - [ ] RMSNorm、RoPE、SwiGLU、GQA、causal/cross attentionなどの再利用性を改善。
 - [ ] RNN/LSTM/GRUなどは必要な用途ができた時点で追加する。
-- [ ] `nn`/`gputcn`/モデル専用経路との重複を、互換性を維持しながら整理。
+- [ ] `nn`との重複を、互換性を維持しながら整理。
+  2026-10-17: UtauTTS専用の部分（ルートのfloat64 TCN、`gputcn`、`Acoustic`、`SpeechTiming`、関連cmd）と
+  モデルの推論（`kokoro`、`hubert`、`irodori`）を外した。kokoro・hubert・SpeechTimingはUtauTTSへ移動。
+  AcousticとSpeechTimingの定義は、CUDAグラフ・可変長メモリ・safetensorsメタデータの試験用にテストへ残した。
 
 **到達点:** MLP、一般的なCNN、時系列ネットワーク、Transformerの小規模モデルを
 モデル専用の数値処理なしで構築・学習できる。
@@ -338,6 +341,8 @@ Irodoriなど個別のアプリケーションで未検証のrelease gateは、�
 ## 次の作業と更新方法
 
 ### 保留（2026-10-11）: UtauTTS向けIrodori F0推論
+
+2026-10-17: 推論時にIrodoriを動かす案は見送り、`irodori`パッケージと`cmd/irodori-infer`は削除した（gitの履歴に残る）。
 
 **保留中。** UtauTTSは推論時にIrodoriを動かす方針をやめ、Irodoriを教師にした抑揚モデル（v12）を
 作る方針に変えた（コストに対して効果が見合わない、ユーザー判断）。途中の実装はブランチ

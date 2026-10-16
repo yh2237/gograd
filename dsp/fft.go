@@ -1,7 +1,5 @@
-// Package dsp holds the signal-processing primitives the Irodori reference
-// needs but that are not specific to it: a power-of-two complex FFT, the
-// periodic Hann window, the magnitude/phase STFT the watermark works in, and a
-// polyphase resampler.
+// Package dsp holds signal-processing primitives: a power-of-two complex FFT,
+// the periodic Hann window, a magnitude/phase STFT, and a polyphase resampler.
 //
 // All of these mirror PyTorch and torchaudio behaviour rather than a textbook
 // ideal, because they exist to reproduce a reference pipeline bit for bit. The

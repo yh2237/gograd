@@ -28,7 +28,7 @@ warpのreductionはsoftmaxのforwardとbackwardを融合します。実体化す
 
 ## モジュールと学習
 
-`Acoustic`はグラフで構成した最初のモデルです。パラメータ名はPyTorchの参照と一致し、小さなfixtureが全ての勾配を確認します。`Module`は順序付きの名前付きパラメータ、バッファ、子を登録し、`StateDict`、`LoadStateDict`、`SaveSafeTensors`、`LoadSafeTensors`を提供します。F32のsafetensorsのloaderは、重みを変える前に名前、形状、オフセット、バイト長を検証します。train/evalの伝播、deviceとdtypeの移動、checkpointの原子的な書き込み、optimizerのstateの直列化も備えます。再利用できるEmbedding、Conv1d、LayerNorm、Linear、Dropout、GELUの層は、通常のstructと子の`Module`ノードでモデルを構成します。`Train(false)`は検証のためにdropoutを無効にします。
+`Module`は順序付きの名前付きパラメータ、バッファ、子を登録し、`StateDict`、`LoadStateDict`、`SaveSafeTensors`、`LoadSafeTensors`を提供します。F32のsafetensorsのloaderは、重みを変える前に名前、形状、オフセット、バイト長を検証します。train/evalの伝播、deviceとdtypeの移動、checkpointの原子的な書き込み、optimizerのstateの直列化も備えます。再利用できるEmbedding、Conv1d、LayerNorm、Linear、Dropout、GELUの層は、通常のstructと子の`Module`ノードでモデルを構成します。`Train(false)`は検証のためにdropoutを無効にします。
 
 パラメータはグラフの末端で、学習しないrunning統計はバッファです。名前は安定したドット区切りのパスで、重複する別名は1度だけ保存します。
 

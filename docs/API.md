@@ -7,8 +7,6 @@ gogradの学習で使う公開APIの一覧です。学習checkpointは`safetenso
 | パッケージ | API | 役割 |
 | --- | --- | --- |
 | `torchpth` | `Read` | PyTorch zip形式のtensorとstate_dictをfloat32で読み込みます。 |
-| `hubert` | `Load`、`Model.Features`、`Model.Close` | safetensorsのHuBERT Baseを読み込み、指定したencoder層の音声特徴を返します。 |
-| `kokoro` | `Load`、`LoadVoice`、`Model.Tokens`、`Model.Synthesize`、`Model.SynthesizeWithDurations` | Kokoro-82Mのチェックポイントとvoice packを読み込み、24 kHz音声、duration、F0を返します。durationを指定して合成することもできます。 |
 | `tensor` | `Device`、`CPU`、`CUDA` | テンソルやモデルを構築するときにバックエンドを選びます。 |
 | `autograd` | `NewCUDAContext`、`NewCUDAContextOn`、`CUDAContext.Device`、`CUDAContext.Close` | 学習ステップの間、呼び出したOSスレッドにCUDAコンテキストを保持します。deviceを選んで検証し、`Close`でそのスレッドの以前のdeviceを復元できます。 |
 | `autograd` | `New`、`Tensor.ToHost`、`Tensor.Backward`、`Tensor.ReleaseGraph`、`Tensor.Close` | float32テンソル、明示的な読み戻し、寿命の管理。 |
@@ -665,6 +663,6 @@ err = sampler.LoadState(state)
 
 - 一般のautogradの演算、CUDAグラフの記録、BF16 autocast、デバイスバッファのプール、opレジストリは実験的な位置づけです。deviceとdtypeの扱いはfloat32を中心に整えており、BF16は任意のシャドウバッファを使います。
 - 互換用の`NoGrad`スコープは、bindしていないテンソルが共有します。CPUで並行実行するには、別々の明示的コンテキストと独立したモデルstateを使います。bindしていないテンソルはプロセス共有のBF16・アテンション設定を使うため、このグローバル設定を並行して変更しないでください。明示的コンテキストはこれらの設定を持ちます。CUDAのstreamとcaptureの状態はOSスレッド単位で、各スレッドは自分のcuBLASハンドル、勾配クリップのプラン、プールのキャッシュを持ちます。割当プールはdeviceとstreamをキーにするため、`NewCUDAContextOn`のコンテキストを持つ独立したgoroutineは、暗黙のstream、capture、device、再利用するバッファを互いに共有しません。1回の記録の中での複数のstreamの重ね合わせと、複数deviceを1つの実行コンテキストで扱うことには対応していません。
-- 統合checkpointはAdamWまたはSGDのoptimizerとOneCycleのstateを復元します。旧`nn`/`gputcn`の学習器は、これまでどおりのcheckpointの経路を使います。サンプリングはホストで行い、`data`パッケージはprefetchを任意で備えた汎用のloaderを別に提供します。
+- 統合checkpointはAdamWまたはSGDのoptimizerとOneCycleのstateを復元します。旧`nn`の学習器は、これまでどおりのcheckpointの経路を使います。サンプリングはホストで行い、`data`パッケージはprefetchを任意で備えた汎用のloaderを別に提供します。
 - safetensorsの書き込みは、同じディレクトリの一時ファイル、sync、renameを使います。読込は不正またはオーバーフローする形状、重複する範囲、16 MiBを超えるヘッダを拒否します。ファイル全体をメモリに読み込むため、ファイルサイズの上限はありません。deviceへの転送の失敗は、検証済みの読込を途中で止めることがあります。
 - GoとPyTorchの学習は、サンプリング、初期化、dropoutに別々の乱数ストリームを使います。演算ごとの照合には初期重みを固定し、明示的なdropoutマスクを使います。学習全体の検証は、同じ軌跡ではなく、測定した品質で比較します。

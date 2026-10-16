@@ -1,16 +1,21 @@
 package autograd
 
 import (
+	encodingbinary "encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
+	"testing"
 
 	"github.com/yh2237/gograd/tensor"
 )
 
 var SpeechTimingDilations = []int{1, 2, 4, 8, 1, 2, 4, 8}
 
-// SpeechTiming composes the UtauTTS Target model. Activations use [batch,time,channel].
-// Its Module emits the exact PyTorch state_dict names expected by LoadTCN.
+// SpeechTiming is a dilated TCN used to exercise variable-length CUDA training.
+// Activations use [batch,time,channel].
 type SpeechTiming struct {
 	Module        Module
 	Phone         *EmbeddingLayer
@@ -22,7 +27,7 @@ type SpeechTiming struct {
 	Continuous    int
 }
 
-// NewSpeechTiming builds the UtauTTS Target model with the original 40-phone vocabulary.
+// NewSpeechTiming builds the model with a 40-phone vocabulary.
 func NewSpeechTiming(continuous int, device tensor.Device, seed int64) (*SpeechTiming, error) {
 	return NewSpeechTimingWithPhones(40, continuous, device, seed)
 }
@@ -225,4 +230,46 @@ func (m *SpeechTimingMultiHead) Forward(ids []int, cont, f0Cont *Tensor, seed ui
 		g = Add(g, y)
 	}
 	return mel, m.F0Output.Forward(g), m.EnergyOutput.Forward(g)
+}
+
+func TestSaveSafeTensorsMetadata(t *testing.T) {
+	m, e := NewSpeechTiming(4, tensor.CPU, 0)
+	if e != nil {
+		t.Fatal(e)
+	}
+	path := filepath.Join(t.TempDir(), "model.safetensors")
+	meta := map[string]string{"format": "speech-timing-tcn-1", "phones": "<pad> <unk>"}
+	if e = m.Module.SaveSafeTensorsMetadata(path, meta); e != nil {
+		t.Fatal(e)
+	}
+	data, e := os.ReadFile(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	hlen := encodingbinary.LittleEndian.Uint64(data[:8])
+	var header map[string]json.RawMessage
+	if e = json.Unmarshal(data[8:8+hlen], &header); e != nil {
+		t.Fatal(e)
+	}
+	if len(header) != 38 {
+		t.Fatalf("checkpoint entries %d, want 37 tensors plus metadata", len(header))
+	}
+	var got map[string]string
+	if e = json.Unmarshal(header["__metadata__"], &got); e != nil {
+		t.Fatal(e)
+	}
+	if got["format"] != meta["format"] {
+		t.Fatalf("format %q", got["format"])
+	}
+	n, e := NewSpeechTiming(4, tensor.CPU, 1)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = n.Module.LoadSafeTensors(path); e != nil {
+		t.Fatal(e)
+	}
+	loaded := n.Module.StateDict()
+	for name, values := range m.Module.StateDict() {
+		closeValues(t, name, loaded[name], values, 0)
+	}
 }

@@ -5,7 +5,7 @@ import (
 	"github.com/yh2237/gograd/tensor"
 )
 
-// Acoustic is the frame acoustic model from the UtauTTS training reference.
+// Acoustic is a frame acoustic model used to exercise CUDA graph capture.
 // Convolution tensors use [batch,time,channels] internally.
 type Acoustic struct {
 	Params                            []Parameter
