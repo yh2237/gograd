@@ -4,6 +4,8 @@ Goで書いた逆伝播の自動微分ライブラリです。参照エンジン
 
 ## 概要
 
+`torchpth`はPyTorchのzip形式チェックポイントを読み込みます。`hubert`はHuBERT Baseの16 kHz音声特徴をCPUで計算し、`kokoro`はKokoro-82Mの24 kHz音声をCPUで合成します。推論時にPythonは不要です。
+
 参照エンジンはCPUのfloat64で実装し、TCNとその損失に必要な演算を持ちます。
 
 - `Linear`、`tanh`、要素ごとの加算・減算・スケール、`clamp`
@@ -20,6 +22,8 @@ Goで書いた逆伝播の自動微分ライブラリです。参照エンジン
 `ExecutionContext`は入力とモジュールのstateを明示的な勾配記録スコープに関連付けます。NoGradは入れ子になり、panic後も復帰します。独立したCPUモデルは、互いのグラフを止めずに学習と推論を並行して実行できます。`cmd/cnn-train`はパラメータと入力のバインド、checkpointの再読込を示します。各コンテキストはBF16 autocastとアテンション選択の`ExecutionOptions`を持ち、既定はFP32と`auto`です。`execution.Autocast`は精度を局所的に切り替え、backwardはforward時に選んだ方針をscopeの終了後やオプション変更後も保ちます。
 
 `data`パッケージは、汎用のDataset、indexのサンプリング、ホスト側のcollateを分離します。Loaderはseed付きshuffle、subset/split、パディング付き系列、有効値マスク、epoch途中のcheckpoint状態に対応します。任意のworkerと上限付きprefetchはバッチ順を保ち、checkpointには受け渡し済みのサンプルだけを記録します。worker 0では同期読込になります。数値のCSVテーブルと直列化できる特徴量標準化で回帰のデータを扱います。非圧縮WAVの読み書きは音声を扱い、例ではフレーム化とaugmentationをアプリ側に置き、サンプルごとに決まるノイズを使います。`cmd/mnist-train`はraw/gzipのMNIST IDXを読み、MLPをCPU/CUDAで学習・評価し、推論用の重みを保存し、model/AdamW/OneCycleとデータ順をPythonなしで再開します。`cmd/tabular-train`は数値CSVを読み（または生成し）、学習データの統計で特徴量を標準化し、同じ状態で再開します。`cmd/audio-train`はWAVを読み（または生成し）、indexから決まるノイズでwindowをaugmentし、denoiseモデルを同じ重みで再開します。
+
+`data.TransformDataset`はsampleのindexとseedを変換関数へ渡します。水平反転とガウスノイズの共通関数は、worker数や読込順が変わっても同じ入力を再現します。借用スライスのコピーと並行呼出しへの対応は変換関数側の責任です。変換の設定とseedはアプリ側のcheckpoint metadataで管理します。詳細は[augmentationの説明](docs/API.md#再現可能なaugmentation)にあります。
 
 テンソルとviewのストレージはallocation leaseで共有します。ベースをcloseしたり、あるグラフの枝をreleaseしても、別の依存がまだ必要とする値は保持します。`RetainData`は値を固定し、`BackwardWithOptions`は複数の損失のために履歴を明示的に保持します。履歴が終わると保存したstateはプールへ戻ります。inputとパラメータの管理された変更はbackwardの前にversionを検証します。
 

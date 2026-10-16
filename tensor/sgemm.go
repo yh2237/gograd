@@ -12,6 +12,42 @@ var sgemmPools sync.Map
 // variable to 0 to retain the 4x8 fallback for diagnosis.
 var use8x8 = useAVX2FMA && os.Getenv("GOGRAD_SGEMM_8X8") != "0"
 
+type PackedB struct {
+	data []float32
+	n, k int
+}
+
+func PackB(b []float32, n, k int, transB bool) *PackedB {
+	if len(b) != n*k {
+		panic("tensor: SGEMM shape mismatch")
+	}
+	nr := 4
+	if useAVX2FMA {
+		nr = 8
+	}
+	groups := (n + nr - 1) / nr
+	packed := &PackedB{data: make([]float32, groups*k*nr), n: n, k: k}
+	for group := 0; group < groups; group++ {
+		column := group * nr
+		width := min(n-column, nr)
+		panel := packed.data[group*k*nr : (group+1)*k*nr]
+		for depth := 0; depth < k; depth++ {
+			if transB {
+				for offset := 0; offset < width; offset++ {
+					panel[depth*nr+offset] = b[(column+offset)*k+depth]
+				}
+			} else {
+				copy(panel[depth*nr:depth*nr+width], b[depth*n+column:depth*n+column+width])
+			}
+		}
+	}
+	return packed
+}
+
+func SGEMMPacked(c, a []float32, b *PackedB, m, maxWorkers int) {
+	sgemmOpWorkers(c, a, nil, m, b.n, b.k, false, false, maxWorkers, b)
+}
+
 func sgemmBuffer(n int) []float32 {
 	p, _ := sgemmPools.LoadOrStore(n, &sync.Pool{})
 	if v := p.(*sync.Pool).Get(); v != nil {
@@ -38,7 +74,11 @@ func SGEMMOp(c, a, b []float32, m, n, k int, transA, transB bool) {
 // SGEMMOpWorkers caps internal row parallelism, useful when independent batch
 // matrices are already processed by outer workers.
 func SGEMMOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWorkers int) {
-	if len(a) != m*k || len(b) != k*n || len(c) != m*n {
+	sgemmOpWorkers(c, a, b, m, n, k, transA, transB, maxWorkers, nil)
+}
+
+func sgemmOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWorkers int, packed *PackedB) {
+	if len(a) != m*k || (packed == nil && len(b) != k*n) || len(c) != m*n {
 		panic("tensor: SGEMM shape mismatch")
 	}
 	if m == 0 || n == 0 {
@@ -62,9 +102,14 @@ func SGEMMOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 		}
 	}
 	groups := (n + nr - 1) / nr
-	bp := sgemmBuffer(groups * k * nr)
-	defer releaseSGEMMBuffer(bp)
-	for g := 0; g < groups; g++ {
+	var bp []float32
+	if packed != nil {
+		bp = packed.data
+	} else {
+		bp = sgemmBuffer(groups * k * nr)
+		defer releaseSGEMMBuffer(bp)
+	}
+	for g := 0; g < groups && packed == nil; g++ {
 		j := g * nr
 		width := min(n-j, nr)
 		panel := bp[g*k*nr : (g+1)*k*nr]
