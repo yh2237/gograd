@@ -133,6 +133,8 @@ func sgemmOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 			defer wg.Done()
 			ap := sgemmBuffer(mc * kc)
 			defer releaseSGEMMBuffer(ap)
+			// 端の小さなブロックも、一時領域でAVXのカーネルを使う。余った行と列の結果は捨てる。
+			var edge [64]float32
 			for row := range jobs {
 				end := min(row+mc, m)
 				for depth := 0; depth < k; depth += kc {
@@ -140,12 +142,15 @@ func sgemmOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 					for i := row; i < end; i += mr {
 						height := min(mr, end-i)
 						panel := ap[(i-row)*kc : (i-row+mr)*kc]
-						for d := 0; d < nk; d++ {
+						if transA {
+							for d := 0; d < nk; d++ {
+								copy(panel[d*mr:d*mr+height], a[(depth+d)*m+i:(depth+d)*m+i+height])
+							}
+						} else {
 							for r := 0; r < height; r++ {
-								if transA {
-									panel[d*mr+r] = a[(depth+d)*m+i+r]
-								} else {
-									panel[d*mr+r] = a[(i+r)*k+depth+d]
+								source := a[(i+r)*k+depth : (i+r)*k+depth+nk]
+								for d, v := range source {
+									panel[d*mr+r] = v
 								}
 							}
 						}
@@ -166,6 +171,16 @@ func sgemmOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 									}
 								} else {
 									kernel4x4(c, aa, bb, i*n+j, n, nk, depth != 0)
+								}
+							} else if useAVX2FMA && use8x8 {
+								if depth != 0 {
+									for r := 0; r < height; r++ {
+										copy(edge[r*nr:r*nr+width], c[(i+r)*n+j:(i+r)*n+j+width])
+									}
+								}
+								kernel8x8AVX(&edge[0], &aa[0], &bb[0], nr, nk, depth != 0)
+								for r := 0; r < height; r++ {
+									copy(c[(i+r)*n+j:(i+r)*n+j+width], edge[r*nr:r*nr+width])
 								}
 							} else {
 								for r := 0; r < height; r++ {
