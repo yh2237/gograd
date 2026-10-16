@@ -352,7 +352,24 @@ func (m *Model) convT(x []float32, t, in, out, kernel, stride, pad, outPad, grou
 }
 
 func (m *Model) Synthesize(phonemes string, voice *Voice, speed float32, rng *torchrng.Generator) (Result, error) {
-	if voice == nil || rng == nil || speed <= 0 {
+	if speed <= 0 {
+		return Result{}, fmt.Errorf("kokoro: invalid synthesis arguments")
+	}
+	return m.synthesizePhonemes(phonemes, voice, speed, nil, rng)
+}
+
+// SynthesizeWithDurationsは、入力記号ごとの長さ（先頭と末尾の0を含む、600サンプル単位）を指定して合成する。
+func (m *Model) SynthesizeWithDurations(phonemes string, voice *Voice, durations []int, rng *torchrng.Generator) (Result, error) {
+	for _, d := range durations {
+		if d < 1 {
+			return Result{}, fmt.Errorf("kokoro: durations must be positive")
+		}
+	}
+	return m.synthesizePhonemes(phonemes, voice, 1, durations, rng)
+}
+
+func (m *Model) synthesizePhonemes(phonemes string, voice *Voice, speed float32, durations []int, rng *torchrng.Generator) (Result, error) {
+	if voice == nil || rng == nil {
 		return Result{}, fmt.Errorf("kokoro: invalid synthesis arguments")
 	}
 	m.mu.Lock()
@@ -367,23 +384,32 @@ func (m *Model) Synthesize(phonemes string, voice *Voice, speed float32, rng *to
 	}
 	ref := voice.data[(len(runes)-1)*256 : len(runes)*256]
 	ids = append(append([]int{0}, ids...), 0)
-	return m.synthesize(ids, ref, speed, rng)
+	if durations != nil && len(durations) != len(ids) {
+		return Result{}, fmt.Errorf("kokoro: %d durations for %d tokens", len(durations), len(ids))
+	}
+	return m.synthesize(ids, ref, speed, durations, rng)
 }
-func (m *Model) synthesize(ids []int, ref []float32, speed float32, rng *torchrng.Generator) (Result, error) {
+
+func (m *Model) synthesize(ids []int, ref []float32, speed float32, durations []int, rng *torchrng.Generator) (Result, error) {
 	bert := m.albert(ids)
 	dEn := m.linear(bert, len(ids), 768, 512, "bert_encoder")
 	d := m.durationEncoder(dEn, ref[128:])
-	x := m.biLSTM(d, len(ids), 640, 256, "predictor.lstm")
-	durLogits := m.linear(x, len(ids), 512, 50, "predictor.duration_proj.linear_layer")
-	dur := make([]int, len(ids))
-	total := 0
-	for i := range dur {
-		var sum float32
-		for _, v := range durLogits[i*50 : (i+1)*50] {
-			sum += sigmoid(v)
+	dur := append([]int(nil), durations...)
+	if dur == nil {
+		x := m.biLSTM(d, len(ids), 640, 256, "predictor.lstm")
+		durLogits := m.linear(x, len(ids), 512, 50, "predictor.duration_proj.linear_layer")
+		dur = make([]int, len(ids))
+		for i := range dur {
+			var sum float32
+			for _, v := range durLogits[i*50 : (i+1)*50] {
+				sum += sigmoid(v)
+			}
+			dur[i] = max(1, int(math.RoundToEven(float64(sum/speed))))
 		}
-		dur[i] = max(1, int(math.RoundToEven(float64(sum/speed))))
-		total += dur[i]
+	}
+	total := 0
+	for _, n := range dur {
+		total += n
 	}
 	aligned := align(d, 640, dur, total)
 	var text []float32

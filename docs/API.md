@@ -8,7 +8,7 @@ gogradの学習で使う公開APIの一覧です。学習checkpointは`safetenso
 | --- | --- | --- |
 | `torchpth` | `Read` | PyTorch zip形式のtensorとstate_dictをfloat32で読み込みます。 |
 | `hubert` | `Load`、`Model.Features`、`Model.Close` | safetensorsのHuBERT Baseを読み込み、指定したencoder層の音声特徴を返します。 |
-| `kokoro` | `Load`、`LoadVoice`、`Model.Tokens`、`Model.Synthesize` | Kokoro-82Mのチェックポイントとvoice packを読み込み、24 kHz音声、duration、F0を返します。 |
+| `kokoro` | `Load`、`LoadVoice`、`Model.Tokens`、`Model.Synthesize`、`Model.SynthesizeWithDurations` | Kokoro-82Mのチェックポイントとvoice packを読み込み、24 kHz音声、duration、F0を返します。durationを指定して合成することもできます。 |
 | `tensor` | `Device`、`CPU`、`CUDA` | テンソルやモデルを構築するときにバックエンドを選びます。 |
 | `autograd` | `NewCUDAContext`、`NewCUDAContextOn`、`CUDAContext.Device`、`CUDAContext.Close` | 学習ステップの間、呼び出したOSスレッドにCUDAコンテキストを保持します。deviceを選んで検証し、`Close`でそのスレッドの以前のdeviceを復元できます。 |
 | `autograd` | `New`、`Tensor.ToHost`、`Tensor.Backward`、`Tensor.ReleaseGraph`、`Tensor.Close` | float32テンソル、明示的な読み戻し、寿命の管理。 |

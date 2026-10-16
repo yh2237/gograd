@@ -135,3 +135,48 @@ func BenchmarkSynthesize(b *testing.B) {
 		}
 	}
 }
+
+func TestSynthesizeWithDurationsMatchesPredicted(t *testing.T) {
+	pth := os.Getenv("KOKORO_PTH")
+	voicePath := os.Getenv("KOKORO_VOICE")
+	if pth == "" || voicePath == "" {
+		t.Skip("set KOKORO_PTH and KOKORO_VOICE")
+	}
+	m, e := Load(pth, filepath.Join(filepath.Dir(pth), "config.json"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	voice, e := LoadVoice(voicePath)
+	if e != nil {
+		t.Fatal(e)
+	}
+	phonemes := "hˈɛloʊ wˈɜɹld."
+	predicted, e := m.Synthesize(phonemes, voice, 1, torchrng.New(7))
+	if e != nil {
+		t.Fatal(e)
+	}
+	forced, e := m.SynthesizeWithDurations(phonemes, voice, predicted.Durations, torchrng.New(7))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if len(forced.Audio) != len(predicted.Audio) || len(forced.F0) != len(predicted.F0) {
+		t.Fatalf("lengths audio %d/%d f0 %d/%d", len(forced.Audio), len(predicted.Audio), len(forced.F0), len(predicted.F0))
+	}
+	for i := range forced.Audio {
+		if forced.Audio[i] != predicted.Audio[i] {
+			t.Fatalf("audio differs at %d", i)
+		}
+	}
+	longer := append([]int(nil), predicted.Durations...)
+	longer[2] += 4
+	stretched, e := m.SynthesizeWithDurations(phonemes, voice, longer, torchrng.New(7))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if len(stretched.Audio) != len(predicted.Audio)+4*600 {
+		t.Fatalf("stretched audio %d samples, want %d", len(stretched.Audio), len(predicted.Audio)+4*600)
+	}
+	if _, e := m.SynthesizeWithDurations(phonemes, voice, longer[1:], torchrng.New(7)); e == nil {
+		t.Fatal("wrong duration count was accepted")
+	}
+}
