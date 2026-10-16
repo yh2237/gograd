@@ -4,6 +4,8 @@ Goで書いた逆伝播の自動微分ライブラリです。参照エンジン
 
 ## 概要
 
+`torchpth`はPyTorchのzip形式チェックポイントを読み込みます。`hubert`はHuBERT Baseの16 kHz音声特徴をCPUで計算し、`kokoro`はKokoro-82Mの24 kHz音声をCPUで合成します。推論時にPythonは不要です。
+
 参照エンジンはCPUのfloat64で実装し、TCNとその損失に必要な演算を持ちます。
 
 - `Linear`、`tanh`、要素ごとの加算・減算・スケール、`clamp`
