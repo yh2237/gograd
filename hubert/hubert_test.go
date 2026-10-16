@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"math"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -95,4 +96,51 @@ func TestTenSecondTiming(t *testing.T) {
 		t.Fatal(e)
 	}
 	t.Logf("10 s audio: %d frames, %s", len(features), time.Since(start))
+}
+
+func TestConcurrentFeaturesMatchSequential(t *testing.T) {
+	path := os.Getenv("HUBERT_SAFETENSORS")
+	if path == "" {
+		t.Skip("set HUBERT_SAFETENSORS")
+	}
+	m, e := Load(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer m.Close()
+	waves := make([][]float32, 4)
+	for w := range waves {
+		waves[w] = make([]float32, 16000+w*4000)
+		for i := range waves[w] {
+			v := float64(i)
+			waves[w][i] = float32(.1*math.Sin(v*(.011+.003*float64(w))) + .02*math.Cos(v*.002))
+		}
+	}
+	results := make([][][]float32, len(waves))
+	var wait sync.WaitGroup
+	for w := range waves {
+		wait.Go(func() {
+			var err error
+			if results[w], err = m.Features(waves[w], 6); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	wait.Wait()
+	for w, wave := range waves {
+		want, e := m.Features(wave, 6)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if len(results[w]) != len(want) {
+			t.Fatalf("wave %d: %d frames, want %d", w, len(results[w]), len(want))
+		}
+		for i := range want {
+			for j := range want[i] {
+				if results[w][i][j] != want[i][j] {
+					t.Fatalf("wave %d differs at frame %d", w, i)
+				}
+			}
+		}
+	}
 }

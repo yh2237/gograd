@@ -16,7 +16,9 @@ type Model struct {
 	convWeights [7][]float32
 	posWeights  []float32
 	packed      map[string]*tensor.PackedB
-	mu          sync.Mutex
+	// muはCloseとFeaturesを、cacheは読み込んだ重みと前処理した重みを守る。
+	mu    sync.RWMutex
+	cache sync.Mutex
 }
 
 func Load(path string) (*Model, error) {
@@ -28,6 +30,8 @@ func Load(path string) (*Model, error) {
 }
 func (m *Model) Close() error { m.mu.Lock(); defer m.mu.Unlock(); return m.file.Close() }
 func (m *Model) get(name string) ([]float32, error) {
+	m.cache.Lock()
+	defer m.cache.Unlock()
 	if x, ok := m.weights[name]; ok {
 		return x, nil
 	}
@@ -47,11 +51,13 @@ func (m *Model) linear(x []float32, rows, in, out int, prefix string) ([]float32
 		return nil, fmt.Errorf("hubert: %s weight shape", prefix)
 	}
 	y := make([]float32, rows*out)
+	m.cache.Lock()
 	packed := m.packed[prefix]
 	if packed == nil {
 		packed = tensor.PackB(w, out, in, true)
 		m.packed[prefix] = packed
 	}
+	m.cache.Unlock()
 	tensor.SGEMMPacked(y, x, packed, rows, 8)
 	b, e := m.get(prefix + ".bias")
 	if e != nil {
@@ -131,9 +137,10 @@ func applyGELU(values []float32) {
 }
 
 // Features returns hidden_states[layer] as contiguous [frames][768] rows.
+// Featuresは複数のgoroutineから同時に呼べる。
 func (m *Model) Features(wave []float32, layer int) ([][]float32, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if layer < 0 || layer > 12 {
 		return nil, fmt.Errorf("hubert: layer must be 0..12")
 	}
@@ -150,10 +157,13 @@ func (m *Model) Features(wave []float32, layer int) ([][]float32, error) {
 		if e != nil {
 			return nil, e
 		}
+		m.cache.Lock()
 		if m.convWeights[i] == nil {
 			m.convWeights[i] = flattenConv(w, ch, 512, kernels[i])
 		}
-		x, frames = conv(x, frames, ch, m.convWeights[i], 512, kernels[i], strides[i])
+		convWeights := m.convWeights[i]
+		m.cache.Unlock()
+		x, frames = conv(x, frames, ch, convWeights, 512, kernels[i], strides[i])
 		ch = 512
 		if i == 0 {
 			nw, e := m.get(base + ".layer_norm.weight")
@@ -304,35 +314,9 @@ func (m *Model) posConv(x []float32, n int) ([]float32, error) {
 	if len(v) != width*48*kernel {
 		return nil, fmt.Errorf("hubert: positional convolution shape")
 	}
-	if m.posWeights == nil {
-		w := make([]float32, len(v))
-		if len(g) == kernel {
-			for k := 0; k < kernel; k++ {
-				var sq float64
-				for i := k; i < len(v); i += kernel {
-					sq += float64(v[i]) * float64(v[i])
-				}
-				scale := float32(float64(g[k]) / math.Sqrt(sq))
-				for i := k; i < len(v); i += kernel {
-					w[i] = v[i] * scale
-				}
-			}
-		} else if len(g) == width {
-			for c := 0; c < width; c++ {
-				base := c * 48 * kernel
-				var sq float64
-				for _, z := range v[base : base+48*kernel] {
-					sq += float64(z) * float64(z)
-				}
-				scale := float32(float64(g[c]) / math.Sqrt(sq))
-				for j := 0; j < 48*kernel; j++ {
-					w[base+j] = v[base+j] * scale
-				}
-			}
-		} else {
-			return nil, fmt.Errorf("hubert: positional weight norm shape")
-		}
-		m.posWeights = w
+	posWeights, e := m.positionalWeights(v, g)
+	if e != nil {
+		return nil, e
 	}
 	y := make([]float32, n*width)
 	const depth = 48 * kernel
@@ -362,7 +346,7 @@ func (m *Model) posConv(x []float32, n int) ([]float32, error) {
 						}
 					}
 					blockOutput := z[:count*48]
-					tensor.SGEMMOpWorkers(blockOutput, a, m.posWeights[group*48*depth:(group+1)*48*depth], count, 48, depth, false, true, 1)
+					tensor.SGEMMOpWorkers(blockOutput, a, posWeights[group*48*depth:(group+1)*48*depth], count, 48, depth, false, true, 1)
 					for t := 0; t < count; t++ {
 						for c := 0; c < 48; c++ {
 							channel := group*48 + c
@@ -472,4 +456,42 @@ func (m *Model) encoderLayer(x []float32, n, index int) ([]float32, error) {
 	}
 	norm(x, nw, nb, n, width, 1e-5)
 	return x, nil
+}
+
+func (m *Model) positionalWeights(v, g []float32) ([]float32, error) {
+	const width = 768
+	const kernel = 128
+	m.cache.Lock()
+	defer m.cache.Unlock()
+	if m.posWeights == nil {
+		w := make([]float32, len(v))
+		if len(g) == kernel {
+			for k := 0; k < kernel; k++ {
+				var sq float64
+				for i := k; i < len(v); i += kernel {
+					sq += float64(v[i]) * float64(v[i])
+				}
+				scale := float32(float64(g[k]) / math.Sqrt(sq))
+				for i := k; i < len(v); i += kernel {
+					w[i] = v[i] * scale
+				}
+			}
+		} else if len(g) == width {
+			for c := 0; c < width; c++ {
+				base := c * 48 * kernel
+				var sq float64
+				for _, z := range v[base : base+48*kernel] {
+					sq += float64(z) * float64(z)
+				}
+				scale := float32(float64(g[c]) / math.Sqrt(sq))
+				for j := 0; j < 48*kernel; j++ {
+					w[base+j] = v[base+j] * scale
+				}
+			}
+		} else {
+			return nil, fmt.Errorf("hubert: positional weight norm shape")
+		}
+		m.posWeights = w
+	}
+	return m.posWeights, nil
 }
