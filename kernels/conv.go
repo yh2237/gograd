@@ -80,6 +80,33 @@ extern "C" __global__ void col2im1d(const float* col, float* dx, int batch, int 
 	}
 	dx[index] += sum;
 }
+extern "C" __global__ void im2col1d_stride(const float* x, float* col, int batch, int channels, int length, int kernel, int out_length, int stride, int padding, int dilation) {
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+	int per = channels * kernel;
+	if (index >= batch * out_length * per) return;
+	int ck = index % per;
+	int bt = index / per;
+	int at = bt % out_length;
+	int b = bt / out_length;
+	int src = at * stride - padding + (ck % kernel) * dilation;
+	col[index] = src >= 0 && src < length ? x[(b * length + src) * channels + ck / kernel] : 0.0f;
+}
+extern "C" __global__ void col2im1d_stride(const float* col, float* dx, int batch, int channels, int length, int kernel, int out_length, int stride, int padding, int dilation) {
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+	if (index >= batch * length * channels) return;
+	int c = index % channels;
+	int bt = index / channels;
+	int t = bt % length;
+	int b = bt / length;
+	float sum = 0.0f;
+	for (int tap = 0; tap < kernel; tap++) {
+		int at_times_stride = t + padding - tap * dilation;
+		if (at_times_stride < 0 || at_times_stride % stride != 0) continue;
+		int at = at_times_stride / stride;
+		if (at < out_length) sum += col[((b * out_length + at) * channels + c) * kernel + tap];
+	}
+	dx[index] += sum;
+}
 `
 
 type convKernelSet struct {
@@ -88,6 +115,8 @@ type convKernelSet struct {
 	toHBT            *cuda.Kernel
 	rowSum           *cuda.Kernel
 	col2im           *cuda.Kernel
+	im2colStride     *cuda.Kernel
+	col2imStride     *cuda.Kernel
 }
 
 var (
@@ -110,6 +139,8 @@ func convKernels() (*convKernelSet, error) {
 			"to_hbt":             &set.toHBT,
 			"row_sum":            &set.rowSum,
 			"col2im1d":           &set.col2im,
+			"im2col1d_stride":    &set.im2colStride,
+			"col2im1d_stride":    &set.col2imStride,
 		} {
 			kernel, err := program.Function(name)
 			if err != nil {
@@ -198,6 +229,30 @@ func Col2im(col, dx *cuda.Buffer, batch, channels, length, kernel, dilation int)
 	args := []unsafe.Pointer{unsafe.Pointer(&colAddr), unsafe.Pointer(&dxAddr),
 		unsafe.Pointer(&b), unsafe.Pointer(&c), unsafe.Pointer(&t), unsafe.Pointer(&k), unsafe.Pointer(&d)}
 	return set.col2im.Launch(elementGrid(batch*channels*length), [3]int{256, 1, 1}, 0, nil, args)
+}
+
+// Im2colStride gathers patches for an explicit stride, padding and dilation.
+func Im2colStride(x, col *cuda.Buffer, batch, channels, length, kernel, outLength, stride, padding, dilation int) error {
+	set, err := convKernels()
+	if err != nil {
+		return err
+	}
+	xAddr, colAddr := x.Pointer(), col.Pointer()
+	args := int32Args(int32(batch), int32(channels), int32(length), int32(kernel), int32(outLength), int32(stride), int32(padding), int32(dilation))
+	args = append([]unsafe.Pointer{unsafe.Pointer(&xAddr), unsafe.Pointer(&colAddr)}, args...)
+	return set.im2colStride.Launch(elementGrid(batch*channels*kernel*outLength), [3]int{256, 1, 1}, 0, nil, args)
+}
+
+// Col2imStride gathers patch gradients into the input gradient.
+func Col2imStride(col, dx *cuda.Buffer, batch, channels, length, kernel, outLength, stride, padding, dilation int) error {
+	set, err := convKernels()
+	if err != nil {
+		return err
+	}
+	colAddr, dxAddr := col.Pointer(), dx.Pointer()
+	args := int32Args(int32(batch), int32(channels), int32(length), int32(kernel), int32(outLength), int32(stride), int32(padding), int32(dilation))
+	args = append([]unsafe.Pointer{unsafe.Pointer(&colAddr), unsafe.Pointer(&dxAddr)}, args...)
+	return set.col2imStride.Launch(elementGrid(batch*channels*length), [3]int{256, 1, 1}, 0, nil, args)
 }
 
 // Conv1dForwardTo gathers time-major x [batch,length,channels] into columns

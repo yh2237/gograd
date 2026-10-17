@@ -46,6 +46,8 @@ type Conv1dLayer struct {
 	Module       Module
 	Weight, Bias *Tensor
 	Dilation     int
+	Stride       int
+	Padding      int
 }
 
 func NewConv1dLayer(in, out, kernel, dilation int, device tensor.Device, rng *rand.Rand) (*Conv1dLayer, error) {
@@ -67,9 +69,35 @@ func NewConv1dLayer(in, out, kernel, dilation int, device tensor.Device, rng *ra
 	l.Module.Parameters = []Parameter{{"weight", w}, {"bias", b}}
 	return l, nil
 }
-func (l *Conv1dLayer) StateModule() *Module      { return &l.Module }
-func (l *Conv1dLayer) Train(training bool)       { l.Module.Train(training) }
-func (l *Conv1dLayer) Forward(x *Tensor) *Tensor { return Conv1dGEMM(x, l.Weight, l.Bias, l.Dilation) }
+func (l *Conv1dLayer) StateModule() *Module { return &l.Module }
+func (l *Conv1dLayer) Train(training bool)  { l.Module.Train(training) }
+func (l *Conv1dLayer) Forward(x *Tensor) *Tensor {
+	if l.Stride == 0 {
+		return Conv1dGEMM(x, l.Weight, l.Bias, l.Dilation)
+	}
+	return Conv1dGEMMStride(x, l.Weight, l.Bias, l.Stride, l.Padding, l.Dilation)
+}
+
+// NewConv1dStrideLayer creates a convolution layer with explicit stride and padding.
+func NewConv1dStrideLayer(in, out, kernel, stride, padding, dilation int, device tensor.Device, rng *rand.Rand) (*Conv1dLayer, error) {
+	if in < 1 || out < 1 || kernel < 1 || stride < 1 || padding < 0 || dilation < 1 {
+		return nil, fmt.Errorf("autograd: invalid Conv1d dimensions")
+	}
+	bound := float64(1) / math.Sqrt(float64(in*kernel))
+	init := func(int) float32 { return float32((rng.Float64()*2 - 1) * bound) }
+	w, e := layerParameter([]int{out, in, kernel}, device, init)
+	if e != nil {
+		return nil, e
+	}
+	b, e := layerParameter([]int{out}, device, init)
+	if e != nil {
+		w.Close()
+		return nil, e
+	}
+	l := &Conv1dLayer{Weight: w, Bias: b, Dilation: dilation, Stride: stride, Padding: padding}
+	l.Module.Parameters = []Parameter{{"weight", w}, {"bias", b}}
+	return l, nil
+}
 
 type LayerNormLayer struct {
 	Module       Module

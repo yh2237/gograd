@@ -31,6 +31,7 @@ var operationRegistry = map[string]KernelPair{
 	"masked_loss":            {"masked-loss", "masked_f/b"},
 	"conv1d":                 {"Conv1d reference", "im2col/col2im+cuBLAS"},
 	"conv1d_gemm":            {"SGEMMOp", "im2col/col2im+cuBLAS"},
+	"conv1d_gemm_stride":     {"SGEMMOp", "im2col_stride/col2im_stride+cuBLAS"},
 	"conv2d":                 {"tiled im2col+SGEMMOp", "tiled im2col/col2im+cuBLAS"},
 	"max_pool2d":             {"NCHW max windows", "pool2d_f/b"},
 	"avg_pool2d":             {"NCHW average windows", "pool2d_f/b"},
