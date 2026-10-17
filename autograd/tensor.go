@@ -689,6 +689,15 @@ func Tanh(a *Tensor) *Tensor {
 	}
 	return unary(a, func(x float32) float32 { return float32(math.Tanh(float64(x))) }, func(x float32) float32 { v := float32(math.Tanh(float64(x))); return 1 - v*v })
 }
+
+// Sin applies sine elementwise.
+func Sin(a *Tensor) *Tensor {
+	a = a.Contiguous()
+	if dispatchBackend("sin", a.Device) {
+		return gpuUnary(a, 7)
+	}
+	return unary(a, func(x float32) float32 { return float32(math.Sin(float64(x))) }, func(x float32) float32 { return float32(math.Cos(float64(x))) })
+}
 func ReLU(a *Tensor) *Tensor {
 	a = a.Contiguous()
 	if dispatchBackend("relu", a.Device) {

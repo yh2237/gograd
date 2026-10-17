@@ -14,7 +14,7 @@ var operationRegistry = map[string]KernelPair{
 	"add_scalar": {"cpuScalar", "scalar_f/b"}, "sub_scalar": {"cpuScalar", "scalar_f/b"},
 	"mul_scalar": {"cpuScalar", "scalar_f/b"}, "div_scalar": {"cpuScalar", "scalar_f/b"},
 	"exp": {"unary", "unary_f/b"}, "log": {"unary", "unary_f/b"},
-	"abs": {"unary", "unary_f/b"}, "tanh": {"unary", "unary_f/b"},
+	"abs": {"unary", "unary_f/b"}, "tanh": {"unary", "unary_f/b"}, "sin": {"unary", "unary_f/b"},
 	"relu": {"unary", "unary_f/b"}, "gelu": {"unary", "unary_f/b"},
 	"reshape":    {"makeView", "view_gather/scatter"},
 	"permute":    {"makeView", "view_gather/scatter"},
