@@ -1,6 +1,11 @@
 package autograd
 
-import "github.com/yh2237/gograd/tensor"
+import (
+	"fmt"
+
+	"github.com/yh2237/gograd/gpu"
+	"github.com/yh2237/gograd/tensor"
+)
 
 // KernelPair names the CPU implementation and the CUDA kernel or implementation
 // used by one differentiable operation. Device selection is centralized here;
@@ -68,9 +73,28 @@ func dispatchBackend(name string, device tensor.Device) bool {
 		return false
 	case tensor.CUDA:
 		return true
+	case tensor.Vulkan, tensor.DirectML:
+		if inferenceMetadataOp(name) {
+			return false
+		}
+		panic(fmt.Errorf("%w: %s on %s", gpu.ErrUnsupported, name, device))
 	default:
+		if _, ok := gpu.Lookup(string(device)); ok {
+			if inferenceMetadataOp(name) {
+				return false
+			}
+			panic(fmt.Errorf("%w: %s on %s", gpu.ErrUnsupported, name, device))
+		}
 		panic("autograd: unsupported device")
 	}
+}
+
+func inferenceMetadataOp(name string) bool {
+	switch name {
+	case "reshape", "permute", "transpose", "slice", "expand", "contiguous", "scalar":
+		return true
+	}
+	return false
 }
 
 // ElementwiseKernel pairs the CPU scalar rule and CUDA kernel opcode. The
@@ -93,6 +117,9 @@ func dispatchElementwise(name string, a, b *Tensor) *Tensor {
 		panic("autograd: unregistered operation " + name)
 	}
 	same(a, b)
+	if inferenceDevice(a.Device) {
+		return inferenceBinary(name, a, b)
+	}
 	a, b = a.Contiguous(), b.Contiguous()
 	if dispatchBackend(name, a.Device) {
 		return gpuBinary(a, b, spec.CUDAOpcode)

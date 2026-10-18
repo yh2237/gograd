@@ -45,6 +45,9 @@ type SGD struct {
 }
 
 func validateSGDParameters(params []Parameter) error {
+	if err := checkTrainingDevices(params); err != nil {
+		return err
+	}
 	seenNames := make(map[string]bool)
 	seenStorage := make(map[*tensorStorage]bool)
 	var device tensor.Device

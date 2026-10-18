@@ -2,6 +2,7 @@ package autograd
 
 import (
 	"github.com/yh2237/gograd/cuda"
+	"github.com/yh2237/gograd/gpu"
 	"github.com/yh2237/gograd/tensor"
 )
 
@@ -59,10 +60,18 @@ func transposeViewCopy(dst, src []float32, shape []int, backward bool) {
 }
 func makeView(a *Tensor, shape, stride []int, offset int) *Tensor {
 	a.assertOpen()
-	if !a.IsContiguous() {
+	if !inferenceDevice(a.Device) && !a.IsContiguous() {
 		panic("autograd: view parent must be contiguous")
 	}
 	context, req := graphRecording([]*Tensor{a})
+	if inferenceDevice(a.Device) && req {
+		panic(gpu.ErrInferenceOnly)
+	}
+	if inferenceDevice(a.Device) {
+		if _, err := (gpu.View{Buffer: a.storage.gpuBuffer, Shape: shape, Strides: stride, Offset: offset}).Validate(a.storage.gpuBuffer.Backend()); err != nil {
+			panic(err)
+		}
+	}
 	v := &Tensor{Data: a.Data, storage: a.storage.acquire(), outputVersion: a.storage.version.Load(), Shape: append([]int(nil), shape...), Strides: append([]int(nil), stride...), Offset: offset, DType: Float32, Device: a.Device, buf: a.buf, RequiresGrad: req, execution: context, intermediate: true}
 	v.attachParents([]*Tensor{a})
 	v.shareBF16(a)
@@ -115,6 +124,12 @@ func makeView(a *Tensor, shape, stride []int, offset int) *Tensor {
 // returned unchanged. Backward maps the copy's logical gradient to its view.
 func (t *Tensor) Contiguous() *Tensor {
 	t.assertOpen()
+	if inferenceDevice(t.Device) {
+		if t.IsContiguous() {
+			return t
+		}
+		return contiguousInference(t)
+	}
 	useCUDA := dispatchBackend("contiguous", t.Device)
 	if t.IsContiguous() {
 		return t
@@ -152,7 +167,9 @@ func Expand(a *Tensor, shape ...int) *Tensor {
 	if len(shape) < len(a.Shape) || len(shape) > 6 {
 		panic("autograd: expand rank")
 	}
-	a = a.Contiguous()
+	if !inferenceDevice(a.Device) {
+		a = a.Contiguous()
+	}
 	str := make([]int, len(shape))
 	pad := len(shape) - len(a.Shape)
 	for i, d := range shape {
@@ -167,5 +184,9 @@ func Expand(a *Tensor, shape ...int) *Tensor {
 			str[i] = a.Strides[i-pad]
 		}
 	}
-	return makeView(a, shape, str, 0)
+	offset := 0
+	if inferenceDevice(a.Device) {
+		offset = a.Offset
+	}
+	return makeView(a, shape, str, offset)
 }

@@ -2,6 +2,7 @@ package autograd
 
 import (
 	"fmt"
+	"github.com/yh2237/gograd/gpu"
 
 	"github.com/yh2237/gograd/tensor"
 )
@@ -87,6 +88,9 @@ func (l *BatchNormLayer) Close() {
 	}
 }
 func (l *BatchNormLayer) Forward(x *Tensor) *Tensor {
+	if inferenceDevice(x.Device) && (l.Training || l.RunningMean == nil) {
+		panic(gpu.ErrInferenceOnly)
+	}
 	useCUDA := dispatchBackend("batch_norm", x.Device)
 	o := BatchNormOptions{Training: l.Training || l.RunningMean == nil, ChannelsLast: l.ChannelsLast, Eps: l.Eps, Momentum: l.Momentum}
 	return batchNorm(x, l.Weight, l.Bias, l.RunningMean, l.RunningVar, l.NumBatchesTracked, o, l.CumulativeMomentum, useCUDA)

@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 
 	"github.com/yh2237/gograd/cuda"
+	"github.com/yh2237/gograd/gpu"
 )
 
 // tensorStorage owns one allocation. Each tensor/view has a lease; returning
@@ -12,6 +13,7 @@ import (
 type tensorStorage struct {
 	data       []float32
 	buffer     *cuda.Buffer
+	gpuBuffer  *gpu.Buffer
 	pooledCPU  bool
 	references atomic.Int64
 	version    atomic.Uint64
@@ -25,6 +27,12 @@ func cpuStorage(data []float32, pooled bool) *tensorStorage {
 
 func deviceStorage(buffer *cuda.Buffer) *tensorStorage {
 	s := &tensorStorage{buffer: buffer}
+	s.references.Store(1)
+	return s
+}
+
+func inferenceStorage(buffer *gpu.Buffer) *tensorStorage {
+	s := &tensorStorage{gpuBuffer: buffer}
 	s.references.Store(1)
 	return s
 }
@@ -52,6 +60,10 @@ func (s *tensorStorage) release() {
 	}
 	if s.buffer != nil {
 		s.buffer.Free()
+	}
+	if s.gpuBuffer != nil {
+		s.gpuBuffer.Close()
+		s.gpuBuffer = nil
 	}
 	s.data, s.buffer = nil, nil
 }

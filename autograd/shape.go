@@ -1,6 +1,7 @@
 package autograd
 
 import (
+	"github.com/yh2237/gograd/gpu"
 	"github.com/yh2237/gograd/tensor"
 	"math"
 	"runtime"
@@ -9,6 +10,29 @@ import (
 
 func Reshape(a *Tensor, s ...int) *Tensor {
 	dispatchBackend("reshape", a.Device)
+	if inferenceDevice(a.Device) {
+		inferenceOperands(a)
+		if len(s) > 6 {
+			panic(gpu.ErrInvalidArgument)
+		}
+		n, err := gpu.Elements(s...)
+		if err != nil {
+			panic(err)
+		}
+		if n != a.Numel() {
+			panic("autograd: reshape size")
+		}
+		st := strides(s)
+		for _, stride := range st {
+			if _, err := gpu.Elements(stride); err != nil {
+				panic(err)
+			}
+		}
+		if !inferenceView(a).Compact() {
+			a = a.Contiguous()
+		}
+		return makeView(a, s, st, a.Offset)
+	}
 	if numel(s) != a.Numel() {
 		panic("autograd: reshape size")
 	}
@@ -30,12 +54,18 @@ func Permute(a *Tensor, axes ...int) *Tensor {
 		seen[x] = true
 		s[i] = a.Shape[x]
 	}
-	a = a.Contiguous()
+	if !inferenceDevice(a.Device) {
+		a = a.Contiguous()
+	}
 	st := make([]int, len(axes))
 	for i, axis := range axes {
 		st[i] = a.Strides[axis]
 	}
-	return makeView(a, s, st, 0)
+	offset := 0
+	if inferenceDevice(a.Device) {
+		offset = a.Offset
+	}
+	return makeView(a, s, st, offset)
 }
 func Transpose(a *Tensor, i, j int) *Tensor {
 	dispatchBackend("transpose", a.Device)
@@ -207,6 +237,14 @@ func Slice(a *Tensor, axis, start, end int) *Tensor {
 	}
 	s := append([]int(nil), a.Shape...)
 	s[axis] = end - start
+	if inferenceDevice(a.Device) {
+		inferenceOperands(a)
+		offset := a.Offset + start*a.Strides[axis]
+		if numel(s) == 0 {
+			offset = a.Offset
+		}
+		return makeView(a, s, a.Strides, offset)
+	}
 	a = a.Contiguous()
 	return makeView(a, s, a.Strides, start*a.Strides[axis])
 }
@@ -236,6 +274,9 @@ func parallelBatches(count int, fn func(int)) {
 	wg.Wait()
 }
 func MatMul(a, b *Tensor) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceMatMul(a, b)
+	}
 	useCUDA := dispatchBackend("matmul", a.Device)
 	same(a, b)
 	a, b = a.Contiguous(), b.Contiguous()

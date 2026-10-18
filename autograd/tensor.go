@@ -56,6 +56,9 @@ func (t *Tensor) IsContiguous() bool {
 	if t.Device == tensor.CPU && len(t.Data) != t.Numel() {
 		return false
 	}
+	if t.storage != nil && t.storage.gpuBuffer != nil && t.storage.gpuBuffer.Len() != t.Numel() {
+		return false
+	}
 	expected := strides(t.Shape)
 	if len(expected) != len(t.Strides) {
 		return false
@@ -126,6 +129,9 @@ func strides(s []int) []int {
 	return out
 }
 func New(data []float32, shape []int, device tensor.Device, grad bool) (*Tensor, error) {
+	if inferenceDevice(device) {
+		return newInferenceTensor(data, shape, device, grad, false)
+	}
 	if numel(shape) != len(data) {
 		return nil, errors.New("autograd: shape/data mismatch")
 	}
@@ -171,6 +177,9 @@ func (t *Tensor) ToHost() ([]float32, error) {
 	if t.Device == tensor.CPU {
 		return append([]float32(nil), t.Data...), nil
 	}
+	if inferenceDevice(t.Device) {
+		return t.storage.gpuBuffer.Backend().Download(t.storage.gpuBuffer, t.Numel())
+	}
 	v := make([]float32, t.Numel())
 	if e := t.buf.CopyToHost(floatBytes(v)); e != nil {
 		return nil, e
@@ -199,6 +208,19 @@ func (t *Tensor) CopyFrom(data []float32) error {
 	}
 	if len(data) != t.Numel() {
 		return errors.New("autograd: copy size mismatch")
+	}
+	if inferenceDevice(t.Device) {
+		if !t.IsContiguous() {
+			if err := copyInferenceView(t, data); err != nil {
+				return err
+			}
+		} else {
+			if err := t.storage.gpuBuffer.Backend().CopyFrom(t.storage.gpuBuffer, data); err != nil {
+				return err
+			}
+		}
+		t.storage.version.Add(1)
+		return nil
 	}
 	if t.Device == tensor.CPU {
 		if !t.IsContiguous() {
@@ -245,6 +267,9 @@ func Must(data []float32, shape []int, grad bool) *Tensor {
 	return v
 }
 func Zeros(shape []int, device tensor.Device, grad bool) (*Tensor, error) {
+	if inferenceDevice(device) {
+		return newInferenceTensor(nil, shape, device, grad, true)
+	}
 	if device == tensor.CUDA {
 		buf, e := cuda.Alloc(numel(shape) * 4)
 		if e != nil {
@@ -260,6 +285,9 @@ func Zeros(shape []int, device tensor.Device, grad bool) (*Tensor, error) {
 }
 func (t *Tensor) Detach() *Tensor {
 	t.assertOpen()
+	if inferenceDevice(t.Device) {
+		return detachInference(t)
+	}
 	if t.Device == tensor.CUDA {
 		src := t
 		if !t.IsContiguous() {
@@ -578,7 +606,10 @@ func Div(a, b *Tensor) *Tensor {
 }
 func Scalar(a *Tensor, v float32) *Tensor {
 	dispatchBackend("scalar", a.Device)
-	b, _ := New([]float32{v}, []int{}, a.Device, false)
+	b, err := New([]float32{v}, []int{}, a.Device, false)
+	if err != nil {
+		panic(err)
+	}
 	b.ephemeral = true
 	b.execution = a.execution
 	return b
@@ -632,6 +663,9 @@ func SubScalar(a *Tensor, v float32) *Tensor {
 	return cpuScalar(a, v, 1)
 }
 func MulScalar(a *Tensor, v float32) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceMulScalar(a, v)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("mul_scalar", a.Device) {
 		return gpuScalar(a, v, 2)

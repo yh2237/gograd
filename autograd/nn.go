@@ -7,6 +7,7 @@ import (
 	"unsafe"
 
 	"github.com/yh2237/gograd/cuda"
+	"github.com/yh2237/gograd/gpu"
 	"github.com/yh2237/gograd/kernels"
 	"github.com/yh2237/gograd/tensor"
 )
@@ -260,7 +261,19 @@ type Parameter struct {
 	Value *Tensor
 }
 
+func checkTrainingDevices(params []Parameter) error {
+	for _, p := range params {
+		if p.Value != nil && p.Value.Device != tensor.CPU && p.Value.Device != tensor.CUDA {
+			return fmt.Errorf("%w: training parameter %s on %s", gpu.ErrInferenceOnly, p.Name, p.Value.Device)
+		}
+	}
+	return nil
+}
+
 func ClipGradNorm(params []Parameter, maxNorm float32) float32 {
+	if err := checkTrainingDevices(params); err != nil {
+		panic(err)
+	}
 	if len(params) > 0 && params[0].Value.Device == tensor.CUDA {
 		clipGPU(params, maxNorm)
 		return float32(math.NaN())
@@ -333,6 +346,9 @@ func (o *AdamW) SyncGraphStepCount() error {
 // implicit group named DefaultParameterGroupName with the given decay. Use
 // NewAdamWGroups for per-group learning-rate scales and weight decay.
 func NewAdamW(params []Parameter, lr, decay float32) *AdamW {
+	if err := checkTrainingDevices(params); err != nil {
+		panic(err)
+	}
 	o, _ := newAdamW(params, lr, []ParameterGroupSpec{{Name: DefaultParameterGroupName, Params: params, WeightDecay: decay}})
 	return o
 }
@@ -348,6 +364,9 @@ func NewAdamWGroups(params []Parameter, lr float32, specs []ParameterGroupSpec) 
 }
 
 func newAdamW(params []Parameter, lr float32, specs []ParameterGroupSpec) (*AdamW, error) {
+	if err := checkTrainingDevices(params); err != nil {
+		return nil, err
+	}
 	groups, owner, err := resolveParameterGroups(params, specs)
 	if err != nil {
 		return nil, err
@@ -380,6 +399,9 @@ func (o *AdamW) groupScale(n int) (stepSize, decay float32) {
 	return stepSize, stepSize * group.WeightDecay
 }
 func (o *AdamW) Step() {
+	if err := checkTrainingDevices(o.Params); err != nil {
+		panic(err)
+	}
 	if cuda.InCapture() {
 		if o.graphStep == nil {
 			panic("autograd: call AdamW.PrepareGraph before capture")

@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/yh2237/gograd/cuda"
+	"github.com/yh2237/gograd/gpu"
 	"github.com/yh2237/gograd/tensor"
 )
 
@@ -19,6 +20,9 @@ type BackwardOptions struct {
 func (t *Tensor) BackwardWithOptions(options BackwardOptions) error {
 	if err := t.checkOpen(); err != nil {
 		return err
+	}
+	if t.Device != tensor.CPU && t.Device != tensor.CUDA {
+		return fmt.Errorf("%w: backward on %s", gpu.ErrInferenceOnly, t.Device)
 	}
 	if t.Numel() != 1 {
 		return fmt.Errorf("autograd: backward requires scalar")
