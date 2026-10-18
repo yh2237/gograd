@@ -1,0 +1,19 @@
+#version 450
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0, std430) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform Params {
+    uint n; uint rank; uint offset; uint direction;
+    uint shape[6]; uint strides[6];
+} p;
+void main() {
+    uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 128u;
+    if (i >= p.n) return;
+    uint rest = i, index = p.offset;
+    for (int axis = int(p.rank)-1; axis >= 0; --axis) {
+        index += (rest % p.shape[axis]) * p.strides[axis];
+        rest /= p.shape[axis];
+    }
+    if (p.direction == 0u) y[i] = x[index];
+    else y[index] = x[i];
+}

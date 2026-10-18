@@ -1,0 +1,53 @@
+#version 450
+// 128 invocations and 1536 bytes of shared memory fit Vulkan 1.1's minimum
+// limits. Each workgroup computes an 8-row by 16-column output tile.
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(constant_id = 0) const uint TRANS_A = 0u;
+layout(constant_id = 1) const uint TRANS_B = 0u;
+layout(set = 0, binding = 0, std430) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1, std430) readonly buffer B { float b[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer C { float c[]; };
+layout(push_constant) uniform Params {
+    uint m; uint n; uint k; uint batch;
+    uint aOffset; uint bOffset;
+    uint aRow; uint aCol; uint bRow; uint bCol;
+    uint batchRank;
+    uint batchShape[4]; uint aBatchStrides[4]; uint bBatchStrides[4];
+    uint tileCols; uint tilesPerMatrix;
+} p;
+shared float tileA[8][16];
+shared float tileB[16][16];
+
+uint indexA(uint row, uint depth) {
+    return TRANS_A != 0u ? row*p.aCol + depth*p.aRow : row*p.aRow + depth*p.aCol;
+}
+uint indexB(uint depth, uint col) {
+    return TRANS_B != 0u ? depth*p.bCol + col*p.bRow : depth*p.bRow + col*p.bCol;
+}
+void main() {
+    uint tile = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint batch = tile / p.tilesPerMatrix;
+    if (batch >= p.batch) return; // Uniform across the entire workgroup.
+    uint matrixTile = tile % p.tilesPerMatrix;
+    uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
+    uint row = (matrixTile/p.tileCols)*8u + ly;
+    uint col = (matrixTile%p.tileCols)*16u + lx;
+    uint rest = batch, ao = p.aOffset, bo = p.bOffset;
+    for (int axis = int(p.batchRank)-1; axis >= 0; --axis) {
+        uint coord = rest % p.batchShape[axis];
+        rest /= p.batchShape[axis];
+        ao += coord*p.aBatchStrides[axis];
+        bo += coord*p.bBatchStrides[axis];
+    }
+    float sum = 0.0;
+    for (uint base = 0u; base < p.k; base += 16u) {
+        uint da = base+lx, db0 = base+ly, db1 = base+ly+8u;
+        tileA[ly][lx] = row < p.m && da < p.k ? a[ao+indexA(row, da)] : 0.0;
+        tileB[ly][lx] = db0 < p.k && col < p.n ? b[bo+indexB(db0, col)] : 0.0;
+        tileB[ly+8u][lx] = db1 < p.k && col < p.n ? b[bo+indexB(db1, col)] : 0.0;
+        barrier();
+        for (uint d = 0u; d < 16u; ++d) sum = fma(tileA[ly][d], tileB[d][lx], sum);
+        barrier();
+    }
+    if (row < p.m && col < p.n) c[(batch*p.m+row)*p.n+col] = sum;
+}
