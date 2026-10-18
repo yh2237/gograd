@@ -6,6 +6,7 @@ import (
 	"unsafe"
 
 	"github.com/yh2237/gograd/cuda"
+	"github.com/yh2237/gograd/gpu"
 )
 
 // Tensor is a contiguous, row-major float32 device tensor.
@@ -22,6 +23,10 @@ type Device string
 const (
 	CPU  Device = "cpu"
 	CUDA Device = "cuda"
+	// Vulkan and DirectML are reserved for the inference backend rollout.
+	// Their presence is not an availability guarantee; consult gpu.Available.
+	Vulkan   Device = "vulkan"
+	DirectML Device = "directml"
 )
 
 // Numel returns the number of elements described by shape.
@@ -40,6 +45,9 @@ func New(shape ...int) (*Tensor, error) {
 
 // NewOn allocates a tensor on the chosen device.
 func NewOn(device Device, shape ...int) (*Tensor, error) {
+	if device == Vulkan || device == DirectML {
+		return nil, fmt.Errorf("%w: %s tensor integration is not implemented yet", gpu.ErrUnavailable, device)
+	}
 	for _, d := range shape {
 		if d < 0 {
 			return nil, fmt.Errorf("tensor: negative dimension")
