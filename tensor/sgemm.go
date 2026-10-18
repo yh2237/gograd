@@ -125,87 +125,109 @@ func sgemmOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 	}
 	tiles := (m + mc - 1) / mc
 	workers := min(max(1, maxWorkers), tiles)
-	jobs := make(chan int, tiles)
-	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ap := sgemmBuffer(mc * kc)
-			defer releaseSGEMMBuffer(ap)
-			// 端の小さなブロックも、一時領域でAVXのカーネルを使う。余った行と列の結果は捨てる。
-			var edge [64]float32
-			for row := range jobs {
-				end := min(row+mc, m)
-				for depth := 0; depth < k; depth += kc {
-					nk := min(kc, k-depth)
-					for i := row; i < end; i += mr {
-						height := min(mr, end-i)
-						panel := ap[(i-row)*kc : (i-row+mr)*kc]
-						if transA {
-							for d := 0; d < nk; d++ {
-								copy(panel[d*mr:d*mr+height], a[(depth+d)*m+i:(depth+d)*m+i+height])
-							}
-						} else {
-							for r := 0; r < height; r++ {
-								source := a[(i+r)*k+depth : (i+r)*k+depth+nk]
-								for d, v := range source {
-									panel[d*mr+r] = v
-								}
+	var jobs chan int
+	run := func() {
+		ap := sgemmBuffer(mc * kc)
+		defer releaseSGEMMBuffer(ap)
+		// 端の小さなブロックも、一時領域でAVXのカーネルを使う。余った行と列の結果は捨てる。
+		var edge [64]float32
+		process := func(row int) {
+			end := min(row+mc, m)
+			for depth := 0; depth < k; depth += kc {
+				nk := min(kc, k-depth)
+				for i := row; i < end; i += mr {
+					height := min(mr, end-i)
+					panel := ap[(i-row)*kc : (i-row+mr)*kc]
+					if transA {
+						for d := 0; d < nk; d++ {
+							copy(panel[d*mr:d*mr+height], a[(depth+d)*m+i:(depth+d)*m+i+height])
+						}
+					} else {
+						for r := 0; r < height; r++ {
+							source := a[(i+r)*k+depth : (i+r)*k+depth+nk]
+							for d, v := range source {
+								panel[d*mr+r] = v
 							}
 						}
 					}
-					for g := 0; g < groups; g++ {
-						j := g * nr
-						width := min(n-j, nr)
-						bb := bp[g*k*nr+depth*nr:]
-						for i := row; i < end; i += mr {
-							height := min(mr, end-i)
-							aa := ap[(i-row)*kc:]
-							if height == mr && width == nr {
-								if useAVX2FMA {
-									if use8x8 {
-										kernel8x8AVX(&c[i*n+j], &aa[0], &bb[0], n, nk, depth != 0)
-									} else {
-										kernel4x8AVX(&c[i*n+j], &aa[0], &bb[0], n, nk, depth != 0)
-									}
+				}
+				for g := 0; g < groups; g++ {
+					j := g * nr
+					width := min(n-j, nr)
+					bb := bp[g*k*nr+depth*nr:]
+					for i := row; i < end; i += mr {
+						height := min(mr, end-i)
+						aa := ap[(i-row)*kc:]
+						if height == mr && width == nr {
+							if useAVX2FMA {
+								if use8x8 {
+									kernel8x8AVX(&c[i*n+j], &aa[0], &bb[0], n, nk, depth != 0)
 								} else {
-									kernel4x4(c, aa, bb, i*n+j, n, nk, depth != 0)
-								}
-							} else if useAVX2FMA && use8x8 {
-								if depth != 0 {
-									for r := 0; r < height; r++ {
-										copy(edge[r*nr:r*nr+width], c[(i+r)*n+j:(i+r)*n+j+width])
-									}
-								}
-								kernel8x8AVX(&edge[0], &aa[0], &bb[0], nr, nk, depth != 0)
-								for r := 0; r < height; r++ {
-									copy(c[(i+r)*n+j:(i+r)*n+j+width], edge[r*nr:r*nr+width])
+									kernel4x8AVX(&c[i*n+j], &aa[0], &bb[0], n, nk, depth != 0)
 								}
 							} else {
+								kernel4x4(c, aa, bb, i*n+j, n, nk, depth != 0)
+							}
+						} else if useAVX2FMA && use8x8 {
+							if depth != 0 {
 								for r := 0; r < height; r++ {
-									for q := 0; q < width; q++ {
-										var sum float32
-										if depth != 0 {
-											sum = c[(i+r)*n+j+q]
-										}
-										for d := 0; d < nk; d++ {
-											sum += aa[d*mr+r] * bb[d*nr+q]
-										}
-										c[(i+r)*n+j+q] = sum
+									copy(edge[r*nr:r*nr+width], c[(i+r)*n+j:(i+r)*n+j+width])
+								}
+							}
+							kernel8x8AVX(&edge[0], &aa[0], &bb[0], nr, nk, depth != 0)
+							for r := 0; r < height; r++ {
+								copy(c[(i+r)*n+j:(i+r)*n+j+width], edge[r*nr:r*nr+width])
+							}
+						} else {
+							for r := 0; r < height; r++ {
+								for q := 0; q < width; q++ {
+									var sum float32
+									if depth != 0 {
+										sum = c[(i+r)*n+j+q]
 									}
+									for d := 0; d < nk; d++ {
+										sum += aa[d*mr+r] * bb[d*nr+q]
+									}
+									c[(i+r)*n+j+q] = sum
 								}
 							}
 						}
 					}
 				}
 			}
+		}
+		if jobs == nil {
+			for row := 0; row < m; row += mc {
+				process(row)
+			}
+		} else {
+			for row := range jobs {
+				process(row)
+			}
+		}
+	}
+	if workers == 1 {
+		// Batched GEMMs often already have outer workers. Avoid launching an
+		// extra goroutine or creating a job channel in that common case.
+		run()
+		return
+	}
+	// Keep dynamic tile assignment for multiple workers: it tolerates uneven
+	// CPU availability better than assigning a fixed set of rows per worker.
+	jobs = make(chan int, tiles)
+	var wg sync.WaitGroup
+	for w := 1; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			run()
 		}()
 	}
 	for row := 0; row < m; row += mc {
 		jobs <- row
 	}
 	close(jobs)
+	run()
 	wg.Wait()
 }
 

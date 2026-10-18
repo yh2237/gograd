@@ -61,6 +61,7 @@ go run ./cmd/audio-train -wav out/tone.wav -device cuda -steps 300 -out out/deno
 go run ./cmd/nn-conv-train -device cpu -hidden 128 -kernel 5 -steps 3
 go run ./cmd/nn-conv-train -device cpu -hidden 128 -kernel 5 -steps 5 -cpuprofile "$env:TEMP/gograd-nn-cpu.pprof"
 go test ./tensor -run '^$' -bench 'Benchmark(SGEMM|NaiveSGEMM)$' -benchtime=1x -cpu=12
+go test ./autograd -run '^$' -bench 'BenchmarkCPU(Unary|Softmax|MatMul)$' -benchmem -benchtime=500ms -count=3 -cpu=12
 go run ./cmd/transformer-bench -device cuda -warmup 1
 go run ./cmd/transformer-bench -device cuda -warmup 2 -graph -bf16
 python tools/bench_transformer.py --device cuda --threads 12 --warmup 1
@@ -70,6 +71,8 @@ go run ./cmd/attention-bench -seq 4096 -algorithm flash
 ```
 
 `nn-conv-train`はパディング付きの合成系列（入力74、出力72、dilation 1,2,4,1,2,4）で6ブロックのresidual Conv1dネットワークを学習し、学習ステップ全体の時間を表示します。CUDAがある環境では`-device cuda`を受け付けます。既定の損失はマスク付きL1で、`-loss mse`でマスク付きMSEを選びます。12スレッドのベンチマークでは`GOMAXPROCS=12`を設定し、`-cpuprofile`でGoのCPUプロファイルを書き出します。
+
+`BenchmarkCPUUnary`と`BenchmarkCPUSoftmax`はforwardとVJP（上流勾配との積）を測り、損失のreductionは含みません。`BenchmarkCPUMatMul`はforwardのみと、入力を凍結して重みだけの勾配を計算する場合を分けます。CPUのSoftmaxは指数関数の結果を再利用し、Softmax/LogSoftmaxは行数と行の幅から並列度を選びます。GELUなどの要素ごとの単項演算も大きな入力では並列に処理します。MatMulはバッチ間と行列積の内部でCPUのワーカーを分け、不要な勾配の行列積を省きます。共通SGEMMの単一ワーカー経路はgoroutineとジョブ用チャネルを作りません。
 
 RTX 3060 Tiと12 CPUスレッド（Goは`GOMAXPROCS=12`、PyTorchは`torch.set_num_threads(12)`）で、温めた学習ステップ全体を3回、対で測った中央値です。
 

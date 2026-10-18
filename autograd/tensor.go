@@ -470,7 +470,13 @@ func (q broadcastIndex) at(i int) int {
 	return (i/(q.d1*q.d2))*q.s0 + (i/q.d2%q.d1)*q.s1 + (i%q.d2)*q.s2
 }
 func parallelFor(n int, fn func(int, int)) {
-	workers := min(runtime.GOMAXPROCS(0), n/65536)
+	parallelForWork(n, 1, fn)
+}
+
+// Split independent items using their element count, not just their count.
+// A softmax row, for example, can contain hundreds of elements.
+func parallelForWork(n, elementsPerItem int, fn func(int, int)) {
+	workers := min(runtime.GOMAXPROCS(0), n, n*elementsPerItem/65536)
 	if workers < 2 {
 		fn(0, n)
 		return
@@ -641,14 +647,18 @@ func DivScalar(a *Tensor, v float32) *Tensor {
 }
 func unary(a *Tensor, f, d func(float32) float32) *Tensor {
 	v := cpuAlloc(len(a.Data))
-	for i, x := range a.Data {
-		v[i] = f(x)
-	}
+	parallelFor(len(v), func(start, end int) {
+		for i := start; i < end; i++ {
+			v[i] = f(a.Data[i])
+		}
+	})
 	return result(v, append([]int(nil), a.Shape...), []*Tensor{a}, func(g []float32) {
 		dx := cpuAlloc(len(g))
-		for i, x := range a.Data {
-			dx[i] = g[i] * d(x)
-		}
+		parallelFor(len(dx), func(start, end int) {
+			for i := start; i < end; i++ {
+				dx[i] = g[i] * d(a.Data[i])
+			}
+		})
 		a.addGrad(dx)
 		cpuRelease(dx)
 	})

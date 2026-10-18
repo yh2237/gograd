@@ -255,26 +255,38 @@ func MatMul(a, b *Tensor) *Tensor {
 	count := numel(batch)
 	aBatch, bBatch := a.Shape[:len(a.Shape)-2], b.Shape[:len(b.Shape)-2]
 	flatLinear := count > 1 && numel(aBatch) == count && numel(bBatch) == 1
+	// Divide the CPU budget between independent batches and each GEMM. In
+	// particular, an ordinary rank-two product must not be capped at one core.
+	gemmWorkers := max(1, runtime.GOMAXPROCS(0)/max(1, count))
 	v := cpuAlloc(numel(s))
-	if flatLinear {
+	if flatLinear || count == 1 {
 		tensor.SGEMM(v, a.Data, b.Data, count*m, n, k)
 	} else {
 		parallelBatches(count, func(z int) {
 			ai := bindex(z, batch, aBatch) * m * k
 			bi := bindex(z, batch, bBatch) * k * n
-			tensor.SGEMMOpWorkers(v[z*m*n:(z+1)*m*n], a.Data[ai:ai+m*k], b.Data[bi:bi+k*n], m, n, k, false, false, 1)
+			tensor.SGEMMOpWorkers(v[z*m*n:(z+1)*m*n], a.Data[ai:ai+m*k], b.Data[bi:bi+k*n], m, n, k, false, false, gemmWorkers)
 		})
 	}
 	return result(v, s, []*Tensor{a, b}, func(g []float32) {
-		da := cpuAlloc(len(a.Data))
-		db := cpuAlloc(len(b.Data))
-		if flatLinear {
-			tensor.SGEMMOp(da, g, b.Data, count*m, k, n, false, true)
-			tensor.SGEMMOp(db, a.Data, g, k, n, count*m, true, false)
-			a.addGrad(da)
-			b.addGrad(db)
-			cpuRelease(da)
-			cpuRelease(db)
+		var da, db []float32
+		if a.RequiresGrad {
+			da = cpuAlloc(len(a.Data))
+			defer cpuRelease(da)
+		}
+		if b.RequiresGrad {
+			db = cpuAlloc(len(b.Data))
+			defer cpuRelease(db)
+		}
+		if flatLinear || count == 1 {
+			if a.RequiresGrad {
+				tensor.SGEMMOp(da, g, b.Data, count*m, k, n, false, true)
+				a.addGrad(da)
+			}
+			if b.RequiresGrad {
+				tensor.SGEMMOp(db, a.Data, g, k, n, count*m, true, false)
+				b.addGrad(db)
+			}
 			return
 		}
 		if count > 1 && numel(aBatch) == count && numel(bBatch) == count {
@@ -282,22 +294,36 @@ func MatMul(a, b *Tensor) *Tensor {
 				ai := bindex(z, batch, aBatch) * m * k
 				bi := bindex(z, batch, bBatch) * k * n
 				gg := g[z*m*n : (z+1)*m*n]
-				tensor.SGEMMOpWorkers(da[ai:ai+m*k], gg, b.Data[bi:bi+k*n], m, k, n, false, true, 1)
-				tensor.SGEMMOpWorkers(db[bi:bi+k*n], a.Data[ai:ai+m*k], gg, k, n, m, true, false, 1)
+				if a.RequiresGrad {
+					tensor.SGEMMOpWorkers(da[ai:ai+m*k], gg, b.Data[bi:bi+k*n], m, k, n, false, true, gemmWorkers)
+				}
+				if b.RequiresGrad {
+					tensor.SGEMMOpWorkers(db[bi:bi+k*n], a.Data[ai:ai+m*k], gg, k, n, m, true, false, gemmWorkers)
+				}
 			})
 			a.addGrad(da)
 			b.addGrad(db)
-			cpuRelease(da)
-			cpuRelease(db)
 			return
 		}
-		tmpA, tmpB := cpuAlloc(m*k), cpuAlloc(k*n)
+		var tmpA, tmpB []float32
+		if a.RequiresGrad {
+			tmpA = cpuAlloc(m * k)
+			defer cpuRelease(tmpA)
+		}
+		if b.RequiresGrad {
+			tmpB = cpuAlloc(k * n)
+			defer cpuRelease(tmpB)
+		}
 		for z := 0; z < count; z++ {
 			ai := bindex(z, batch, a.Shape[:len(a.Shape)-2]) * m * k
 			bi := bindex(z, batch, b.Shape[:len(b.Shape)-2]) * k * n
 			gg := g[z*m*n : (z+1)*m*n]
-			tensor.SGEMMOp(tmpA, gg, b.Data[bi:bi+k*n], m, k, n, false, true)
-			tensor.SGEMMOp(tmpB, a.Data[ai:ai+m*k], gg, k, n, m, true, false)
+			if a.RequiresGrad {
+				tensor.SGEMMOp(tmpA, gg, b.Data[bi:bi+k*n], m, k, n, false, true)
+			}
+			if b.RequiresGrad {
+				tensor.SGEMMOp(tmpB, a.Data[ai:ai+m*k], gg, k, n, m, true, false)
+			}
 			for i, v := range tmpA {
 				da[ai+i] += v
 			}
@@ -307,10 +333,6 @@ func MatMul(a, b *Tensor) *Tensor {
 		}
 		a.addGrad(da)
 		b.addGrad(db)
-		cpuRelease(tmpA)
-		cpuRelease(tmpB)
-		cpuRelease(da)
-		cpuRelease(db)
 	})
 }
 func Embedding(weight *Tensor, ids []int, shape []int) *Tensor {

@@ -2,9 +2,71 @@ package tensor
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 )
+
+func TestSGEMMWorkerScheduling(t *testing.T) {
+	avx, wide := useAVX2FMA, use8x8
+	defer func() { useAVX2FMA, use8x8 = avx, wide }()
+	for _, backend := range []struct {
+		name      string
+		avx, wide bool
+	}{{"go", false, false}, {"avx4x8", avx, false}, {"avx8x8", avx, avx}} {
+		t.Run(backend.name, func(t *testing.T) {
+			useAVX2FMA, use8x8 = backend.avx, backend.wide
+			for _, shape := range [][3]int{{1, 1, 1}, {33, 11, 257}, {129, 17, 319}} {
+				m, n, k := shape[0], shape[1], shape[2]
+				a, b := make([]float32, m*k), make([]float32, k*n)
+				for i := range a {
+					a[i] = float32(i%17-8) * .01
+				}
+				for i := range b {
+					b[i] = float32(i%13-6) * .02
+				}
+				at, bt := make([]float32, len(a)), make([]float32, len(b))
+				for i := 0; i < m; i++ {
+					for d := 0; d < k; d++ {
+						at[d*m+i] = a[i*k+d]
+					}
+				}
+				for d := 0; d < k; d++ {
+					for j := 0; j < n; j++ {
+						bt[j*k+d] = b[d*n+j]
+					}
+				}
+				want, got := make([]float32, m*n), make([]float32, m*n)
+				naive(want, a, b, m, n, k)
+				check := func() {
+					t.Helper()
+					for i, v := range got {
+						if math.IsNaN(float64(v)) || math.Abs(float64(v-want[i])) > 1e-4 {
+							t.Fatalf("shape %v entry %d: %g != %g", shape, i, v, want[i])
+						}
+					}
+				}
+				for _, workers := range []int{0, 1, 3, 12} {
+					for _, tc := range []struct {
+						a, b   []float32
+						ta, tb bool
+					}{{a, b, false, false}, {at, b, true, false}, {a, bt, false, true}, {at, bt, true, true}} {
+						SGEMMOpWorkers(got, tc.a, tc.b, m, n, k, tc.ta, tc.tb, workers)
+						check()
+					}
+					for _, transposed := range []bool{false, true} {
+						source := b
+						if transposed {
+							source = bt
+						}
+						SGEMMPacked(got, a, PackB(source, n, k, transposed), m, workers)
+						check()
+					}
+				}
+			}
+		})
+	}
+}
 
 func naive(c, a, b []float32, m, n, k int) {
 	clear(c)
