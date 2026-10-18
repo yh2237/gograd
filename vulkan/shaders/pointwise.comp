@@ -10,5 +10,18 @@ void main() {
     if (i >= p.n) return;
     if (p.op == 0u) y[i] = a[i] + b[i];
     else if (p.op == 1u) y[i] = a[i] * b[i];
-    else y[i] = a[i] * p.scalar;
+    else if (p.op == 2u) y[i] = a[i] * p.scalar;
+    else {
+        float v = a[i];
+        if (v > 10.0) { y[i] = v; return; }
+        if (v < -10.0) { y[i] = 0.0; return; }
+        if (p.op == 3u) y[i] = 0.5*v*(1.0+tanh(0.7978845608*(v+0.044715*v*v*v)));
+        else {
+            // Abramowitz-Stegun 7.1.26, erf absolute error < 1.5e-7.
+            float z = abs(v)*0.7071067812;
+            float t = 1.0/(1.0+0.3275911*z);
+            float e = 1.0-(((((1.061405429*t-1.453152027)*t)+1.421413741)*t-0.284496736)*t+0.254829592)*t*exp(-z*z);
+            y[i] = 0.5*v*(1.0+(v < 0.0 ? -e : e));
+        }
+    }
 }

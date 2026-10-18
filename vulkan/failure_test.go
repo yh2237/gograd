@@ -10,6 +10,7 @@ import (
 type failingDriver struct {
 	failure                  error
 	allocated, freed, closed int
+	computeCalls, failAt     int
 }
 
 func (*failingDriver) info() Info {
@@ -28,11 +29,77 @@ func (d *failingDriver) pointwise(out, a, b *block, n, kind uint32, scalar float
 	return d.failure
 }
 func (d *failingDriver) close() { d.closed++ }
+func (d *failingDriver) reduce(out, a, weight, bias *block, count, affineCount uint32, p reduceParams) error {
+	return d.computeFailure()
+}
+func (d *failingDriver) conv(out, src, bias *block, outCount, srcCount, biasCount uint32, p convParams) error {
+	return d.computeFailure()
+}
 func (d *failingDriver) viewCopy(out, src *block, outCount, srcCount uint32, p viewParams) error {
 	return d.failure
 }
 func (d *failingDriver) gemm(out, a, b *block, outCount, aCount, bCount uint32, p gemmParams, variant int) error {
-	return d.failure
+	return d.computeFailure()
+}
+
+func (d *failingDriver) computeFailure() error {
+	d.computeCalls++
+	if d.failAt == 0 || d.computeCalls == d.failAt {
+		return d.failure
+	}
+	return nil
+}
+
+func TestVulkanTransformerFailures(t *testing.T) {
+	for _, operation := range []string{"softmax", "layernorm", "groupnorm", "conv_im2col", "conv_gemm", "conv_bias"} {
+		t.Run(operation, func(t *testing.T) {
+			d := &failingDriver{failure: errors.New("injected transformer failure"), failAt: 1}
+			if operation == "conv_gemm" {
+				d.failAt = 2
+			}
+			if operation == "conv_bias" {
+				d.failAt = 3
+			}
+			b := NewBackend()
+			b.once.Do(func() { b.driver = d })
+			t.Cleanup(func() {
+				if err := b.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			var buffers []*gpu.Buffer
+			alloc := func(n int) *gpu.Buffer {
+				v, err := b.Alloc(n)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(v.Close)
+				buffers = append(buffers, v)
+				return v
+			}
+			x, w, bias, y := alloc(8), alloc(4), alloc(4), alloc(8)
+			var err error
+			switch operation {
+			case "softmax":
+				err = b.Softmax(y, x, 2, 4)
+			case "layernorm":
+				err = b.LayerNorm(y, x, w, bias, 2, 4, 1e-5)
+			case "groupnorm":
+				err = b.GroupNorm(y, x, w, bias, 1, 2, 4, 2, 1e-5)
+			default:
+				err = b.Conv1d(y, x, alloc(16), bias, gpu.Conv1dOptions{Batch: 1, InputLength: 2, InChannels: 4, OutChannels: 4, Kernel: 1, Stride: 1, Dilation: 1})
+			}
+			if !errors.Is(err, d.failure) || b.Available() {
+				t.Fatalf("%v, available=%t", err, b.Available())
+			}
+			for _, v := range buffers {
+				v.Close()
+			}
+			if s := b.MemoryStats(); s.LiveBuffers != 0 || s.ReservedBytes != 0 {
+				t.Fatalf("failed compute leaked scratch: %+v", s)
+			}
+		})
+	}
 }
 
 func TestVulkanFailureDisablesBackend(t *testing.T) {

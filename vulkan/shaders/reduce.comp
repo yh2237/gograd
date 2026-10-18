@@ -1,0 +1,66 @@
+#version 450
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0, std430) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer W { float w[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Y { float y[]; };
+layout(set = 0, binding = 3, std430) readonly buffer B { float b[]; };
+layout(push_constant) uniform Params {
+    uint rows; uint cols; uint kind; uint frames; uint channels; uint groups;
+    float eps;
+} p;
+shared float scratch[128];
+
+float sumReduce(float value) {
+    uint lane = gl_LocalInvocationID.x;
+    scratch[lane] = value;
+    barrier();
+    for (uint step = 64u; step > 0u; step >>= 1u) {
+        if (lane < step) scratch[lane] += scratch[lane+step];
+        barrier();
+    }
+    float total = scratch[0];
+    barrier(); // All lanes finish reading before the next reduction.
+    return total;
+}
+float maxReduce(float value) {
+    uint lane = gl_LocalInvocationID.x;
+    scratch[lane] = value;
+    barrier();
+    for (uint step = 64u; step > 0u; step >>= 1u) {
+        if (lane < step) scratch[lane] = max(scratch[lane], scratch[lane+step]);
+        barrier();
+    }
+    float total = scratch[0];
+    barrier();
+    return total;
+}
+uint indexOf(uint row, uint j) {
+    if (p.kind != 2u) return row*p.cols+j;
+    uint cg = p.channels/p.groups;
+    return (row/p.groups)*p.frames*p.channels + (j/cg)*p.channels + (row%p.groups)*cg + j%cg;
+}
+void main() {
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y*gl_NumWorkGroups.x;
+    if (row >= p.rows) return;
+    uint lane = gl_LocalInvocationID.x;
+    if (p.kind == 0u) {
+        float mx = uintBitsToFloat(0xff800000u);
+        for (uint j = lane; j < p.cols; j += 128u) mx = max(mx, x[row*p.cols+j]);
+        mx = maxReduce(mx);
+        float sum = 0.0;
+        for (uint j = lane; j < p.cols; j += 128u) sum += exp(x[row*p.cols+j]-mx);
+        sum = sumReduce(sum);
+        for (uint j = lane; j < p.cols; j += 128u) y[row*p.cols+j] = exp(x[row*p.cols+j]-mx)/sum;
+    } else {
+        float sum = 0.0;
+        for (uint j = lane; j < p.cols; j += 128u) sum += x[indexOf(row,j)];
+        float mean = sumReduce(sum)/float(p.cols);
+        float variance = 0.0;
+        for (uint j = lane; j < p.cols; j += 128u) { float z = x[indexOf(row,j)]-mean; variance += z*z; }
+        float inv = inversesqrt(sumReduce(variance)/float(p.cols)+p.eps);
+        for (uint j = lane; j < p.cols; j += 128u) {
+            uint idx = indexOf(row,j), ch = p.kind == 1u ? j : idx%p.channels;
+            y[idx] = (x[idx]-mean)*inv*w[ch]+b[ch];
+        }
+    }
+}

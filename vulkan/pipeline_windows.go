@@ -23,15 +23,15 @@ func (d *vkDriver) initCommands() error {
 }
 
 func (d *vkDriver) initPipeline() error {
-	bindings := [3]vkDescriptorBinding{}
+	bindings := [4]vkDescriptorBinding{}
 	for i := range bindings {
 		bindings[i] = vkDescriptorBinding{Binding: uint32(i), Type: 7, Count: 1, Stage: 0x20}
 	}
-	layout := vkDescriptorLayoutCreateInfo{vkHeader: header(32), BindingCount: 3, Bindings: &bindings[0]}
+	layout := vkDescriptorLayoutCreateInfo{vkHeader: header(32), BindingCount: 4, Bindings: &bindings[0]}
 	if err := result("vkCreateDescriptorSetLayout", d.call("vkCreateDescriptorSetLayout", d.device, uintptr(unsafe.Pointer(&layout)), 0, uintptr(unsafe.Pointer(&d.descriptorLayout)))); err != nil {
 		return err
 	}
-	sizes := vkDescriptorPoolSize{Type: 7, Count: 3}
+	sizes := vkDescriptorPoolSize{Type: 7, Count: 4}
 	pool := vkDescriptorPoolCreateInfo{vkHeader: header(33), MaxSets: 1, SizeCount: 1, Sizes: &sizes}
 	if err := result("vkCreateDescriptorPool", d.call("vkCreateDescriptorPool", d.device, uintptr(unsafe.Pointer(&pool)), 0, uintptr(unsafe.Pointer(&d.descriptorPool)))); err != nil {
 		return err
@@ -68,6 +68,18 @@ func (d *vkDriver) initPipeline() error {
 		if d.gemmPipelines[variant], err = d.createCompute(d.gemmShader, &specialization); err != nil {
 			return err
 		}
+	}
+	if d.reduceShader, err = d.createShader(reduceSPV); err != nil {
+		return err
+	}
+	if d.reducePipeline, err = d.createCompute(d.reduceShader, nil); err != nil {
+		return err
+	}
+	if d.convShader, err = d.createShader(convSPV); err != nil {
+		return err
+	}
+	if d.convPipeline, err = d.createCompute(d.convShader, nil); err != nil {
+		return err
 	}
 	return nil
 }
@@ -236,6 +248,48 @@ func (d *vkDriver) gemm(out, a, b *block, outCount, aCount, bCount uint32, p gem
 		}
 		d.before(out, accessShaderWrite, stageCompute)
 		d.bindCompute(d.gemmPipelines[variant], unsafe.Pointer(&p), unsafe.Sizeof(p))
+		d.call("vkCmdDispatch", d.command, uintptr(x), uintptr(y), 1)
+		d.barrier(out, accessShaderWrite, accessShaderRead|accessShaderWrite|accessTransferRead, stageCompute, stageCompute|stageTransfer)
+	})
+}
+
+func (d *vkDriver) reduce(out, a, weight, bias *block, count, affineCount uint32, p reduceParams) error {
+	x, y, err := groupGrid(uint64(p.Rows), d.properties.MaxWorkGroupCount)
+	if err != nil {
+		return err
+	}
+	d.bindBuffers(out, a, weight, count, count, affineCount)
+	info := vkDescriptorBufferInfo{Buffer: bias.buffer, Range: uint64(affineCount) * 4}
+	write := vkDescriptorWrite{vkHeader: header(35), Set: d.descriptorSet, Binding: 3, Count: 1, Type: 7, BufferInfo: &info}
+	d.call("vkUpdateDescriptorSets", d.device, 1, uintptr(unsafe.Pointer(&write)), 0, 0)
+	return d.submit(func() {
+		d.before(a, accessShaderRead, stageCompute)
+		if weight != a {
+			d.before(weight, accessShaderRead, stageCompute)
+		}
+		if bias != a && bias != weight {
+			d.before(bias, accessShaderRead, stageCompute)
+		}
+		d.before(out, accessShaderWrite, stageCompute)
+		d.bindCompute(d.reducePipeline, unsafe.Pointer(&p), unsafe.Sizeof(p))
+		d.call("vkCmdDispatch", d.command, uintptr(x), uintptr(y), 1)
+		d.barrier(out, accessShaderWrite, accessShaderRead|accessShaderWrite|accessTransferRead, stageCompute, stageCompute|stageTransfer)
+	})
+}
+
+func (d *vkDriver) conv(out, src, bias *block, outCount, srcCount, biasCount uint32, p convParams) error {
+	x, y, err := dispatchGrid(p.N, d.properties.MaxWorkGroupCount)
+	if err != nil {
+		return err
+	}
+	d.bindBuffers(out, src, bias, outCount, srcCount, biasCount)
+	return d.submit(func() {
+		d.before(src, accessShaderRead, stageCompute)
+		if bias != src {
+			d.before(bias, accessShaderRead, stageCompute)
+		}
+		d.before(out, accessShaderWrite, stageCompute)
+		d.bindCompute(d.convPipeline, unsafe.Pointer(&p), unsafe.Sizeof(p))
 		d.call("vkCmdDispatch", d.command, uintptr(x), uintptr(y), 1)
 		d.barrier(out, accessShaderWrite, accessShaderRead|accessShaderWrite|accessTransferRead, stageCompute, stageCompute|stageTransfer)
 	})

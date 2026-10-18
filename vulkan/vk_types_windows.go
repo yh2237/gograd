@@ -245,6 +245,8 @@ func checkABI() error {
 		{"push constants", unsafe.Sizeof(vkPointwisePush{}), 12},
 		{"view push constants", unsafe.Sizeof(viewParams{}), 64},
 		{"gemm push constants", unsafe.Sizeof(gemmParams{}), 100},
+		{"reduction push constants", unsafe.Sizeof(reduceParams{}), 28},
+		{"conv push constants", unsafe.Sizeof(convParams{}), 40},
 		{"specialization entry", unsafe.Sizeof(vkSpecializationMapEntry{}), 16},
 		{"specialization info", unsafe.Sizeof(vkSpecializationInfo{}), 32},
 	} {

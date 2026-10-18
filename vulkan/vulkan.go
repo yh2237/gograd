@@ -47,6 +47,8 @@ type driver interface {
 	pointwise(out, a, b *block, n, kind uint32, scalar float32) error
 	viewCopy(out, src *block, outCount, srcCount uint32, params viewParams) error
 	gemm(out, a, b *block, outCount, aCount, bCount uint32, params gemmParams, variant int) error
+	reduce(out, a, weight, bias *block, count, affineCount uint32, params reduceParams) error
+	conv(out, src, bias *block, outCount, srcCount, biasCount uint32, params convParams) error
 	close()
 }
 

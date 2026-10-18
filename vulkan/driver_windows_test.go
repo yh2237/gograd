@@ -50,3 +50,39 @@ func TestVulkanTwoDimensionalGEMM(t *testing.T) {
 	}
 	checkMatrix(t, b, out, want)
 }
+
+func TestVulkanTwoDimensionalTransformer(t *testing.T) {
+	b := testBackend(t)
+	b.driver.(*vkDriver).properties.MaxWorkGroupCount[0] = 2
+	data, want := make([]float32, 7*13), make([]float32, 7*13)
+	for i := range data {
+		data[i] = float32(i / 13)
+	}
+	for i := range want {
+		want[i] = 1.0 / 13
+	}
+	out := testAlloc(t, b, len(data))
+	if err := b.Softmax(out, testUpload(t, b, data), 7, 13); err != nil {
+		t.Fatal(err)
+	}
+	checkMatrix(t, b, out, want)
+	x, w := make([]float32, 333*3), make([]float32, 5*3*3)
+	for i := range x {
+		x[i] = 1
+	}
+	for i := range w {
+		w[i] = 1
+	}
+	want = make([]float32, 333*5)
+	for i := range want {
+		want[i] = 9
+		if i/5 == 0 || i/5 == 332 {
+			want[i] = 6
+		}
+	}
+	out = testAlloc(t, b, len(want))
+	if err := b.Conv1d(out, testUpload(t, b, x), testUpload(t, b, w), nil, gpu.Conv1dOptions{Batch: 1, InputLength: 333, InChannels: 3, OutChannels: 5, Kernel: 3, Stride: 1, Padding: 1, Dilation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	checkMatrix(t, b, out, want)
+}

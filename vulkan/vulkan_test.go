@@ -63,7 +63,7 @@ func checkValues(t *testing.T, b *Backend, x *gpu.Buffer, want []float32) {
 }
 
 func TestEmbeddedShader(t *testing.T) {
-	for _, code := range [][]byte{pointwiseSPV, viewSPV, gemmSPV} {
+	for _, code := range [][]byte{pointwiseSPV, viewSPV, gemmSPV, reduceSPV, convSPV} {
 		if len(code) < 20 || len(code)%4 != 0 || binary.LittleEndian.Uint32(code) != 0x07230203 {
 			t.Fatal("invalid embedded SPIR-V")
 		}

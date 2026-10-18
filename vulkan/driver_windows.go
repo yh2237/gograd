@@ -14,18 +14,19 @@ import (
 )
 
 type vkDriver struct {
-	dll                                             *syscall.DLL
-	getProc                                         *syscall.Proc
-	procs                                           map[string]uintptr
-	instance, physical, device, queue, command      uintptr
-	commandPool, fence                              uint64
-	descriptorLayout, descriptorPool, descriptorSet uint64
-	pipelineLayout, shader, pipeline                uint64
-	viewShader, viewPipeline                        uint64
-	gemmShader                                      uint64
-	gemmPipelines                                   [4]uint64
-	properties                                      Info
-	memory                                          vkMemoryProperties
+	dll                                                    *syscall.DLL
+	getProc                                                *syscall.Proc
+	procs                                                  map[string]uintptr
+	instance, physical, device, queue, command             uintptr
+	commandPool, fence                                     uint64
+	descriptorLayout, descriptorPool, descriptorSet        uint64
+	pipelineLayout, shader, pipeline                       uint64
+	viewShader, viewPipeline                               uint64
+	gemmShader                                             uint64
+	gemmPipelines                                          [4]uint64
+	reduceShader, reducePipeline, convShader, convPipeline uint64
+	properties                                             Info
+	memory                                                 vkMemoryProperties
 }
 
 func result(op string, value uintptr) error {
@@ -219,6 +220,8 @@ func (d *vkDriver) close() {
 			handle uint64
 		}{
 			{"vkDestroyPipeline", d.pipeline}, {"vkDestroyPipeline", d.viewPipeline},
+			{"vkDestroyPipeline", d.reducePipeline}, {"vkDestroyPipeline", d.convPipeline},
+			{"vkDestroyShaderModule", d.reduceShader}, {"vkDestroyShaderModule", d.convShader},
 			{"vkDestroyShaderModule", d.shader}, {"vkDestroyShaderModule", d.viewShader}, {"vkDestroyShaderModule", d.gemmShader}, {"vkDestroyPipelineLayout", d.pipelineLayout},
 			{"vkDestroyDescriptorPool", d.descriptorPool}, {"vkDestroyDescriptorSetLayout", d.descriptorLayout},
 			{"vkDestroyFence", d.fence}, {"vkDestroyCommandPool", d.commandPool},
