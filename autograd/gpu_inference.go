@@ -3,6 +3,7 @@ package autograd
 import (
 	"fmt"
 
+	_ "github.com/yh2237/gograd/directml" // Lazy registration, as with Vulkan.
 	"github.com/yh2237/gograd/gpu"
 	"github.com/yh2237/gograd/tensor"
 	_ "github.com/yh2237/gograd/vulkan" // Lazy registration; importing autograd does not load a driver.

@@ -1,14 +1,16 @@
 # GPUバックエンド実装の進捗
 
 ローカルの`notes/gpu-backend-plan.md`に沿って、M0の共通APIとCUDAアダプタ、
-M1のWindows/amd64向けVulkan基盤、M2のGEMMとview、M3のトランスフォーマー向け演算を実装した。LinuxのローダーとDirectMLは未実装。
+M1のWindows/amd64向けVulkan基盤、M2のGEMMとview、M3のトランスフォーマー向け演算、
+M4のWindows/amd64向けDirectML基盤を実装した。LinuxのVulkanローダーとM5のDirectML拡張は未実装。
 
 | デバイス | 実行環境 | 現在の範囲 |
 | --- | --- | --- |
 | CPU / CUDA | 従来どおり | 既存の推論・学習。CUDAの新アダプタも利用可 |
 | Vulkan | Windows/amd64、Vulkan 1.1以上の計算GPU | 基本演算、GEMM、view、正規化、Conv1d、構成演算による自己注意。推論のみ |
 | Vulkan | Linux、その他のOS/アーキテクチャ | スタブ。`Available() == false` |
-| DirectML | すべて | 未登録。`Available() == false` |
+| DirectML | Windows/amd64、DirectMLとD3D12対応の計算GPU | 転送、Add / Mul / MulScalar、GEMMの転置4通り。推論のみ |
+| DirectML | その他のOS/アーキテクチャ | スタブ。`Available() == false` |
 
 ## 実装した範囲
 
@@ -42,15 +44,24 @@ M1のWindows/amd64向けVulkan基盤、M2のGEMMとview、M3のトランスフ�
 - Concatは入力ごとに出力viewへScatterする。非連続入力と空の入力片にも対応し、呼び出し元の入力スライスは変更しない。
 - `ScaledDotProductAttention`はGEMM → スケール・加算mask → Softmax → GEMMで構成する。
   専用の融合カーネルではなく、中間のscoreとweightもGPU上に置く。評価時のDropoutは入力をそのまま返す。
+- M4のDirectMLは、純GoのCOM呼び出しでDXGI / D3D12 / DirectMLを使う。
+  ハードウェアアダプタだけを列挙し、D3D12とDirectMLが作れるデバイスのうち専用ビデオメモリの多いものを優先する。
+  WARPなどのソフトウェアアダプタは選ばない。
+- DirectMLのテンソルはD3D12 DEFAULTヒープに置き、UPLOAD / READBACKヒープ経由で転送する。
+  リソースを256バイト単位のサイズクラスでプールし、キャッシュ上限は既定で256 MiB。
+  小さなバッファでもD3D12の配置単位のメモリを使うため、上限と使用量はWidthではなく`GetResourceAllocationInfo`の確保サイズで数える。
+- DirectMLのAdd / Mulは要素演算子、MulScalarはIdentity演算子のScaleBias、GEMMはDML_GEMMを使う。
+  初回は演算子をコンパイルしてGPU上で初期化し、形・転置・スカラー値ごとに再利用する。
+  キャッシュは最大64件かつtemporary / persistentリソースの合計256 MiBまで。`ReleaseOperators`で明示的に破棄できる。
 
 ## 現時点の仕様と制約
 
-- `gpu`自体はドライバを読み込まない。`autograd`のimportでCUDAアダプタとVulkanが登録され、
+- `gpu`自体はドライバを読み込まない。`autograd`のimportでCUDAアダプタ・Vulkan・DirectMLが登録され、
   実際のドライバの読み込みは利用時まで遅延する。
 - Windows/amd64では`vulkan-1.dll`をシステムディレクトリから読み、利用可能なGPUを選ぶ。
   `vulkan.DeviceInfo()`で選択結果を、`vulkan.Err()`で利用できない理由を取得できる。
   初期化は一度だけ行い、失敗を記憶する。ドライバを後から導入した場合はプロセスを再起動する。
-- Vulkanが使えない環境や未登録のDirectMLでは、テンソル生成は`gpu.ErrUnavailable`。
+- 各バックエンドが使えない環境では、テンソル生成は`gpu.ErrUnavailable`。
   転送やsubmitでデバイスが失敗した場合も、以後`Available() == false`となる。
 - `gpu.Get`は利用できないデバイスから別のデバイスへ自動で切り替えない。
   必要ならアプリがテンソルやモデルを生成する前にCPUを選ぶ。
@@ -77,10 +88,23 @@ M1のWindows/amd64向けVulkan基盤、M2のGEMMとview、M3のトランスフ�
   Expanded viewなど、書き込み先が重複するviewは更新前に拒否する。
 - Vulkanはバックエンド内のmutexでqueue・command pool・descriptorを同期するため、CUDAのようなOSスレッド固定は不要。
   ただし同じTensorやモデルの変更を複数goroutineから行う際の同期は、引き続き呼び出し側の責任。
+- DirectMLもバックエンドのmutexでCOMオブジェクトとqueueを同期し、OSスレッド固定は不要。
+  DLLはシステムディレクトリの`dxgi.dll` / `d3d12.dll` / `DirectML.dll`だけを読み込む。
+  各submitでリソース状態の遷移、UAVバリア、フェンス待ちを行い、完了前にバッファ・記述子を再利用しない。
+  `directml.DeviceInfo()`でアダプタとfeature levelを、`directml.Err()`で利用できない理由を取得できる。
+- DirectMLのM4では、autogradの連続な2D MatMul、同じ形の要素演算、Reshape、Detachを使える。
+  GEMMの`transA` / `transB`はバックエンドAPIで利用できるが、autogradの非連続view、バッチGEMM、
+  要素数を増やすブロードキャスト、正規化・GELU・Softmax・Conv1d・ConcatはM5の作業として残る。
+  これらの未対応経路は`gpu.ErrUnsupported`で、CPUへ戻して計算しない。`LinearLayer`もM5のview対応が必要。
+- `directml.MemoryStats()`はテンソルとステージングのリソースを数え、演算子内部のヒープは含めない。
+  キャッシュ済み演算子の件数とtemporary / persistentリソースは`directml.CachedOperatorStats()`で別に確認できる。
+  未キャッシュの一時的な演算子とドライバ内部の管理領域を含む、プロセス全体のVRAM量ではない。
 - 現在はsubmitごとにフェンスを待つ。CPUより速いことやM6の2倍という性能目標は、まだ主張しない。
   command bufferのまとめと性能調整は後続の作業。
 - `vulkan.NewBackend()`は独立したdevice/queueを作る。独立したバックエンドの`Close()`は全バッファの解放後に行う。
   `autograd`が使う登録済みの既定バックエンドはプロセス寿命で、`Close()`できない。キャッシュは`ReleasePool()`で返せる。
+- DirectMLにも独立した`NewBackend` / `Close`と、既定バックエンドの`ReleasePool` / `ReleaseOperators`を用意した。
+  独立したバックエンドは、全テンソルを解放してからCloseする。
 - CUDAの演算には従来どおり`autograd.NewCUDAContext` / `NewCUDAContextOn`によるOSスレッドの固定が必要。
   演算の全バッファは同じdevice/streamで確保する。異なる選択で実行すると`gpu.ErrBackendMismatch`。
 - CUDAアダプタの転送・zero・解放は割当元のdevice/streamを使い、呼び出し元の選択を復元する。
@@ -115,6 +139,8 @@ CPUへフォールバックした場合は、実際のデバイスをCPUと表�
 go run ./cmd/vulkan-infer -n 100003
 go run ./cmd/vulkan-infer -linear
 go run ./cmd/vulkan-infer -cpu-fallback
+go run ./cmd/directml-infer
+go run ./cmd/directml-infer -m 7 -n 11 -k 13 -cpu-fallback
 ```
 
 ## シェーダの再生成（開発者向け）
@@ -133,6 +159,8 @@ go generate ./vulkan
 go test ./gpu
 go test ./autograd -run 'Test(GPUDeviceRolloutGuards|CUDAInferenceBackend)$' -v
 go test ./vulkan -v
+go test ./directml -v
+go test ./autograd -run TestDirectMLTensorInference -v
 go test ./autograd -run 'Test(InferenceGPU|VulkanTensorInference)' -v
 go test ./...
 go vet ./...
@@ -145,8 +173,13 @@ VulkanはRTX 3060 Ti、API 1.4.341、compute queue 2で検証した。
 `cmd/vulkan-infer -linear`の`[2,768,74] @ [74,768] + bias`もCPUとの最大絶対誤差は0だった。
 Vulkanのテストは`-gcflags=all=-d=checkptr=2`でも成功した。
 GPU実機テストをスキップさせずに検証する場合は、`GOGRAD_REQUIRE_VULKAN=1`を設定する。
+DirectMLは同じRTX 3060 Ti、feature level 6.4で検証した。
+実機テストのスキップを禁止するには`GOGRAD_REQUIRE_DIRECTML=1`を設定する。
+`cmd/directml-infer`の`[74,768] @ [768,768]`と要素演算のCPUとの差は0だった。
+DirectMLとautogradのDirectML経路は`-gcflags=all=-d=checkptr=2`でも検証した。
 Linux/amd64とmacOS/arm64向けにも、cgoなしで`autograd`のテストバイナリをクロスコンパイルした。
 これらはスタブ経路のビルド確認で、GPUの実行確認ではない。
+Windows/386ではDirectML単独のスタブとドライバ不要テストも実行した。
 Windows/386の`autograd`は、既存のCUDAパッケージの2 GiB定数がintでoverflowするためビルドできない。
 今回のVulkanローダーもWindows/amd64のみを対象にしている。
 
@@ -168,9 +201,13 @@ M3では3072列までのSoftmax / LayerNorm、GroupNorm、Conv1dのbias有無と
 各回のReleaseGraph後にGPUの使用中メモリが元へ戻ることを確認する。
 ドライバなしでも、NoGradの伝播、暗黙のdownloadがないこと、失敗時に呼び出し元の入力graphを壊さないことを確認する。
 Conv1dはim2col・GEMM・biasの各段階で失敗を注入し、一時バッファを含めて回収されることを確認する。
+DirectMLのM4では、0要素・部分サイズの要素演算、GEMMの転置4通りとK=0、8 goroutineでの並行実行、
+バッファプールと演算子キャッシュの上限・明示的な解放を確認する。CPU一致は`atol=1e-5`、`rtol=1e-5`。
+autogradではGEMMからAdd / MulScalar / Reshapeをつなぎ、親を早期Closeしてから読み戻せることを確認する。
+所有権、二重解放、ドライバ失敗後の回収、未対応環境のスタブはドライバなしでも検証する。
 
 ## 残る作業
 
 1. M1のLinuxローダー。`dlopen`と関数ポインタ呼び出しを、cgoなしの呼出規約を含めて検証する。
-2. M4/M5のDirectML実装。
+2. M5のDirectML拡張（view、バッチGEMM、正規化・活性化・Softmax・Conv1d・Concat）。
 3. M6の記録のまとめ、キャッシュ調整と実測ベンチマーク。
