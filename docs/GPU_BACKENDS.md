@@ -1,12 +1,12 @@
 # GPUバックエンド実装の進捗
 
 ローカルの`notes/gpu-backend-plan.md`に沿って、M0の共通APIとCUDAアダプタ、
-M1のWindows/amd64向けVulkan基盤、M2のGEMMとviewを実装した。LinuxのローダーとDirectMLは未実装。
+M1のWindows/amd64向けVulkan基盤、M2のGEMMとview、M3のトランスフォーマー向け演算を実装した。LinuxのローダーとDirectMLは未実装。
 
 | デバイス | 実行環境 | 現在の範囲 |
 | --- | --- | --- |
 | CPU / CUDA | 従来どおり | 既存の推論・学習。CUDAの新アダプタも利用可 |
-| Vulkan | Windows/amd64、Vulkan 1.1以上の計算GPU | 基本演算、GEMM、バッチ・view。推論のみ |
+| Vulkan | Windows/amd64、Vulkan 1.1以上の計算GPU | 基本演算、GEMM、view、正規化、Conv1d、構成演算による自己注意。推論のみ |
 | Vulkan | Linux、その他のOS/アーキテクチャ | スタブ。`Available() == false` |
 | DirectML | すべて | 未登録。`Available() == false` |
 
@@ -35,6 +35,13 @@ M1のWindows/amd64向けVulkan基盤、M2のGEMMとviewを実装した。Linux�
   GEMMは入力viewを直接読むため、転置やバッチの展開行列を作らない。
 - `gpu.View`と、追加のバックエンド能力を表す`gpu.ViewBackend` / `gpu.ViewMatMuler`を追加。Gather / ScatterはGPU上で実行する。
   Permute / Transpose / Slice / Expandは共有ストレージのメタデータを組み合わせる。連続な範囲のReshapeもコピーしない。
+- M3のGELU（tanh近似とerf式）、Softmax、LayerNorm、GroupNormを埋め込みシェーダで実装。
+  Softmaxと正規化は128 invocationsのworkgroupで行ごとに集約し、正規化の分散は平均からの差で求める。
+- Conv1dはGPU上のim2colとGEMM、任意のbias加算で計算する。stride / padding / dilationに対応する。
+  im2colの一時バッファは処理が成功・失敗した後にプールへ返す。デバイスのstorage buffer上限を超える場合は明示的に拒否する。
+- Concatは入力ごとに出力viewへScatterする。非連続入力と空の入力片にも対応し、呼び出し元の入力スライスは変更しない。
+- `ScaledDotProductAttention`はGEMM → スケール・加算mask → Softmax → GEMMで構成する。
+  専用の融合カーネルではなく、中間のscoreとweightもGPU上に置く。評価時のDropoutは入力をそのまま返す。
 
 ## 現時点の仕様と制約
 
@@ -51,13 +58,18 @@ M1のWindows/amd64向けVulkan基盤、M2のGEMMとviewを実装した。Linux�
   `Download`だけは先頭の一部を読み戻せる。
 - Conv1dは`[batch,time,in_channels]`、重みは`[out_channels,in_channels,kernel]`。
   biasはnilにできる。stride/dilationは正の値を明示する。
-- 共通のGELUはtanh近似。CUDAアダプタのGEMMはFP32で、既存のBF16設定を参照しない。
+- 共通の`Backend.GELU`はtanh近似。任意の`gpu.ExactGELUBackend`はerf式のGELUを表し、Vulkanが実装する。
+  `autograd.GELU(x, false)`をtanh近似へ読み替えることはない。erf自体は誤差上限1.5e-7の多項式近似を使う。
+  CUDAアダプタのGEMMはFP32で、既存のBF16設定を参照しない。
 - 新GPUの入力やパラメータの`RequiresGrad`は保持する。trueの入力を使うforwardには、
   その入力の`ExecutionContext.NoGrad`が必要。記録を要求した場合は出力を割り当てる前に拒否する。
   BatchNormの統計更新とoptimizerは、NoGrad中でも拒否する。
-- Vulkanの対応演算はAdd / Mul / MulScalar、MatMul、GPU間コピーとrank 6までのview。
-  `LinearLayer`の転置付き投影とbiasのブロードキャストも使える。
-  GELU、正規化、Softmax、Conv1d、Concatなどは引き続き`gpu.ErrUnsupported`で、M3で追加する。
+- Vulkanの対応演算はAdd / Mul / MulScalar、MatMul、GELU、Softmax、LayerNorm、GroupNorm、Conv1d、Concat、
+  構成演算による自己注意、GPU間コピーとrank 6までのview。`LinearLayer`の転置付き投影とbiasのブロードキャストも使える。
+  Softmaxは任意の軸を受け付け、非最終軸ならGPU上で軸を移して計算し、逆順に並べ替えたviewを返す。
+  BiasGELU / BiasResidualも基本演算の組み合わせで実行し、既存の`TransformerEncoderLayer`を評価モードとNoGradで使える。
+  LogSoftmax、FlashAttentionなどは引き続き`gpu.ErrUnsupported`。
+  明示的に`AttentionAlgorithm="flash"`を選んだ場合も拒否する。学習時のDropoutはNoGrad中でも`gpu.ErrInferenceOnly`。
   旧`tensor.Tensor` / `nn`経路はCPU/CUDAのままで、新GPUは`autograd`から使う。
 - viewのstride/offsetは要素数単位で、負のstrideは未対応。
   非連続なToHost / Contiguous / Detachや、要素演算のブロードキャストはGatherで実体化するが、CPUへは戻さない。
@@ -91,6 +103,11 @@ defer y.ReleaseGraph()
 values, err := y.ToHost() // 中間結果の読み戻しは不要
 ```
 
+既存の`TransformerEncoderLayer`を使う場合は、`layer.Training = false`と
+`layer.Attention.Training = false`を設定し、`execution.BindModule(&layer.Module)`で
+全パラメータを同じcontextに結び付けてから、`execution.NoGrad`内でForwardする。
+学習フラグが残っていれば、中間バッファを割り当てる前に拒否する。
+
 実行できる小さな例も用意した。起動時にGPU名・APIバージョン・compute queueを表示し、出力をCPUと照合する。
 CPUへフォールバックした場合は、実際のデバイスをCPUと表示する。GPU上での失敗を暗黙にCPUでやり直すことはない。
 
@@ -102,7 +119,7 @@ go run ./cmd/vulkan-infer -cpu-fallback
 
 ## シェーダの再生成（開発者向け）
 
-通常の`go build` / `go test`は、同梱の`vulkan/shaders/{pointwise,view,gemm}.spv`を使う。SDKやコンパイラは不要。
+通常の`go build` / `go test`は、同梱の`vulkan/shaders/{pointwise,view,gemm,reduce,conv}.spv`を使う。SDKやコンパイラは不要。
 ソースは隣の`.comp`ファイルにある。現在のバイナリはKhronos glslang 16.6.0で生成し、Vulkan 1.1を対象にしている。
 ソースを変えた場合だけ、`glslang`をPATHに置いて次を実行する。
 
@@ -143,10 +160,17 @@ Vulkan実機では0要素・部分workgroup・2次元dispatch・複数goroutine�
 GEMMは768×768×74と768³を含め転置4通りをCPU SGEMMと照合し、`atol=1e-4`、`rtol=1e-4`で検証する。
 バッチ軸のブロードキャスト、rank 6、部分タイル、K=0、slice/transpose/expandを通した読込、
 viewへの書き込み、RetainData、親の早期Close、失敗時の一時バッファ回収も確認する。
+M3では3072列までのSoftmax / LayerNorm、GroupNorm、Conv1dのbias有無とstride / padding / dilation、
+非連続入力、任意軸のSoftmaxとConcatをCPUと照合する。
+`TestInferenceGPUTransformerNetwork`はConv1d → GroupNorm → 2-head causal自己注意 → LayerNorm → FFNを
+3回実行し、`atol=1e-4`、`rtol=1e-4`とコサイン0.999以上を検証する。RTX 3060 Tiではコサイン1.0だった。
+既存の`TransformerEncoderLayer`でも、評価モードのforwardを3回繰り返してCPUと照合し、
+各回のReleaseGraph後にGPUの使用中メモリが元へ戻ることを確認する。
+ドライバなしでも、NoGradの伝播、暗黙のdownloadがないこと、失敗時に呼び出し元の入力graphを壊さないことを確認する。
+Conv1dはim2col・GEMM・biasの各段階で失敗を注入し、一時バッファを含めて回収されることを確認する。
 
 ## 残る作業
 
 1. M1のLinuxローダー。`dlopen`と関数ポインタ呼び出しを、cgoなしの呼出規約を含めて検証する。
-2. M3の正規化・活性化・Softmax・Conv1d・Concatと小さなネットワークでの照合。
-3. M4/M5のDirectML実装。
-4. M6の記録のまとめ、キャッシュ調整と実測ベンチマーク。
+2. M4/M5のDirectML実装。
+3. M6の記録のまとめ、キャッシュ調整と実測ベンチマーク。

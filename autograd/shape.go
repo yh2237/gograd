@@ -173,6 +173,9 @@ func Concat(axis int, inputs ...*Tensor) *Tensor {
 	if len(inputs) == 0 {
 		panic("autograd: empty concat")
 	}
+	if inferenceDevice(inputs[0].Device) {
+		return inferenceConcat(axis, inputs...)
+	}
 	same(inputs[0], inputs[1:]...)
 	s := append([]int(nil), inputs[0].Shape...)
 	if axis < 0 {

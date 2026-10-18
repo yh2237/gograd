@@ -4,6 +4,9 @@ import "github.com/yh2237/gograd/tensor"
 
 // Conv1dGEMM lowers odd-kernel, same-padded convolution to matrix products.
 func Conv1dGEMM(x, w, b *Tensor, dilation int) *Tensor {
+	if inferenceDevice(x.Device) {
+		return inferenceConv1d(x, w, b, 1, 0, dilation, true)
+	}
 	useCUDA := dispatchBackend("conv1d_gemm", x.Device)
 	return conv1dGEMM(x, w, b, 1, 0, dilation, true, useCUDA)
 }
@@ -11,6 +14,9 @@ func Conv1dGEMM(x, w, b *Tensor, dilation int) *Tensor {
 // Conv1dGEMMStride applies a time-major 1D convolution with explicit stride,
 // symmetric padding and dilation. Weights have shape [out, in, kernel].
 func Conv1dGEMMStride(x, w, b *Tensor, stride, padding, dilation int) *Tensor {
+	if inferenceDevice(x.Device) {
+		return inferenceConv1d(x, w, b, stride, padding, dilation, false)
+	}
 	useCUDA := dispatchBackend("conv1d_gemm_stride", x.Device)
 	return conv1dGEMM(x, w, b, stride, padding, dilation, false, useCUDA)
 }

@@ -5,6 +5,7 @@ import (
 	"unsafe"
 
 	"github.com/yh2237/gograd/cuda"
+	"github.com/yh2237/gograd/gpu"
 )
 
 func axisParts(shape []int, axis int) (int, int, int) {
@@ -18,6 +19,9 @@ func axisParts(shape []int, axis int) (int, int, int) {
 }
 
 func Softmax(a *Tensor, axis int) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceSoftmax(a, axis)
+	}
 	dispatchBackend("softmax", a.Device)
 	return softmax(a, axis, false)
 }
@@ -114,6 +118,13 @@ func softmax(a *Tensor, axis int, logmode bool) *Tensor {
 // Dropout uses the same index/seed hash on CPU and CUDA. A fixed seed makes a
 // forward/backward pair reproducible without keeping a mask tensor.
 func Dropout(a *Tensor, p float32, seed uint32, training bool) *Tensor {
+	if inferenceDevice(a.Device) {
+		inferenceOperands(a)
+		if training {
+			panic(gpu.ErrInferenceOnly)
+		}
+		return a
+	}
 	useCUDA := dispatchBackend("dropout", a.Device)
 	if !training || p == 0 {
 		return a
@@ -175,10 +186,19 @@ func Dropout(a *Tensor, p float32, seed uint32, training bool) *Tensor {
 var AttentionAlgorithm = "auto"
 
 func ScaledDotProductAttention(q, k, v, mask *Tensor) *Tensor {
+	if inferenceDevice(q.Device) {
+		return inferenceAttention(q, k, v, mask)
+	}
 	dispatchBackend("attention", q.Device)
 	return attentionWithDropout(q, k, v, mask, 0, 0, false)
 }
 func attentionWithDropout(q, k, v, mask *Tensor, p float32, seed uint32, training bool) *Tensor {
+	if inferenceDevice(q.Device) {
+		if training {
+			panic(gpu.ErrInferenceOnly)
+		}
+		return inferenceAttention(q, k, v, mask)
+	}
 	useCUDA := dispatchBackend("attention", q.Device)
 	same(q, k, v, mask)
 	options := executionOptions(q, k, v, mask)

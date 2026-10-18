@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand"
 
+	"github.com/yh2237/gograd/gpu"
 	"github.com/yh2237/gograd/tensor"
 )
 
@@ -60,6 +61,9 @@ func (m *MultiheadAttention) Forward(q, k, v, mask *Tensor) *Tensor {
 	return m.ForwardSeed(q, k, v, mask, 0)
 }
 func (m *MultiheadAttention) ForwardSeed(q, k, v, mask *Tensor, seed uint32) *Tensor {
+	if inferenceDevice(q.Device) && m.Training {
+		panic(gpu.ErrInferenceOnly)
+	}
 	if len(q.Shape) != 3 || len(k.Shape) != 3 || len(v.Shape) != 3 || q.Shape[0] != k.Shape[0] || k.Shape[0] != v.Shape[0] || k.Shape[1] != v.Shape[1] || q.Shape[2] != m.Model || k.Shape[2] != m.Model || v.Shape[2] != m.Model {
 		panic("autograd: attention shape")
 	}
@@ -131,6 +135,9 @@ func (m *TransformerEncoderLayer) param(name string) *Tensor {
 	panic("autograd: missing encoder parameter")
 }
 func (m *TransformerEncoderLayer) Forward(x, mask *Tensor, stepSeed uint32) *Tensor {
+	if inferenceDevice(x.Device) && (m.Training || m.Attention.Training) {
+		panic(gpu.ErrInferenceOnly)
+	}
 	h := LayerNorm(x, m.param("norm1.weight"), m.param("norm1.bias"), 1e-5)
 	h = m.Attention.ForwardSeed(h, h, h, mask, stepSeed+3)
 	x = Add(x, Dropout(h, m.Dropout, stepSeed, m.Training))

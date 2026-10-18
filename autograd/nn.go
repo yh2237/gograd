@@ -28,6 +28,9 @@ func GradientNormToHost() float32 {
 
 // Conv1d uses [batch,time,channels] and [out,in,kernel] weights.
 func Conv1d(x, w, b *Tensor, dilation int) *Tensor {
+	if inferenceDevice(x.Device) {
+		return inferenceConv1d(x, w, b, 1, 0, dilation, true)
+	}
 	useCUDA := dispatchBackend("conv1d", x.Device)
 	x, w, b = x.Contiguous(), w.Contiguous(), b.Contiguous()
 	if useCUDA {
@@ -89,6 +92,9 @@ func Conv1d(x, w, b *Tensor, dilation int) *Tensor {
 
 // GroupNorm normalizes each sample across its time and channels per group.
 func GroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
+	if inferenceDevice(x.Device) {
+		return inferenceGroupNorm(x, w, b, groups, eps)
+	}
 	useCUDA := dispatchBackend("group_norm", x.Device)
 	same(x, w, b)
 	x, w, b = x.Contiguous(), w.Contiguous(), b.Contiguous()
@@ -175,6 +181,9 @@ func GroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
 
 // LayerNorm normalizes over the last dimension.
 func LayerNorm(x, w, b *Tensor, eps float32) *Tensor {
+	if inferenceDevice(x.Device) {
+		return inferenceLayerNorm(x, w, b, eps)
+	}
 	useCUDA := dispatchBackend("layer_norm", x.Device)
 	if len(x.Shape) < 1 {
 		panic("autograd: layernorm rank")

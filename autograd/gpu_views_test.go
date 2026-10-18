@@ -30,6 +30,13 @@ func (b *inferenceTestBackend) Gather(out *gpu.Buffer, src gpu.View) error {
 	return nil
 }
 func (b *inferenceTestBackend) Scatter(dst gpu.View, src *gpu.Buffer) error {
+	b.mu.Lock()
+	fail := b.failNext
+	b.failNext = false
+	b.mu.Unlock()
+	if fail {
+		return injectedInferenceError
+	}
 	n, err := dst.ValidateWrite(b)
 	if err != nil {
 		return err

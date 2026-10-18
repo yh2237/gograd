@@ -760,6 +760,9 @@ func ReLU(a *Tensor) *Tensor {
 	})
 }
 func GELU(a *Tensor, approx bool) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceGELU(a, approx)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("gelu", a.Device) {
 		if approx {

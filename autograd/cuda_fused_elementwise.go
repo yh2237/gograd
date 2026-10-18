@@ -8,6 +8,9 @@ import (
 
 // BiasGELU combines the feed-forward bias and exact GELU on CUDA.
 func BiasGELU(x, b *Tensor) *Tensor {
+	if inferenceDevice(x.Device) {
+		return inferenceBiasGELU(x, b)
+	}
 	if !dispatchBackend("bias_gelu", x.Device) {
 		return GELU(Add(x, b), false)
 	}
@@ -43,6 +46,9 @@ func BiasGELU(x, b *Tensor) *Tensor {
 
 // BiasResidual combines a channel bias and a residual addition on CUDA.
 func BiasResidual(x, b, residual *Tensor) *Tensor {
+	if inferenceDevice(x.Device) {
+		return inferenceBiasResidual(x, b, residual)
+	}
 	if !dispatchBackend("bias_residual", x.Device) {
 		return Add(Add(x, b), residual)
 	}
