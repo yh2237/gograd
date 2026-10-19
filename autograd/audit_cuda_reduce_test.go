@@ -123,48 +123,74 @@ func BenchmarkAuditScalarReduceCUDA(b *testing.B) {
 	if !cuda.Available() {
 		b.Skip("CUDA unavailable")
 	}
+	for _, n := range []int{256, 65536, 1 << 20} {
+		for _, mean := range []bool{false, true} {
+			for _, baseline := range []bool{true, false} {
+				b.Run(fmt.Sprintf("n=%d/mean=%t/elementAtomics=%t", n, mean, baseline), func(b *testing.B) {
+					benchmarkAuditScalarReduce(b, n, mean, baseline)
+				})
+			}
+		}
+	}
+}
+
+// benchmarkAuditScalarReduce measures one configuration. testing runs every
+// sub-benchmark on a new goroutine, and a CUDA context belongs to the OS
+// thread that created it, so the context has to be created here instead of in
+// the parent benchmark.
+func benchmarkAuditScalarReduce(b *testing.B, n int, mean, baseline bool) {
 	ctx, err := NewCUDAContext()
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer ctx.Close()
-	for _, n := range []int{256, 65536, 1 << 20} {
-		for _, mean := range []bool{false, true} {
-			for _, baseline := range []bool{true, false} {
-				b.Run(fmt.Sprintf("n=%d/mean=%t/elementAtomics=%t", n, mean, baseline), func(b *testing.B) {
-					x, y := mustAlloc(n), mustAlloc(1)
-					defer x.Free()
-					defer y.Free()
-					if err := x.Memset(0, x.Size()); err != nil {
-						b.Fatal(err)
-					}
-					graphKernel("reduce_scalar_f") // Compile before timing.
-					xp, yp, size := ptr(x), ptr(y), int32(n)
-					d1, d2, zero := int32(1), int32(n), int32(0)
-					scale := float32(1)
-					if mean {
-						scale /= float32(n)
-					}
-					if err := cuda.Synchronize(); err != nil {
-						b.Fatal(err)
-					}
-					b.SetBytes(int64(n * 4))
-					b.ResetTimer()
-					for range b.N {
-						if err := y.Memset(0, 4); err != nil {
-							b.Fatal(err)
-						}
-						if baseline {
-							launch("reduce_f", n, unsafe.Pointer(&xp), unsafe.Pointer(&yp), unsafe.Pointer(&size), unsafe.Pointer(&d1), unsafe.Pointer(&d2), unsafe.Pointer(&zero), unsafe.Pointer(&zero), unsafe.Pointer(&zero), unsafe.Pointer(&scale))
-						} else {
-							launchScalarReduce(xp, yp, size, scale)
-						}
-					}
-					if err := cuda.Synchronize(); err != nil {
-						b.Fatal(err)
-					}
-				})
-			}
+	x, y := mustAlloc(n), mustAlloc(1)
+	defer x.Free()
+	defer y.Free()
+	if err := x.Memset(0, x.Size()); err != nil {
+		b.Fatal(err)
+	}
+	graphKernel("reduce_scalar_f") // Compile before timing.
+	xp, yp, size := ptr(x), ptr(y), int32(n)
+	d1, d2, zero := int32(1), int32(n), int32(0)
+	scale := float32(1)
+	if mean {
+		scale /= float32(n)
+	}
+	if err := cuda.Synchronize(); err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(n * 4))
+	b.ResetTimer()
+	for range b.N {
+		if err := y.Memset(0, 4); err != nil {
+			b.Fatal(err)
 		}
+		if baseline {
+			launch("reduce_f", n, unsafe.Pointer(&xp), unsafe.Pointer(&yp), unsafe.Pointer(&size), unsafe.Pointer(&d1), unsafe.Pointer(&d2), unsafe.Pointer(&zero), unsafe.Pointer(&zero), unsafe.Pointer(&zero), unsafe.Pointer(&scale))
+		} else {
+			launchScalarReduce(xp, yp, size, scale)
+		}
+	}
+	if err := cuda.Synchronize(); err != nil {
+		b.Fatal(err)
+	}
+}
+
+// testing runs every sub-benchmark on its own goroutine. A CUDA context is
+// current only on the OS thread that created it, so a benchmark body that
+// launches a kernel has to create the context in the sub-benchmark itself.
+// Inheriting the parent's context fails with "invalid context".
+func TestAuditScalarReduceBenchmarkContextPerSubBenchmark(t *testing.T) {
+	if !cuda.Available() {
+		t.Skip("CUDA unavailable")
+	}
+	result := testing.Benchmark(func(b *testing.B) {
+		b.Run("sub", func(b *testing.B) {
+			benchmarkAuditScalarReduce(b, 256, false, false)
+		})
+	})
+	if result.N == 0 {
+		t.Fatal("scalar reduce benchmark did not run")
 	}
 }
