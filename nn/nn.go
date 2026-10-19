@@ -320,7 +320,9 @@ func (s *Sequential) Backward(blas *cuda.Blas, grad *tensor.Tensor) (*tensor.Ten
 		if err != nil {
 			return nil, err
 		}
-		if current != grad {
+		// A module may hand back the gradient it received. Releasing it here
+		// would free a buffer the next module still reads.
+		if current != grad && current != next {
 			current.Close()
 		}
 		current = next
