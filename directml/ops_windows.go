@@ -163,6 +163,8 @@ func (d *nativeDriver) compile(key opKey) (_ *compiled, err error) {
 	}
 	defer release(initializer)
 	var initProps, execProps bindingProperties
+	// GetBindingProperties returns the descriptor count and the resource sizes
+	// by value, so the call fills the buffer instead of an HRESULT.
 	call(initializer, 8, uintptr(unsafe.Pointer(&initProps)))
 	call(op.operator, 8, uintptr(unsafe.Pointer(&execProps)))
 	heapDesc := descriptorHeapDesc{Count: max(1, max(initProps.Descriptors, execProps.Descriptors)), Flags: 1}

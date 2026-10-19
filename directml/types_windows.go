@@ -78,6 +78,9 @@ type gemmDesc struct {
 	Alpha, Beta    float32
 	Fused          *operatorDesc
 }
+
+// bindingProperties mirrors DML_BINDING_PROPERTIES: a descriptor count
+// followed by the temporary and persistent resource sizes.
 type bindingProperties struct {
 	Descriptors           uint32
 	Temporary, Persistent uint64

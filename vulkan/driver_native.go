@@ -61,6 +61,24 @@ func (d *vkDriver) resolve(name string) error {
 	return nil
 }
 
+// deviceScore ranks the candidate devices. A discrete GPU outranks an
+// integrated one, and a compute-only queue family outranks a combined one.
+// The device types are the Vulkan ones: 1 is an integrated GPU, 2 a discrete
+// GPU and 4 a CPU, which is rejected before the scoring.
+func deviceScore(deviceType uint32, queueFlags uint32) int {
+	score := 10
+	switch deviceType {
+	case 1:
+		score = 50
+	case 2:
+		score = 100
+	}
+	if queueFlags&1 == 0 {
+		score++
+	}
+	return score
+}
+
 func openDriver() (_ driver, err error) {
 	if err := checkABI(); err != nil {
 		return nil, err
@@ -177,16 +195,7 @@ func (d *vkDriver) selectPhysical() error {
 			if family.Count == 0 || family.Flags&2 == 0 {
 				continue
 			}
-			score := 10
-			if p.DeviceType == 1 {
-				score = 50
-			}
-			if p.DeviceType == 2 {
-				score = 100
-			}
-			if family.Flags&1 == 0 {
-				score++
-			} // Prefer a compute-only family.
+			score := deviceScore(p.DeviceType, family.Flags)
 			if score <= best {
 				continue
 			}

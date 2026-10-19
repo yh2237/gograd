@@ -60,6 +60,9 @@ func RunBranches(branches []StreamBranch) error {
 			if firstErr == nil {
 				firstErr = err
 			}
+			// The branch's work is already enqueued. Wait for it, otherwise the
+			// caller could free the branch's buffers while they are read.
+			_ = branch.Stream.Synchronize()
 			break
 		}
 		if err := event.Record(branch.Stream); err != nil {
@@ -67,6 +70,7 @@ func RunBranches(branches []StreamBranch) error {
 			if firstErr == nil {
 				firstErr = err
 			}
+			_ = branch.Stream.Synchronize()
 			break
 		}
 		if err := event.WaitOn(target); err != nil {
@@ -74,6 +78,7 @@ func RunBranches(branches []StreamBranch) error {
 			if firstErr == nil {
 				firstErr = err
 			}
+			_ = branch.Stream.Synchronize()
 			break
 		}
 		event.Destroy()
