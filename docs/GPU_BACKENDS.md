@@ -46,13 +46,13 @@ Vulkanの`gpu.FusedBiasBackend`は1次元biasの`BiasGELU`と、同shapeのresid
 
 追加能力が未実装か`ErrUnsupported`を返す場合は既存のGPU演算へ合成する。実行エラーは伝搬し、CPUでやり直すことはない。融合した残差加算も`(x + bias) + residual`の順序を保つ。
 
-Vulkan / DirectMLのバッファプールは既定で256 MiB。`MemoryStats`で使用量を確認し、`SetPoolCacheLimit`で上限変更、`ReleasePool`でキャッシュを解放できる。DirectMLはリソースのWidthではなく`GetResourceAllocationInfo`の確保量で数える。
+Vulkan / DirectMLのバッファプールは既定で256 MiB。`MemoryStats`で使用量を確認し、`SetPoolCacheLimit`で上限変更、`ReleasePool`でキャッシュを解放できる。DirectMLはリソースのWidthではなく`GetResourceAllocationInfo`の確保量で数える。Vulkanの`MemoryStats`は、完了を確認できなかった割当を`QuarantinedBytes` / `QuarantinedBuffers`として報告する。
 
 DirectMLの演算子キャッシュは最大64件、temporary / persistentリソース合計256 MiB。形・転置・スカラー値で再利用し、`ReleaseOperators`で解放する。バッチ内のdescriptorスロットも上限に数え、準備中の演算子は退避しない。キャッシュしない演算子もフェンス完了まで保持する。
 
 `directml.MemoryStats`は演算子内部のヒープを含まない。`CachedOperatorStats`はキャッシュ済みの演算子だけを数え、いずれもプロセス全体のVRAM量ではない。
 
-`NewBackend()`で作った独立バックエンドは全テンソルを解放してから`Close()`する。`autograd`が使う登録済みの既定バックエンドはプロセス寿命で、`Close()`は使えない。バッファの重複解放は安全。
+`NewBackend()`で作った独立バックエンドは全テンソルを解放してから`Close()`する。`autograd`が使う登録済みの既定バックエンドはプロセス寿命で、`Close()`は使えない。バッファの重複解放は安全。submit失敗後に完了を確認できないVulkanバックエンドは割当を隔離し、`Close()`がエラーを返す。デバイスロストまたは待機成功を確認できるまで、そのバックエンドを再利用しない。
 
 ## 使用例
 
