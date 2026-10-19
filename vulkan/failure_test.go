@@ -50,6 +50,9 @@ func (d *failingDriver) conv1d(p convBatch) error {
 func (d *failingDriver) viewCopy(out, src *block, outCount, srcCount uint32, p viewParams) error {
 	return d.failure
 }
+func (d *failingDriver) binaryViews(out, a, b *block, outCount, aCount, bCount uint32, p binaryParams) error {
+	return d.failure
+}
 func (d *failingDriver) gemm(out, a, b *block, outCount, aCount, bCount uint32, p gemmParams, variant int) error {
 	return d.computeFailure()
 }

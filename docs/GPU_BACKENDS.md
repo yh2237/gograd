@@ -24,7 +24,7 @@ VulkanとDirectMLは`autograd`から使うFP32推論バックエンド。学習�
 
 `gpu.Backend`はFP32バッファの割当・転送・演算を定義する。バッファは割当元を記録し、別バックエンドでの利用と解放後の使用を拒否する。登録済みバックエンドの置き換えは禁止。
 
-Vulkanは埋め込みSPIR-V、device-localバッファ、host-visible/coherentなステージングを使う。GEMMは8×16の出力タイル、K方向16、128 invocations、共有メモリ1536 Bで計算し、転置4通りのパイプラインを保持する。viewの入力はstrideとoffsetで直接読む。Conv1dはGPU上のim2colとGEMMに展開する。
+Vulkanは埋め込みSPIR-V、device-localバッファ、host-visible/coherentなステージングを使う。GEMMは8×16の出力タイル、K方向16、128 invocations、共有メモリ1536 Bで計算し、転置4通りのパイプラインを保持する。viewの入力はstrideとoffsetで直接読む。Conv1dはGPU上のim2colとGEMMに展開する。`gpu.ViewBinaryBackend`のAdd / Mulは2つのviewのstrideとoffsetから添字を計算し、1 dispatchで評価する。
 
 DirectMLは純GoのCOM呼出しでD3D12 DEFAULT / UPLOAD / READBACKリソースを使う。Conv1dのtime-majorデータはstride付きNCHW記述子で表す。LayerNorm / GroupNormは正規化とチャネルごとのaffine演算で構成する。
 
@@ -83,7 +83,7 @@ go run ./cmd/gpu-infer-bench -warmup 2 -iters 7 -json
 
 ## シェーダの再生成
 
-通常のビルドは同梱の`vulkan/shaders/{pointwise,view,gemm,reduce,conv}.spv`を使う。隣の`.comp`を変更した場合だけ、`glslang`をPATHに置いて再生成する。現在はglslang 16.6.0、Vulkan 1.1を対象にしている。
+通常のビルドは同梱の`vulkan/shaders/{pointwise,view,binary,gemm,reduce,conv}.spv`を使う。隣の`.comp`を変更した場合だけ、`glslang`をPATHに置いて再生成する。現在はglslang 16.6.0、Vulkan 1.1を対象にしている。
 
 ```sh
 go generate ./vulkan

@@ -2,6 +2,7 @@ package vulkan
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/yh2237/gograd/gpu"
 )
@@ -11,6 +12,15 @@ import (
 type viewParams struct {
 	N, Rank, Offset, Direction uint32
 	Shape, Strides             [6]uint32
+}
+
+// binaryParams mirrors the GLSL block of binary.comp: the common shape and
+// the two stride sets, plus the element offsets of the operands.
+type binaryParams struct {
+	N, Rank, Op, OffsetA, OffsetB uint32
+	Shape                         [6]uint32
+	StridesA                      [6]uint32
+	StridesB                      [6]uint32
 }
 
 type gemmParams struct {
@@ -24,6 +34,77 @@ type gemmParams struct {
 
 func (b *Backend) Gather(out *gpu.Buffer, src gpu.View) error  { return b.copyView(out, src, false) }
 func (b *Backend) Scatter(dst gpu.View, src *gpu.Buffer) error { return b.copyView(src, dst, true) }
+
+// AddViews evaluates a + b on two views with the same broadcast shape. The
+// operands keep their strides, so no expansion buffer is needed.
+func (b *Backend) AddViews(out *gpu.Buffer, a, right gpu.View) error {
+	return b.binaryViews(out, a, right, 0)
+}
+
+// MulViews evaluates a * b on two views with the same broadcast shape.
+func (b *Backend) MulViews(out *gpu.Buffer, a, right gpu.View) error {
+	return b.binaryViews(out, a, right, 1)
+}
+
+func (b *Backend) binaryViews(out *gpu.Buffer, a, right gpu.View, kind uint32) error {
+	if err := b.lock(); err != nil {
+		return err
+	}
+	defer b.mu.Unlock()
+	n, err := a.Validate(b)
+	if err != nil {
+		return err
+	}
+	rn, err := right.Validate(b)
+	if err != nil {
+		return err
+	}
+	if n != rn || !slices.Equal(a.Shape, right.Shape) {
+		return fmt.Errorf("%w: view operands must share a shape", gpu.ErrInvalidArgument)
+	}
+	if len(a.Shape) > 6 {
+		return fmt.Errorf("%w: view rank", gpu.ErrUnsupported)
+	}
+	y, err := b.native(out, n)
+	if err != nil {
+		return err
+	}
+	// The shader addresses the operands through their strides, so the
+	// descriptor range has to cover every element the view can reach.
+	usedA, usedB := viewSpan(a), viewSpan(right)
+	x, err := b.native(a.Buffer, a.Buffer.Len())
+	if err != nil {
+		return err
+	}
+	w, err := b.native(right.Buffer, right.Buffer.Len())
+	if err != nil {
+		return err
+	}
+	if y == x || y == w {
+		return fmt.Errorf("%w: view output aliases input", gpu.ErrInvalidArgument)
+	}
+	if n == 0 {
+		return nil
+	}
+	p := binaryParams{N: uint32(n), Rank: uint32(len(a.Shape)), Op: kind, OffsetA: uint32(a.Offset), OffsetB: uint32(right.Offset)}
+	for i := range a.Shape {
+		p.Shape[i] = uint32(a.Shape[i])
+		p.StridesA[i] = uint32(a.Strides[i])
+		p.StridesB[i] = uint32(right.Strides[i])
+	}
+	return b.fail(b.driver.binaryViews(y, x, w, uint32(n), uint32(usedA), uint32(usedB), p))
+}
+
+// viewSpan reports the number of elements a view can reach from its offset.
+func viewSpan(v gpu.View) int {
+	span := 1
+	for i, stride := range v.Strides {
+		if v.Shape[i] > 1 {
+			span += (v.Shape[i] - 1) * stride
+		}
+	}
+	return v.Offset + span
+}
 
 func (b *Backend) copyView(linear *gpu.Buffer, view gpu.View, scatter bool) error {
 	if err := b.lock(); err != nil {

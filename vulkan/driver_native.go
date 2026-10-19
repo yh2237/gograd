@@ -22,6 +22,7 @@ type vkDriver struct {
 	descriptorSets                                         [3]uint64
 	pipelineLayout, shader, pipeline                       uint64
 	viewShader, viewPipeline                               uint64
+	binaryShader, binaryPipeline                           uint64
 	gemmShader                                             uint64
 	gemmPipelines                                          [4]uint64
 	reduceShader, reducePipeline, convShader, convPipeline uint64
@@ -238,9 +239,12 @@ func (d *vkDriver) close() error {
 			handle uint64
 		}{
 			{"vkDestroyPipeline", d.pipeline}, {"vkDestroyPipeline", d.viewPipeline},
+			{"vkDestroyPipeline", d.binaryPipeline},
 			{"vkDestroyPipeline", d.reducePipeline}, {"vkDestroyPipeline", d.convPipeline},
 			{"vkDestroyShaderModule", d.reduceShader}, {"vkDestroyShaderModule", d.convShader},
-			{"vkDestroyShaderModule", d.shader}, {"vkDestroyShaderModule", d.viewShader}, {"vkDestroyShaderModule", d.gemmShader}, {"vkDestroyPipelineLayout", d.pipelineLayout},
+			{"vkDestroyShaderModule", d.shader}, {"vkDestroyShaderModule", d.viewShader},
+			{"vkDestroyShaderModule", d.binaryShader}, {"vkDestroyShaderModule", d.gemmShader},
+			{"vkDestroyPipelineLayout", d.pipelineLayout},
 			{"vkDestroyDescriptorPool", d.descriptorPool}, {"vkDestroyDescriptorSetLayout", d.descriptorLayout},
 			{"vkDestroyFence", d.fence}, {"vkDestroyCommandPool", d.commandPool},
 		} {

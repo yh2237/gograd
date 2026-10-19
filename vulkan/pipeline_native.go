@@ -61,6 +61,12 @@ func (d *vkDriver) initPipeline() error {
 	if d.viewPipeline, err = d.createCompute(d.viewShader, nil); err != nil {
 		return err
 	}
+	if d.binaryShader, err = d.createShader(binarySPV); err != nil {
+		return err
+	}
+	if d.binaryPipeline, err = d.createCompute(d.binaryShader, nil); err != nil {
+		return err
+	}
 	if d.gemmShader, err = d.createShader(gemmSPV); err != nil {
 		return err
 	}
@@ -295,6 +301,29 @@ func (d *vkDriver) viewCopy(out, src *block, outCount, srcCount uint32, p viewPa
 		d.before(src, accessShaderRead, stageCompute)
 		d.before(out, accessShaderWrite, stageCompute)
 		d.bindCompute(d.viewPipeline, unsafe.Pointer(&p), unsafe.Sizeof(p))
+		d.call("vkCmdDispatch", d.command, uintptr(x), uintptr(y), 1)
+		d.barrier(out, accessShaderWrite, accessShaderRead|accessShaderWrite|accessTransferRead, stageCompute, stageCompute|stageTransfer)
+	})
+}
+
+// binaryViews evaluates an elementwise operation on two strided views. The
+// output is compact; the operands keep their own strides and offsets.
+func (d *vkDriver) binaryViews(out, a, b *block, outCount, aCount, bCount uint32, p binaryParams) error {
+	if d.failure != nil {
+		return d.failure
+	}
+	x, y, err := dispatchGrid(p.N, d.properties.MaxWorkGroupCount)
+	if err != nil {
+		return err
+	}
+	d.bindBuffers(out, a, b, outCount, aCount, bCount)
+	return d.submit(func() {
+		d.before(a, accessShaderRead, stageCompute)
+		if b != a {
+			d.before(b, accessShaderRead, stageCompute)
+		}
+		d.before(out, accessShaderWrite, stageCompute)
+		d.bindCompute(d.binaryPipeline, unsafe.Pointer(&p), unsafe.Sizeof(p))
 		d.call("vkCmdDispatch", d.command, uintptr(x), uintptr(y), 1)
 		d.barrier(out, accessShaderWrite, accessShaderRead|accessShaderWrite|accessTransferRead, stageCompute, stageCompute|stageTransfer)
 	})
