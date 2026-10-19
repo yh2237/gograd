@@ -15,6 +15,7 @@ type testDriver struct {
 	allocated, freed, closed, releasedOperators int
 	computeCalls, failAt                        int
 	lastKey                                     opKey
+	lastOffsets                                 [3]uint64
 }
 
 func (*testDriver) info() Info { return Info{Name: "fixture", FeatureLevel: 0x1000} }
@@ -50,6 +51,16 @@ func (d *testDriver) copy(out, src *allocation, n uint64) error {
 }
 func (d *testDriver) execute(key opKey, out *allocation, inputs ...*allocation) error {
 	d.lastKey = key
+	return d.computeFailure()
+}
+func (d *testDriver) executeAt(key opKey, out *allocation, inputs ...resourceBinding) error {
+	d.lastKey = key
+	d.lastOffsets = [3]uint64{}
+	for i, v := range inputs {
+		if i < len(d.lastOffsets) {
+			d.lastOffsets[i] = v.offset
+		}
+	}
 	return d.computeFailure()
 }
 func (d *testDriver) copyView(out, src *allocation, v gpu.View, scatter bool) error {
@@ -311,6 +322,56 @@ func TestDirectMLPortableStridedGEMM(t *testing.T) {
 	x.Close()
 	y.Close()
 	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDirectMLPortableAlignedBindings(t *testing.T) {
+	b, d := fixture()
+	x, err := b.Alloc(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	y, err := b.Alloc(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := gpu.View{Buffer: x, Shape: []int{2, 2}, Strides: []int{1, 2}, Offset: 4}
+	if err := b.MatMulViews(y, v, v); err != nil {
+		t.Fatal(err)
+	}
+	if d.allocated != 2 || d.computeCalls != 1 || d.lastOffsets[0] != 16 || d.lastOffsets[1] != 16 {
+		t.Fatal("aligned GEMM materialized an input", d.lastOffsets)
+	}
+	if err := b.AddViews(y, v, v); err != nil {
+		t.Fatal(err)
+	}
+	if d.allocated != 2 || d.computeCalls != 2 || d.lastOffsets[0] != 16 {
+		t.Fatal("aligned binary materialized an input")
+	}
+	if err := b.Gather(y, v); err != nil {
+		t.Fatal(err)
+	}
+	if d.allocated != 2 || d.computeCalls != 3 || d.lastKey.kind != opIdentity || d.lastOffsets[0] != 16 {
+		t.Fatal("aligned gather recorded per-element copies")
+	}
+	v.Offset = 1
+	before := d.computeCalls
+	if err := b.MulViews(y, v, v); !errors.Is(err, gpu.ErrUnsupported) {
+		t.Fatal(err)
+	}
+	if d.computeCalls != before || !b.Available() {
+		t.Fatal("unsupported layout was dispatched or disabled the backend")
+	}
+	if err := b.Synchronize(); err != nil {
+		t.Fatal(err)
+	}
+	x.Close()
+	y.Close()
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Synchronize(); !errors.Is(err, gpu.ErrClosed) {
 		t.Fatal(err)
 	}
 }

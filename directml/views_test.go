@@ -3,6 +3,7 @@ package directml
 import (
 	"errors"
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/yh2237/gograd/gpu"
@@ -129,5 +130,60 @@ func TestDirectMLViewGEMM(t *testing.T) {
 			}
 			checkTransformer(t, b, out, want)
 		})
+	}
+}
+
+func TestDirectMLAlignedBinaryViews(t *testing.T) {
+	b := testBackend(t)
+	x := upload(t, b, []float32{0, 0, 0, 0, 1, 2, 3, 4, 5, 6})
+	w := upload(t, b, []float32{0, 0, 0, 0, 10, 20, 30})
+	a := gpu.View{Buffer: x, Shape: []int{2, 3}, Strides: []int{3, 1}, Offset: 4}
+	right := gpu.View{Buffer: w, Shape: []int{2, 3}, Strides: []int{0, 1}, Offset: 4}
+	out := alloc(t, b, 6)
+	if err := b.AddViews(out, a, right); err != nil {
+		t.Fatal(err)
+	}
+	check(t, b, out, []float32{11, 22, 33, 14, 25, 36})
+	if err := b.MulViews(out, a, right); err != nil {
+		t.Fatal(err)
+	}
+	check(t, b, out, []float32{10, 40, 90, 40, 100, 180})
+	a.Offset = 1
+	if err := b.AddViews(out, a, right); !errors.Is(err, gpu.ErrUnsupported) {
+		t.Fatal(err)
+	}
+	if !b.Available() {
+		t.Fatal("unsupported view poisoned the backend")
+	}
+	base := upload(t, b, []float32{1, 2, 3, 4, 5, 6, 7, 8})
+	v := gpu.View{Buffer: base, Shape: []int{2, 2}, Strides: []int{1, 2}, Offset: 4}
+	matrix := alloc(t, b, 4)
+	if err := b.Gather(matrix, v); err != nil {
+		t.Fatal(err)
+	}
+	check(t, b, matrix, []float32{5, 7, 6, 8})
+	if err := b.MatMulViews(matrix, v, v); err != nil {
+		t.Fatal(err)
+	}
+	check(t, b, matrix, []float32{67, 91, 78, 106})
+}
+
+func TestDirectMLGatherPreservesFloatBits(t *testing.T) {
+	b := testBackend(t)
+	values := []float32{0, 0, 0, 0, math.Float32frombits(0x80000000), math.Float32frombits(0x7fc01234), math.Float32frombits(0x7fc54321), float32(math.Inf(-1))}
+	x := upload(t, b, values)
+	v := gpu.View{Buffer: x, Shape: []int{2, 2}, Strides: []int{1, 2}, Offset: 4}
+	out := alloc(t, b, 4)
+	if err := b.Gather(out, v); err != nil {
+		t.Fatal(err)
+	}
+	got, err := b.Download(out, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, index := range []int{4, 6, 5, 7} {
+		if math.Float32bits(got[i]) != math.Float32bits(values[index]) {
+			t.Fatalf("[%d] bits=%08x want %08x", i, math.Float32bits(got[i]), math.Float32bits(values[index]))
+		}
 	}
 }

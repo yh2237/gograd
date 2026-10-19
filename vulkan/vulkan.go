@@ -74,6 +74,7 @@ var _ gpu.Backend = (*Backend)(nil)
 var _ gpu.Copier = (*Backend)(nil)
 var _ gpu.ViewBackend = (*Backend)(nil)
 var _ gpu.ViewMatMuler = (*Backend)(nil)
+var _ gpu.Synchronizer = (*Backend)(nil)
 
 func NewBackend() *Backend {
 	return &Backend{stats: AllocationStats{CacheLimitBytes: defaultCacheLimit}}
@@ -121,6 +122,16 @@ func (b *Backend) Available() bool {
 	}
 	b.mu.Unlock()
 	return true
+}
+
+// Synchronize waits behind any active operation. Every Vulkan operation already
+// waits for its fence before releasing mu, so no extra submission is necessary.
+func (b *Backend) Synchronize() error {
+	if err := b.lock(); err != nil {
+		return err
+	}
+	b.mu.Unlock()
+	return nil
 }
 func (b *Backend) Err() error {
 	if err := b.lock(); err != nil {

@@ -54,6 +54,13 @@ type opKey struct {
 // Higher-rank public views are copied on the device before folding batch axes.
 type tensorLayout struct{ sizes, strides [4]uint32 }
 
+// resourceBinding offsets are bytes, aligned to DirectML's 16-byte tensor
+// alignment. They are bindings, not cache keys: changing a slice reuses its op.
+type resourceBinding struct {
+	memory *allocation
+	offset uint64
+}
+
 const (
 	opAdd uint32 = iota
 	opMul
@@ -64,6 +71,7 @@ const (
 	opNorm
 	opConv
 	opSoftmax
+	opIdentity
 )
 const (
 	heapDefault  uint32 = 1
@@ -81,6 +89,7 @@ type driver interface {
 	read(*allocation, []float32) error
 	copy(out, src *allocation, size uint64) error
 	execute(key opKey, out *allocation, inputs ...*allocation) error
+	executeAt(key opKey, out *allocation, inputs ...resourceBinding) error
 	copyView(out, src *allocation, v gpu.View, scatter bool) error
 	operatorStats() OperatorStats
 	releaseOperators()
@@ -104,6 +113,7 @@ type Backend struct {
 
 var _ gpu.Backend = (*Backend)(nil)
 var _ gpu.Copier = (*Backend)(nil)
+var _ gpu.Synchronizer = (*Backend)(nil)
 
 func NewBackend() *Backend {
 	return &Backend{stats: AllocationStats{CacheLimitBytes: defaultCacheLimit}}
@@ -146,6 +156,16 @@ func (b *Backend) Available() bool {
 	}
 	b.mu.Unlock()
 	return true
+}
+
+// Synchronize waits behind active work. All current DirectML operations wait for
+// their fence while holding mu; consequently no extra command list is needed.
+func (b *Backend) Synchronize() error {
+	if err := b.lock(); err != nil {
+		return err
+	}
+	b.mu.Unlock()
+	return nil
 }
 func (b *Backend) Err() error {
 	if err := b.lock(); err != nil {

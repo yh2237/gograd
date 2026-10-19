@@ -106,6 +106,9 @@ func (d *nativeDriver) compile(key opKey) (_ *compiled, err error) {
 		desc = operatorDesc{Type: 24, Desc: unsafe.Pointer(&binary)}
 	case opScalar:
 		desc = operatorDesc{Type: 1, Desc: unsafe.Pointer(&identity)}
+	case opIdentity:
+		identity.ScaleBias = nil // A view copy must not change signed zero or NaN bits.
+		desc = operatorDesc{Type: 1, Desc: unsafe.Pointer(&identity)}
 	case opGEMM:
 		if key.aLayout.sizes[0] == 0 {
 			a, b, out = newTensor(key.m, key.k), newTensor(key.k, key.n), newTensor(key.m, key.n)
@@ -244,6 +247,14 @@ func (d *nativeDriver) recordDispatch(op *compiled, dispatchable *object, resour
 }
 
 func (d *nativeDriver) execute(key opKey, out *allocation, inputs ...*allocation) error {
+	bindings := make([]resourceBinding, len(inputs))
+	for i, v := range inputs {
+		bindings[i].memory = v
+	}
+	return d.executeAt(key, out, bindings...)
+}
+
+func (d *nativeDriver) executeAt(key opKey, out *allocation, inputs ...resourceBinding) error {
 	op := d.operators[key]
 	if op == nil {
 		var err error
@@ -278,21 +289,21 @@ func (d *nativeDriver) execute(key opKey, out *allocation, inputs ...*allocation
 			d.order = append(d.order, key)
 		}
 	}
-	if key.kind == opScalar {
+	if key.kind == opScalar || key.kind == opIdentity {
 		inputs = inputs[:1]
 	}
 	// GEMM has a third, optional C input. Bind NONE when Beta is zero.
 	if key.kind == opGEMM {
-		inputs = append(inputs, nil)
+		inputs = append(inputs, resourceBinding{})
 	}
 	if key.kind == opNorm {
-		inputs = append(inputs, nil, nil)
+		inputs = append(inputs, resourceBinding{}, resourceBinding{})
 	}
 	buffers := make([]bufferBinding, len(inputs))
 	descs := make([]bindingDesc, len(inputs))
 	for i, v := range inputs {
-		if v != nil {
-			buffers[i] = bufferBinding{Resource: v.native.(*object), Size: v.size}
+		if v.memory != nil {
+			buffers[i] = bufferBinding{Resource: v.memory.native.(*object), Offset: v.offset, Size: v.memory.size - v.offset}
 			descs[i] = bindingDesc{Type: 1, Desc: &buffers[i]}
 		}
 	}
@@ -300,6 +311,9 @@ func (d *nativeDriver) execute(key opKey, out *allocation, inputs ...*allocation
 	output := bufferBinding{Resource: out.native.(*object), Size: out.size}
 	outputDesc := bindingDesc{Type: 1, Desc: &output}
 	call(op.table, 9, 1, uintptr(unsafe.Pointer(&outputDesc)))
-	resources := append([]*allocation{out, op.temporary, op.persistent}, inputs...)
+	resources := []*allocation{out, op.temporary, op.persistent}
+	for _, v := range inputs {
+		resources = append(resources, v.memory)
+	}
 	return d.recordDispatch(op, op.operator, resources...)
 }

@@ -1,6 +1,7 @@
 package autograd
 
 import (
+	"errors"
 	"fmt"
 
 	_ "github.com/yh2237/gograd/directml" // Lazy registration, as with Vulkan.
@@ -98,10 +99,6 @@ func inferenceBinary(name string, a, b *Tensor) *Tensor {
 	if err != nil {
 		panic(err)
 	}
-	x, releaseA := inferenceBuffer(backend, av)
-	defer releaseA()
-	y, releaseB := inferenceBuffer(backend, bv)
-	defer releaseB()
 	out, err := backend.Alloc(n)
 	if err != nil {
 		panic(err)
@@ -112,6 +109,23 @@ func inferenceBinary(name string, a, b *Tensor) *Tensor {
 			panic(r)
 		}
 	}()
+	if views, ok := backend.(gpu.ViewBinaryBackend); ok {
+		if name == "add" {
+			err = views.AddViews(out, av, bv)
+		} else {
+			err = views.MulViews(out, av, bv)
+		}
+		if err == nil {
+			return inferenceResult(out, shape, context, a, b)
+		}
+		if !errors.Is(err, gpu.ErrUnsupported) {
+			panic(err)
+		}
+	}
+	x, releaseA := inferenceBuffer(backend, av)
+	defer releaseA()
+	y, releaseB := inferenceBuffer(backend, bv)
+	defer releaseB()
 	if name == "add" {
 		err = backend.Add(out, x, y, n)
 	} else {

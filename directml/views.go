@@ -1,9 +1,13 @@
 package directml
 
-import "github.com/yh2237/gograd/gpu"
+import (
+	"github.com/yh2237/gograd/gpu"
+	"slices"
+)
 
 var _ gpu.ViewBackend = (*Backend)(nil)
 var _ gpu.ViewMatMuler = (*Backend)(nil)
+var _ gpu.ViewBinaryBackend = (*Backend)(nil)
 
 func (b *Backend) Gather(out *gpu.Buffer, src gpu.View) error  { return b.copyView(out, src, false) }
 func (b *Backend) Scatter(dst gpu.View, src *gpu.Buffer) error { return b.copyView(src, dst, true) }
@@ -36,7 +40,18 @@ func (b *Backend) copyView(linear *gpu.Buffer, v gpu.View, scatter bool) error {
 	if scatter {
 		return b.fail(b.driver.copyView(base, flat, v, true))
 	}
-	return b.fail(b.driver.copyView(flat, base, v, false))
+	return b.gatherLocked(flat, base, v)
+}
+
+func (b *Backend) gatherLocked(out, src *allocation, v gpu.View) error {
+	if v.Offset%4 == 0 && len(v.Shape) <= 4 && !v.Compact() {
+		a := viewLayout(v)
+		s := a.sizes
+		y := compactLayout(s[0], s[1], s[2], s[3])
+		n, _ := gpu.Elements(v.Shape...)
+		return b.fail(b.driver.executeAt(opKey{kind: opIdentity, n: n, aLayout: a, yLayout: y}, out, resourceBinding{src, uint64(v.Offset) * 4}))
+	}
+	return b.fail(b.driver.copyView(out, src, v, false))
 }
 
 // materializeLocked copies only on the GPU. In particular, byte offsets need
@@ -59,7 +74,7 @@ func (b *Backend) materializeLocked(v gpu.View) (*allocation, func(), error) {
 		return nil, nil, err
 	}
 	if n != 0 {
-		if err := b.fail(b.driver.copyView(out, base, v, false)); err != nil {
+		if err := b.gatherLocked(out, base, v); err != nil {
 			b.put(out)
 			return nil, nil, err
 		}
@@ -131,14 +146,14 @@ func (b *Backend) MatMulViews(out *gpu.Buffer, a, right gpu.View) error {
 	}
 	// Ordinary batch/head transposes and expansions can be read directly by
 	// baseline four-axis GEMM. No expanded matrices or transpose copies needed.
-	if a.Offset == 0 && right.Offset == 0 && len(shape) <= 4 {
+	if a.Offset%4 == 0 && right.Offset%4 == 0 && len(shape) <= 4 {
 		avLayout, bvLayout := viewLayout(av), viewLayout(bv)
 		ys := [4]uint32{1, 1, 1, 1}
 		for i, d := range shape {
 			ys[4-len(shape)+i] = uint32(d)
 		}
 		yLayout := compactLayout(ys[0], ys[1], ys[2], ys[3])
-		return b.fail(b.driver.execute(opKey{kind: opGEMM, m: m, n: cols, k: k, aLayout: avLayout, bLayout: bvLayout, yLayout: yLayout}, y, x, w))
+		return b.fail(b.driver.executeAt(opKey{kind: opGEMM, m: m, n: cols, k: k, aLayout: avLayout, bLayout: bvLayout, yLayout: yLayout}, y, resourceBinding{x, uint64(a.Offset) * 4}, resourceBinding{w, uint64(right.Offset) * 4}))
 	}
 	x, releaseA, err := b.materializeLocked(av)
 	if err != nil {
@@ -168,4 +183,53 @@ func viewLayout(v gpu.View) tensorLayout {
 		layout.strides[axis] = uint32(v.Strides[i])
 	}
 	return layout
+}
+
+func (b *Backend) AddViews(out *gpu.Buffer, a, right gpu.View) error {
+	return b.binaryViews(out, a, right, opAdd)
+}
+func (b *Backend) MulViews(out *gpu.Buffer, a, right gpu.View) error {
+	return b.binaryViews(out, a, right, opMul)
+}
+func (b *Backend) binaryViews(out *gpu.Buffer, a, right gpu.View, kind uint32) error {
+	if err := b.lock(); err != nil {
+		return err
+	}
+	defer b.mu.Unlock()
+	n, err := a.Validate(b)
+	if err != nil {
+		return err
+	}
+	rn, err := right.Validate(b)
+	if err != nil {
+		return err
+	}
+	if n != rn || !slices.Equal(a.Shape, right.Shape) {
+		return gpu.ErrInvalidArgument
+	}
+	y, err := b.native(out, n)
+	if err != nil {
+		return err
+	}
+	x, err := b.native(a.Buffer, a.Buffer.Len())
+	if err != nil {
+		return err
+	}
+	w, err := b.native(right.Buffer, right.Buffer.Len())
+	if err != nil {
+		return err
+	}
+	if y == x || y == w {
+		return gpu.ErrInvalidArgument
+	}
+	if n == 0 {
+		return nil
+	}
+	if len(a.Shape) > 4 || a.Offset%4 != 0 || right.Offset%4 != 0 {
+		return gpu.ErrUnsupported
+	}
+	al, bl := viewLayout(a), viewLayout(right)
+	s := al.sizes
+	yl := compactLayout(s[0], s[1], s[2], s[3])
+	return b.fail(b.driver.executeAt(opKey{kind: kind, n: n, aLayout: al, bLayout: bl, yLayout: yl}, y, resourceBinding{x, uint64(a.Offset) * 4}, resourceBinding{w, uint64(right.Offset) * 4}))
 }

@@ -123,7 +123,7 @@ func inferenceTestNew(t *testing.T, device tensor.Device, shape []int, seed int)
 func TestInferenceGPUTransformerOps(t *testing.T) {
 	inferenceTestDevices(t, func(t *testing.T, device tensor.Device) {
 		inferenceLeakCheck(t, device)
-		for _, op := range []string{"gelu", "gelu_exact", "bias_gelu", "bias_residual", "softmax_last", "softmax_middle", "softmax_first", "layernorm", "groupnorm", "concat", "conv_same", "conv_stride", "conv_no_bias"} {
+		for _, op := range []string{"gelu", "gelu_exact", "bias_gelu", "bias_residual", "broadcast_rank5", "broadcast_unaligned", "softmax_last", "softmax_middle", "softmax_first", "layernorm", "groupnorm", "concat", "conv_same", "conv_stride", "conv_no_bias"} {
 			t.Run(op, func(t *testing.T) {
 				inferenceLeakCheck(t, device)
 				build := func(d tensor.Device) *Tensor {
@@ -139,6 +139,10 @@ func TestInferenceGPUTransformerOps(t *testing.T) {
 						return BiasGELU(x, bias)
 					case "bias_residual":
 						return BiasResidual(x, bias, x)
+					case "broadcast_rank5":
+						return Add(Expand(x, 1, 1, 2, 7, 8), bias)
+					case "broadcast_unaligned":
+						return Mul(Slice(x, 2, 1, 8), Slice(bias, 0, 1, 8))
 					case "softmax_last":
 						return Softmax(x, -1)
 					case "softmax_middle":

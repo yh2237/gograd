@@ -20,6 +20,7 @@ type inferenceTestBackend struct {
 	live, allocations, downloads int
 	failNext                     bool
 	failCopy, failZero           bool
+	viewBinaryEnabled            bool
 }
 
 var inferenceFixture = &inferenceTestBackend{}
