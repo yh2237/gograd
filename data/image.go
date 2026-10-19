@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"image"
+	"image/color"
 	_ "image/jpeg"
 	_ "image/png"
 	"os"
@@ -29,17 +30,30 @@ func ReadImageFile(path string) ([]float32, []int, error) {
 func pixelsFromImage(img image.Image) ([]float32, []int, error) {
 	b := img.Bounds()
 	width, height := b.Dx(), b.Dy()
-	switch img.(type) {
-	case *image.Gray, *image.Gray16, *image.Paletted:
+	gray := false
+	switch v := img.(type) {
+	case *image.Gray, *image.Gray16:
+		gray = true
+	case *image.Paletted:
+		gray = true
+		for _, c := range v.Palette {
+			r, g, b, _ := c.RGBA()
+			if r != g || g != b {
+				gray = false
+				break
+			}
+		}
+	}
+	if gray {
 		out := make([]float32, width*height)
 		for y := 0; y < height; y++ {
 			for x := 0; x < width; x++ {
-				r, _, _, _ := img.At(b.Min.X+x, b.Min.Y+y).RGBA()
-				out[y*width+x] = float32(r) / 65535
+				c := color.Gray16Model.Convert(img.At(b.Min.X+x, b.Min.Y+y)).(color.Gray16)
+				out[y*width+x] = float32(c.Y) / 65535
 			}
 		}
 		return out, []int{1, height, width}, nil
-	default:
+	} else {
 		out := make([]float32, 3*width*height)
 		for y := 0; y < height; y++ {
 			for x := 0; x < width; x++ {
@@ -91,12 +105,13 @@ func WriteIDX(imagesPath, labelsPath string, rows, cols int, images [][]byte, la
 // ScaleImage resamples img to width/height by nearest neighbor. If channels is 3,
 // the result has 3 planes; otherwise a single grayscale plane.
 func ScaleImage(img image.Image, width, height, channels int) []uint8 {
+	minimum := img.Bounds().Min
 	srcH, srcW := img.Bounds().Dy(), img.Bounds().Dx()
 	if channels == 3 {
 		out := make([]uint8, 3*width*height)
 		for y := 0; y < height; y++ {
 			for x := 0; x < width; x++ {
-				r, g, b, _ := img.At(srcW*x/width, srcH*y/height).RGBA()
+				r, g, b, _ := img.At(minimum.X+srcW*x/width, minimum.Y+srcH*y/height).RGBA()
 				out[0*width*height+(y*width)+x] = uint8(r >> 8)
 				out[1*width*height+(y*width)+x] = uint8(g >> 8)
 				out[2*width*height+(y*width)+x] = uint8(b >> 8)
@@ -107,8 +122,8 @@ func ScaleImage(img image.Image, width, height, channels int) []uint8 {
 	out := make([]uint8, width*height)
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
-			r, _, _, _ := img.At(srcW*x/width, srcH*y/height).RGBA()
-			out[y*width+x] = uint8(r >> 8)
+			c := color.GrayModel.Convert(img.At(minimum.X+srcW*x/width, minimum.Y+srcH*y/height)).(color.Gray)
+			out[y*width+x] = c.Y
 		}
 	}
 	return out

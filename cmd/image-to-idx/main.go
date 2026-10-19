@@ -6,7 +6,7 @@ import (
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
-	"math"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,11 +31,19 @@ func main() {
 		fmt.Fprintln(os.Stderr, "image-to-idx: -size must be positive")
 		os.Exit(2)
 	}
-
-	entries, err := os.ReadDir(*src)
-	if err != nil {
+	if err := convertImages(*src, *outImages, *outLabels, *size, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+}
+
+func convertImages(src, outImages, outLabels string, size int, log io.Writer) error {
+	if src == "" || outImages == "" || outLabels == "" || size <= 0 {
+		return fmt.Errorf("image-to-idx: source, outputs and positive size required")
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return fmt.Errorf("image-to-idx: read directory %s: %w", src, err)
 	}
 	var classes []string
 	for _, e := range entries {
@@ -45,8 +53,10 @@ func main() {
 	}
 	sort.Strings(classes)
 	if len(classes) == 0 {
-		fmt.Fprintln(os.Stderr, "image-to-idx: no class subdirectories found")
-		os.Exit(1)
+		return fmt.Errorf("image-to-idx: no class subdirectories found in %s", src)
+	}
+	if len(classes) > 256 {
+		return fmt.Errorf("image-to-idx: %s has %d classes; IDX byte labels support at most 256", src, len(classes))
 	}
 	classIndex := map[string]int{}
 	for i, c := range classes {
@@ -57,10 +67,13 @@ func main() {
 	var labels []byte
 	converted := 0
 	for _, class := range classes {
-		classDir := filepath.Join(*src, class)
+		classDir := filepath.Join(src, class)
 		err := filepath.Walk(classDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info == nil || info.IsDir() {
-				return nil //nolint:errcheck
+			if err != nil {
+				return fmt.Errorf("image-to-idx: traverse %s: %w", path, err)
+			}
+			if info.IsDir() {
+				return nil
 			}
 			ext := strings.ToLower(filepath.Ext(path))
 			if ext != ".png" && ext != ".jpg" && ext != ".jpeg" {
@@ -68,36 +81,34 @@ func main() {
 			}
 			f, err := os.Open(path)
 			if err != nil {
-				return nil
+				return fmt.Errorf("image-to-idx: open %s: %w", path, err)
 			}
 			img, _, err := image.Decode(f)
-			f.Close()
+			closeErr := f.Close()
 			if err != nil {
-				return nil
+				return fmt.Errorf("image-to-idx: decode %s: %w", path, err)
 			}
-			pixels := data.ScaleImage(img, *size, *size, 1)
-			quantized := make([]byte, len(pixels))
-			for i, v := range pixels {
-				quantized[i] = byte(math.Round(float64(v) * 255))
+			if closeErr != nil {
+				return fmt.Errorf("image-to-idx: close %s: %w", path, closeErr)
 			}
-			images = append(images, quantized)
+			images = append(images, data.ScaleImage(img, size, size, 1))
 			labels = append(labels, byte(classIndex[class]))
 			converted++
 			return nil
 		})
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return err
 		}
 	}
 
 	if len(images) == 0 {
-		fmt.Fprintln(os.Stderr, "image-to-idx: no readable images found")
-		os.Exit(1)
+		return fmt.Errorf("image-to-idx: no images found in %s", src)
 	}
-	if err := data.WriteIDX(*outImages, *outLabels, *size, *size, images, labels); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	if err := data.WriteIDX(outImages, outLabels, size, size, images, labels); err != nil {
+		return fmt.Errorf("image-to-idx: write %s and %s: %w", outImages, outLabels, err)
 	}
-	fmt.Printf("converted=%d classes=%d size=%dx%d\n", converted, len(classes), *size, *size)
+	if log != nil {
+		_, err = fmt.Fprintf(log, "converted=%d classes=%d size=%dx%d\n", converted, len(classes), size, size)
+	}
+	return err
 }

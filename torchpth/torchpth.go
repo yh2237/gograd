@@ -106,7 +106,7 @@ func Read(filename string) (map[string]Tensor, error) {
 }
 
 func (d *decoder) bytes(n int) ([]byte, error) {
-	if n < 0 || d.pos+n > len(d.data) {
+	if n < 0 || n > len(d.data)-d.pos {
 		return nil, fmt.Errorf("torchpth: truncated pickle")
 	}
 	b := d.data[d.pos : d.pos+n]
@@ -260,6 +260,9 @@ func (d *decoder) run() (any, error) {
 			v, e := d.bytes(4)
 			if e != nil {
 				return nil, e
+			}
+			if len(d.stack) == 0 {
+				return nil, fmt.Errorf("torchpth: empty memo")
 			}
 			d.memo[int(binary.LittleEndian.Uint32(v))] = d.stack[len(d.stack)-1]
 		case 'h':

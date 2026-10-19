@@ -263,23 +263,20 @@ func encodeWAVSample(raw []byte, value float32, bits int, float bool) {
 		}
 		return
 	}
+	// Keep multiplication and rounding in float64: MaxInt32 rounds up to
+	// 2147483648 in float32, which converts a positive endpoint to a negative int.
+	scale := float64((int64(1) << uint(bits-1)) - 1)
+	quantized := math.Round(math.Max(-1, math.Min(1, float64(value))) * scale)
+	quantized = math.Max(-scale-1, math.Min(scale, quantized))
+	q := int32(quantized)
 	switch bits {
 	case 8:
-		raw[0] = byte(roundWAVSample(clamp(value, -1, 1)*127) + 128)
+		raw[0] = byte(q + 128)
 	case 16:
-		binary.LittleEndian.PutUint16(raw, uint16(int16(roundWAVSample(clamp(value, -1, 1)*32767))))
+		binary.LittleEndian.PutUint16(raw, uint16(int16(q)))
 	case 24:
-		value := roundWAVSample(clamp(value, -1, 1) * 8388607)
-		raw[0], raw[1], raw[2] = byte(value), byte(value>>8), byte(value>>16)
+		raw[0], raw[1], raw[2] = byte(q), byte(q>>8), byte(q>>16)
 	default:
-		binary.LittleEndian.PutUint32(raw, uint32(roundWAVSample(clamp(value, -1, 1)*2147483647)))
+		binary.LittleEndian.PutUint32(raw, uint32(q))
 	}
-}
-
-func roundWAVSample(value float32) int32 {
-	return int32(math.Round(float64(value)))
-}
-
-func clamp(value, low, high float32) float32 {
-	return max(low, min(high, value))
 }

@@ -142,7 +142,10 @@ func readSafetensors(path string) (map[string]safeTensorEntry, map[string]string
 		delete(header, "__metadata__")
 	}
 	data := file[8+int(hlen):]
-	entries := make(map[string]safeTensorEntry, len(header))
+	// Validate the complete layout before allocating decoded tensor payloads.
+	// Otherwise many aliases of one range can amplify a small file enormously
+	// before the overlap check eventually rejects it.
+	validated := make(map[string]safeHeader, len(header))
 	var ranges [][2]int
 	for name, rawEntry := range header {
 		var meta safeHeader
@@ -163,17 +166,22 @@ func readSafetensors(path string) (map[string]safeTensorEntry, map[string]string
 		if end > start {
 			ranges = append(ranges, [2]int{start, end})
 		}
-		values := make([]float32, count)
-		for i := range values {
-			values[i] = math.Float32frombits(encodingbinary.LittleEndian.Uint32(data[start+i*4:]))
-		}
-		entries[name] = safeTensorEntry{Values: values, Shape: meta.Shape}
+		validated[name] = meta
 	}
 	sort.Slice(ranges, func(i, j int) bool { return ranges[i][0] < ranges[j][0] })
 	for i := 1; i < len(ranges); i++ {
 		if ranges[i][0] < ranges[i-1][1] {
 			return nil, nil, fmt.Errorf("autograd: overlapping tensor ranges")
 		}
+	}
+	entries := make(map[string]safeTensorEntry, len(validated))
+	for name, meta := range validated {
+		start, end := meta.Offsets[0], meta.Offsets[1]
+		values := make([]float32, (end-start)/4)
+		for i := range values {
+			values[i] = math.Float32frombits(encodingbinary.LittleEndian.Uint32(data[start+i*4:]))
+		}
+		entries[name] = safeTensorEntry{Values: values, Shape: meta.Shape}
 	}
 	return entries, metadata, nil
 }

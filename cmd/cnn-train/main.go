@@ -237,10 +237,14 @@ func main() {
 	out := flag.String("out", "", "optional safetensors checkpoint (existing parent directory)")
 	images := flag.String("images", "", "optional IDX images for real image training")
 	labels := flag.String("labels", "", "optional IDX labels for real image training")
-	trainLimit := flag.Int("train-limit", 2000, "training subset for real image data")
-	validLimit := flag.Int("valid-limit", 1000, "validation subset for real image data")
+	trainLimit := flag.Int("train-limit", 2000, "training subset for real image data (0 = all)")
+	validLimit := flag.Int("valid-limit", 1000, "validation subset from remaining real images (0 = all remaining)")
 	augment := flag.Bool("augment", false, "apply deterministic horizontal flips during training")
 	flag.Parse()
+	if *trainLimit < 0 || *validLimit < 0 {
+		fmt.Fprintln(os.Stderr, "cnn-train: train-limit and valid-limit must be nonnegative")
+		os.Exit(1)
+	}
 	if *images != "" || *labels != "" {
 		if _, err := trainReal(tensor.Device(*device), *steps, *trainLimit, *validLimit, *images, *labels, *out, os.Stdout, *augment); err != nil {
 			fmt.Fprintln(os.Stderr, err)
