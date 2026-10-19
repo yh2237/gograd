@@ -113,6 +113,14 @@ func resolveParameterGroups(params []Parameter, specs []ParameterGroupSpec) ([]P
 	for i := range owner {
 		owner[i] = -1
 	}
+	// Look the parameters up by their value instead of scanning the list for
+	// every grouped parameter.
+	lookup := make(map[*Tensor]int, len(params))
+	for i, live := range params {
+		if live.Value != nil {
+			lookup[live.Value] = i
+		}
+	}
 	groups := make([]ParameterGroup, 0, len(specs))
 	specNames := make([]string, len(specs))
 	names := make(map[string]bool, len(specs))
@@ -139,14 +147,8 @@ func resolveParameterGroups(params []Parameter, specs []ParameterGroupSpec) ([]P
 			if p.Value == nil {
 				return nil, nil, fmt.Errorf("autograd: group %q has a parameter without a value", spec.Name)
 			}
-			found := -1
-			for i, live := range params {
-				if live.Value == p.Value {
-					found = i
-					break
-				}
-			}
-			if found < 0 {
+			found, ok := lookup[p.Value]
+			if !ok {
 				return nil, nil, fmt.Errorf("autograd: parameter %q is not part of this optimizer", p.Name)
 			}
 			if params[found].Name != p.Name {

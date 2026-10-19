@@ -75,6 +75,10 @@ func (m *Module) StateDict() map[string][]float32 {
 	walk("", m)
 	return out
 }
+
+// LoadStateDict copies the saved values into the module. The state holds flat
+// values, so only the element counts are checked; use LoadSafeTensors when the
+// shapes have to be validated as well.
 func (m *Module) LoadStateDict(state map[string][]float32) error {
 	all := m.StateDict()
 	if len(all) != len(state) {

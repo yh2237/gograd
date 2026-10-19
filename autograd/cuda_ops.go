@@ -211,8 +211,11 @@ func gpuEmbedding(w *Tensor, ids []int, shape []int, padding int) *Tensor {
 		id32[i] = int32(v)
 	}
 	idBuf := mustAlloc(len(ids))
-	if e := idBuf.CopyFromHost(unsafe.Slice((*byte)(unsafe.Pointer(&id32[0])), len(ids)*4)); e != nil {
-		panic(e)
+	// An empty batch has no index to upload.
+	if len(ids) > 0 {
+		if e := idBuf.CopyFromHost(unsafe.Slice((*byte)(unsafe.Pointer(&id32[0])), len(ids)*4)); e != nil {
+			panic(e)
+		}
 	}
 	return gpuEmbeddingBuffer(w, idBuf, shape, padding, true)
 }
@@ -258,7 +261,15 @@ func gpuReduce(a *Tensor, s []int, selected []bool, mean bool) *Tensor {
 	n, d1, d2 := int32(a.Numel()), inDims[1], inDims[2]
 	scale := float32(1)
 	if mean {
-		scale = 1 / float32(a.Numel()/numel(s))
+		// An empty reduction has no output element, so the divisor stays zero
+		// instead of dividing by zero.
+		divisor := 0
+		if numel(s) > 0 {
+			divisor = a.Numel() / numel(s)
+		}
+		if divisor > 0 {
+			scale = 1 / float32(divisor)
+		}
 	}
 	ap, yp := ptr(a.buf), ptr(out)
 	if numel(s) == 1 {

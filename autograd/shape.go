@@ -69,6 +69,16 @@ func Permute(a *Tensor, axes ...int) *Tensor {
 }
 func Transpose(a *Tensor, i, j int) *Tensor {
 	dispatchBackend("transpose", a.Device)
+	// Negative axes count from the end, like the other shape operations.
+	if i < 0 {
+		i += len(a.Shape)
+	}
+	if j < 0 {
+		j += len(a.Shape)
+	}
+	if i < 0 || i >= len(a.Shape) || j < 0 || j >= len(a.Shape) {
+		panic("autograd: invalid permutation")
+	}
 	axes := make([]int, len(a.Shape))
 	for k := range axes {
 		axes[k] = k
@@ -107,8 +117,14 @@ func reduce(a *Tensor, mean bool, axes ...int) *Tensor {
 		return gpuReduce(a, s, selected, mean)
 	}
 	v := cpuAlloc(numel(s))
-	mapping := make([]int, len(a.Data))
-	count := float32(len(a.Data) / len(v))
+	// The divisor is the number of reduced elements per output element. An
+	// empty reduction has no output element, so the divisor stays zero instead
+	// of dividing by zero.
+	divisor := 0
+	if len(v) > 0 {
+		divisor = len(a.Data) / len(v)
+	}
+	count := float32(divisor)
 	outStrides := strides(s)
 	mapAt := func(i int) int {
 		j := 0
@@ -120,6 +136,12 @@ func reduce(a *Tensor, mean bool, axes ...int) *Tensor {
 			}
 		}
 		return j
+	}
+	// The index map is only needed by the backward pass.
+	_, record := graphRecording([]*Tensor{a})
+	var mapping []int
+	if record {
+		mapping = make([]int, len(a.Data))
 	}
 	workers := min(runtime.GOMAXPROCS(0), len(a.Data)/65536)
 	if workers >= 2 && len(v) <= 65536 {
@@ -133,7 +155,9 @@ func reduce(a *Tensor, mean bool, axes ...int) *Tensor {
 				defer wg.Done()
 				for i := start; i < end; i++ {
 					j := mapAt(i)
-					mapping[i] = j
+					if mapping != nil {
+						mapping[i] = j
+					}
 					partials[w][j] += a.Data[i]
 				}
 			}(w, start, end)
@@ -147,7 +171,9 @@ func reduce(a *Tensor, mean bool, axes ...int) *Tensor {
 	} else {
 		for i, x := range a.Data {
 			j := mapAt(i)
-			mapping[i] = j
+			if mapping != nil {
+				mapping[i] = j
+			}
 			v[j] += x
 		}
 	}

@@ -71,6 +71,18 @@ func (t *Tensor) ensureBF16() *cuda.Buffer {
 	return t.currentBF16()
 }
 
+// ensureBF16Lease returns the cached BF16 shadow and a lease on its storage.
+// The lease keeps the allocation alive while a graph node holds a raw pointer
+// to it: invalidating the shadow between the forward and the backward must not
+// free the memory the backward still reads.
+func (t *Tensor) ensureBF16Lease() (uintptr, *tensorStorage) {
+	buffer := t.ensureBF16()
+	if t.bf16Storage == nil {
+		return 0, nil
+	}
+	return ptr(buffer), t.bf16Storage.acquire()
+}
+
 // gemmBatchedPrepared receives BF16 operand buffers created by a producer or
 // cached on a tensor. This avoids a cast per GEMM while preserving FP32 output.
 func (o ExecutionOptions) gemmBatchedPrepared(m, n, k int, ta, tb bool, a, a16 uintptr, as int64, b, b16 uintptr, bs int64, c uintptr, cs int64, count int, beta float32) error {

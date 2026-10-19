@@ -1,6 +1,9 @@
 package autograd
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // IndexLoaderは決定的なシャッフル順でミニバッチの添字を列挙する。
 // エポックごとに順列が変わり、同じseedなら再現できる。
@@ -42,7 +45,8 @@ func (l *IndexLoader) Epoch() [][]int {
 		if end > len(order) {
 			end = len(order)
 		}
-		batches = append(batches, order[start:end])
+		// Copy the batch so that appending to it cannot overwrite the next one.
+		batches = append(batches, slices.Clone(order[start:end]))
 	}
 	return batches
 }

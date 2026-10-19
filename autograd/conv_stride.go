@@ -86,9 +86,10 @@ func gpuConv1dStride(x, w, b *Tensor, bs, length, ci, co, k, outLength, rows, de
 	})
 	var cols16 *cuda.Buffer
 	var wp16 uintptr
+	var wLease *tensorStorage
 	if options.BF16Autocast {
 		cols16 = castBF16(cols.Pointer(), rows*depth)
-		wp16 = ptr(w.ensureBF16())
+		wp16, wLease = w.ensureBF16Lease()
 	}
 	timedGPU("conv_forward_sgemm", func() error {
 		return options.gemmSinglePrepared(rows, co, depth, false, true, cols.Pointer(), ptr(cols16), w.buf.Pointer(), wp16, out.Pointer(), 0)
@@ -122,6 +123,9 @@ func gpuConv1dStride(x, w, b *Tensor, bs, length, ci, co, k, outLength, rows, de
 	r.aux = []*cuda.Buffer{cols}
 	if cols16 != nil {
 		r.aux = append(r.aux, cols16)
+	}
+	if wLease != nil {
+		r.savedLeases = append(r.savedLeases, wLease)
 	}
 	return r
 }

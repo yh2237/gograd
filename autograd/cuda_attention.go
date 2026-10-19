@@ -38,10 +38,11 @@ func gpuAttention(q, k, v, mask *Tensor, options ExecutionOptions) *Tensor {
 	scores, probs, out := mustAlloc(count*m*n), mustAlloc(count*m*n), mustAlloc(count*m*e)
 	qa, ka, va, sa, pa, oa := ptr(q.buf), ptr(k.buf), ptr(v.buf), ptr(scores), ptr(probs), ptr(out)
 	var q16, k16, v16 uintptr
+	var qLease, kLease, vLease *tensorStorage
 	if options.BF16Autocast {
-		q16 = ptr(q.ensureBF16())
-		k16 = ptr(k.ensureBF16())
-		v16 = ptr(v.ensureBF16())
+		q16, qLease = q.ensureBF16Lease()
+		k16, kLease = k.ensureBF16Lease()
+		v16, vLease = v.ensureBF16Lease()
 	}
 	timedGPU("attn_qk", func() error {
 		return options.gemmBatchedPrepared(m, n, d, false, true, qa, q16, int64(m*d), ka, k16, int64(n*d), sa, int64(m*n), count, 0)
@@ -109,6 +110,11 @@ func gpuAttention(q, k, v, mask *Tensor, options ExecutionOptions) *Tensor {
 	r.aux = []*cuda.Buffer{probs}
 	if probs16 != nil {
 		r.aux = append(r.aux, probs16)
+	}
+	for _, lease := range []*tensorStorage{qLease, kLease, vLease} {
+		if lease != nil {
+			r.savedLeases = append(r.savedLeases, lease)
+		}
 	}
 	return r
 }

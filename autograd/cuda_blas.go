@@ -95,9 +95,10 @@ func gpuMatMul(a, b *Tensor, s []int, m, n, k int, batch []int) *Tensor {
 	bs, bRegular := matrixBatchStride(bb, batch, k*n)
 	regular := aRegular && bRegular && count > 1
 	var ap16, bp16 uintptr
+	var aLease, bLease *tensorStorage
 	if options.BF16Autocast && regular {
-		ap16 = ptr(a.ensureBF16())
-		bp16 = ptr(b.ensureBF16())
+		ap16, aLease = a.ensureBF16Lease()
+		bp16, bLease = b.ensureBF16Lease()
 	}
 	if regular {
 		timedGPU("matmul_strided", func() error {
@@ -112,7 +113,7 @@ func gpuMatMul(a, b *Tensor, s []int, m, n, k int, batch []int) *Tensor {
 			})
 		}
 	}
-	return resultGPU(out, s, []*Tensor{a, b}, func(g *cuda.Buffer) {
+	r := resultGPU(out, s, []*Tensor{a, b}, func(g *cuda.Buffer) {
 		da, db := a.ensureGradGPU(), b.ensureGradGPU()
 		var g16 *cuda.Buffer
 		if options.BF16Autocast && regular && (da != nil || db != nil) {
@@ -155,6 +156,13 @@ func gpuMatMul(a, b *Tensor, s []int, m, n, k int, batch []int) *Tensor {
 			}
 		}
 	})
+	if aLease != nil {
+		r.savedLeases = append(r.savedLeases, aLease)
+	}
+	if bLease != nil {
+		r.savedLeases = append(r.savedLeases, bLease)
+	}
+	return r
 }
 func gpuConv1d(x, w, b *Tensor, dilation int) *Tensor {
 	options := executionOptions(x, w, b)
@@ -166,9 +174,10 @@ func gpuConv1d(x, w, b *Tensor, dilation int) *Tensor {
 	timedGPU("conv_im2col", func() error { return kernels.Im2col(x.buf, cols, bs, ci, t, k, dilation) })
 	var cols16 *cuda.Buffer
 	var wp16 uintptr
+	var wLease *tensorStorage
 	if options.BF16Autocast {
 		cols16 = castBF16(cols.Pointer(), rows*depth)
-		wp16 = ptr(w.ensureBF16())
+		wp16, wLease = w.ensureBF16Lease()
 	}
 	timedGPU("conv_forward_sgemm", func() error {
 		return options.gemmSinglePrepared(rows, co, depth, false, true, cols.Pointer(), ptr(cols16), w.buf.Pointer(), wp16, out.Pointer(), 0)
@@ -200,6 +209,9 @@ func gpuConv1d(x, w, b *Tensor, dilation int) *Tensor {
 	r.aux = []*cuda.Buffer{cols}
 	if cols16 != nil {
 		r.aux = append(r.aux, cols16)
+	}
+	if wLease != nil {
+		r.savedLeases = append(r.savedLeases, wLease)
 	}
 	return r
 }
