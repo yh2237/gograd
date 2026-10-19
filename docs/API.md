@@ -1,668 +1,435 @@
 # 学習API
 
-gogradの学習で使う公開APIの一覧です。学習checkpointは`safetensors`の`gograd-training-1`形式で保存し、推論用の重みは名前とレイアウトをそのまま保ちます。
+CPU/CUDAで使う学習APIです。学習checkpointはsafetensorsの`gograd-training-1`形式で保存します。Vulkan/DirectMLの推論は[GPUバックエンド](GPU_BACKENDS.md)にあります。コード断片ではエラー処理を省略しています。
 
 ## 学習で使うAPI
 
-| パッケージ | API | 役割 |
+| パッケージ | API | 用途 |
 | --- | --- | --- |
-| `torchpth` | `Read` | PyTorch zip形式のtensorとstate_dictをfloat32で読み込みます。 |
-| `tensor` | `Device`、`CPU`、`CUDA` | テンソルやモデルを構築するときにバックエンドを選びます。 |
-| `autograd` | `NewCUDAContext`、`NewCUDAContextOn`、`CUDAContext.Device`、`CUDAContext.Close` | 学習ステップの間、呼び出したOSスレッドにCUDAコンテキストを保持します。deviceを選んで検証し、`Close`でそのスレッドの以前のdeviceを復元できます。 |
-| `autograd` | `New`、`Tensor.ToHost`、`Tensor.Backward`、`Tensor.ReleaseGraph`、`Tensor.Close` | float32テンソル、明示的な読み戻し、寿命の管理。 |
-| `autograd` | `RetainData`、`RetainGrad`、`BackwardWithOptions`、`BackwardOptions` | 共有ストレージの寿命、forward値と勾配の保持、複数回のbackwardのための履歴保持。 |
-| `autograd` | `NewExecutionContext`、`ExecutionContext.New`、`Zeros`、`Bind`、`BindModule`、`NoGrad`、`Recording`、`SetCUDA`、`CUDA`、`WithCUDA`、`Tensor.ExecutionContext` | テンソルとviewが伝える明示的な記録スコープ。独立したCPUモデルは別々のコンテキストで学習と推論を並行できます。`SetCUDA`でdeviceとstreamを記録し、`WithCUDA`が呼び出したOSスレッドの選択を一時的に切り替えて元に戻します。 |
-| `autograd` | `ExecutionOptions`、`ExecutionContext.SetOptions`、`Options`、`Autocast` | コンテキストごとのBF16とアテンションの方針、スコープ付きの精度、backwardに渡すforward方針のスナップショット。 |
-| `autograd` | `NewEmbeddingLayer`、`NewConv1dLayer`、`NewLayerNormLayer`、`NewLinearLayer`、`DropoutLayer`、`GELULayer`、`Sequential` | 再利用できるグラフモジュール。畳み込みの活性化は`[batch,time,channels]`、重みは`[out,in,kernel]`です。 |
-| `autograd` | `Conv2d`、`Conv2dOptions`、`NewConv2dLayer`、`Conv2dLayer` | NCHWの活性化、`[out,in/groups,kH,kW]`の重み、任意のbias、grouped/depthwise畳み込み、CPU/CUDAの勾配。 |
-| `autograd` | `MaxPool2d`、`AvgPool2d`、`AdaptiveAvgPool2d`、各オプションと層 | CPU/CUDAのNCHW pooling。重複する窓の勾配、ceil mode、明示的な平均の除数を持ちます。 |
-| `autograd` | `BatchNorm`、`BatchNormOptions`、`NewBatchNormLayer`、`BatchNormLayerOptions`、`BatchNormLayer` | rank 2〜6のチャネル正規化、CPU/CUDAの学習・評価の勾配、名前付きのaffineパラメータとrunning state。 |
-| `autograd` | `Module.StateDict`、`LoadStateDict`、`SaveSafeTensors`、`SaveSafeTensorsMetadata`、`LoadSafeTensors` | 名前付きのfloat32 state。metadataの値は文字列です。 |
-| `autograd` | `TrainingLoop[B]`、`BatchReader[B]`、`PositionSampler`、`UpdateSchedule`、`OneCycle.Updates` | optimizer更新の境界を共通化する学習ループ。勾配のゼロ化、更新ごとの`Step`、一定間隔の報告、停止時の状態保存を持ちます。 |
-| `autograd` | `GradAccumulator`、`NewGradAccumulator`、`GradAccumulator.Backward`、`Pending`、`Reset`、`Groups` | 1回のoptimizer更新を複数のmicro-batchへ分ける勾配蓄積。損失を1/groupsにスケールしてBackwardし、group完了を報告します。 |
-| `autograd` | `MSELoss`、`L1Loss`、`BCEWithLogitsLoss`、`LossOptions`、`Reduction` | 予測とtargetからスカラーを返す汎用の損失。mean/sumのreductionと要素ごとの重みを持ち、重み付き平均の除数はPyTorchの各損失に合わせます。 |
-| `autograd` | `MaskedLoss(pred,target,false)`、`ClipGradNorm`、`NewAdamW`、`NewOneCycle` | NaNフレームをマスクしたL1、クリップ、AdamW、PyTorchの2段cosineのOneCycle LR。 |
-| `autograd` | `AdamW.State`、`LoadState`、`SaveSafeTensors`、`LoadSafeTensors`、`Close` | CPU/CUDAの名前付きパラメータ形状、モーメント、ハイパーパラメータ、ステップ数。optimizerが持つバッファを解放します。 |
-| `autograd` | `Optimizer`、`CheckpointOptimizer`、`OptimizerSnapshot`、`LearningRate`、`SetLearningRate` | 共通の更新・リセット・学習率・寿命のAPIと、AdamW/SGDの型付きcheckpointスナップショット。OneCycleはOptimizerを受け取ります。 |
-| `autograd` | `NewSGD`、`SGDOptions`、`SGD.State`、`SGDState`、`LoadState`、`SaveSafeTensors`、`LoadSafeTensors` | CPU/CUDAのSGD。momentum/dampening、Nesterov、coupled decay、ascent、momentumの遅延初期化、stateの再開。 |
-| `autograd` | `ParameterGroupSpec`、`PartitionParameters`、`NewSGDGroups`、`NewAdamWGroups`、`OptimizerGroupState` | SGD/AdamWの名前付きパラメータグループ。グループごとの学習率スケールとweight decay、optimizer stateに記録するgroup membership。 |
-| `autograd` | `SaveTrainingCheckpoint`、`LoadTrainingCheckpoint`、`TrainingCheckpointMetadata` | model/bufferとAdamW/SGDとOneCycleを、呼び出し側のmetadataと共に1つのファイルへ原子的に保存するcheckpoint。名前・形状・stateはlive objectへコピーする前に検証します。 |
-| `autograd` | `Module.Train`、`SetTraining` | train/evalモードの再帰的な伝播。`OnTrainingChange`はdropoutなどのstatefulな層をモジュールツリーへ接続します。 |
-| `autograd` | `IndexLoader.State`、`LoadState`、`WindowSampler.Batch`、`State`、`LoadState` | 再開できるepoch順またはPCGのランダムwindow。短い系列のパディングとcontextの破棄の判断を含みます。 |
-| `autograd` | `StreamBranch`、`RunBranches` | 1つの記録の中の独立した分岐をそれぞれのstreamでenqueueし、呼び出したスレッドのカレントstreamへeventで合流させます。分岐の切り方は呼び出し側が指定します。 |
-| `cuda` | `SetCurrentStream`、`CurrentStream`、`CurrentStreamHandle`、`WithStream` | 呼び出したOSスレッドの暗黙のstreamの選択と照会。`WithStream`はスコープの終了時に前の選択へ戻します。 |
-| `cuda` | `Event`、`NewEvent`、`Event.Record`、`Stream.WaitEvent`、`Event.WaitOn`、`ElapsedTime` | stream間の順序付けと計時。あるstreamの完了をeventとして記録し、別のstreamがそれを待ってから読み取ります。`Event.WaitOn`は待たせる側をstreamの値または既定のstreamで指定します。 |
-| `cuda` | `MemoryStats`、`ResetAllocationPeak`、`SetPoolCacheLimit`、`ReleasePool` | 使用中・キャッシュ・予約バイトの照会。再利用するCUDA割当の上限設定と解放。 |
-| `data` | `Dataset[T]`、`SliceDataset`、`NewSubset`、`RandomSplit` | ホスト側のランダムアクセスsample、index view、決定的で重複しない分割。 |
-| `data` | `Sampler`、`StatefulSampler`、`NewIndexSampler`、`IndexSamplerState` | トランザクション的なindex選択、seed付きの順列、epoch途中と将来のepochの再開。 |
-| `data` | `NewLoader[T,B]`、`LoaderOptions`、`LoaderState`、`CollateFunc`、`Loader.Close` | contextを考慮したバッチ処理、任意の順序付きホストprefetch、drop-last、不透明なsampler checkpoint payload。 |
-| `data` | `FloatSample`、`FloatBatch`、`Stack`、`PadSequences`、`PaddingOptions`、`OpenIDX` | 所有権を持つfloat32のホストバッチ、系列長とboolマスク、raw/gzipのbyte画像・ラベルデータセット。 |
-| `data` | `TransformDataset[T]`、`RandomHorizontalFlipFloat32`、`FlipsHorizontallyFloat32`、`RandomVerticalFlipFloat32`、`FlipsVerticallyFloat32`、`AddGaussianNoiseFloat32` | indexとseedに基づくホスト側のaugmentation。画像の水平/垂直反転とガウスノイズの加算。 |
-| `data` | `ParseNumericCSV`、`ParseOptions`、`NumericTable`、`RegressionSamples`、`RegressionSample`、`RegressionBatch`、`StackRegression` | 数値のCSV/TSVテーブルと回帰の行。有限値、ヘッダとコメントの処理、特徴量とtarget列の指定、同じ長さのstacking。 |
-| `data` | `Standardizer`、`FitStandardizer`、`StandardizerState`、`Apply`、`ApplyBatch`、`State`、`LoadState` | training splitでfitする決定的な特徴量の中心化とスケール。直列化でき、学習・検証・推論で同じ変換を共有します。 |
-| `data` | `ReadWAV`、`ReadWAVFile`、`ReadWAVMono`、`WAV`、`Mono`、`WriteWAV`、`WAVEncoding` | 非圧縮のPCM/float RIFF音声（`WAVE_FORMAT_EXTENSIBLE`を含む）、チャネル平均のmono、例で使う書き出し。 |
-| `metrics` | `Mean.Add`、`Value`、`Accuracy.UpdateLogits`、`Correct`、`Regression.Update`、`MSE`、`RMSE`、`MAE`、各型の`Count`と`Reset` | ホスト側で集計する損失の平均、分類の正解率、回帰の誤差。テンソルやバックエンドには依存しません。 |
+| `torchpth` | `Read` | PyTorch zipのtensor / state_dictをfloat32で読む |
+| `tensor` | `Device`、`CPU`、`CUDA` | 構築時のdevice選択 |
+| `autograd` | `NewCUDAContext`、`NewCUDAContextOn`、`CUDAContext.Device`、`Close` | OSスレッド固定、CUDA deviceの選択と復元 |
+| `autograd` | `New`、`Zeros`、`ToHost`、`Backward`、`ReleaseGraph`、`Close` | テンソル、勾配、寿命管理 |
+| `autograd` | `RetainData`、`RetainGrad`、`BackwardWithOptions`、`BackwardOptions` | 値・勾配・履歴の保持 |
+| `autograd` | `NewExecutionContext`、`New`、`Zeros`、`Bind`、`BindModule`、`NoGrad`、`Recording`、`Tensor.ExecutionContext` | 記録スコープの分離 |
+| `autograd` | `ExecutionOptions`、`SetOptions`、`Options`、`Autocast` | BF16とアテンションの選択 |
+| `autograd` | `ExecutionContext.SetCUDA`、`CUDA`、`WithCUDA` | device / streamの記録と一時適用 |
+| `autograd` | `NewEmbeddingLayer`、`NewConv1dLayer`、`NewLayerNormLayer`、`NewLinearLayer`、`DropoutLayer`、`GELULayer`、`Sequential` | グラフモジュール。Conv1dは入力`[batch,time,channels]`、重み`[out,in,kernel]` |
+| `autograd` | `Conv2d`、`Conv2dOptions`、`NewConv2dLayer`、`Conv2dLayer` | grouped / depthwiseを含むNCHW畳み込み |
+| `autograd` | `MaxPool2d`、`AvgPool2d`、`AdaptiveAvgPool2d`、各Options / Layer | NCHW pooling |
+| `autograd` | `BatchNorm`、`BatchNormOptions`、`NewBatchNormLayer`、`BatchNormLayerOptions` | 正規化とrunning state |
+| `autograd` | `Module.StateDict`、`LoadStateDict`、`SaveSafeTensors`、`SaveSafeTensorsMetadata`、`LoadSafeTensors` | 名前付きF32 state。metadataの値は文字列 |
+| `autograd` | `Module.Train`、`SetTraining`、`OnTrainingChange` | 子モジュールへのtrain/eval伝播 |
+| `autograd` | `TrainingLoop[B]`、`BatchReader[B]`、`PositionSampler`、`UpdateSchedule`、`OneCycle.Updates` | 更新・報告・停止時保存 |
+| `autograd` | `GradAccumulator`、`NewGradAccumulator`、`Backward`、`Pending`、`Reset`、`Groups` | micro-batchの勾配蓄積 |
+| `autograd` | `MSELoss`、`L1Loss`、`BCEWithLogitsLoss`、`LossOptions`、`Reduction` | mean / sumと要素ごとの重み付き損失 |
+| `autograd` | `MaskedLoss(pred,target,false)`、`ClipGradNorm`、`NewAdamW`、`NewOneCycle` | NaNフレームをマスクしたL1、クリップ、AdamW、OneCycle |
+| `autograd` | `Optimizer`、`CheckpointOptimizer`、`OptimizerSnapshot`、`LearningRate`、`SetLearningRate` | 更新・学習率・checkpointの共通API |
+| `autograd` | `AdamW.State`、`LoadState`、`SaveSafeTensors`、`LoadSafeTensors`、`Close` | モーメント・設定・ステップの保存と復元 |
+| `autograd` | `NewSGD`、`SGDOptions`、`SGD.State`、`SGDState`、`LoadState`、`SaveSafeTensors`、`LoadSafeTensors` | momentum / Nesterov / decay / ascentとstateの復元 |
+| `autograd` | `ParameterGroupSpec`、`PartitionParameters`、`NewSGDGroups`、`NewAdamWGroups`、`OptimizerGroupState` | グループごとの学習率スケールとdecay |
+| `autograd` | `SaveTrainingCheckpoint`、`LoadTrainingCheckpoint`、`TrainingCheckpointMetadata` | model / optimizer / OneCycle / metadataの一括保存 |
+| `autograd` | `IndexLoader.State`、`LoadState`、`WindowSampler.Batch`、`State`、`LoadState` | epoch順・PCG windowの再開 |
+| `autograd` | `StreamBranch`、`RunBranches` | 独立したCUDA分岐のenqueueとeventによる合流 |
+| `cuda` | `SetCurrentStream`、`CurrentStream`、`CurrentStreamHandle`、`WithStream` | 呼出しスレッドのstream選択 |
+| `cuda` | `Event`、`NewEvent`、`Record`、`Stream.WaitEvent`、`Event.WaitOn`、`ElapsedTime` | stream間の順序付けと計時 |
+| `cuda` | `MemoryStats`、`ResetAllocationPeak`、`SetPoolCacheLimit`、`ReleasePool` | 割当量・ピーク・キャッシュ上限 |
+| `data` | `Dataset[T]`、`SliceDataset`、`NewSubset`、`RandomSplit` | sample取得と分割 |
+| `data` | `Sampler`、`StatefulSampler`、`NewIndexSampler`、`IndexSamplerState` | index選択、shuffle、途中再開 |
+| `data` | `NewLoader[T,B]`、`LoaderOptions`、`LoaderState`、`CollateFunc`、`Close` | バッチ処理と上限付きprefetch |
+| `data` | `FloatSample`、`FloatBatch`、`Stack`、`PadSequences`、`PaddingOptions`、`OpenIDX` | ホストバッチ、系列長・マスク、画像データ |
+| `data` | `TransformDataset[T]`、`RandomHorizontalFlipFloat32`、`FlipsHorizontallyFloat32`、`RandomVerticalFlipFloat32`、`FlipsVerticallyFloat32`、`AddGaussianNoiseFloat32` | seed / indexに基づくaugmentation |
+| `data` | `ParseNumericCSV`、`ParseOptions`、`NumericTable`、`RegressionSamples`、`RegressionSample`、`RegressionBatch`、`StackRegression` | 数値CSV / TSVと回帰バッチ |
+| `data` | `Standardizer`、`FitStandardizer`、`StandardizerState`、`Apply`、`ApplyBatch`、`State`、`LoadState` | 学習データの統計による標準化 |
+| `data` | `ReadWAV`、`ReadWAVFile`、`ReadWAVMono`、`WAV`、`Mono`、`WriteWAV`、`WAVEncoding` | 非圧縮RIFF音声の入出力 |
+| `metrics` | `Mean`、`Accuracy`、`Regression`、各型の`Count` / `Reset` | ホスト側の損失平均・正解率・回帰誤差 |
 
-`cuda.MemoryStats()`は、gogradのCUDAアロケータが持つ物理バイト数を返します。`LiveBytes`、`CachedBytes`、`ReservedBytes`、`PeakLiveBytes`、`PeakReservedBytes`、`CachedBuffers`、`CacheLimitBytes`です。既定のキャッシュ上限は2 GiBです。`SetPoolCacheLimit`は上限を下げたときに、最も長く使われていないキャッシュをすぐに解放します。使用中のテンソルと、記録したグラフが予約している割当は解放しません。`ResetAllocationPeak`はピークの値を現在の値に戻します。この値には、gogradのプールを通さずCUDAライブラリが直接確保した分は含まれません。`Buffer.Size()`は、物理的なサイズクラスが大きくても、要求した論理バイト数を返します。
+CUDAのdevice・暗黙のstream・capture状態はOSスレッド単位です。処理の間は`NewCUDAContext`を保持します。`NewCUDAContextOn`はdeviceを検証して選択し、`Close`で以前のdeviceへ戻します。
 
-CUDAのdevice、stream、captureの状態は、それを使うOSスレッドに属します。`SetDevice`と`CurrentDevice`でdeviceを選び、`autograd.NewCUDAContextOn`はgoroutineを検証済みのdeviceに固定し、`Close`でそのスレッドの以前のdeviceを復元します。`Buffer.Device()`は割当が属するdeviceを返します。再利用するプールの項目はdeviceとstreamとサイズクラスをキーにします。解放したブロックは同じstreamにだけ返すため、あるstreamがまだ読み取り中のブロックを別のstreamが再利用することはありません。`CopyFromHost`、`CopyToHost`、`Memset`/`MemsetAsync`、`Free`はバッファ自身のdeviceを選んで呼び出し側のdeviceを復元するため、複数deviceのコードは周囲のdeviceに依存しません。`SetCurrentStream`と`CurrentStreamHandle`は、呼び出したスレッドでカーネル起動とevent記録が使う暗黙のstreamを選びます。何も選ばないときは既定のstreamを使います。`CurrentStream`は選択中のstreamを返し、`WithStream(stream, fn)`はスコープの終了時（panic時も含む）に前の選択へ戻します。cuBLASのハンドルもこの暗黙のstreamに追従するため、NVRTCカーネル、memset、コピー、GEMMが同じstreamに乗ります。
+割当プールはdevice・stream・サイズクラスで分離します。`Buffer.Device()`は割当先、`Buffer.Size()`は論理バイト数を返します。コピー・memset・freeはバッファ自身のdeviceを選び、呼出し側のdeviceを復元します。カーネルとcuBLASは選択中のstreamに従い、`WithStream`はpanic時も以前の選択へ戻します。
 
-1つの記録の中で処理を複数のstreamへ分けるには、`RunBranches`が使えます。分岐ごとにstreamと処理を渡すと、ライブラリが各分岐をそのstreamへenqueueし、呼び出したスレッドのカレントstreamが全分岐を待つようにeventを記録します。合流後は、結果を呼び出し側のstreamでそのまま消費できます。分岐の切り方は呼び出し側が決め、自動で分割はしません。
+`MemoryStats`は`LiveBytes`、`CachedBytes`、`ReservedBytes`、`PeakLiveBytes`、`PeakReservedBytes`、`CachedBuffers`、`CacheLimitBytes`を返します。キャッシュ上限は既定で2 GiBです。上限を下げると古いキャッシュから解放しますが、使用中とCUDAグラフが予約した割当は解放しません。CUDAライブラリ独自の割当は含みません。`ResetAllocationPeak`はピークを現在値へ戻します。
+
+独立した分岐は呼出し側が指定します。`RunBranches`は各streamへ処理をenqueueし、カレントstreamが全分岐を待つeventを記録します。
 
 ```go
-// leftとrightは呼び出し側が用意したstreamです。
 err := autograd.RunBranches([]autograd.StreamBranch{
     {Stream: left, Run: func() error { ya = branchA(x); return nil }},
     {Stream: right, Run: func() error { yb = branchB(x); return nil }},
 })
-// エラーを処理します。この時点でカレントstreamは両方の分岐を待ちます。
-// yaとybを合流させ、Backwardとoptimizer.Step()まで通常どおり実行します。
 ```
 
-`Event.Record`と`Stream.WaitEvent`／`Event.WaitOn`を使えば、合流点を自分で書くこともできます。あるstreamの結果を別のstreamが読むときは、作り手のstreamでeventを記録し、読み手のstreamが待ってから続きをenqueueします。割当プールはstreamごとに分かれているため、片方のstreamが解放したバッファをもう片方が再利用することはありません。
+手動の合流には`Event.Record`と`Stream.WaitEvent` / `Event.WaitOn`を使います。`Event.WaitOn`は待たせる側のstreamを指定します。streamはそのstreamのバッファを解放するまで保持してください。
 
-```go
-// rightの完了をeventに記録し、leftがそれを待ってから合流します。
-event, err := cuda.NewEvent(false)
-// エラーを処理します。終わったらevent.Destroy()を呼びます。
-_ = err
-err = event.Record(right)
-err = event.WaitOn(left)
-// エラーを処理します。以降のleftの処理はrightの完了後に実行されます。
-````Capture`は明示的なstreamを必要とし、現在のdeviceを変更せずに記録し、同じスレッドでの入れ子のcaptureを拒否し、記録したdeviceでグラフを再生します。したがって独立したスレッドは、それぞれ別の暗黙のstreamとcaptureの状態を保ちます。
+`Capture`は明示的なstreamが必要で、同じスレッドでの入れ子を拒否します。現在のdeviceを変えずに記録し、記録したdeviceで再生します。
 
 ## 実行コンテキストと勾配の記録
 
-独立した実行には`ExecutionContext`を使います。コンテキストはテンソルが持ち、演算とviewが伝え、`Detach`が保ちます。goroutineごとの状態は使いません。ゼロ値のコンテキストは勾配を記録します。
+`ExecutionContext`は入力とモデルstateに結び付く記録スコープです。演算・view・`Detach`が継承し、異なる明示的コンテキストを組み合わせる演算はpanicします。ゼロ値は勾配を記録します。
 
 ```go
 execution := autograd.NewExecutionContext()
 model, err := autograd.NewLinearLayer(2, 3, tensor.CPU,
     rand.New(rand.NewSource(7)))
-// エラーを処理します。
-_ = err
 err = execution.BindModule(model.StateModule())
-// エラーを処理します。Forwardやworkerの起動より前に、全パラメータとバッファをbindします。
 x, err := execution.New([]float32{1, 2}, []int{1, 2}, tensor.CPU, true)
-// エラーを処理します。
-_ = err
 loss := autograd.Sum(model.Forward(x), 0, 1)
 err = loss.Backward()
-// エラーを処理します。グラフを解放する前に勾配を読みます。
 loss.ReleaseGraph()
 
 execution.NoGrad(func() {
     prediction := model.Forward(x)
-    // prediction.RequiresGradはfalseで、ToHostで値を読めます。
     prediction.ReleaseGraph()
 })
-// コールバックがpanicしても、execution.Recording()は再びtrueになります。
 ```
 
-- `BindModule`は登録済みのパラメータとバッファを再帰的に扱い、コンテキストを変える前に全ての末端を検証します。グラフを組む前にbindします。パラメータだけの枝（重みのtranspose、embeddingなど）も対象です。`Bind`は既存の末端を扱います。別のコンテキストの割当や、既に組んだグラフのbindは拒否します。パラメータとoptimizerの値は複製しません。
-- 異なる2つの明示的コンテキストを組み合わせる演算はpanicします。bindしていない定数は、bind済みのグラフに加われます。完全に分離するには、勾配の要らない入力も含めて、全てのモデルstateと入力・マスクをそのコンテキストで作ります。
-- `execution.NoGrad`はそのコンテキストだけに効き、安全に入れ子にできます。factoryの`requiresGrad`引数を保ち、既存のグラフを変えません。記録済みの損失に対するBackwardは、NoGradの中でも実行できます。記録していない定数のスカラーに対するBackwardは、CPUとCUDAのどちらでもエラーを返します。
-- パッケージの`autograd.New`/`Zeros`と`autograd.NoGrad`は、bindしていないテンソル向けの互換APIとして残ります。パッケージのNoGradは共有の既定スコープを制御し、明示的コンテキストを無効にしません。明示的コンテキストを使う新しいコードは、パッケージ関数ではなくそのコンテキストのNoGradを呼びます。
-- NoGradはコンテキスト全体を制御し、1つのgoroutineだけを対象にしません。並行して動かすworkerごとに、コンテキストと独立したモデルstateを用意します。共有するモデルでは、テンソルの値、勾配、optimizerのstate、train/evalの切り替えを並行して変更できません。bind自体は初期化の手順です。
-- 推論の結果は寿命の親を保ち、`ReleaseGraph`がCPUの中間値とCUDAの補助バッファを回収できるようにします。導関数のコールバックは保ちません。グラフの回収後も値が必要な場合はretainしたハンドルを使います。`Detach`は独立したストレージを作り、履歴を切り、非連続なviewも含めてコンテキストの同一性を保ちます。
+入力・モデル・optimizerの所有者が各リソースを解放します。
 
-このコンテキストが分離するのは、勾配の記録、BF16モード、アテンションの選択です。CUDAのstreamやcapture、割当プールの寿命は持ちませんが、`SetCUDA(device, stream)`で使うdeviceとstreamを記録できます。記録した組は`WithCUDA(fn)`が呼び出したOSスレッドに適用し、`fn`の終了時（panic時も含む）に以前の選択へ戻します。CUDAを使う呼び出し側は、これまでどおり呼び出したOSスレッドで`NewCUDAContext`を保持します。`NewCUDAContextOn`はdeviceを選び、`Close`でそのスレッドの以前のdeviceを復元します。`cuda`パッケージは暗黙のstreamとcaptureの可否をOSスレッド単位で持つため、別々のコンテキストを持つgoroutineが互いのstreamを上書きしません。1回の記録の中で処理を複数のstreamへ分けることもできますが、分け方と`Event`を使った合流は呼び出し側が指定します。フレームワークが記録を自動で複数のstreamへ分割することはありません。`cmd/cnn-train`は明示的コンテキストのAPIを使います。
+- `BindModule`は登録済みのパラメータとバッファを再帰的に検証してbindする。重みのtransposeなど、パラメータだけの部分式を含め、グラフを組む前に行う。既存のグラフや別コンテキストの割当のbindは拒否し、値は複製しない。
+- bindしていない定数はbind済みの演算へ加われる。完全に分離するには、勾配の要らない入力とマスクも含め、モデルstateと入力を同じコンテキストへ結び付ける。
+- `NoGrad`はコンテキスト全体に効く。入れ子とpanicから復帰し、factoryの`requiresGrad`や既存グラフは変えない。記録済み損失のBackwardはNoGrad内でも実行できるが、未記録の定数スカラーのBackwardはエラー。
+- パッケージの`New` / `Zeros` / `NoGrad`はbindしていないテンソル用の互換API。共有の既定スコープを使い、明示的コンテキストには作用しない。
+- 並行workerには独立したコンテキストと変更可能なモデルstateを用意する。同じモデルの値・勾配・optimizer state・train/evalを並行して変更しない。
+
+コンテキストはストレージ、stream、capture、割当プールの寿命を管理しません。CUDAではOSスレッドを固定したうえで`SetCUDA` / `WithCUDA`を使います。
 
 ```go
-stream, err := cuda.NewStream() // 呼び出し側が寿命を管理します
-// エラーを処理します。終わったらstream.Destroy()を呼びます。
+stream, err := cuda.NewStream()
 execution.SetCUDA(0, stream)
 err = execution.WithCUDA(func() error {
-    // このスコープのkernel、cuBLAS、コピーはstreamに乗ります。
-    // forward、Backward、optimizer.Step()を通常どおり実行します。
+    // kernel、cuBLAS、コピーをこのstreamで実行する。
     return nil
 })
-// エラーを処理します。スレッドのdeviceとstreamは前の選択に戻っています。
+// streamを使う全バッファの解放後にstream.Destroy()を呼ぶ。
 ```
+
+`WithCUDA`は終了時とpanic時に以前のdevice / streamへ戻します。1回の記録を複数streamへ分ける場合も、分割と合流は呼出し側で指定します。
 
 ### 精度とアテンションの方針
 
-明示的コンテキストの既定は、ゼロ値のコンテキストも含めて`ExecutionOptions{BF16Autocast: false, AttentionAlgorithm: "auto"}`です。パッケージレベルの`BF16Autocast`や`AttentionAlgorithm`は継承しません。`Options`はコピーを返すため、forwardの間に`SetOptions`で更新します。不正なアテンション名はコンテキストを変えずにエラーを返し、空の名前は`auto`に正規化します。
+明示的コンテキストの既定は`ExecutionOptions{BF16Autocast: false, AttentionAlgorithm: "auto"}`です。互換用のグローバル設定を継承しません。`Options`はコピーを返します。`SetOptions`は不正なアテンション名なら状態を変更せずエラーを返し、空の名前を`auto`に正規化します。
 
 ```go
 err = execution.SetOptions(autograd.ExecutionOptions{
     AttentionAlgorithm: "materialized",
 })
-// エラーを処理します。上と同じように、モデルstateをbindし、executionで入力を作ります。
-var mixedLoss *autograd.Tensor
 execution.Autocast(true, func() {
-    mixedLoss = autograd.Sum(model.Forward(x), 0, 1)
+    loss = autograd.Sum(model.Forward(x), 0, 1)
 })
-// 精度はFP32に戻ります。CUDAでは、直前のforwardで対象の演算が選んだBF16の方針を
-// backwardも使います。
-err = mixedLoss.Backward()
-// エラーを処理します。
-mixedLoss.ReleaseGraph()
+err = loss.Backward()
+loss.ReleaseGraph()
 ```
 
-- `Autocast(enabled, fn)`が変えるのは、このコンテキストのBF16フラグだけです。入れ子のscopeとpanicは以前の精度を復元し、アテンションの選択には影響しません。NoGradと同じく、1つのgoroutineではなくコンテキスト全体に効きます。独立したworkerには別々のコンテキストと、変更可能なモデルstateが必要です。
-- 精度に影響する演算は、forwardのときに設定をスナップショットします。その後backwardは、scopeを抜けた後や`SetOptions`の変更後、互換用のグローバル設定の変更後でも、保持した履歴の再実行も含めてその方針を保ちます。記録したCUDAグラフも、記録時のカーネルと精度の選択を再生時に保ちます。選択を変えるには、新しく記録し直します。
-- BF16はCUDAのGEMMオペランドとシャドウを使い、累積・出力・勾配・master weight・optimizerのモーメントはFP32です。CPUの計算と、Conv2dのように未対応のCUDA演算はFP32のままです。tiled flash attentionもFP32で計算します。
-- アテンション名は`materialized`、`flash`、`auto`です。dropoutが有効でない対応可能なCUDAアテンションでは、`materialized`はGEMMとsoftmaxを、`flash`はtiled経路を使います（Q/KとVのhead次元は128まで）。`auto`は、実体化したときのスコアのscratchの見積もりが1 GiBに達するとtiledアテンションを選びます。CPU、dropoutが有効な場合、融合できないレイアウトは、演算を組み合わせた経路を使います。
-- bindしていないテンソルは、パッケージレベルの互換設定を使います。このグローバル設定は共有なので、並行して変更しないでください。明示的コンテキストはこれを参照せず、bindしていない定数はコンテキストに束ねた演算へ加われます。コンテキストのオプションはforwardの合間に設定します。複数の演算からなるforwardの途中で変えても、そのforward全体が1つのスナップショットになるわけではありません。
+`Autocast`はBF16フラグだけを一時変更し、入れ子・panicの後に復元します。forwardが保存した精度とアテンションの方針は設定変更後やretainしたBackwardでも保ちます。CUDAグラフも記録時のカーネルを再生するため、選択を変えるには記録し直します。
+
+BF16はCUDA GEMMのオペランドとシャドウに使い、累積・出力・勾配・master weight・optimizerのモーメントはFP32です。CPU、Conv2dなどの未対応演算、tiled flash attentionはFP32のままです。
+
+| アテンション名 | CUDAでの選択 |
+| --- | --- |
+| `materialized` | GEMMとsoftmax |
+| `flash` | Q/KとVのhead次元128までのtiled経路 |
+| `auto` | スコアscratchの見積もりが1 GiB以上ならtiled、それ未満なら実体化 |
+
+CPU、dropout有効、融合できないレイアウトは合成経路を使います。オプションはforwardの合間に設定してください。複数演算からなるforward全体が1つのスナップショットになるわけではありません。互換用のグローバル設定を並行して変更しないでください。
 
 ## テンソルのストレージとグラフの寿命
 
-テンソルとviewの割当は、グラフの辺とは別に参照カウントします。依存するviewや保存した計算がまだ使っている間は、ベースのハンドルをcloseしても割当はCPU/CUDAのプールへ戻りません。あるグラフの枝をreleaseしても、別の枝が使っている先祖は回収しません。これは明示的な寿命の管理で、放棄したグラフも`ReleaseGraph`/`Close`が必要です。
+ストレージの参照数とグラフの依存数は別に管理します。ベースをCloseしても、viewや保存した計算が必要とする割当は保持します。ある枝のReleaseGraphが別の枝の先祖を回収することはありません。GoのGCによるグラフ回収は行いません。
 
-- `New`/`Zeros`が作る末端（入力、パラメータ、バッファ）は呼び出し側が所有します。`ReleaseGraph`は中間値と内部の一時的な末端を回収し、永続する入力とパラメータは`Close`が必要です。
-- `Close`はそのハンドルの公開利用を終わらせ、繰り返し呼べます。割当と保存したstateは、依存するグラフの辺が終わるまで**内部で**読み取れます。生き残ったviewは読み取りやbackwardに使えますが、closeしたベースの`ToHost`、`GradToHost`、`CopyFrom`はエラーを返します。
-- `RetainData`はforwardの値を固定し、`RetainGrad`は値と中間の勾配を固定します。どちらも導関数の履歴は保ちません。読み取った後に解放するには`Close`を使います。retainしたviewは、ベースのグラフを回収した後、共有する割当だけを保てます。
-- `Backward`は導関数のコールバックと保存した統計を使います。CUDAでは未使用の中間値も自動的に回収し、CPUではforwardの値が`ReleaseGraph`まで残ります。retainしていないCUDAの出力は、backwardの前に読み取ります。
-- `BackwardWithOptions(BackwardOptions{RetainGraph: true})`は、どちらのバックエンドでも履歴と保存した割当を保ち、もう一度実行できます。末端の勾配は加算され、中間のadjointは伝播のために新しくなります。要求したretain済みの勾配は、2度伝播せずに加算します。
-- 消費した履歴を通す2度目のbackwardはエラーを返します。損失を1つのスカラーにまとめて1回backwardする場合、履歴の保持は不要です。retainした実行が終わったら`ReleaseGraph`が必要です。
+| 操作 | 保持・解放するもの |
+| --- | --- |
+| `New` / `Zeros` | 呼出し側が所有する入力・パラメータ・バッファを作る |
+| `Close` | そのハンドルの公開利用を終了する。繰り返し呼べる |
+| `ReleaseGraph` | 中間値と内部の一時的な末端を回収する。永続する末端はCloseが必要 |
+| `RetainData` | 値と共有する割当を保持する。履歴は保持しない |
+| `RetainGrad` | 値と中間の勾配を保持する。履歴は保持しない |
+| `Detach` | 独立したストレージへコピーし、履歴を切る。非連続viewとコンテキストも扱う |
+| `BackwardWithOptions(RetainGraph: true)` | 履歴と保存した割当を保持し、再度Backwardできる |
 
-```go
-x := autograd.Must([]float32{2, 3}, []int{2}, true)
-shared := autograd.Mul(x, x)
-left := autograd.Sum(shared, 0)
-right := autograd.Sum(autograd.MulScalar(shared, 3), 0)
-err := left.BackwardWithOptions(autograd.BackwardOptions{RetainGraph: true})
-// エラーを処理します。xの勾配は[4,6]です。
-_ = err
-err = right.Backward()
-// エラーを処理します。加算後のxの勾配は[16,24]です。
-left.ReleaseGraph()
-right.ReleaseGraph()
-x.Close()
-```
+Close済みのハンドルの`ToHost` / `GradToHost` / `CopyFrom`はエラーですが、依存するviewやbackwardは内部の値を使えます。retainしたハンドルも読み終えたらCloseしてください。
 
-マスク付き損失のtargetと、CUDAのembedding用indexバッファは、微分しないものの保存された寿命の依存です。呼び出し側が元のハンドルをcloseした後も、retainしたbackwardから使えます。CPUの正規化の統計とim2colのバッファも、履歴を使い切るか解放したときにだけプールへ戻ります。BF16のシャドウは共有のleaseを持ち、対応するFP32ストレージが変わると別名も含めて無効になります。
+通常のBackwardは履歴を消費し、CUDAの未使用中間値を回収します。retainしていないCUDA出力はBackward前に読み取ります。CPUのforward値はReleaseGraphまで残り、消費済み履歴の再利用はエラーです。retainした実行では末端の勾配を加算し、中間のadjointは伝播用に作り直します。実行後はReleaseGraphしてください。
 
-`CopyFrom`とeagerなAdamWの更新は、viewが共有するストレージのversionを進めます。Backwardは、勾配を変える**前に**記録したオペランドと出力のversionを検証し、forward以降の変更を拒否します。retainした実行の間の変更も拒否します。この検証は必要以上に厳しく、導関数によっては全てのオペランドを必要としないこともあります。CPUの`Data`への直接書き込みと、CUDAバッファへの外部からの書き込み・再生はversionを追跡しません。グラフが生きている間に、これらの経路で保存した値を変えないでください。重みの初期化はグラフを組む前に済ませます。
+マスクのtarget、embeddingのindex、正規化の統計、im2colなども必要な履歴が終わるまで保持します。BF16シャドウはFP32ストレージの変更で別名も含めて無効になります。
 
-`Data`スライスと`Buffer()`は借用であり、独立した所有者ではありません。`Data`の差し替え、テンソルが所有するバッファのFree、ハンドルが終わった後の借用メモリの利用はしないでください。TensorとIndexBufferは所有状態をコピーせずポインタで保ちます。独立したCPUコンテキストは読み取り専用の定数を共有できますが、共有テンソルに対する並行の変更・close・backwardは対応していません。
+`CopyFrom`とeagerなoptimizer更新はストレージのversionを進めます。Backwardは勾配を書き込む前に、保存したオペランドと出力のversionを検証します。CPUの`Data`への直接書込、外部からのCUDA書込・再生は追跡しないため、グラフが生きている間は保存値を変更しないでください。
+
+`Data`と`Buffer()`は借用です。Dataの差替え、Tensor所有バッファのFree、ハンドル終了後の借用メモリ利用はしないでください。TensorとIndexBufferは所有状態をコピーせずポインタで保持し、共有テンソルの変更・Close・Backwardを並行して行わないでください。
 
 ## Conv2dとCNNの学習
 
-`Conv2d(x, weight, bias, options)`は、`[batch,channels,height,width]`の入力にゼロパディング付きのcross-correlationを行います。重みはPyTorchと同じ`[out_channels,in_channels/groups,kernel_height,kernel_width]`のレイアウトです。biasは`nil`または`[out_channels]`のテンソルを渡します。カーネルの大きさは重みから決まり、矩形や偶数でもかまいません。
+`Conv2d(x, weight, bias, options)`はCPU/CUDAのNCHW cross-correlationです。入力は`[batch,channels,height,width]`、重みは`[out_channels,in_channels/groups,kH,kW]`、biasはnilまたは`[out_channels]`です。矩形・偶数カーネル、非連続viewに対応します。
 
-`Conv2dOptions`はheight/widthの順の`[2]int`の組を持ちます。
+| `Conv2dOptions` | 条件・既定 |
+| --- | --- |
+| `Stride` / `Dilation` | height / width順。両方0なら`[1,1]`、それ以外は両方正 |
+| `Padding` | 各軸の非負な対称パディング。既定0 |
+| `Groups` | 0なら1。両チャネル数を割り切ること。`Groups == in_channels`でdepthwise |
 
-- `Stride`と`Dilation`: どちらも0の組は`[1,1]`が既定です。それ以外は両方の値が正でなければなりません。
-- `Padding`: 各軸に対する非負の対称なゼロパディングです。既定はパディングなしのvalid convolutionです。
-- `Groups`: 0は1が既定です。どちらのチャネル数もgroupsで割り切れる必要があります。`Groups == in_channels`はdepthwise畳み込みになり、出力チャネルのmultiplierも扱えます。
-
-各軸の出力サイズは`floor((input + 2*padding - dilation*(kernel-1) - 1)/stride) + 1`です。deviceの組み合わせ、形状、オプションが不正な場合は演算の境界でpanicし、層のコンストラクタはエラーを返します。入力、カーネル、出力の各次元は正で、各テンソルの要素数はCUDAの符号付き32ビットのindex上限に収まる必要があります。非連続のviewも受け取り、実体化を通して勾配を受け取ります。
+出力サイズは各軸で`floor((input + 2*padding - dilation*(kernel-1) - 1)/stride) + 1`です。入力・カーネル・出力の次元は正、要素数は符号付き32ビットindex内である必要があります。不正な演算はpanicし、層のコンストラクタはエラーを返します。
 
 ```go
-device := tensor.CPU // NewCUDAContextを保持している間はtensor.CUDA
-rng := rand.New(rand.NewSource(7))
 conv, err := autograd.NewConv2dLayer(4, 8, [2]int{3, 5},
     autograd.Conv2dOptions{
         Stride: [2]int{1, 2}, Padding: [2]int{1, 2}, Groups: 2,
-    }, true, device, rng) // trueでbiasを登録し、falseではBiasはnilのままです
-// エラーを処理します。conv.StateModule()は"weight"と、biasがあれば"bias"を登録します。
-_ = err
-root := autograd.Module{Children: []autograd.NamedModule{
-    {Name: "conv", Module: conv.StateModule()},
-}}
-x, err := autograd.New(make([]float32, 2*4*8*10), []int{2, 4, 8, 10}, device, true)
-// エラーを処理します。
-_ = err
-y := conv.Forward(x) // [2,8,8,5]
-loss := autograd.Mean(y, 0, 1, 2, 3)
-err = loss.Backward() // 入力、重み、biasの勾配
-// エラーを処理します。グラフを解放する前に出力と勾配を読みます。
-loss.ReleaseGraph()
-err = root.SaveSafeTensors("conv.safetensors")
-// エラーを処理します。終わったら入力、パラメータ、optimizerが持つバッファをcloseします。
+    }, true, device, rand.New(rand.NewSource(7)))
 ```
 
-CPUとCUDAはどちらも、1バッチ1グループずつを空間タイルへ展開します。im2colと出力タイルの組は4 MiBまで（カーネルだけでこの予算を超える場合は1列まで）で、1タイルの出力位置は最大512です。Backwardは完全なim2col行列を保存せず、展開を再計算します。CPUは共有のSGEMMを、CUDAはcuBLASとデバイス側の展開・scatterカーネルをホストへの転送なしで使います。Conv2dはBF16 autocastが有効でもFP32で計算します。CUDAの入力勾配のscatterはatomic加算を使うため、bit単位ではなく数値として再現します。
+CPU/CUDAは空間タイルへ展開してGEMMを行います。im2colと出力タイルの予算は4 MiB、出力位置は最大512です。カーネルだけで予算を超える場合は1列を使います。Backwardは完全なim2colを保存せず再計算します。BF16有効時もFP32で計算し、CUDAの入力勾配はatomic加算のためbit単位の再現を保証しません。
 
-`cmd/cnn-train`は、Conv2d/BatchNorm/ReLUの2ブロック、maxによるダウンサンプリング、adaptive global average pooling、線形分類器、cross-entropy、AdamWを、縦横のノイズ付きストライプ画像で動かします。保存時は新しいモデルを作り直し、全てのパラメータを厳密に再読込し、推論のlogitsを比較します（CUDAのreductionは和の順序が変わり得ます）。外部データセットもPythonも不要です。
+CNN例はConv2d / BatchNorm / ReLU、max pooling、adaptive global average pooling、分類器、cross-entropy、AdamWを使い、保存後の再読込みを確認します。出力先ディレクトリを作ってから実行してください。
 
 ```sh
 go run ./cmd/cnn-train -device cpu -steps 60 -out out/cnn.safetensors
 go run ./cmd/cnn-train -device cuda -steps 60 -out out/cnn-cuda.safetensors
 ```
 
-`out`の親ディレクトリは先に作っておきます。これはアーキテクチャと学習の動作確認用で、画像認識の品質を測るものではありません。リポジトリに含めたConv2dのfixtureは、Goのテスト中にPythonを必要とせず、全ての出力とVJPの要素をPyTorchと照合します。作り直すには`python tools/gen_conv2d_fixture.py`を使います。
-
 ## NCHW pooling
 
-`MaxPool2d`、`AvgPool2d`、`AdaptiveAvgPool2d`は、CPUまたはCUDAのfloat32の`[batch,channels,height,width]`入力を受け取ります。非連続のviewは実体化し、勾配を元のストレージへ戻します。入力と出力の各次元は正で、全要素数はConv2dと同じく符号付き32ビットのindexに収まる必要があります。不正なオプションや形状は、実体化や出力の確保より前にpanicします。
+`MaxPool2d`、`AvgPool2d`、`AdaptiveAvgPool2d`はCPU/CUDAのFP32 NCHW入力を扱います。次元は正、要素数は符号付き32ビットindex内である必要があります。非連続viewは実体化し、不正な形状・設定は割当の前にpanicします。
 
-```go
-down := autograd.MaxPool2d(x, autograd.MaxPool2dOptions{
-    KernelSize: [2]int{2, 2}, // strideの既定も[2,2]です
-})
-smoothed := autograd.AvgPool2d(down, autograd.AvgPool2dOptions{
-    KernelSize: [2]int{3, 3}, Stride: [2]int{1, 1},
-    Padding: [2]int{1, 1}, ExcludePad: true,
-})
-pooled := autograd.AdaptiveAvgPool2d(smoothed, [2]int{1, 1})
-features := autograd.Reshape(pooled, pooled.Shape[0], pooled.Shape[1])
-// featuresは[batch,channels]です。LinearLayerと損失を組み合わせます。
-```
+- `KernelSize`は必須。Strideが全て0ならKernelSizeを使う。maxのDilationが全て0なら`[1,1]`。その他のstride / dilationは正、Paddingは各軸0〜カーネルサイズの半分。averageのdilationは1。
+- 出力式はConv2dと同じ。`CeilMode`はceilを使い、右端・下端のパディングだけで始まる最後の窓を除く。
+- maxのパディングは負の無限大。同値はrow-majorで最初の有効要素、NaNは最後のNaNを選ぶ。dilationした窓に有効要素がなければ負の無限大となり、入力勾配を生まない。indexのテンソルは返さない。
+- averageは既定でパディングも除数に含める。`ExcludePad: true`は有効位置だけを数える。ceilの部分窓でも、要求したパディングを超える位置は除数から除く。正の`DivisorOverride`は除数を上書きし、0は通常、負はエラー。
+- adaptiveの正の出力サイズに対し、各binは`floor(position*input/output)`から`ceil((position+1)*input/output)`。binの重なりと入力より大きい出力に対応し、勾配は全binの寄与を加算する。
 
-- `MaxPool2dOptions`は`KernelSize`、`Stride`、`Padding`、`Dilation`の組と`CeilMode`を持ちます。`AvgPool2dOptions`は`KernelSize`、`Stride`、`Padding`、`CeilMode`、`ExcludePad`、`DivisorOverride`を持ちます。組はheight/widthの順です。`KernelSize`は必須です。strideが全て0なら`KernelSize`、max poolingのdilationが全て0なら`[1,1]`が既定です。その他のstrideとdilationの値は正でなければなりません。paddingは対称で、各軸で0からカーネルサイズの半分までです。average poolingのdilationは1です。
-- 各軸の出力サイズは`floor((input + 2*padding - dilation*(kernel-1) - 1)/stride) + 1`です。`CeilMode`はfloorをceilに替え、その後で右端または下端のパディングだけで始まる最後の窓を除きます。窓は入力の外へはみ出せます。
-- max poolingのパディングは負の無限大として扱います。最大値が同じときは、row-majorで最初の有効な要素を選びます。NaNは最後のNaNを選びます。選んだindexは勾配を記録するときだけ保存し、retainしたbackwardでも保ちます。dilationした窓に有効な要素がない場合は負の無限大を返し、入力の勾配を生みません。このAPIは値だけを返し、indexのテンソルは返しません。
-- average poolingは既定でゼロパディングも除数に数え、PyTorchの`count_include_pad=true`と同じです。有効な入力位置だけを数えるには`ExcludePad: true`を設定します。ceil modeの部分的な窓では、要求したパディングを超える位置は既定の設定でも除外します。正の`DivisorOverride`は数えた個数を置き換え、0は通常の個数を使います。負の値は拒否します。
-- adaptive poolingは正の`[output_height,output_width]`を必要とします。各binは`floor(position*input/output)`で始まり、`ceil((position+1)*input/output)`で終わります。binは重なり合い、出力サイズが入力サイズより大きくてもかまいません。backwardは全てのbinの寄与を加算します。
-- `MaxPool2dLayer{Options: ...}`、`AvgPool2dLayer{Options: ...}`、`AdaptiveAvgPool2dLayer{OutputSize: ...}`は`Sequential`用の`TensorLayer`を実装します。パラメータ、バッファ、train/evalに依存するstateは持ちません。bindした入力のコンテキストの同一性とNoGradの動作は通常どおり伝わります。
-- poolingはBF16 autocastの下でもFP32で計算します。CUDAはホストへの転送なしでデバイスカーネルを使い、captureと再生に対応し、重複する勾配をatomic加算で積みます。勾配はbit単位ではなく、数値で比較します。
-
-リポジトリに含めたPyTorchのfixtureは、矩形カーネル、dilationしたmax pooling、ceil modeの補正、パディングを含める・除く場合、除数の上書き、割り切れないadaptive bin、adaptiveのアップサンプリングについて、全ての出力と入力のVJPを確認します。作り直すにはPyTorchが必要で（`python tools/gen_pool2d_fixture.py`）、GoのテストはJSONをそのまま使います。3つの演算は有限差分でも独立に確認します。
+各Layerは`TensorLayer`を実装し、パラメータ・バッファ・train/eval stateを持ちません。BF16下でもFP32です。CUDAの重複する勾配はatomic加算で、capture / 再生に対応します。
 
 ## BatchNorm
 
-`BatchNorm(x, weight, bias, runningMean, runningVar, options)`は、チャネル軸以外の全ての次元を正規化します。入力はrank 2〜6で、チャネルは軸1（`NC`、`NCL`、`NCHW`など）か、`ChannelsLast: true`のときは最後の軸（`NC`、`NLC`、`NHWC`など）にあります。形状は保たれます。重みとbiasはそれぞれ独立に任意の`[channels]`ベクトルで、省略すると重みは1、biasは0になります。全てのテンソルは同じdeviceと、互換な実行コンテキストを共有する必要があります。
+`BatchNorm(x, weight, bias, runningMean, runningVar, options)`はrank 2〜6のチャネル以外を正規化します。チャネル軸は既定1、`ChannelsLast: true`なら最後です。weight / biasは独立に任意の`[channels]`で、省略時は1 / 0です。テンソルのdeviceと実行コンテキストは互換でなければなりません。
 
-`BatchNormOptions`は`Training`、`ChannelsLast`、`Eps`、`Momentum`を持ちます。
+- `Eps`は0なら`1e-5`、それ以外は正で有限。
+- 学習はチャネルごとに2サンプル以上必要。出力は偏りのあるバッチ分散、running varianceは不偏分散を使う。
+- running mean / varianceは両方nilか、両方とも連続した勾配不要の`[channels]`。nilの学習はstateを更新しない。関数版の評価は両方が必要で、1サンプルでもよい。
+- `Momentum`は有限の`[0,1]`。更新式は`(1-Momentum)*old + Momentum*batch`。関数版の0はrunning値を凍結するが、学習の正規化はバッチ統計のまま。変更するrunningバッファは他の入力・stateとaliasしない。
+- 各forwardはmean / 逆標準偏差を保存する。後のrunning更新・Close・モード変更で既存グラフの導関数は変わらない。入力とaffineの管理された変更はversion検証の対象。
 
-- epsilonが0なら`1e-5`が既定です。それ以外は正で有限でなければなりません。
-- 学習はチャネルごとに2サンプル以上を必要とします。サンプル数はチャネル以外の次元の積です。出力は偏りのあるバッチ分散（サンプル数で割る）を使います。running分散の更新は不偏推定量（サンプル数から1を引いて割る）を使います。
-- running meanとvarianceは、両方nilであるか、両方とも連続した勾配の要らない`[channels]`バッファでなければなりません。nilでの学習はバッチ統計を使い、running stateを記録しません。評価は両方のバッファを必要とし、チャネルごとに1サンプルでもかまいません。
-- runningの更新は`(1-Momentum)*old + Momentum*batch`で、momentumは`[0,1]`の有限値です。関数版でmomentumが0のときはrunningの値を凍結し、学習の正規化をrunning統計に切り替えるわけではありません。変更可能なrunningバッファは、他の入力やstateの割当と別名になってはいけません。
-- Backwardは入力と任意のaffineパラメータを微分します。各forwardはmeanと逆標準偏差の割当を自分用に保存します。forwardの後にrunningバッファを更新・closeしたり、層のモードを変えたりしても、既に組んだグラフの導関数は変わりません。入力やaffineの管理された変更は、通常どおり保存したversionの検証を起こします。
+`BatchNormLayerOptions{}`はaffineとrunning統計、epsilon `1e-5`、momentum `0.1`、channels-first、学習モードが既定です。`DisableAffine`は重み・biasを省き、`DisableRunningStats`は学習・評価ともバッチ統計を使うため学習時のサンプル数要件も適用します。
 
-層のAPIは、学習するパラメータと勾配の要らないstateをModuleへ登録します。
+層のMomentumはポインタで、nilは`0.1`、0を指せば明示的に凍結します。`CumulativeMomentum`は`1/num_batches_tracked`でバッチ平均を取ります。サンプル数で重み付けした平均ではありません。オプションは構築時にコピーします。
 
-```go
-norm, err := autograd.NewBatchNormLayer(8, autograd.BatchNormLayerOptions{}, device)
-// エラーを処理します。オプションが全て0ならaffineと統計の追跡が有効になり、
-// epsilon 1e-5、momentum 0.1、channels-first、学習モードになります。
-_ = err
-defer norm.Close()
-root := autograd.Module{Children: []autograd.NamedModule{
-    {Name: "norm", Module: norm.StateModule()},
-}}
-execution := autograd.NewExecutionContext()
-err = execution.BindModule(&root)
-// エラーを処理します。Forwardの前にexecutionで入力を作ります。
-root.Train(true)
-y := norm.Forward(x)
-// 損失、backward、更新を組み合わせます。終わったらグラフを解放します。
-_ = y
-root.Train(false)
-execution.NoGrad(func() {
-    prediction := norm.Forward(x)
-    prediction.ReleaseGraph()
-})
-err = root.SaveSafeTensors("norm.safetensors")
-// エラーを処理します。同じ構成を作り直してstateを読み込み、Train(false)にします。
-```
+Moduleへ`weight` / `bias`と`running_mean` / `running_var` / スカラーの`num_batches_tracked`を登録します。バッファはoptimizerの対象外です。全stateがF32のためカウンタの整数精度は`2^24`までで、PyTorchのI64を取り込む際は変換が必要です。
 
-`BatchNormLayerOptions`は既定でaffineとrunning stateを使います。`DisableAffine`は重みとbiasを省きます。`DisableRunningStats`は全てのrunningバッファを省き、学習と評価の両方でバッチ統計を使います（学習のサンプル数要件も含みます）。`Momentum`は任意のポインタで、nilは`0.1`が既定、0を指すポインタはrunningの値を明示的に凍結します。`CumulativeMomentum: true`は`1/num_batches_tracked`を更新の重みに使い、観測した**バッチ**の平均に一致します（サンプルで重み付けした平均ではありません）。オプションは構築時にコピーするため、後から渡したmomentumの変数を変えても層は変わりません。
+`Train` / `Module.Train`が統計更新を制御し、NoGradは勾配記録だけを制御します。モードと構成はStateDictに保存しません。層は`TensorLayer` / `Trainer` / `ParameterizedLayer`を実装し、Closeはaffineとバッファを解放します。
 
-- パラメータは`weight`と`bias`、バッファは`running_mean`、`running_var`、スカラーの`num_batches_tracked`です。いずれもModule、safetensors、学習checkpointを通して保存・再読込します。バッファは`NamedParameters`とoptimizerの更新から除きます。現在のstate形式はバッチカウンタも含めてF32で、整数を正確に表せるのは`2^24`までです。PyTorchのI64カウンタとは形式が異なるため、PyTorchのstateを取り込むときは現在のF32形式へ変換します。
-- `Train`と再帰的な`Module.Train`が統計を制御し、NoGradは導関数の記録だけを制御します。学習中のNoGradのforwardでもrunningの値とカウンタは更新します。追跡ありの評価では更新しません。モードと構成は呼び出し側が再現し、StateDictには保存しません。
-- この層は`TensorLayer`、`Trainer`、`ParameterizedLayer`を実装します。`Close`はaffineパラメータとバッファを解放し、繰り返し呼べます。独立したworkerは別々のコンテキストと、変更可能な層のstateを使います。
-- CPUとCUDAは、BF16 autocastの下でもFP32の出力と勾配を計算します。モーメントのreductionはfloat64で累積し、FP32の統計を保存します。CUDAのrunning更新とバッチ数の計上はデバイス上に留まり、累積平均も含めてグラフの再生に対応します。通常どおりモデルをbindし、`NewCUDAContext`を保持します。stateの確認や書き出しにだけ、明示的なホストへの読み戻しが必要です。
-
-PyTorchのfixtureは、forward、入力とaffineの全てのVJP、偏りあり・なしの分散、channels-first/lastのレイアウト、rank 2〜6、サンプルが1つの評価、reductionの端を確認します。複数ステップの列では、固定・累積の更新、NoGradの学習、追跡を無効にした評価を追加で比較します。Goだけのテストは、有限差分、選択的な勾配、共有・retainした履歴、closeした先祖、独立したCPU worker、stateの再読込、CUDAのcaptureとメモリ回収を確認します。作り直すには`python tools/gen_batchnorm_fixture.py`を使います。
+CPU/CUDAとも出力・勾配・保存統計はFP32、モーメントのreductionはfloat64累積です。CUDAのrunning更新とカウンタはデバイス上で行い、累積平均もcapture / 再生に対応します。
 
 ## 汎用の損失
 
-`MSELoss`、`L1Loss`、`BCEWithLogitsLoss`は、同じ形状と同じdeviceの予測とtargetを受け取り、スカラーを返します。既存の要素演算とreductionを組み合わせて実装しているため、CPUとCUDAで同じ契約です。
+`MSELoss`、`L1Loss`、`BCEWithLogitsLoss`は同shape・同deviceの予測とtargetからスカラーを返します。
 
-```go
-loss := autograd.MSELoss(prediction, target, autograd.LossOptions{})
-// 要素ごとの重みで、0の重みの要素を平均から外します。
-loss = autograd.L1Loss(prediction, target, autograd.LossOptions{Weight: weights})
-// 二値分類のlogitsは、数値的に安定なこちらを使います。
-loss = autograd.BCEWithLogitsLoss(logits, target, autograd.LossOptions{Reduction: autograd.ReductionSum})
-```
+| 設定 | 仕様 |
+| --- | --- |
+| `ReductionMean` | ゼロ値の既定 |
+| `ReductionSum` | 総和。`none`は未提供 |
+| `LossOptions.Weight` | 同shape・同deviceの勾配不要テンソル |
+| MSE / L1の重み付きmean | 重みの和で割り、0の重みを平均から除く |
+| BCEの重み付きmean | 要素数で割る。0の重みも除数に含む |
 
-- `LossOptions.Reduction`は`ReductionMean`（ゼロ値）と`ReductionSum`です。reduceしない`none`はありません。損失がスカラーで、`Backward`がスカラーを要求するためです。要素ごとの値が必要な場合は要素演算を組み合わせます。
-- `LossOptions.Weight`は予測と同じ形状とdeviceの任意のテンソルで、勾配は持ちません。要素をスケールし、`ReductionMean`では0の重みがその要素を平均から外します。
-- 重み付き平均の除数は、PyTorchの損失ごとの実装に合わせます。`MSELoss`と`L1Loss`は重みの和で割り、`BCEWithLogitsLoss`は要素数で割ります。そのためBCEの平均では、0の重みは除数から要素を外しません。外したいときは`ReductionSum`を使い、除数を自分で指定します。
-- `BCEWithLogitsLoss`は`max(x,0) - x*y + log(1+exp(-|x|))`の形で計算するため、logitの絶対値が大きくても有限です。targetは`[0,1]`の確率です。確率そのものを渡すBCEは対数のclampが必要になるため提供しません。
-- `MaskedLoss`はrank 3のNaNフレームマスク専用として残ります。無効なフレームをNaNで表す既存の用途はそちらを使います。
-- 形状が一致しない場合、deviceが混在する場合、未知のreductionはpanicします。損失は`ToHost`で読み、`Backward`の後は通常どおり`ReleaseGraph`で解放します。
-
-`testdata/losses.json`（`tools/gen_losses_fixture.py`が生成）は、3つの損失×mean/sum×重みあり/なしの12ケースで、損失値と予測勾配をPyTorchとCPU/CUDAで照合します。ゼロ重みのマスク、未知のreduction、形状とdeviceの不一致、スカラー入力はGoのテストで確認します。`cmd/tabular-train`と`cmd/audio-train`は、手で組んだ平均二乗誤差ではなく`MSELoss`を使います。
+BCEは`max(x,0) - x*y + log(1+exp(-|x|))`で計算し、targetは`[0,1]`です。確率そのものを渡すBCEは未提供です。NaNフレームのマスクにはrank 3専用の`MaskedLoss`を使います。形状・device不一致、未知のreductionはpanicします。
 
 ### 学習ループ
 
-`TrainingLoop`はoptimizer更新の境界を共通化します。readerからバッチを読み、更新（または蓄積のgroup）の先頭で勾配をゼロにし、更新ごとに1回だけ`Optimizer.Step`とスケジューラの`Step`を呼び、損失を一定の間隔で報告します。呼び出し側は`Step`で1つのmicro-batchのグラフを作り、`GradAccumulator.Backward`へ渡します。
+`TrainingLoop[B]`はreaderからmicro-batchを取得し、groupの先頭でZeroGrad、完了した更新ごとにOptimizer.StepとSchedule.Stepを1回呼びます。呼出し側の`Step`がグラフを作り、`GradAccumulator.Backward`へ渡します。
 
-```go
-loop := autograd.TrainingLoop[data.FloatBatch]{
-    Reader: loader, Sampler: sampler, Optimizer: optimizer, Schedule: schedule,
-    Updates: 100, Applied: schedule.StepCount, Accumulate: 4, LogEvery: 25,
-    Step: func(ctx context.Context, batch data.FloatBatch, accumulator *autograd.GradAccumulator) (float64, bool, error) {
-        // 入力を作り、損失を組み立て、accumulator.Backward(loss)を呼びます。
-        // 作ったテンソルの寿命はこの関数が持ちます。
-        return loss, complete, nil
-    },
-    Report: func(update int, loss float64) { fmt.Printf("step=%d loss=%f\n", update, loss) },
-    Save:   func(savepoint []byte) error { return autograd.SaveTrainingCheckpoint(path, model, optimizer, schedule, nil) },
-}
-err := loop.Run(ctx)
-// エラーを処理します。
-```
-
-- `Reader`は`*data.Loader[T, B]`、`Sampler`は`*data.IndexSampler`、`Schedule`は`*OneCycle`がそのまま満たします。readerが`io.EOF`を返すとepochを進めて学習を続けます。
-- `Report`は最初の更新、`LogEvery`間隔、最後の更新で呼ばれます。報告する損失はその更新の最後のmicro-batchの値です。
-- `Save`は、計画した更新まで到達したときと、contextがrunを終えたときに1回だけ呼ばれます。readerや`Step`のエラーでrunが終わったときは呼ばれません。
-- `Accumulate`が2以上のときは`Sampler`が必要です。groupの途中でcontextが終わると、未完了の勾配を捨ててsamplerをgroupの先頭へ戻し、そのpayloadを`Save`へ渡します。model、optimizer、スケジューラは最後に完了した更新を保つため、再開時にそのgroupのデータを読み直します。
-- 巻くのはsamplerだけです。forwardで変わるrunning統計やカウンタは、呼び出し側が元に戻す必要があります。
-
-MNIST、数値回帰、音声の例はこのloopで学習ループを組み、`data.Stack`/`StackRegression`/collate関数と`autograd.TrainingLoop`の組だけが例ごとに違います。テストでは、更新数と報告の間隔、epochをまたぐ読込、蓄積の途中と完了直後の中断で`Save`が受け取るsavepoint、readerのエラー時に`Save`が呼ばれないことを確認します。
+- ReaderがEOFなら次のepochへ進む。
+- Reportは最初・LogEvery間隔・最後の更新で呼ばれ、その更新の最後のmicro-batchの損失を受け取る。
+- Saveは予定更新の完了時、またはcontext終了時に1回呼ぶ。reader / Stepのエラーでは保存しない。
+- `Accumulate >= 2`にはSamplerが必要。途中のキャンセルでは勾配を捨て、Samplerをgroupの先頭へ戻し、そのpayloadをSaveへ渡す。model / optimizer / scheduleは最後の完了更新を保つ。
+- 巻き戻すのはSamplerだけ。forwardが更新したrunning統計や乱数状態は呼出し側で戻す。
 
 ## 勾配蓄積
 
-`GradAccumulator`は、1回のoptimizer更新を複数のmicro-batchに分けます。損失を`1/groups`にスケールしてからBackwardし、蓄積した勾配がgroup内のmicro-batchの平均になるようにします。
+`GradAccumulator`は損失を`1/groups`にスケールしてBackwardし、group完了を返します。蓄積器はループ外で作り、各micro-batchの損失を渡します。ZeroGrad、クリップ、optimizer / scheduleのStepは呼出し側で行い、クリップと更新はgroup完了後に行ってください。
 
 ```go
 accumulator, err := autograd.NewGradAccumulator(4)
-// エラーを処理します。
-for {
-    if accumulator.Pending() == 0 {
-        optimizer.ZeroGrad()
-    }
-    loss := autograd.CrossEntropy(model.Forward(batch.Values), batch.Labels, -1)
-    complete, err := accumulator.Backward(loss)
-    loss.ReleaseGraph()
-    // エラーを処理します。
-    if !complete {
-        continue
-    }
+```
+
+各micro-batchで次の処理を行います。
+
+```go
+if accumulator.Pending() == 0 {
+    optimizer.ZeroGrad()
+}
+complete, err := accumulator.Backward(loss)
+loss.ReleaseGraph()
+if complete {
     autograd.ClipGradNorm(params, 1)
     optimizer.Step()
     schedule.Step(optimizer)
 }
 ```
 
-- 勾配のゼロ化、クリップ、`Step`、スケジューラは呼び出し側が持ちます。蓄積した勾配に対してクリップしたいので、`Backward`がgroup完了を返した時点でクリップと`Step`を行います。
-- 端数になった最後のgroupは`1/groups`のスケールを保つため、実効バッチが小さくなります。途中で更新することにした場合は`Reset()`を呼びます。
-- checkpointは完了したgroupの後で取ります。未完了の勾配はパラメータの勾配バッファにあり、checkpointには含まれません。
-- 平均するのは各micro-batchの損失です。1つの大きなバッチの平均損失と同じ勾配になるのは、各micro-batchの有効件数と損失の分母が等しい場合です。短いバッチや有効件数の異なるマスクを混ぜる場合は、件数に応じた重み付けを呼び出し側で行います。
-- `autograd`のテストは、8件のバッチを4つのmicro-batchに分けて蓄積した勾配が、1回のBackwardの勾配とCPU/CUDAで一致することを確認します。端数になったgroupのスケール、`Pending`/`Reset`、`groups`が1未満の拒否も確認します。
+端数groupでも`1/groups`のスケールを保ちます。途中で更新した場合はResetしてください。未完了の勾配はcheckpointに含まれないため、保存はgroup完了後に行います。
+
+平均するのはmicro-batchごとの損失です。大きな1バッチと同じ勾配になるのは、有効件数と分母が等しい場合だけで、短いバッチや異なるマスクは呼出し側で重み付けします。
 
 ## 評価指標
 
-`metrics`の各型はゼロ値から使えます。空の集計結果は0で、観測の有無は`Count()`で区別します。`Reset()`で集計を消せます。同じ集計への並行書込には対応していません。
+`metrics`はホスト配列を集計します。各型はゼロ値から使え、空の値は0、Countで観測の有無を区別し、Resetで消去します。同じ集計への並行書込は非対応です。
 
-- `Mean.Add(value, weight)`は、バッチの平均値と、その平均の対象になった件数を受け取ります。最後のバッチが短くても、バッチ数で割るのではなく件数で重み付けします。マスク付き損失では有効件数を渡します。
-- `Accuracy.UpdateLogits(scores, labels, classes, ignoreIndex)`は、行優先の`[len(labels), classes]`のスコアから正解率を集計します。同点では小さいクラス番号を選びます。`ignoreIndex`のラベルは分母・分子の両方から除き、`Correct()`は正解件数、`Count()`は有効件数を返します。
-- `Regression.Update(prediction, target)`は、同じ長さのfloat32配列からMSE、RMSE、MAEを集計します。差分と和はfloat64で計算します。複数出力の回帰でも、`Count()`と平均の分母はサンプル数ではなく要素数です。
+- `Mean.Add(value, weight)`は平均値を対象件数で重み付けする。マスク付き損失は有効件数を渡す。
+- `Accuracy.UpdateLogits(scores, labels, classes, ignoreIndex)`は`[len(labels),classes]`のrow-majorスコアを扱う。同点は小さいクラス番号、ignoreIndexは分子・分母から除く。Correctは正解件数、Countは有効件数。
+- `Regression.Update(prediction, target)`は同長のfloat32配列からMSE / RMSE / MAEを求める。差分と和はfloat64、Countと除数はサンプル数ではなく要素数。
 
-更新メソッドは形状の不一致、NaN/Inf、不正な件数やoverflowを拒否し、エラー時には集計を変えません。無視する分類行のスコアも有限値である必要があります。
-
-```go
-var errorMetric metrics.Regression
-err := errorMetric.Update(predictions, targets)
-// エラーを処理します。
-fmt.Printf("count=%d rmse=%g mae=%g\n", errorMetric.Count(), errorMetric.RMSE(), errorMetric.MAE())
-```
-
-MNIST例は`Mean`と`Accuracy`、数値回帰の例は`Regression`を使います。テストでは長さの異なるバッチ、同点、無視ラベル、空の入力、不正な入力での集計保持を確認します。
+形状不一致、NaN/Inf、不正な件数、overflowは集計を変えずに拒否します。無視する分類行のスコアも有限値が必要です。
 
 ## 中断時の保存
 
-3つの学習例は、`TrainingLoop.Save`へcheckpointの保存を渡します。loopは計画した更新まで到達したときと、contextがrunを終えたときにSaveを1回だけ呼ぶため、キャンセルや期限切れを検出する処理を各例が書かなくても、最後に完了した更新の状態が残ります。中断時には評価や推論用の重みの書き出しは行いません。更新前に中断した場合も、初期状態のcheckpointから再開できます。
+MNIST・数値回帰・音声の例は`TrainingLoop.Save`で最後の完了更新を保存します。更新前の中断でも初期checkpointから再開できます。中断時には評価と推論用重みの書出しは行いません。
 
-蓄積はepochをまたいで続き、短いバッチも1個のmicro-batchとして数えます。蓄積途中で中断した場合は未完了の勾配を捨て、保存するsamplerの状態をそのgroupの先頭へ戻します。再開後は未完了だったgroupのデータを再読込します。これらの例のモデルには変更されるrunning統計やdropoutの乱数状態がありません。別のモデルで同じ方式を使う場合は、forwardで変更したバッファや乱数状態も戻す必要があります。
-
-テストでは、蓄積の途中とepochをまたいだ途中での中断から再開し、モデル・optimizer・スケジューラ・データ順を中断なしの結果と比較します。CPUでは厳密一致、CUDAでは既存の許容誤差内の一致を確認します。数値回帰と音声は更新後のキャンセルと更新前の期限切れから再開し、CPUのcheckpoint全体がバイト単位で一致します。
+蓄積はepochをまたぎ、短いバッチも1 micro-batchとして数えます。未完了groupはデータを読み直します。例のモデルは変更されるrunning統計・dropoutの乱数状態を持ちません。他のモデルではそれらの巻戻しも必要です。
 
 ## OptimizerとSGD
 
-`Optimizer`は`Step()`、`ZeroGrad()`、`LearningRate() float32`、`SetLearningRate(float32)`、`Close()`を公開します。AdamWとSGDがこれを実装し、`OneCycle.Step(optimizer)`はスケジュールを進めて次の更新の学習率をインターフェース経由で設定します。AdamWの学習率フィールドや直接の呼び出しはこれまでどおり使えます。`SetLearningRate`は有限で非負の値を受け取り、不正な入力ではpanicします。`CheckpointOptimizer`は`Snapshot`、`ValidateSnapshot`、`LoadSnapshot`を追加し、`adamw`または`sgd`のタグを持つバージョン付きの`OptimizerSnapshot`を扱います。AdamWの型付きのState/LoadStateはそのまま残ります。独自の更新を実装する場合もOptimizerとOneCycleを組み合わせられますが、現在のcheckpointのエンコーダは組み込みの2つに対応します。
+`Optimizer`は`Step()`、`ZeroGrad()`、`LearningRate() float32`、`SetLearningRate(float32)`、`Close()`を公開します。OneCycleはこのAPIで次の学習率を設定します。学習率は有限で非負、不正値はpanicします。
 
-```go
-schedule := autograd.NewOneCycle(.1, 100, .3)
-sgd, err := autograd.NewSGD(model.NamedParameters(), autograd.SGDOptions{
-    LR: float32(schedule.LR()), Momentum: .9,
-    Nesterov: true, WeightDecay: .0001,
-})
-// エラーを処理します。
-_ = err
-defer sgd.Close()
-var optimizer autograd.Optimizer = sgd
-optimizer.ZeroGrad()
-// 損失を組み、Backwardしてから、通常どおりグラフを解放します。
-optimizer.Step()
-schedule.Step(optimizer)
-err = autograd.SaveTrainingCheckpoint("run.safetensors", model, sgd, schedule, metadata)
-// エラーを処理します。LoadTrainingCheckpointがモデル、オプション、バッファ、スケジュールを復元します。
-```
+`CheckpointOptimizer`は`Snapshot` / `ValidateSnapshot` / `LoadSnapshot`を追加し、`adamw` / `sgd`のタグ付きstateを扱います。独自OptimizerとOneCycleは組み合わせられますが、checkpointのエンコーダは組込みの2種類だけに対応します。
 
-`NewSGD(params, options)`は、構成やパラメータが不正なときにエラーを返します。パラメータは、同じdevice上の、名前が異なり連続したfloat32の末端で、要素数が正である必要があります。コンストラクタはパラメータのスライスとオプションをコピーするため、パラメータの同一性と順序を保ってください。学習率は`SGD.LR`フィールドでも参照できます。その他のハイパーパラメータは構成をコピーし、stateを通して復元します。
+`NewSGD(params, options)`のパラメータは同deviceの名前が一意な連続F32末端で、要素数は正である必要があります。スライスとオプションをコピーするため、パラメータの同一性・順序を保ってください。
 
-`SGDOptions`はLR、Momentum、Dampening、WeightDecay、Nesterov、Maximizeを持ちます。
+| `SGDOptions` | 仕様 |
+| --- | --- |
+| LR / Momentum / Dampening / WeightDecay | 有限・非負。LR=0でもmomentumは更新 |
+| Nesterov | Momentum > 0かつDampening=0が必要 |
+| Maximize | 生の勾配だけ符号反転。decayは値を縮める |
 
-- 数値は有限で非負です。学習率が0でもmomentumは更新します。Nesterovは正のmomentumとdampening 0を必要とします。momentumが0なら通常のSGDで、dampeningは効きません。
-- `d = grad`（Maximizeでは`-grad`）から始め、coupled decayの`WeightDecay * parameter`を加えます。これはAdamWのdecoupled decayと異なります。
-- momentumが正のとき、最初のバッファはdampeningなしの`d`そのものです。以降は`buffer = Momentum*buffer + (1-Dampening)*d`です。降下にはバッファを、Nesterovでは`d + Momentum*buffer`を使い、パラメータから`LR * update`を引きます。Maximizeは生の勾配の符号だけを反転し、decayはパラメータを縮めます。
-- 勾配がないパラメータは、パラメータ、decay、バッファの更新を飛ばします。0の勾配は存在するものとして、decayとmomentumを適用します。遅延初期化はパラメータごとなので、後のステップで初めて勾配を受けたパラメータも、dampeningなしの最初のバッファを得ます。StepCountは、全勾配がないステップも含めてoptimizerのStep呼び出しを数え、スケジューラと揃います。
-- eagerな`SGD.ZeroGrad`は、どちらのdeviceでも勾配を無い状態に戻します。準備済みまたは記録済みのCUDAグラフは、再生に安定したアドレスが必要なため、勾配の割当を保って0で埋めます。AdamWはこれまでのZeroGradの方針を保ちます。
-- CPU/CUDAの更新は管理されたストレージのversionを進め、eagerな変更でBF16のシャドウを無効にします。SGDはautocastの下でもFP32で更新します。CUDAの更新、momentum、初期化はデバイス上に留まり、ステップごとの読み戻しはありません。`Close`はoptimizerのstateだけを解放し、モデルのパラメータは呼び出し側が持ちます。
+`d = grad`（Maximize時は`-grad`）に`WeightDecay * parameter`を加えます。momentumの最初のバッファはdampeningなしの`d`、以後は`buffer = Momentum*buffer + (1-Dampening)*d`です。更新は通常buffer、Nesterovは`d + Momentum*buffer`を使い、`LR * update`を引きます。Momentum=0では通常のSGDでDampeningは作用しません。
 
-`SGD.State`は順序付きの名前と形状、全てのオプション、ステップ数、momentumバッファ、パラメータごとのInitializedフラグを持ちます。使われていないパラメータのバッファは、スナップショットにもファイルにもありません。`LoadState`は全てのオプション、名前、形状、フラグ、バッファを検証してからstateを置き換えます。スナップショットは独立したコピーです。単体のSGDのsafetensorsは`gograd-sgd`のmetadataを使い、統合checkpointは`gograd-training-1`を保ったままoptimizerの種類をタグで示します。種類のタグがない既存のAdamWの学習ファイルはAdamWとして扱います。optimizerの種類が一致しない読込は、liveのモデル値を変える前に拒否します。
+勾配がないパラメータはdecayとstate更新も飛ばします。0の勾配は更新対象です。momentumの遅延初期化はパラメータごと、StepCountは全勾配がないStepも数えます。eagerなZeroGradは勾配を無い状態へ戻しますが、CUDAグラフ用に準備した割当は保持して0で埋めます。
 
-CUDAのcaptureは、AdamWと同じく`SGD.PrepareGraph`、`GraphStepCount`、`SyncGraphStepCount`を使います。パラメータごとのデバイス上のフラグが最初のmomentumの初期化を扱い、更新の完了後にフラグを立てるカーネルを続けます。記録した再生はデバイス上のステップ数を進めます。stateやcheckpointの書き出しはその数を読み、eagerのStepへ戻るときに同期します。記録したハイパーパラメータは記録時に固定され、stateの復元や割当のやり直しは、先に古いグラフを終わらせる必要があります。外部からの再生による書き込みは、ホスト側のストレージversionの追跡対象外です。
+stateは名前・形状・全オプション・ステップ・初期化フラグと、初期化済みのmomentumを保存します。LoadStateは全てを検証してから置換します。単体ファイルのmetadataは`gograd-sgd`、統合形式は`gograd-training-1`です。種類タグのない旧学習checkpointはAdamWとして扱い、種類の不一致はmodel変更前に拒否します。
 
-リポジトリに含めたPyTorchのSGD fixtureは、通常、decay、momentum、dampening、Nesterov、ascent、学習率の変更、遅れて来る勾配と無い勾配、0の勾配を扱います。Goのテストは、全てのパラメータとバッファの値、遅延stateの往復、checkpointの再開、旧AdamWの読込、保存したversionの検証、CUDAグラフとBF16キャッシュの動作を比較します。作り直すには`python tools/gen_sgd_fixture.py`を使います。
+CPU/CUDAのeager更新はストレージのversionを進め、BF16シャドウを無効にします。SGDはFP32、CUDAの更新とstateはデバイス上に留まります。Closeが解放するのはoptimizer stateで、パラメータは呼出し側の所有です。
+
+CUDAグラフでは`PrepareGraph` / `GraphStepCount` / `SyncGraphStepCount`を使います。stateの書出しとeagerへの復帰ではデバイス上のステップ数を同期します。state復元や割当変更は古いグラフを終了してから行ってください。外部再生による書込はホスト側versionの追跡対象外です。
 
 ### パラメータグループ
 
-`ParameterGroupSpec{Name, Params, LRScale, WeightDecay}`は、学習率スケールとweight decayを共有する1組のパラメータに名前を付けます。`NewSGDGroups`と`NewAdamWGroups`がこのspecを受け取り、平坦な`NewSGD`/`NewAdamW`は`default`という1つの暗黙のグループと同じです。
+`ParameterGroupSpec{Name, Params, LRScale, WeightDecay}`を`NewSGDGroups` / `NewAdamWGroups`へ渡します。平坦なコンストラクタは暗黙の`default`グループに相当します。`PartitionParameters`で名前により分割できます。
 
-```go
-specs, err := autograd.PartitionParameters(params, func(name string) string {
-    if strings.HasSuffix(name, ".bias") {
-        return "no_decay"
-    }
-    return "decay"
-})
-// エラーを処理します。
-_ = err
-for i := range specs {
-    specs[i].WeightDecay = 1e-4
-}
-specs[0].WeightDecay = 0 // biasのグループは最初のラベルの0のdecayを保ちます
-optimizer, err := autograd.NewSGDGroups(params, options, specs)
-```
-
-- specはパラメータを過不足なく分割します。全てのパラメータがいずれか1つのグループに属し、同じパラメータが2度現れず、名前は一意で空でなく、各グループは空でありません。コンストラクタの時点での違反はエラーを返します。
-- `LRScale`はoptimizerの基準の学習率に掛かるため、`OneCycle`と`SetLearningRate`は1つの学習率から全てのグループを動かします。有限で非負である必要があり、0は基準の学習率をそのまま使うことを選びます。WeightDecayはそのグループ自身の絶対的なdecayです。どちらも`AdamWState.Groups`/`SGDState.Groups`に、グループのパラメータ名を持つ順序付きの`OptimizerGroupState`として記録します。
-- `NewAdamWGroups(params, lr, specs)`は基準のdecayを取りません。`NewSGDGroups(params, options, specs)`はmomentum/dampening/Nesterov/Maximizeを共有し、`options.WeightDecay`が0でない場合は拒否するため、decayは常にグループごとに設定します。公開フィールドの`AdamW.WeightDecay`と、stateの基準の`WeightDecay`/`Options.WeightDecay`は、最初のグループのdecayを写します。
-- 読込は、liveのstateに触れる前にグループ数、名前、membership、スケール、decayを検証します。グループ以前に書かれたstateはグループの一覧を持たず、スケールを持たない1つのグループのoptimizerにだけ読み込め、decayは保存された基準のハイパーパラメータから取ります。グループ化したstateは平坦なoptimizerが拒否し、その逆も同じです。checkpointは学習の意味を保ちます。
-- CUDAはグループごとのステップサイズとdecayを、それぞれのカーネル引数として適用します。記録したグラフは記録時に基準の学習率とグループのスケールを焼き込むため、スケジューラが基準の学習率を変えた後はeagerの更新とずれます。
-
-リポジトリに含めたパラメータグループのPyTorch fixtureは、異なる学習率とdecayを持つ2つのグループのSGDとAdamWを、勾配がない場合と0の勾配も含めて扱います。Goのテストは、CPUとCUDAで全てのパラメータ、momentumとmomentの値、グループの記録を比較し、stateの往復、レイアウトの再利用、統合checkpointの再開、スケジューラによるスケール、CUDAグラフの再生も確認します。作り直すには`python tools/gen_param_groups_fixture.py`を使います。
+- specは全パラメータを過不足なく1回ずつ含み、名前は一意・非空、各グループも非空。
+- LRScaleは基準学習率への倍率で有限・非負。0は基準学習率をそのまま使う指定。WeightDecayはグループごとの絶対値。
+- `NewSGDGroups`の`options.WeightDecay`は0が必要。momentum / dampening / Nesterov / Maximizeは全グループで共有する。
+- stateは順序付きのパラメータ名とグループ構成を保存する。復元はmembership・スケール・decayを変更前に検証する。
+- グループのない旧stateはスケールを持たない1グループのoptimizerだけが受け入れ、保存済みの基準decayを使う。グループ化したstateと平坦なoptimizerの相互読込みは拒否する。
+- 公開の基準WeightDecayは最初のグループの値を写す。CUDAグラフは記録時の基準学習率とスケールを固定するため、後のスケジューラ更新を自動では反映しない。
 
 ## 汎用のホストデータとバッチ処理
 
-`data`パッケージはテンソルやバックエンドに依存しません。`Dataset[T]`は`Len() int`と`Get(context.Context, index) (T, error)`を公開し、sampleは任意のGoの型でかまいません。`SliceDataset[T]`はメモリ上のスライスを適合させます。`NewSubset`はindexを検証してコピーし、元のsampleはコピーしません。`Indices()`はコピーを返します。`RandomSplit(size, validationCount, seed)`はデータセット全体を覆う、重複しない学習と検証のindexを返します。反復とcheckpointの復元の間、データセットの長さ、内容、indexの同一性を保ってください。
+`Dataset[T]`は`Len() int`と`Get(context.Context, index) (T, error)`を公開します。`SliceDataset`はスライスを使い、`NewSubset`はindexだけをコピーします。Indicesはコピーを返します。`RandomSplit(size, validationCount, seed)`は全件を覆う重複しない分割を作ります。反復・再開中はデータの長さ・内容・indexの同一性を保ってください。
 
 ```go
-dataset := data.SliceDataset[data.FloatSample]{
-    {Values: []float32{1, 2}, Shape: []int{2}, Label: 0},
-    {Values: []float32{3, 4}, Shape: []int{2}, Label: 1},
-}
 sampler, err := data.NewIndexSampler(dataset.Len(), data.SamplerOptions{
     Shuffle: true, Seed: 7,
 })
-// エラーを処理します。
-_ = err
 loader, err := data.NewLoader[data.FloatSample, data.FloatBatch](
     dataset, sampler, data.Stack, data.LoaderOptions{BatchSize: 2},
 )
-// エラーを処理します。
-_ = err
-defer loader.Close() // 読み手が動いている途中で止めるときに必要です
-for {
-    batch, err := loader.Next(context.Background())
-    if err == io.EOF { break } // このepochの終わりで、以降のepochの終わりではありません
-    // その他のエラーを処理します。
-    x, err := execution.New(batch.Values, batch.Shape, device, false)
-    // エラーを処理します。batch.LabelsをCrossEntropyに渡します。xは呼び出し側がcloseします。
-    _ = err
-    _ = x
-}
-err = loader.NextEpoch() // indexを戻します。shuffleの順序は決定的に変わります
-// エラーを処理します。
-```
-
-- `IndexSampler`の既定は昇順です。shuffleは`SamplerOptions.Seed`でseedした専用のPCGストリームを使い、パッケージのグローバルな乱数は使いません。`Peek(count)`は次に来るindexのコピーを返し、状態を進めません。`Advance(count)`は消費したindexを確定します。`NextEpoch`は次の順序を始め、未使用の現在の残りを捨てます。空のデータセットはすぐにEOFを返します。
-- 既定では、`Loader.Next`はsampleを逐次取得してcollateし、キャンセルを確認してからsamplerを進めます。読込、collate、キャンセルのエラーはカーソルを変えずに残すため、再試行できます。コールバックのEOFは`UnexpectedEOF`に変換し、切り詰めた入力が正常なepochの終わりに見えるのを防ぎます。キャンセルはコールバックの境界で協調的に行い、`Dataset.Get`も自身のcontextに従う必要があります。
-- `BatchSize`は正でなければなりません。最後のバッチは既定で小さくなります。`DropLast`はその不完全な末尾を消費してEOFを返します。samplerとデータセットのサイズの不一致や、データセットの長さの変化はエラーです。`Loader`と変更可能なsamplerは逐次使うため、独立したworkerには別々のsamplerとloaderが必要です。読み取り専用のデータセットは、その`Get`が並行呼び出しに対応していれば共有できます。
-- `Stack`はsampleの形状が等しいことを検証し、値とラベルをコピーしてバッチの軸を前に付けます。スカラーも扱えます。`PadSequences`は末尾の次元が一致することを必要とし、最初のsampleの軸をバッチの最大か指定した`Length`まで埋めます。短い固定の`Length`には`Truncate: true`が必要で、暗黙には切り詰めません。`PaddingOptions.Value`は埋める値を選びます。`FloatBatch.Shape`は`[batch,time,...]`、`Lengths`は残した長さ、`Mask`は`[batch,time]`の平坦なboolスライスで、残した入力位置だけがtrueです。空の系列も有効で、全て空の自動バッチではtimeの大きさが0になります。
-- 組み込みのfloatのcollateは、所有権を持つ新しいホストスライスを返します。sampleがデータセットのストレージを借用することがあり、独自のcollateは借用したsampleを変更してはいけません。バッチの変換とアップロードは呼び出し側の`ExecutionContext`で行います。整数のラベルとboolのマスクは、アプリがテンソル表現を選ぶまでホストのデータのままです。
-
-### 数値のCSVテーブルと回帰のsample
-
-`ParseNumericCSV(r, ParseOptions)`は、任意のコメント行とヘッダを持つ矩形の数値CSV/TSVテーブルを読みます。フィールドは前後の空白を除き、有限でなければなりません。最初の不正な行は1始まりの行番号を報告します。`NumericTable.RegressionSamples`は行を`RegressionSample{Features, Target}`へ分けます。特徴量は既定で最後の列以外の全てで、`targetColumn`に-1を渡すと最後の列を選びます。`StackRegression`は同じ長さのsampleを、`Values`/`Shape`が`[batch,features]`で`Targets`がスカラーの`RegressionBatch`へcollateします。`Stack`と同じ汎用の`Loader`にそのまま使えます。
-
-```go
-file, err := os.Open("data.csv")
-// エラーを処理します。ファイルをcloseします。
-table, err := data.ParseNumericCSV(file, data.ParseOptions{})
-samples, err := table.RegressionSamples(nil, -1)
-batch, err := data.StackRegression(samples[:16])
-```
-
-`Standardizer`は特徴量ごとの決定的な中心化とスケールの変換です。`FitStandardizer`はtraining splitの平均と母分散をfloat64で累積するため、統計がfloat32の和の順序に依存しません。定数の特徴量はスケール1になり、`Apply`の後で正確に0になります。`Apply`はコピーを返し、`ApplyBatch`はcollate済みのバッチをその場で標準化します。`State`/`LoadState`は統計をJSONで往復させます。これが実行の再現性を支える約束で、training splitでfitし、stateを学習checkpointに保存し、検証と推論で再利用します。`LoadState`は不正なversion、サイズの不一致、非有限または正でないスケールを拒否します。
-
-`cmd/tabular-train`は、このテーブルを読むGoだけの回帰の例です（`-generate`で決定的な合成データを書きます）。`RandomSplit`で学習と検証に分け、standardizerは学習の行だけでfitし、小さなMLPを平均二乗誤差で学習します。standardizerのstate、loaderの順序、データセットのfingerprintを、AdamW/SGDとOneCycleのstateと共に保存するため、中断した実行は厳密に再開します。データ、分割、batch、steps、seed、hiddenの大きさ、optimizerの変更は、読み込む前に拒否します。時刻は同一性に含みません。
-
-### 再現可能なaugmentation
-
-`TransformDataset[T]`は`Base.Get`で取得したsampleを`Apply(index, seed, sample)`へ渡します。indexはこのdatasetに渡された値、seedは`Seed`フィールドの値そのもので、自動では混ぜません。`Apply == nil`ならsampleをそのまま返します。nilのcontext、キャンセル、不正なindex、nilのBaseはエラーになります。
-
-```go
-augmented := data.TransformDataset[data.FloatSample]{
-    Base: images,
-    Seed: 7,
-    Apply: func(index int, seed uint64, sample data.FloatSample) (data.FloatSample, error) {
-        out := data.FloatSample{
-            Values: append([]float32(nil), sample.Values...),
-            Shape: append([]int(nil), sample.Shape...),
-            Label: sample.Label,
-        }
-        if len(out.Shape) != 3 {
-            return data.FloatSample{}, fmt.Errorf("CHW画像が必要です")
-        }
-        // 横反転・縦反転・ガウスノイズを index/seed により決定的に適用。
-        if err := data.RandomHorizontalFlipFloat32(out.Values, out.Shape[0], out.Shape[1], out.Shape[2], seed, index, .5); err != nil {
-            return data.FloatSample{}, err
-        }
-        if err := data.RandomVerticalFlipFloat32(out.Values, out.Shape[0], out.Shape[1], out.Shape[2], seed, index, .3); err != nil {
-            return data.FloatSample{}, err
-        }
-        if err := data.AddGaussianNoiseFloat32(out.Values, seed, index, .02); err != nil {
-            return data.FloatSample{}, err
-        }
-        return out, nil
-    },
-}
-```
-
-wrapperはsampleをコピーしません。借用したスライスを変更する場合は、例のようにcallbackでコピーしてください。workerを使う場合、`Base.Get`と`Apply`は並行呼出しに対応する必要があります。先読みしたsampleは破棄・再取得されるため、共有の乱数や呼出し回数に依存せず、同じseed・index・入力から同じ結果を返してください。
-
-`RandomHorizontalFlipFloat32`はCHW順のスライスを指定確率で水平反転します。各次元は正、スライスの長さは次元の積と一致する必要があります。確率は有限の`[0,1]`、indexは0以上です。確率0でも入力を検証し、不正な入力では変更せずにエラーを返します。`FlipsHorizontallyFloat32`は同じshape検証を行い、常に反転します。
-
-`RandomVerticalFlipFloat32`はCHW順のスライスを指定確率で行を上下反転します。`FlipsVerticallyFloat32`は同じshape検証を行い、常に反転します。`FlipEarly`は旧int-seed APIとして残しています。32-bit環境でseedを切り詰めないよう、新しいコードではuint64を受け取る`RandomHorizontalFlipFloat32`/`RandomVerticalFlipFloat32`を使ってください。これらの関数とノイズ関数は`error`を返すため、呼出し側で確認してください。
-
-`AddGaussianNoiseFloat32(values, seed, index, std)`は値をその場で更新します。indexは0以上、標準偏差は有限かつ0以上、入力値は全て有限である必要があります。標準偏差0は入力を変えません。空のスライスも受け付けます。検証失敗やfloat32のoverflowでは入力を変更しません。出力の範囲はclipしません。
-
-組込み変換の乱数はseedとindexだけから作るため、epochが変わっても同じsampleの変換は同じです。元データのindexを分割後も使うには、変換したdatasetを`NewSubset`へ渡します。逆順に包むと、変換のindexはsubset内の位置になります。wrapperはfingerprintや変換の状態を保存しません。元データ、分割、seed、変換の種類・version・設定はアプリ側のcheckpoint metadataで照合してください。
-
-`cmd/cnn-train`のIDX経路は`-augment`指定時だけ、学習画像に横反転（確率.5）・縦反転（確率.3）・ガウスノイズ（std .02）の合成変換を適用します。検証画像は変更しません。反転がラベルの意味を保つかはデータによるため、この設定は認識精度の改善を保証するものではありません。`cmd/audio-train`は共通のノイズ関数を使い、従来と同じPCGのseedとfloat32の式で入力を作ります。テストでは、worker数を変えた再開、epochをまたぐ読込、callback失敗後の再試行、元データが変わらないことを厳密に比較します。
-
-### WAV音声とaugmentation
-
-`ReadWAV(r)`は非圧縮のRIFF音声を復号します。8/16/24/32ビットの整数PCM（8ビットは符号なし）と32/64ビットのIEEE float、`WAVE_FORMAT_EXTENSIBLE`のfmtチャンクを含みます。整数のsampleは`2^(bits-1)`で割り、floatは書かれたまま使います。一般的なPyTorchの読込と同じ扱いです。結果は`SampleRate`、`Channels`、`Bits`、`Float`、`Samples`（インターリーブ）、`Mono()`を公開します。`ReadWAVFile`と`ReadWAVMono`はファイルとチャネル平均の場合を扱います。圧縮コーデック、未知のレイアウト、フレーム数が整数にならないデータサイズは、推測せずに拒否します。
-
-`WriteWAV(w, samples, WAVEncoding{Channels, SampleRate, Bits, Float})`は同じレイアウトを書き出します。整数の出力は表せる範囲にclampし、最も近い段へ丸めます。floatの出力は非有限のsampleを拒否します。したがって往復の誤差は、整数PCMでは最小段の1.5倍以内、floatでは誤差なしです。
-
-```go
-wav, err := data.ReadWAVFile("tone.wav")
-// エラーを処理します。
-mono := wav.Mono()
-file, err := os.Create("copy.wav") // この後WriteWAV(file, wav.Samples, data.WAVEncoding{...})を呼びます
-```
-
-`cmd/audio-train`は音声の例です。monoの信号を固定長のwindowに分け、各windowへ`(seed, window index)`から専用のPCGストリームで導いたガウスノイズを加えます。反復の順序は使いません。これがアプリ側のaugmentationの約束で、worker、prefetch、再開は入力を変えられず、seedはcheckpointの同一性なので、中断した実行は同じノイズの入力と同じ重みを再現します。例はMLPのdenoiserを平均二乗誤差で学習し、入力と出力のSNRをdBで表示し、モデル、optimizer、スケジュール、loaderの順序、WAVのfingerprintをまとめてcheckpointに保存します。
-
-### データのcheckpoint
-
-`IndexSampler.State`はversion、サイズ、seedとshuffleの設定、epoch、現在位置、完全な順序、PCGのstateを記録します。復元はstateを変える前に構成、順列、乱数のバイト列を検証します。したがって再開は、現在のepochの残りと以降のshuffleされたepochの両方を保ちます。
-
-`Loader.State() (LoaderState, error)`は、データセットのサイズ、batchサイズ、DropLastを、不透明なsamplerのpayloadに加えます。samplerは`StatefulSampler`（MarshalBinary/UnmarshalBinary）を実装する必要があり、`IndexSampler`は実装しています。`Loader.LoadState`は互換でない構成を、samplerを復元する前に拒否します。stateのスナップショットは順序とpayloadをコピーし、学習checkpointの呼び出し側metadataにJSONで入れられます。データセットの内容、subsetやsplitの同一性、独自のcollateの構成は呼び出し側のmetadataです。長さが一致するだけでは、同じデータであることの証明になりません。
-
-### 並列readerと上限付きprefetch
-
-`LoaderOptions.Workers`に正の数を設定すると、ホスト側のreaderのgoroutineが有効になります。`Workers=0`は同期経路を保ちます。`Prefetch`は現在のバッチも含めて、未処理のバッチ数を制限します。0は並列時に2が既定で、同期時は0のままにします。負の値や、容量が溢れる設定はエラーです。readerの数は、利用できるsampleの枠までに制限します。`Dataset.Get`は並行呼び出しに対応し、collateまで有効なsampleストレージを返す必要があります。
-
-```go
-loader, err := data.NewLoader[data.FloatSample, data.FloatBatch](
-    dataset, sampler, data.Stack,
-    data.LoaderOptions{BatchSize: 64, Workers: 4, Prefetch: 3},
-)
-// エラーを処理します。indexは先読みしますが、渡す順序はsamplerの順です。
-_ = err
 defer loader.Close()
 ```
 
-- workerが呼ぶのは`Dataset.Get`だけです。collateは`Next`の呼び出し元のgoroutineで直列に行い、先読みしません。テンソルの生成とCUDAのスレッドの所有権は、受け取る側に留まります。未処理のjob、結果、sampleのバッチは、設定したprefetchの枠までに制限し、完了した順序は渡す順序を変えません。
-- 失敗したバッチは、どのreaderが先に終わったかではなく、そのバッチのsampler順で最初に失敗したsampleを報告します。読込やcollateのエラーは未処理の先読みを捨て、readerをjoinし、確定済みのカーソルを再試行のために保ちます。worker内のデータセットのpanicは順序付きの読込エラーになり、collateのpanicはreaderの後片付けの後に受け取る側で再びpanicします。
-- readerは、その作業を始めた`Next`呼び出しのcontextを引き継ぎます。`Next`の間のキャンセルはreaderをキャンセルしてjoinし、そのバッチは未消費のままです。呼び出しの合間に以前の作業のcontextがキャンセルされていても、生きているcontextでの次の`Next`は確定済みのカーソルからやり直します。collateの後のキャンセル確認は、indexを確定する前に起きます。`Dataset.Get`はキャンセルに協調する必要があり、後片付けは進行中のコールバックの終了を待ちます。
-- `Close() error`は繰り返し呼べ、readerをキャンセルしてjoinし、未配達のsampleを捨てます。EOFと最後に配達したバッチも、終了したreaderを解放します。`NextEpoch`はindexの順序を変える前に古いreaderを止めます。メソッドは`Close`/`State`/`LoadState`も含めて逐次で、`Next`のcontextをキャンセルしてブロックした呼び出しを中断します。別の`Loader`のメソッドを並行して呼ばないでください。
-- `State`はreaderを止めて先読みを捨ててから、**配達済み**のsampler位置を直列化します。`LoadState`も同様に、古い読込を止めてから復元します。WorkersとPrefetchは論理的な`LoaderState`に含まれないため、既存の同期のcheckpointは、並列readerや別のreader数で再開できます。batchサイズ、DropLast、データの同一性、独自のcollateやaugmentationのstateは、元の約束のままです。反復中はsamplerをloaderが所有するものとして扱い、先読みをかかえたまま別途進めたり戻したりしないでください。
+`IndexSampler`の既定は昇順です。shuffleは専用のseed付きPCG、Peekは状態を進めず次のindexをコピーし、Advanceで確定します。NextEpochは残りを捨て次の順序を始めます。空のデータセットはEOFを返します。
 
-`Dataset.Get`の副作用と、呼び出しに依存する乱数は、`Loader`が巻き戻したりcheckpointに保存したりしません。再現できるprefetchには、決定的なsampleの取得（またはアプリが管理するsampleごと・epochごとの乱数）が必要で、独自のcollateのstateは呼び出し側のmetadataに置きます。
+`Loader.Next`は取得・collate・キャンセル確認が成功した後にだけカーソルを進めます。読込やcollateの失敗は再試行でき、callbackのEOFはUnexpectedEOFへ変換します。BatchSizeは正、末尾は既定で小さいバッチとなり、DropLastでは消費してEOFを返します。
+
+`Stack`は同shapeのsampleをコピーしてバッチ軸を付けます。`PadSequences`は末尾次元の一致が必要で、時間軸を最大長か指定Lengthまで`PaddingOptions.Value`で埋めます。短いLengthへの切詰めにはTruncateが必要です。Lengthsは残した長さ、Maskは`[batch,time]`のbool配列で、有効位置だけtrueです。空系列に対応します。
+
+組込みcollateは所有するホストスライスを返します。独自collateは借用sampleを変更しないでください。ラベル・マスクのテンソル化とdeviceへの転送は呼出し側が行います。Loaderと変更可能なSamplerは逐次使用し、独立workerには別インスタンスを用意してください。
+
+### 数値のCSVテーブルと回帰のsample
+
+`ParseNumericCSV`はコメント・ヘッダ付きの矩形CSV/TSVを読みます。空白を除いた各値は有限で、不正な行は1始まりの行番号を報告します。`RegressionSamples`は特徴量とスカラーtargetへ分け、targetColumn=-1なら最後の列です。`StackRegression`は同長の特徴量を`[batch,features]`へまとめます。
+
+`FitStandardizer`は学習splitだけで平均・母分散をfloat64累積し、定数特徴量のscaleを1にします。Applyはコピー、ApplyBatchはその場で変換します。State / LoadStateで統計を保存し、検証・推論に再利用します。不正version・サイズ・非有限値・正でないscaleは拒否します。
+
+`cmd/tabular-train`は`-generate`またはCSVを使い、standardizer・loader順・fingerprintをoptimizer / OneCycleと保存します。再開時にデータ・分割・batch・steps・seed・hidden・optimizerの変更を拒否し、時刻は比較しません。
+
+### 再現可能なaugmentation
+
+`TransformDataset[T]`は`Base.Get`の結果を`Apply(index, seed, sample)`へ渡します。indexとSeedを自動で混ぜず、Apply=nilならそのまま返します。nilのcontext / Base、キャンセル、不正indexはエラーです。
+
+sampleはコピーしません。借用スライスを変更するcallbackでコピーし、worker使用時はBase.GetとApplyを並行安全にしてください。先読みの破棄・再取得があるため、共有乱数や呼出し回数に依存させないでください。
+
+- 水平・垂直反転はCHW順、正の次元、長さの一致、有限の確率`[0,1]`、非負indexが必要。確率0でも検証し、失敗時は入力を変更しない。`FlipsHorizontallyFloat32` / `FlipsVerticallyFloat32`は常に反転する。
+- 新しい反転APIはuint64のseedを受け取る。旧int-seed APIの`FlipEarly`は32-bit環境でseedが切り詰められるため、新規コードでは使わない。
+- `AddGaussianNoiseFloat32`は非負index、有限かつ非負のstd、有限の入力が必要。std=0と空配列を受け入れ、検証失敗・float32 overflowでは変更しない。出力はclipしない。
+
+組込み変換はseed / indexだけで乱数を作り、epochが変わっても同じsampleには同じ変換となります。元indexを保つには変換したdatasetをSubsetで包みます。逆順ではsubset内の位置を使います。元データ・分割・変換の種類 / version / 設定 / seedはアプリ側metadataに保存してください。
+
+CNNのIDX経路は`-augment`時だけ横反転.5、縦反転.3、ノイズstd .02を学習画像に適用します。検証画像は変えません。反転がラベルの意味を保つかはデータ次第です。
+
+### WAV音声とaugmentation
+
+`ReadWAV`は非圧縮RIFFの8/16/24/32ビット整数PCM、32/64ビットIEEE float、`WAVE_FORMAT_EXTENSIBLE`に対応します。整数は`2^(bits-1)`で割り、8ビットは符号なし、floatは値をそのまま使います。Samplesはインターリーブ、Monoはチャネル平均です。圧縮・未知のレイアウト・フレーム数が整数にならないサイズは拒否します。
+
+`WriteWAV`は整数を表現範囲にclampして最も近い段へ丸め、floatの非有限値を拒否します。往復誤差は整数PCMで最小段の1.5倍以内、floatでは誤差なしです。
+
+`cmd/audio-train`はmonoをwindowへ分け、`(seed, window index)`の専用PCGでノイズを作ります。worker / prefetch / 再開で入力を変えず、MLPのdenoiserをMSEで学習します。SNRをdBで表示し、WAVのfingerprint、seed、model / optimizer / schedule / loader順を保存します。
+
+### データのcheckpoint
+
+`IndexSampler.State`はversion・サイズ・seed・shuffle・epoch・位置・全順序・PCG stateを保存します。復元前に構成・順列・乱数payloadを検証し、現在と将来のepochの順序を保ちます。
+
+`Loader.State`はサイズ・BatchSize・DropLastとStatefulSamplerのpayloadを持ちます。LoadStateは構成を検証してから復元します。データ内容・subset / split・独自collateの同一性はアプリ側metadataで管理します。長さの一致だけでは同じデータとは判定しません。
+
+### 並列readerと上限付きprefetch
+
+Workers=0は同期、正ならホストreaderを使います。Prefetchは現在のバッチを含む未処理バッチ数の上限で、並列時の0は既定2、同期時は0です。負値・容量overflowはエラーです。reader数はsampleの枠に制限します。
+
+- workerが呼ぶのはDataset.Getだけ。collateはNextの呼出し元で直列に行う。テンソル生成とCUDAスレッド管理も呼出し側に残る。
+- 結果は完了順ではなくsampler順に渡す。複数の失敗はsampler順で最初のsampleを報告する。
+- 読込 / collate失敗時は未処理の先読みを捨て、readerをjoinし、確定済みカーソルを保つ。workerのpanicは読込エラー、collateのpanicは後片付け後に再panicする。
+- contextのキャンセルはreaderの完了を待つ。Getはキャンセルに協調し、collateまで有効なsampleを返す必要がある。生きているcontextで次のNextを呼べば未消費のバッチから再試行する。
+- Closeは繰返し呼べ、readerをキャンセル・joinする。EOF、最終バッチ、NextEpochでも古いreaderを解放する。Close / State / LoadStateを含む同じLoaderのメソッドは逐次で呼ぶ。
+- Stateはreaderと先読みを止め、配達済み位置だけを保存する。LoadStateも古い読込を停止する。Workers / Prefetchはstateの同一性に含まれないため、変更して再開できる。
+
+反復中のSamplerはLoaderが所有するものとして扱い、外から進めたり戻したりしないでください。Getの副作用、共有乱数、独自collateのstateはLoaderが巻き戻しません。
 
 ### raw/gzip IDXとMNISTの例
 
-`OpenIDX(imagesPath, labelsPath)`はMNIST形式のbyte IDX（magic 2051/2049）を読み、次元、個数、payloadの正確な長さを検証し、ファイル名の拡張子によらずrawまたはgzipのデータを受け取ります。データセットはコンパクトなuint8の画像とラベルをメモリに保ちます。`Get`は所有権を持つ、`[0,1]`に正規化したfloat32の`[1,height,width]`画像と、その整数ラベルを返します。`ImageSize`と`Classes`は幾何と最大ラベル+1を返します。`Fingerprint`は復号した両ファイルのSHA-256なので、gzipのコンテナのバイト列だけを変えても同一性は変わりません。
+`OpenIDX`はmagic 2051/2049の画像・ラベルを読み、次元・個数・payload長を検証します。拡張子によらずraw / gzipに対応します。内部はuint8で保持し、Getは所有する`[0,1]`のfloat32 CHW画像と整数ラベルを返します。Fingerprintは復号した両ファイルのSHA-256です。
 
-`cmd/mnist-train`は784→64→10のMLP、cross-entropy、AdamWまたはSGD、OneCycleを使います。MNISTの学習・テストのIDXの組を読み、学習はshuffleしたバッチ、テストは昇順の評価を使い、推論用の重みを保存してから、作り直して再読込し、logitsを比較します。ダウンロードは任意で、GoのHTTPとgzipで行います。公開ミラーから取得するのは不足しているファイルだけで、代わりにローカルのファイルを用意できます。通常のテストは小さなローカル生成のIDXとHTTPのテストサーバーを使い、ネットワークもPythonも必要としません。
+MNIST例は784→64→10のMLP、cross-entropy、AdamW / SGD、OneCycleを使います。学習はshuffle、評価は昇順です。`-download`は不足ファイルだけ取得し、ローカルIDXも使えます。
 
 ```sh
 go run ./cmd/mnist-train -download -device cpu -steps 100 -stop-after 40 -train-limit 2000 -valid-limit 1000
 go run ./cmd/mnist-train -device cpu -steps 100 -train-limit 2000 -valid-limit 1000 -resume out/mnist.safetensors.training.safetensors
 go run ./cmd/mnist-train -device cuda -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-cuda.safetensors
-go run ./cmd/mnist-train -device cpu -workers 4 -prefetch 3 -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-prefetch.safetensors
-go run ./cmd/mnist-train -device cpu -optimizer sgd -momentum .9 -nesterov -steps 100 -train-limit 2000 -valid-limit 1000 -out out/mnist-sgd.safetensors
 ```
 
-データの既定のディレクトリは`out/mnist`、出力は`out/mnist.safetensors`、batchサイズは64、seedは7です。ディレクトリは必要に応じて作ります。`TrainLimit`/`ValidLimit`は、それぞれの公式の分割の先頭からN件を選びます（0は全て）。`StopAfter`は完了した更新の絶対数で、`Steps`は計画したスケジュール全体を表し、再開時に変えてはいけません。checkpointの既定は出力に`.training.safetensors`を付けたもので、推論と学習のパスは別にする必要があります。`-workers`と`-prefetch`は学習と評価の両方の読込を制御し、既定は0（同期）です。`-accum N`は1回のoptimizer更新をN個のmicro-batchに分けます（既定1）。損失はNで割られ、N個を蓄積してから1回だけ更新します。checkpointは配達済みのデータ順だけを記録するため、再開時に変えられます。コマンドのloaderは、完了時もエラー時もcloseします。
+既定はデータ`out/mnist`、出力`out/mnist.safetensors`、batch 64、seed 7です。TrainLimit / ValidLimitの0は全件、それ以外は公式splitの先頭N件です。StopAfterは完了更新の絶対数、Stepsは再開でも変えないスケジュール全体の更新数です。学習checkpointは既定で出力に`.training.safetensors`を付け、推論出力とは別パスにします。
 
-`-optimizer adamw|sgd`は更新を選びます。`-lr`はOneCycleのピークを選び（0ならAdamWは.005、SGDは.1が既定）、`-momentum`はSGDで.9が既定、`-nesterov`はNesterov版を有効にします。この例のcoupled/decoupled decayは.0001です。optimizerの選択、学習率、momentum、Nesterov、micro-batch数はcheckpointの同一性で、再開時の変更は拒否します。古いMNISTのAdamWのmetadataは、元の.005のピークと既定の設定として認識します。`-no-decay-suffix`（既定は`bias`、空で無効）は、一致するパラメータをdecayなしのグループへ移します。これもcheckpointの同一性で、別の値で書かれたcheckpointの再開は拒否します。グループ以前に書かれたcheckpointはsuffixを記録していないため、再開には空の値が必要です。
+`-workers` / `-prefetch`は学習と評価の両方に作用し、既定は同期の0です。`-accum N`はN micro-batchごとに更新し、既定1です。データ・subset・seed・batch構成・蓄積数・optimizer設定は再開時に照合します。
 
-学習のstateには、モデル、AdamWのモーメントまたはSGDのmomentumとオプション、OneCycleとloaderのstate、データセット全体のfingerprint、実効のsubsetサイズ、seed、batchの構成を含みます。これらの同一性の変更は、liveのモデルstateを読み込む前に拒否します。中断は、キャンセルを返す前に最後に完了した更新のcheckpointを保存します。テストは、中断なしの場合とepoch途中で再開した場合の重み、モーメント、スケジュール、データ順を比較します。CPUの値は厳密に一致し、CUDAの浮動小数点は、既存のbias勾配のカーネルがatomic加算を使うため、数値として比較します。
+`-optimizer adamw|sgd`はoptimizer、`-lr`はOneCycleのピークを選び、0ならAdamW .005 / SGD .1です。SGDのmomentumは既定.9、`-nesterov`で有効化します。decayは.0001です。`-no-decay-suffix`は既定`bias`で、一致するパラメータのdecayを無効にし、空ならグループ分けを無効にします。これもcheckpointの同一性に含み、グループ導入前のcheckpointの再開は空にします。
 
 ## 学習の再開
 
+model、optimizer、スケジューラ、samplerを先に構築し、更新完了後に保存します。
+
 ```go
-sampler, err := autograd.NewWindowSampler(frameCounts, 400, 16, 0.15, 0)
-// エラーを処理します。返されたwindowを選んだdeviceのテンソルへ集めます。
-windows := sampler.Batch()
-_ = windows
 sampleJSON, err := json.Marshal(sampler.State())
-// エラーを処理します。optimizerの更新とscheduler.Step(opt)の後にだけ保存します。
 err = autograd.SaveTrainingCheckpoint("training.safetensors", &model.Module,
     opt, schedule, map[string]string{"sampler": string(sampleJSON)})
-// エラーを処理します。モデル、optimizer、スケジューラは先に構築しておきます。
 metadata, err := autograd.LoadTrainingCheckpoint("training.safetensors",
     &model.Module, opt, schedule)
-// エラーを処理します。次のバッチをサンプリングする前にstreamを復元します。
 var state autograd.WindowSamplerState
 err = json.Unmarshal([]byte(metadata["sampler"]), &state)
-// エラーを処理します。
 err = sampler.LoadState(state)
-// エラーを処理します。学習の終わりにopt.Close()が自身のバッファを解放します。
 ```
 
-パラメータの順序、名前、形状は一致する必要があります。読込は学習率、decay、beta、epsilonを復元し、新しい既定を黙って使うことはありません。モデルのモード、dropoutのseed、データセットの同一性、samplerのstateは呼び出し側の責任です。アプリケーション側がこれらを記録・検証し、決定的なdropoutのseedには完了したステップ数を使います。`OneCycle`は統合checkpointが直列化し、推論用やoptimizer単体のファイルは完全な学習checkpointではありません。CUDAグラフでは、保存の前に未完了のlaunchを同期し、新しいグラフを記録する前にstateを復元します。optimizerのスナップショットは、古いホストのステップ数ではなく、記録したデバイス上のカウンタを読みます。
+名前・順序・形状を検証してからmodel / optimizerへコピーします。学習率・decay・beta・epsilon・OneCycleを復元し、モデルのモード、dropout seed、データとsamplerの同一性は呼出し側で管理します。推論用重みやoptimizer単体のファイルだけでは学習全体を再開できません。
+
+CUDAグラフは未完了launchを同期してから保存し、stateを復元してから新しく記録します。optimizerのスナップショットはホストの古い値ではなくデバイス上のステップ数を読みます。
 
 ## 互換性の注意
 
-- 一般のautogradの演算、CUDAグラフの記録、BF16 autocast、デバイスバッファのプール、opレジストリは実験的な位置づけです。deviceとdtypeの扱いはfloat32を中心に整えており、BF16は任意のシャドウバッファを使います。
-- 互換用の`NoGrad`スコープは、bindしていないテンソルが共有します。CPUで並行実行するには、別々の明示的コンテキストと独立したモデルstateを使います。bindしていないテンソルはプロセス共有のBF16・アテンション設定を使うため、このグローバル設定を並行して変更しないでください。明示的コンテキストはこれらの設定を持ちます。CUDAのstreamとcaptureの状態はOSスレッド単位で、各スレッドは自分のcuBLASハンドル、勾配クリップのプラン、プールのキャッシュを持ちます。割当プールはdeviceとstreamをキーにするため、`NewCUDAContextOn`のコンテキストを持つ独立したgoroutineは、暗黙のstream、capture、device、再利用するバッファを互いに共有しません。1回の記録の中での複数のstreamの重ね合わせと、複数deviceを1つの実行コンテキストで扱うことには対応していません。
-- 統合checkpointはAdamWまたはSGDのoptimizerとOneCycleのstateを復元します。旧`nn`の学習器は、これまでどおりのcheckpointの経路を使います。サンプリングはホストで行い、`data`パッケージはprefetchを任意で備えた汎用のloaderを別に提供します。
-- safetensorsの書き込みは、同じディレクトリの一時ファイル、sync、renameを使います。読込は不正またはオーバーフローする形状、重複する範囲、16 MiBを超えるヘッダを拒否します。ファイル全体をメモリに読み込むため、ファイルサイズの上限はありません。deviceへの転送の失敗は、検証済みの読込を途中で止めることがあります。
-- GoとPyTorchの学習は、サンプリング、初期化、dropoutに別々の乱数ストリームを使います。演算ごとの照合には初期重みを固定し、明示的なdropoutマスクを使います。学習全体の検証は、同じ軌跡ではなく、測定した品質で比較します。
+- autograd、CUDA graph、BF16、割当プール、opレジストリは実験的な位置づけです。dtypeはfloat32を中心とし、BF16は任意のシャドウを使います。
+- CUDAのdevice / stream / captureはOSスレッド単位で、プールはdevice / stream単位です。複数deviceを1つの実行コンテキストで扱うことは未対応です。独立分岐の複数stream実行にはRunBranchesを使います。
+- safetensorsは同じディレクトリの一時ファイル、sync、renameで保存します。読込みは不正形状・overflow・重複範囲・16 MiB超のヘッダを拒否します。通常のLoadSafeTensorsはファイル全体をメモリへ読み、大きいファイルにはOpenSafeTensorFile / LoadSafeTensorsStreamを使えます。deviceへの転送失敗は読込みを途中で止める場合があります。
+- 旧`nn`は独自のcheckpoint経路を保ちます。学習checkpointはAdamW / SGDとOneCycleを対象にします。
+- GoとPyTorchはサンプリング・初期化・dropoutの乱数ストリームが異なります。演算比較は重みとマスクを固定し、学習全体は測定した品質で比較します。
