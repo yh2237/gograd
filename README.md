@@ -1,6 +1,8 @@
 # gograd
 
-Goで書いたfloat32のテンソル・自動微分ライブラリです。CPU/CUDAで学習と推論、Vulkan/DirectMLで推論を行います。通常の利用にcgo・Cコンパイラ・Pythonは不要です。
+Goで書いたfloat32のテンソル・自動微分ライブラリです。CPU/CUDAで学習と推論、Vulkan/DirectMLで推論を行います。
+
+cgo・Cコンパイラ・Pythonは不要です。
 
 ## 動作環境
 
