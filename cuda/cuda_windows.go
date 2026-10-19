@@ -362,14 +362,26 @@ func withDevice(device int, fn func() error) error {
 	return runErr
 }
 
-const defaultPoolCacheLimit = 2 << 30
+const defaultPoolCacheLimit int64 = 2 << 30
+
+// initialPoolCacheLimit keeps the documented 2 GiB default on 64-bit while
+// clamping it to the largest int on 32-bit builds, where the constant itself
+// does not fit in an int.
+func initialPoolCacheLimit() int {
+	limit := defaultPoolCacheLimit
+	maximum := int64(^uint(0) >> 1)
+	if limit > maximum {
+		limit = maximum
+	}
+	return int(limit)
+}
 
 var (
 	poolMu                           sync.Mutex
 	poolTable                        = map[poolKey][]uintptr{}
 	poolLRU                          list.List
 	poolNodes                        = map[uintptr]*list.Element{}
-	cachedBytes, poolCacheLimit      = 0, defaultPoolCacheLimit
+	cachedBytes, poolCacheLimit      = 0, initialPoolCacheLimit()
 	liveBytes, peakLiveBytes         int
 	reservedBytes, peakReservedBytes int
 )
