@@ -380,7 +380,7 @@ func TestInferenceGPUTransformerGuards(t *testing.T) {
 		}
 	}
 	_, allocations, _ := inferenceFixture.snapshot()
-	for _, op := range []func(){func() { GELU(x, true) }, func() { Softmax(x, -1) }, func() { LayerNorm(x, w, bias, 1e-5) }, func() { GroupNorm(x, w, bias, 1, 1e-5) }, func() { Conv1d(x, cw, bias, 1) }, func() { Concat(1, x, x) }, func() { ScaledDotProductAttention(x, x, x, nil) }} {
+	for _, op := range []func(){func() { GELU(x, true) }, func() { BiasGELU(x, bias) }, func() { BiasResidual(x, bias, x) }, func() { Softmax(x, -1) }, func() { LayerNorm(x, w, bias, 1e-5) }, func() { GroupNorm(x, w, bias, 1, 1e-5) }, func() { Conv1d(x, cw, bias, 1) }, func() { Concat(1, x, x) }, func() { ScaledDotProductAttention(x, x, x, nil) }} {
 		assertGPUErrorPanic(t, gpu.ErrInferenceOnly, op)
 	}
 	if _, after, _ := inferenceFixture.snapshot(); after != allocations {

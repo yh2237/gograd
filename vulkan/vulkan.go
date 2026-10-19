@@ -45,6 +45,7 @@ type driver interface {
 	copy(out, src *block, size uint64) error
 	zero(out *block, size uint64) error
 	pointwise(out, a, b *block, n, kind uint32, scalar float32) error
+	fusedBias(out, a, bias, residual *block, n, channels, kind uint32) error
 	viewCopy(out, src *block, outCount, srcCount uint32, params viewParams) error
 	gemm(out, a, b *block, outCount, aCount, bCount uint32, params gemmParams, variant int) error
 	reduce(out, a, weight, bias *block, count, affineCount uint32, params reduceParams) error

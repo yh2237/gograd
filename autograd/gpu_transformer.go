@@ -1,8 +1,10 @@
 package autograd
 
 import (
+	"errors"
 	"fmt"
 	"math"
+	"slices"
 
 	"github.com/yh2237/gograd/gpu"
 )
@@ -255,7 +257,9 @@ func inferenceAttention(q, k, v, mask *Tensor) *Tensor {
 }
 
 func inferenceBiasGELU(x, bias *Tensor) *Tensor {
-	inferenceOperands(x, bias)
+	if out, ok := inferenceFusedBias(x, bias); ok {
+		return out
+	}
 	sum := Add(x, bias)
 	defer func() {
 		if r := recover(); r != nil {
@@ -267,7 +271,9 @@ func inferenceBiasGELU(x, bias *Tensor) *Tensor {
 }
 
 func inferenceBiasResidual(x, bias, residual *Tensor) *Tensor {
-	inferenceOperands(x, bias, residual)
+	if out, ok := inferenceFusedBias(x, bias, residual); ok {
+		return out
+	}
 	sum := Add(x, bias)
 	defer func() {
 		if r := recover(); r != nil {
@@ -276,4 +282,50 @@ func inferenceBiasResidual(x, bias, residual *Tensor) *Tensor {
 		}
 	}()
 	return Add(sum, residual)
+}
+
+// Fusion is optional and deliberately narrower than general broadcasting. Keep
+// the existing Add/GELU composition for other shapes or ErrUnsupported. Scratch
+// for non-contiguous inputs stays local; only the output enters graph storage.
+func inferenceFusedBias(inputs ...*Tensor) (*Tensor, bool) {
+	backend, context := inferenceOperands(inputs...)
+	x, bias := inputs[0], inputs[1]
+	fused, ok := backend.(gpu.FusedBiasBackend)
+	if !ok || len(x.Shape) == 0 || len(bias.Shape) != 1 {
+		return nil, false
+	}
+	cols := x.Shape[len(x.Shape)-1]
+	if cols < 1 || bias.Shape[0] != cols || (len(inputs) == 3 && !slices.Equal(x.Shape, inputs[2].Shape)) {
+		return nil, false
+	}
+	values := make([]*gpu.Buffer, len(inputs))
+	for i, v := range inputs {
+		value, release := inferenceBuffer(backend, inferenceView(v))
+		defer release()
+		values[i] = value
+	}
+	out, err := backend.Alloc(x.Numel())
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			out.Close()
+			panic(r)
+		}
+	}()
+	rows := x.Numel() / cols
+	if len(inputs) == 2 {
+		err = fused.BiasGELU(out, values[0], values[1], rows, cols)
+	} else {
+		err = fused.BiasResidual(out, values[0], values[1], values[2], rows, cols)
+	}
+	if errors.Is(err, gpu.ErrUnsupported) {
+		out.Close()
+		return nil, false
+	}
+	if err != nil {
+		panic(err)
+	}
+	return inferenceResult(out, x.Shape, context, inputs...), true
 }

@@ -28,6 +28,9 @@ func (d *failingDriver) zero(*block, uint64) error            { return d.failure
 func (d *failingDriver) pointwise(out, a, b *block, n, kind uint32, scalar float32) error {
 	return d.failure
 }
+func (d *failingDriver) fusedBias(out, a, bias, residual *block, n, channels, kind uint32) error {
+	return d.computeFailure()
+}
 func (d *failingDriver) close() { d.closed++ }
 func (d *failingDriver) reduce(out, a, weight, bias *block, count, affineCount uint32, p reduceParams) error {
 	return d.computeFailure()

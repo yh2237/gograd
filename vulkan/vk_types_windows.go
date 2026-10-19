@@ -193,8 +193,9 @@ type vkComputePipelineCreateInfo struct {
 	BaseIndex            int32
 }
 type vkPointwisePush struct {
-	N, Kind uint32
-	Scalar  float32
+	N, Kind  uint32
+	Scalar   float32
+	Channels uint32
 }
 
 type vkSpecializationMapEntry struct {
@@ -242,7 +243,8 @@ func checkABI() error {
 		{"shader", unsafe.Sizeof(vkShaderCreateInfo{}), 40},
 		{"shader stage", unsafe.Sizeof(vkShaderStage{}), 48},
 		{"compute pipeline", unsafe.Sizeof(vkComputePipelineCreateInfo{}), 96},
-		{"push constants", unsafe.Sizeof(vkPointwisePush{}), 12},
+		{"push constants", unsafe.Sizeof(vkPointwisePush{}), 16},
+		{"pointwise channels offset", unsafe.Offsetof(vkPointwisePush{}.Channels), 12},
 		{"view push constants", unsafe.Sizeof(viewParams{}), 64},
 		{"gemm push constants", unsafe.Sizeof(gemmParams{}), 100},
 		{"reduction push constants", unsafe.Sizeof(reduceParams{}), 28},

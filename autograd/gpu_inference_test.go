@@ -21,6 +21,8 @@ type inferenceTestBackend struct {
 	failNext                     bool
 	failCopy, failZero           bool
 	viewBinaryEnabled            bool
+	fusedBiasEnabled             bool
+	fusedBiasCalls               int
 }
 
 var inferenceFixture = &inferenceTestBackend{}

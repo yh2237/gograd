@@ -206,12 +206,40 @@ func (d *vkDriver) pointwise(out, a, b *block, n, kind uint32, scalar float32) e
 }
 
 func (d *vkDriver) bindBuffers(out, a, b *block, outCount, aCount, bCount uint32) {
-	infos := [3]vkDescriptorBufferInfo{{Buffer: a.buffer, Range: uint64(aCount) * 4}, {Buffer: b.buffer, Range: uint64(bCount) * 4}, {Buffer: out.buffer, Range: uint64(outCount) * 4}}
-	writes := [3]vkDescriptorWrite{}
+	// Binding 3 is statically used by pointwise's fused residual branch. Bind a
+	// valid dummy even for other operations; a dynamic branch is not sufficient
+	// to leave a shader-visible descriptor uninitialized. Reductions override it.
+	infos := [4]vkDescriptorBufferInfo{{Buffer: a.buffer, Range: uint64(aCount) * 4}, {Buffer: b.buffer, Range: uint64(bCount) * 4}, {Buffer: out.buffer, Range: uint64(outCount) * 4}, {Buffer: a.buffer, Range: uint64(aCount) * 4}}
+	writes := [4]vkDescriptorWrite{}
 	for i := range writes {
 		writes[i] = vkDescriptorWrite{vkHeader: header(35), Set: d.descriptorSet, Binding: uint32(i), Count: 1, Type: 7, BufferInfo: &infos[i]}
 	}
-	d.call("vkUpdateDescriptorSets", d.device, 3, uintptr(unsafe.Pointer(&writes[0])), 0, 0)
+	d.call("vkUpdateDescriptorSets", d.device, uintptr(len(writes)), uintptr(unsafe.Pointer(&writes[0])), 0, 0)
+}
+
+func (d *vkDriver) fusedBias(out, a, bias, residual *block, n, channels, kind uint32) error {
+	x, y, err := dispatchGrid(n, d.properties.MaxWorkGroupCount)
+	if err != nil {
+		return err
+	}
+	d.bindBuffers(out, a, bias, n, n, channels)
+	info := vkDescriptorBufferInfo{Buffer: residual.buffer, Range: uint64(n) * 4}
+	write := vkDescriptorWrite{vkHeader: header(35), Set: d.descriptorSet, Binding: 3, Count: 1, Type: 7, BufferInfo: &info}
+	d.call("vkUpdateDescriptorSets", d.device, 1, uintptr(unsafe.Pointer(&write)), 0, 0)
+	return d.submit(func() {
+		d.before(a, accessShaderRead, stageCompute)
+		if bias != a {
+			d.before(bias, accessShaderRead, stageCompute)
+		}
+		if residual != a && residual != bias {
+			d.before(residual, accessShaderRead, stageCompute)
+		}
+		d.before(out, accessShaderWrite, stageCompute)
+		push := vkPointwisePush{N: n, Kind: kind, Channels: channels}
+		d.bindCompute(d.pipeline, unsafe.Pointer(&push), unsafe.Sizeof(push))
+		d.call("vkCmdDispatch", d.command, uintptr(x), uintptr(y), 1)
+		d.barrier(out, accessShaderWrite, accessShaderRead|accessShaderWrite|accessTransferRead, stageCompute, stageCompute|stageTransfer)
+	})
 }
 
 func (d *vkDriver) bindCompute(pipeline uint64, push unsafe.Pointer, size uintptr) {
