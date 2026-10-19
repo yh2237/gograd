@@ -27,7 +27,8 @@ func NewGradAccumulator(groups int) (*GradAccumulator, error) {
 
 // Backward scales loss by 1/groups, back-propagates it, and reports whether this
 // call completed a group. It consumes the loss graph, so the caller releases the
-// loss afterwards as usual.
+// loss afterwards as usual. The loss tensor itself stays readable: only the
+// accumulator's own scaled copy is released.
 func (a *GradAccumulator) Backward(loss *Tensor) (bool, error) {
 	if a == nil || a.groups < 1 {
 		return false, fmt.Errorf("autograd: invalid gradient accumulator")
@@ -37,7 +38,9 @@ func (a *GradAccumulator) Backward(loss *Tensor) (bool, error) {
 	}
 	scaled := MulScalar(loss, 1/float32(a.groups))
 	err := scaled.Backward()
-	scaled.ReleaseGraph()
+	// Close releases only the scaled node. Releasing the whole graph would
+	// dispose the caller's loss, which is still needed to report its value.
+	scaled.Close()
 	if err != nil {
 		return false, err
 	}
