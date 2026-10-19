@@ -1,4 +1,4 @@
-//go:build windows && amd64
+//go:build (windows || (linux && !android)) && amd64
 
 package vulkan
 
@@ -7,7 +7,7 @@ import (
 	"unsafe"
 )
 
-// These are the Vulkan 1.1 C ABI layouts on Windows/amd64. Dispatchable handles
+// These are the Vulkan 1.1 C ABI layouts on Windows/Linux amd64. Dispatchable handles
 // are uintptr; non-dispatchable handles and VkDeviceSize are uint64. Pointer
 // fields use Go pointer types so pointed-to arguments stay visible to the GC.
 type vkHeader struct {

@@ -1,11 +1,10 @@
-//go:build windows && amd64
+//go:build (windows || (linux && !android)) && amd64
 
 package vulkan
 
 import (
 	"bytes"
 	"fmt"
-	"path/filepath"
 	"runtime"
 	"syscall"
 	"unsafe"
@@ -14,8 +13,8 @@ import (
 )
 
 type vkDriver struct {
-	dll                                                    *syscall.DLL
-	getProc                                                *syscall.Proc
+	library                                                *vkLibrary
+	getProc                                                uintptr
 	procs                                                  map[string]uintptr
 	instance, physical, device, queue, command             uintptr
 	commandPool, fence                                     uint64
@@ -38,13 +37,12 @@ func result(op string, value uintptr) error {
 
 //go:uintptrescapes
 func (d *vkDriver) call(name string, args ...uintptr) uintptr {
-	r, _, _ := syscall.SyscallN(d.procs[name], args...)
-	return r
+	return callNative(d.procs[name], args...)
 }
 
 func (d *vkDriver) resolve(name string) error {
 	cname, _ := syscall.BytePtrFromString(name)
-	proc, _, _ := d.getProc.Call(d.instance, uintptr(unsafe.Pointer(cname)))
+	proc := callNative(d.getProc, d.instance, uintptr(unsafe.Pointer(cname)))
 	runtime.KeepAlive(cname)
 	if proc == 0 {
 		return fmt.Errorf("%w: missing Vulkan function %s", gpu.ErrUnavailable, name)
@@ -57,26 +55,17 @@ func openDriver() (_ driver, err error) {
 	if err := checkABI(); err != nil {
 		return nil, err
 	}
-	// Load from the system directory rather than the application's working
-	// directory. kernel32 is a Windows KnownDLL.
-	var system [32768]uint16
-	getSystem := syscall.NewLazyDLL("kernel32.dll").NewProc("GetSystemDirectoryW")
-	n, _, e := getSystem.Call(uintptr(unsafe.Pointer(&system[0])), uintptr(len(system)))
-	if n == 0 || n >= uintptr(len(system)) {
-		return nil, fmt.Errorf("%w: GetSystemDirectoryW: %v", gpu.ErrUnavailable, e)
-	}
-	path := filepath.Join(syscall.UTF16ToString(system[:n]), "vulkan-1.dll")
-	dll, err := syscall.LoadDLL(path)
+	library, err := openVulkanLibrary()
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", gpu.ErrUnavailable, err)
+		return nil, err
 	}
-	d := &vkDriver{dll: dll, procs: make(map[string]uintptr)}
+	d := &vkDriver{library: library, procs: make(map[string]uintptr)}
 	defer func() {
 		if err != nil {
 			d.close()
 		}
 	}()
-	d.getProc, err = dll.FindProc("vkGetInstanceProcAddr")
+	d.getProc, err = library.lookup("vkGetInstanceProcAddr")
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", gpu.ErrUnavailable, err)
 	}
@@ -237,8 +226,8 @@ func (d *vkDriver) close() {
 		d.call("vkDestroyInstance", d.instance, 0)
 		d.instance = 0
 	}
-	if d.dll != nil {
-		d.dll.Release()
-		d.dll = nil
+	if d.library != nil {
+		d.library.close()
+		d.library = nil
 	}
 }
