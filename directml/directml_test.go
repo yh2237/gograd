@@ -165,9 +165,6 @@ func TestDirectMLValidation(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := b.GELU(y, x, 4); !errors.Is(err, gpu.ErrUnsupported) {
-		t.Fatal(err)
-	}
 	x.Close()
 	if err := b.MulScalar(y, x, 4, 1); !errors.Is(err, gpu.ErrClosed) {
 		t.Fatal(err)

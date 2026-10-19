@@ -39,17 +39,31 @@ type allocation struct {
 	heap      uint32
 }
 type opKey struct {
-	kind    uint32
-	m, n, k int
-	ta, tb  bool
-	scalar  uint32
+	kind                      uint32
+	m, n, k                   int
+	ta, tb                    bool
+	scalar                    uint32
+	bias                      uint32
+	batch                     int
+	aLayout, bLayout, yLayout tensorLayout
+	conv                      gpu.Conv1dOptions
+	hasBias                   bool
 }
+
+// Four-dimensional descriptors cover the baseline DirectML feature level.
+// Higher-rank public views are copied on the device before folding batch axes.
+type tensorLayout struct{ sizes, strides [4]uint32 }
 
 const (
 	opAdd uint32 = iota
 	opMul
 	opScalar
 	opGEMM
+	opTanh
+	opGELUExact
+	opNorm
+	opConv
+	opSoftmax
 )
 const (
 	heapDefault  uint32 = 1
@@ -66,7 +80,8 @@ type driver interface {
 	write(*allocation, []float32) error
 	read(*allocation, []float32) error
 	copy(out, src *allocation, size uint64) error
-	execute(key opKey, out, a, b *allocation) error
+	execute(key opKey, out *allocation, inputs ...*allocation) error
+	copyView(out, src *allocation, v gpu.View, scatter bool) error
 	operatorStats() OperatorStats
 	releaseOperators()
 	close()

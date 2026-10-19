@@ -2,6 +2,7 @@ package directml
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/yh2237/gograd/gpu"
@@ -12,6 +13,8 @@ import (
 type testDriver struct {
 	failure                                     error
 	allocated, freed, closed, releasedOperators int
+	computeCalls, failAt                        int
+	lastKey                                     opKey
 }
 
 func (*testDriver) info() Info { return Info{Name: "fixture", FeatureLevel: 0x1000} }
@@ -45,10 +48,23 @@ func (d *testDriver) copy(out, src *allocation, n uint64) error {
 	copy(out.native.([]float32)[:n/4], src.native.([]float32)[:n/4])
 	return nil
 }
-func (d *testDriver) execute(opKey, *allocation, *allocation, *allocation) error { return d.failure }
-func (*testDriver) operatorStats() OperatorStats                                 { return OperatorStats{} }
-func (d *testDriver) releaseOperators()                                          { d.releasedOperators++ }
-func (d *testDriver) close()                                                     { d.closed++ }
+func (d *testDriver) execute(key opKey, out *allocation, inputs ...*allocation) error {
+	d.lastKey = key
+	return d.computeFailure()
+}
+func (d *testDriver) copyView(out, src *allocation, v gpu.View, scatter bool) error {
+	return d.computeFailure()
+}
+func (d *testDriver) computeFailure() error {
+	d.computeCalls++
+	if d.failAt == 0 || d.computeCalls == d.failAt {
+		return d.failure
+	}
+	return nil
+}
+func (*testDriver) operatorStats() OperatorStats { return OperatorStats{} }
+func (d *testDriver) releaseOperators()          { d.releasedOperators++ }
+func (d *testDriver) close()                     { d.closed++ }
 func fixture() (*Backend, *testDriver) {
 	d := &testDriver{}
 	b := NewBackend()
@@ -193,6 +209,108 @@ func TestDirectMLLazyRegistration(t *testing.T) {
 	independent.ReleaseOperators()
 	independent.ReleasePool()
 	if err := independent.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDirectMLPortableM5Failures(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		at   int
+	}{{"view_gemm", 1}, {"view_gemm", 2}, {"view_gemm", 3}, {"gelu", 1}, {"gelu", 6}, {"gelu", 9}, {"norm", 1}, {"norm", 2}, {"norm", 3}} {
+		t.Run(fmt.Sprintf("%s/%d", tc.name, tc.at), func(t *testing.T) {
+			b, d := fixture()
+			inputSize := 4
+			if tc.name == "view_gemm" {
+				inputSize = 5
+			}
+			x, err := b.Alloc(inputSize)
+			if err != nil {
+				t.Fatal(err)
+			}
+			w, err := b.Alloc(inputSize)
+			if err != nil {
+				t.Fatal(err)
+			}
+			y, err := b.Alloc(4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d.failure = errors.New("injected M5 step failure")
+			d.failAt = tc.at
+			switch tc.name {
+			case "view_gemm":
+				a := gpu.View{Buffer: x, Shape: []int{2, 2}, Strides: []int{1, 2}, Offset: 1}
+				right := a
+				right.Buffer = w
+				err = b.MatMulViews(y, a, right)
+			case "gelu":
+				err = b.GELU(y, x, 4)
+			case "norm":
+				err = b.LayerNorm(y, x, w, w, 1, 4, 1e-5)
+			}
+			if !errors.Is(err, d.failure) || b.Available() {
+				t.Fatalf("%v, available=%t", err, b.Available())
+			}
+			if stats := b.MemoryStats(); stats.LiveBuffers != 3 || stats.CachedBuffers != 0 {
+				t.Fatalf("scratch survived failure: %+v", stats)
+			}
+			x.Close()
+			w.Close()
+			y.Close()
+			if d.allocated != d.freed {
+				t.Fatalf("%+v", d)
+			}
+			if err := b.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestDirectMLPortableFeatureGate(t *testing.T) {
+	b, d := fixture()
+	x, err := b.Alloc(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	y, err := b.Alloc(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.GELUExact(y, x, 4); !errors.Is(err, gpu.ErrUnsupported) {
+		t.Fatal(err)
+	}
+	if !b.Available() || d.computeCalls != 0 {
+		t.Fatal("unsupported feature was dispatched or disabled the device")
+	}
+	x.Close()
+	y.Close()
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDirectMLPortableStridedGEMM(t *testing.T) {
+	b, d := fixture()
+	x, err := b.Alloc(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	y, err := b.Alloc(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := gpu.View{Buffer: x, Shape: []int{2, 2}, Strides: []int{1, 2}}
+	if err := b.MatMulViews(y, v, v); err != nil {
+		t.Fatal(err)
+	}
+	if d.allocated != 2 || d.computeCalls != 1 || d.lastKey.aLayout.strides[2] != 1 || d.lastKey.aLayout.strides[3] != 2 {
+		t.Fatal("strided GEMM allocated copies instead of describing the input", d.lastKey)
+	}
+	x.Close()
+	y.Close()
+	if err := b.Close(); err != nil {
 		t.Fatal(err)
 	}
 }

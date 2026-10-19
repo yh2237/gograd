@@ -48,14 +48,26 @@ func (d *nativeDriver) releaseOperators() {
 // Tensor descriptors only need to survive CreateOperator. Each descriptor uses
 // four axes to support the baseline DirectML feature level, without copying data.
 type tensorSpec struct {
-	sizes  [4]uint32
-	buffer bufferTensorDesc
-	tensor tensorDesc
+	sizes   [4]uint32
+	strides [4]uint32
+	buffer  bufferTensorDesc
+	tensor  tensorDesc
 }
 
 func newTensor(rows, cols int) *tensorSpec {
 	t := &tensorSpec{sizes: [4]uint32{1, 1, uint32(rows), uint32(cols)}}
 	t.buffer = bufferTensorDesc{DataType: 1, Dimensions: 4, Sizes: &t.sizes[0], Bytes: uint64(rows) * uint64(cols) * 4}
+	t.tensor = tensorDesc{Type: 1, Desc: &t.buffer}
+	return t
+}
+
+func layoutTensor(layout tensorLayout) *tensorSpec {
+	t := &tensorSpec{sizes: layout.sizes, strides: layout.strides}
+	span := uint64(1)
+	for i, dim := range t.sizes {
+		span += uint64(dim-1) * uint64(t.strides[i])
+	}
+	t.buffer = bufferTensorDesc{DataType: 1, Dimensions: 4, Sizes: &t.sizes[0], Strides: &t.strides[0], Bytes: span * 4}
 	t.tensor = tensorDesc{Type: 1, Desc: &t.buffer}
 	return t
 }
@@ -68,11 +80,25 @@ func (d *nativeDriver) compile(key opKey) (_ *compiled, err error) {
 		}
 	}()
 	a, b, out := newTensor(1, key.n), newTensor(1, key.n), newTensor(1, key.n)
+	if key.aLayout.sizes[0] != 0 {
+		a = layoutTensor(key.aLayout)
+	}
+	if key.bLayout.sizes[0] != 0 {
+		b = layoutTensor(key.bLayout)
+	}
+	if key.yLayout.sizes[0] != 0 {
+		out = layoutTensor(key.yLayout)
+	}
 	var desc operatorDesc
-	scale := scaleBias{Scale: math.Float32frombits(key.scalar)}
+	scale := scaleBias{Scale: math.Float32frombits(key.scalar), Bias: math.Float32frombits(key.bias)}
 	binary := binaryDesc{A: &a.tensor, B: &b.tensor, Out: &out.tensor}
 	identity := identityDesc{In: &a.tensor, Out: &out.tensor, ScaleBias: &scale}
 	gemm := gemmDesc{Alpha: 1}
+	unary := unaryDesc{In: &a.tensor, Out: &out.tensor}
+	norm := normDesc{In: &a.tensor, Out: &out.tensor, NormalizeVariance: 1, Epsilon: math.Float32frombits(key.scalar)}
+	var convolution convDesc
+	var convBias *tensorSpec
+	strides, dilations, start, end, outputPadding := [2]uint32{1, uint32(key.conv.Stride)}, [2]uint32{1, uint32(key.conv.Dilation)}, [2]uint32{0, uint32(key.conv.Padding)}, [2]uint32{0, uint32(key.conv.Padding)}, [2]uint32{}
 	switch key.kind {
 	case opAdd:
 		desc = operatorDesc{Type: 4, Desc: unsafe.Pointer(&binary)}
@@ -81,24 +107,50 @@ func (d *nativeDriver) compile(key opKey) (_ *compiled, err error) {
 	case opScalar:
 		desc = operatorDesc{Type: 1, Desc: unsafe.Pointer(&identity)}
 	case opGEMM:
-		a, b, out = newTensor(key.m, key.k), newTensor(key.k, key.n), newTensor(key.m, key.n)
-		if key.ta {
-			a = newTensor(key.k, key.m)
-			gemm.TransA = 1
-		}
-		if key.tb {
-			b = newTensor(key.n, key.k)
-			gemm.TransB = 1
+		if key.aLayout.sizes[0] == 0 {
+			a, b, out = newTensor(key.m, key.k), newTensor(key.k, key.n), newTensor(key.m, key.n)
+			if key.ta {
+				a = newTensor(key.k, key.m)
+				gemm.TransA = 1
+			}
+			if key.tb {
+				b = newTensor(key.n, key.k)
+				gemm.TransB = 1
+			}
+			batch := uint32(max(1, key.batch))
+			a.sizes[0], b.sizes[0], out.sizes[0] = batch, batch, batch
+			a.buffer.Bytes *= uint64(batch)
+			b.buffer.Bytes *= uint64(batch)
+			out.buffer.Bytes *= uint64(batch)
 		}
 		gemm.A, gemm.B, gemm.Out = &a.tensor, &b.tensor, &out.tensor
 		desc = operatorDesc{Type: 54, Desc: unsafe.Pointer(&gemm)}
+	case opTanh:
+		desc = operatorDesc{Type: 51, Desc: unsafe.Pointer(&unary)}
+	case opGELUExact:
+		desc = operatorDesc{Type: 157, Desc: unsafe.Pointer(&unary)}
+	case opSoftmax:
+		desc = operatorDesc{Type: 48, Desc: unsafe.Pointer(&unary)}
+	case opNorm:
+		desc = operatorDesc{Type: 73, Desc: unsafe.Pointer(&norm)}
+	case opConv:
+		o := key.conv
+		a = layoutTensor(ntcLayout(o.Batch, o.InputLength, o.InChannels))
+		b = layoutTensor(compactLayout(uint32(o.OutChannels), uint32(o.InChannels), 1, uint32(o.Kernel)))
+		out = layoutTensor(ntcLayout(o.Batch, key.n, o.OutChannels))
+		convolution = convDesc{In: &a.tensor, Filter: &b.tensor, Out: &out.tensor, Mode: 1, Direction: 0, Dimensions: 2, Strides: &strides[0], Dilations: &dilations[0], Start: &start[0], End: &end[0], OutputPadding: &outputPadding[0], Groups: 1}
+		if key.hasBias {
+			convBias = layoutTensor(compactLayout(1, uint32(o.OutChannels), 1, 1))
+			convolution.Bias = &convBias.tensor
+		}
+		desc = operatorDesc{Type: 53, Desc: unsafe.Pointer(&convolution)}
 	}
 	var abstract *object
 	if err := hresult("CreateOperator", call(d.dml, 8, uintptr(unsafe.Pointer(&desc)), uintptr(unsafe.Pointer(iidOperator)), uintptr(unsafe.Pointer(&abstract)))); err != nil {
 		return nil, err
 	}
 	defer release(abstract)
-	// No half-precision flags: all M4 calculations request float32 semantics.
+	// No half-precision flags: all operators request float32 semantics.
 	if err := hresult("CompileOperator", call(d.dml, 9, uintptr(unsafe.Pointer(abstract)), 0, uintptr(unsafe.Pointer(iidCompiled)), uintptr(unsafe.Pointer(&op.operator)))); err != nil {
 		return nil, err
 	}
@@ -191,7 +243,7 @@ func (d *nativeDriver) recordDispatch(op *compiled, dispatchable *object, resour
 	})
 }
 
-func (d *nativeDriver) execute(key opKey, out, a, b *allocation) error {
+func (d *nativeDriver) execute(key opKey, out *allocation, inputs ...*allocation) error {
 	op := d.operators[key]
 	if op == nil {
 		var err error
@@ -226,13 +278,15 @@ func (d *nativeDriver) execute(key opKey, out, a, b *allocation) error {
 			d.order = append(d.order, key)
 		}
 	}
-	inputs := []*allocation{a, b}
 	if key.kind == opScalar {
 		inputs = inputs[:1]
 	}
 	// GEMM has a third, optional C input. Bind NONE when Beta is zero.
 	if key.kind == opGEMM {
 		inputs = append(inputs, nil)
+	}
+	if key.kind == opNorm {
+		inputs = append(inputs, nil, nil)
 	}
 	buffers := make([]bufferBinding, len(inputs))
 	descs := make([]bindingDesc, len(inputs))
@@ -246,5 +300,6 @@ func (d *nativeDriver) execute(key opKey, out, a, b *allocation) error {
 	output := bufferBinding{Resource: out.native.(*object), Size: out.size}
 	outputDesc := bindingDesc{Type: 1, Desc: &output}
 	call(op.table, 9, 1, uintptr(unsafe.Pointer(&outputDesc)))
-	return d.recordDispatch(op, op.operator, out, a, b, op.temporary, op.persistent)
+	resources := append([]*allocation{out, op.temporary, op.persistent}, inputs...)
+	return d.recordDispatch(op, op.operator, resources...)
 }

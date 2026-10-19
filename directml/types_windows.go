@@ -57,6 +57,20 @@ type identityDesc struct {
 	In, Out   *tensorDesc
 	ScaleBias *scaleBias
 }
+type unaryDesc struct{ In, Out *tensorDesc }
+type normDesc struct {
+	In, Scale, Bias, Out            *tensorDesc
+	CrossChannel, NormalizeVariance uint32
+	Epsilon                         float32
+	Fused                           *operatorDesc
+}
+type convDesc struct {
+	In, Filter, Bias, Out                         *tensorDesc
+	Mode, Direction, Dimensions                   uint32
+	Strides, Dilations, Start, End, OutputPadding *uint32
+	Groups                                        uint32
+	Fused                                         *operatorDesc
+}
 type scaleBias struct{ Scale, Bias float32 }
 type gemmDesc struct {
 	A, B, C, Out   *tensorDesc
@@ -97,6 +111,7 @@ func checkABI() error {
 		{"resource allocation info", unsafe.Sizeof(resourceAllocationInfo{}), 16},
 		{"tensor", unsafe.Sizeof(tensorDesc{}), 16}, {"buffer tensor", unsafe.Sizeof(bufferTensorDesc{}), 48},
 		{"operator", unsafe.Sizeof(operatorDesc{}), 16}, {"GEMM", unsafe.Sizeof(gemmDesc{}), 56},
+		{"normalization", unsafe.Sizeof(normDesc{}), 56}, {"convolution", unsafe.Sizeof(convDesc{}), 104},
 		{"binding properties", unsafe.Sizeof(bindingProperties{}), 24}, {"binding table", unsafe.Sizeof(bindingTableDesc{}), 32},
 		{"buffer binding", unsafe.Sizeof(bufferBinding{}), 24}, {"binding", unsafe.Sizeof(bindingDesc{}), 16},
 		{"feature query", unsafe.Sizeof(featureQuery{}), 16},
