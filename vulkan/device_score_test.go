@@ -1,3 +1,5 @@
+//go:build (windows || (linux && !android)) && amd64
+
 package vulkan
 
 import "testing"
