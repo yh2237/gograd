@@ -3,6 +3,7 @@
 ローカルの`notes/gpu-backend-plan.md`に沿って、M0の共通APIとCUDAアダプタ、
 M1のWindows/amd64向けVulkan基盤、M2のGEMMとview、M3のトランスフォーマー向け演算、
 M4のWindows/amd64向けDirectML基盤、M5のDirectML向けトランスフォーマー演算を実装した。LinuxのVulkanローダーは未実装。
+M6では共通の推論ベンチマークと、DirectMLのviewコピー削減を追加した。計測条件と実測は[性能検証](GPU_BACKEND_PERFORMANCE.md)にまとめている。
 
 | デバイス | 実行環境 | 現在の範囲 |
 | --- | --- | --- |
@@ -54,11 +55,15 @@ M4のWindows/amd64向けDirectML基盤、M5のDirectML向けトランスフォ�
   初回は演算子をコンパイルしてGPU上で初期化し、形・転置・スカラー値ごとに再利用する。
   キャッシュは最大64件かつtemporary / persistentリソースの合計256 MiBまで。`ReleaseOperators`で明示的に破棄できる。
 - M5ではDirectMLにも`gpu.ViewBackend` / `gpu.ViewMatMuler`を実装した。
-  offset=0かつrank 4以下のGEMMは、転置やゼロstrideのブロードキャストをテンソル記述子で直接読む。
+  offsetが16バイト境界に揃い、rank 4以下のGEMMは、転置やゼロstrideのブロードキャストをテンソル記述子で直接読む。
   それ以外のviewはGPU上で連続化し、rank 6までのバッチ軸をまとめてバッチGEMMを実行する。
-- DirectMLのGather / ScatterはD3D12のバッファ間コピーを使い、末尾の連続な範囲をまとめて記録する。
+- DirectMLのGatherは、16バイト境界かつrank 4以下の非連続viewなら、ScaleBiasを設定しないIdentity演算子で一括コピーする。
+  それ以外のGatherとScatterはD3D12のバッファ間コピーを使い、末尾の連続な範囲をまとめて記録する。
   offsetが16バイト境界に揃わなくても扱える。Scatterは指定した要素だけを書き、viewの隙間にある別名の値を壊さない。
   Concatも共通のScatter経路で実行する。CPUが扱うのはコピー位置のメタデータだけで、テンソル値は読み戻さない。
+- 追加能力の`gpu.ViewBinaryBackend`をDirectMLに実装した。対応するviewのAdd / Mulは、
+  biasなどのゼロstrideも記述子で表して直接計算し、展開用バッファを作らない。
+  未対応のrankやalignmentなら、共通層が従来のGPU上のGather経路を使う。CPU計算へのフォールバックではない。
 - DirectMLのLayerNorm / GroupNormはMeanVarianceNormalizationで正規化した後、GPU上でチャネルごとの重みとbiasを適用する。
   GroupNormは`[batch,groups,frames,channels_per_group]`のstride付き記述子で各グループを独立に正規化する。
   Softmaxは行単位のDML_ACTIVATION_SOFTMAXを使う。
@@ -96,7 +101,8 @@ M4のWindows/amd64向けDirectML基盤、M5のDirectML向けトランスフォ�
   明示的に`AttentionAlgorithm="flash"`を選んだ場合も拒否する。学習時のDropoutはNoGrad中でも`gpu.ErrInferenceOnly`。
   旧`tensor.Tensor` / `nn`経路はCPU/CUDAのままで、新GPUは`autograd`から使う。
 - viewのstride/offsetは要素数単位で、負のstrideは未対応。
-  非連続なToHost / Contiguous / Detachや、要素演算のブロードキャストはGatherで実体化するが、CPUへは戻さない。
+  非連続なToHost / Contiguous / Detachや、必要なブロードキャストはGPU上のGatherで実体化する。
+  対応するDirectMLの要素演算はviewを直接読み、不要な実体化を避ける。中間値をCPUへ戻すことはない。
   非連続なCopyFromはScatterで共有ストレージを更新し、全別名のversionを進める。
   Expanded viewなど、書き込み先が重複するviewは更新前に拒否する。
 - Vulkanはバックエンド内のmutexでqueue・command pool・descriptorを同期するため、CUDAのようなOSスレッド固定は不要。
@@ -112,8 +118,10 @@ M4のWindows/amd64向けDirectML基盤、M5のDirectML向けトランスフォ�
 - `directml.MemoryStats()`はテンソルとステージングのリソースを数え、演算子内部のヒープは含めない。
   キャッシュ済み演算子の件数とtemporary / persistentリソースは`directml.CachedOperatorStats()`で別に確認できる。
   未キャッシュの一時的な演算子とドライバ内部の管理領域を含む、プロセス全体のVRAM量ではない。
-- 現在はsubmitごとにフェンスを待つ。CPUより速いことやM6の2倍という性能目標は、まだ主張しない。
-  command bufferのまとめと性能調整は後続の作業。
+- 現在はsubmitごとにフェンスを待つ。`gpu.Synchronizer`をVulkan / DirectMLに実装し、読み戻しなしで完了を確認できる。
+  既存の各演算がmutex内でフェンスを待つため、Synchronizeは進行中の演算が終わるのを待ち、新しい空submitは増やさない。
+  実測した常駐データの条件ではCPUより高速だったが、全GPU・全サイズでの速度や初回実行の高速化を保証しない。
+  command bufferのまとめと継続的な性能調整は後続の作業。
   特にDirectMLのtanh近似GELUは複数dispatch、複雑なviewは複数copyを使うため、M6での削減対象になる。
 - `vulkan.NewBackend()`は独立したdevice/queueを作る。独立したバックエンドの`Close()`は全バッファの解放後に行う。
   `autograd`が使う登録済みの既定バックエンドはプロセス寿命で、`Close()`できない。キャッシュは`ReleasePool()`で返せる。
@@ -156,6 +164,7 @@ go run ./cmd/vulkan-infer -cpu-fallback
 go run ./cmd/directml-infer
 go run ./cmd/directml-infer -encoder
 go run ./cmd/directml-infer -m 7 -n 11 -k 13 -cpu-fallback
+go run ./cmd/gpu-infer-bench -warmup 2 -iters 7 -json
 ```
 
 ## シェーダの再生成（開発者向け）
@@ -227,8 +236,12 @@ rank 6のバッチbroadcastとviewの合成、非連続な部分書き込みを�
 M3と同じConv1d＋自己注意＋FFNのコサインはDirectMLでも1.0で、既存Encoder層の反復実行後に使用中メモリが元へ戻ることも確認した。
 ドライバなしのテストでは、view実体化・近似GELU・正規化の途中失敗で一時バッファが残らないこと、
 erf式GELUのfeature制約がGPU dispatch前に判定され、バックエンドを利用不可にしないことを確認する。
+M6のテストでは、aligned offset付きのGEMM / Add / Mulが入力を実体化しないこと、
+非対応レイアウトがGPU上の実体化へ戻ること、Gatherが負のゼロとNaN payloadを保つことも確認する。
+推論ベンチマークにはCPUだけで動くコマンド・集計・一致判定のテストを用意した。
 
 ## 残る作業
 
 1. M1のLinuxローダー。`dlopen`と関数ポインタ呼び出しを、cgoなしの呼出規約を含めて検証する。
-2. M6の記録のまとめ、キャッシュ調整と実測ベンチマーク。
+2. M6の残り：command記録のまとめ、融合演算・cacheの追加調整とAMD / Intelでの実測。
+   ベンチマークとDirectMLの主要なviewコピー削減は実装済み。READMEは既存の未コミット変更を維持している。
