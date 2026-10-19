@@ -159,8 +159,21 @@ func Capture(stream *Stream, fn func() error) (*Graph, error) {
 		return nil, driverError("cuStreamBeginCapture", code)
 	}
 	var graph uintptr
+	captureEnded := false
+	defer func() {
+		if captureEnded {
+			return
+		}
+		// The callback panicked. End the capture anyway, otherwise the stream
+		// stays in capture mode and rejects every later operation.
+		if code, _, _ := a.streamEndCapture.Call(stream.handle, uintptr(unsafe.Pointer(&graph))); code != 0 && graph != 0 {
+			a.graphDestroy.Call(graph)
+		}
+	}()
 	runErr := fn()
-	if code, _, _ := a.streamEndCapture.Call(stream.handle, uintptr(unsafe.Pointer(&graph))); code != 0 {
+	code, _, _ := a.streamEndCapture.Call(stream.handle, uintptr(unsafe.Pointer(&graph)))
+	captureEnded = true
+	if code != 0 {
 		if graph != 0 {
 			a.graphDestroy.Call(graph)
 		}

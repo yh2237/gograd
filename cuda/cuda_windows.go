@@ -322,6 +322,7 @@ type Buffer struct {
 	size     int // requested size
 	capacity int // physical allocation and pool class
 	device   int // device the allocation belongs to
+	stream   uintptr
 	freed    bool
 }
 
@@ -344,6 +345,8 @@ type poolKey struct {
 
 // withDevice runs fn with device current and restores the previous device of the
 // calling thread, so buffer operations never depend on ambient device state.
+// The device is restored even when fn panics, and the error of fn wins over a
+// failed restore.
 func withDevice(device int, fn func() error) error {
 	previous, err := CurrentDevice()
 	if err != nil {
@@ -355,11 +358,20 @@ func withDevice(device int, fn func() error) error {
 	if err := SetDevice(device); err != nil {
 		return err
 	}
-	runErr := fn()
-	if err := SetDevice(previous); err != nil {
-		return err
+	runErr := func() (err error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				// Restore the device before the panic continues.
+				_ = SetDevice(previous)
+				panic(recovered)
+			}
+		}()
+		return fn()
+	}()
+	if runErr != nil {
+		return runErr
 	}
-	return runErr
+	return SetDevice(previous)
 }
 
 const defaultPoolCacheLimit int64 = 2 << 30
@@ -531,7 +543,11 @@ func Alloc(size int) (*Buffer, error) {
 	if err != nil {
 		return nil, err
 	}
-	key := poolKey{device: device, stream: currentStreamHandle(), size: capacity}
+	// The block stays bound to the stream that was current when it was
+	// allocated. Freeing it on another stream must not let that stream reuse
+	// memory the owning stream may still be reading.
+	stream := currentStreamHandle()
+	key := poolKey{device: device, stream: stream, size: capacity}
 	poolMu.Lock()
 	list := poolTable[key]
 	if len(list) > 0 {
@@ -547,7 +563,7 @@ func Alloc(size int) (*Buffer, error) {
 		}
 		addLiveBytes(capacity)
 		poolMu.Unlock()
-		return &Buffer{pointer: pointer, size: size, capacity: capacity, device: device}, nil
+		return &Buffer{pointer: pointer, size: size, capacity: capacity, device: device, stream: stream}, nil
 	}
 	poolMu.Unlock()
 	var pointer uintptr
@@ -578,7 +594,7 @@ func Alloc(size int) (*Buffer, error) {
 	}
 	addLiveBytes(capacity)
 	poolMu.Unlock()
-	return &Buffer{pointer: pointer, size: size, capacity: capacity, device: device}, nil
+	return &Buffer{pointer: pointer, size: size, capacity: capacity, device: device, stream: stream}, nil
 }
 
 // Free returns the allocation to the internal pool on its own device. It is safe
@@ -593,7 +609,7 @@ func (b *Buffer) Free() error {
 	if state := launchStateForThread(); state.capturing && state.touched != nil {
 		state.touched[b.pointer] = b.capacity
 	}
-	cachePointerLocked(b.pointer, b.capacity, b.device, currentStreamHandle())
+	cachePointerLocked(b.pointer, b.capacity, b.device, b.stream)
 	victims := trimPoolLocked()
 	poolMu.Unlock()
 	b.pointer = 0
@@ -603,28 +619,41 @@ func (b *Buffer) Free() error {
 // ReleasePool frees every buffer currently held by the internal pool, freeing
 // each block on the device it was allocated on.
 func ReleasePool() error {
+	if InCapture() {
+		// A captured graph may still reference these blocks.
+		return fmt.Errorf("cuda: cannot release the pool during capture")
+	}
 	a, err := load()
 	if err != nil {
 		return err
 	}
 	poolMu.Lock()
 	defer poolMu.Unlock()
+	var firstErr error
 	for key, list := range poolTable {
 		for _, pointer := range list {
 			if err := withDevice(key.device, func() error {
 				code, _, _ := a.free.Call(pointer)
 				return runtimeError("cudaFree", code)
 			}); err != nil {
-				return err
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
 			}
 			reservedBytes -= key.size
 		}
+		// Every pointer of this key leaves the pool, including one whose free
+		// failed: handing it out again could reuse memory that is already gone.
+		delete(poolTable, key)
+		for _, pointer := range list {
+			uncacheAccountingLocked(pointer, key.size)
+		}
 	}
-	poolTable = map[poolKey][]uintptr{}
 	poolLRU.Init()
 	poolNodes = map[uintptr]*list.Element{}
 	cachedBytes = 0
-	return nil
+	return firstErr
 }
 
 // Pointer returns the raw device address.
@@ -692,8 +721,14 @@ func (b *Buffer) memsetAsync(value byte, size int) error {
 	if err != nil {
 		return err
 	}
-	stream := currentStreamHandle()
 	return withDevice(b.device, func() error {
+		// A stream belongs to the context of the device that created it, so it
+		// can only order work for a buffer on that device. Otherwise the
+		// default stream of the buffer's device is used.
+		stream := uintptr(0)
+		if selected := CurrentStream(); selected != nil && selected.device == b.device {
+			stream = selected.handle
+		}
 		code, _, _ := a.memsetAsync.Call(b.pointer, uintptr(value), uintptr(size), stream)
 		return runtimeError("cudaMemsetAsync", code)
 	})
@@ -702,11 +737,16 @@ func (b *Buffer) memsetAsync(value byte, size int) error {
 // Stream is a non-default CUDA stream.
 type Stream struct {
 	handle uintptr
+	device int
 }
 
-// NewStream creates a stream.
+// NewStream creates a stream on the current device.
 func NewStream() (*Stream, error) {
 	a, err := load()
+	if err != nil {
+		return nil, err
+	}
+	device, err := CurrentDevice()
 	if err != nil {
 		return nil, err
 	}
@@ -715,7 +755,7 @@ func NewStream() (*Stream, error) {
 	if err := runtimeError("cudaStreamCreate", code); err != nil {
 		return nil, err
 	}
-	return &Stream{handle: handle}, nil
+	return &Stream{handle: handle, device: device}, nil
 }
 
 // Synchronize waits for all work on the stream.

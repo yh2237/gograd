@@ -17,8 +17,8 @@ extern "C" __global__ void adamw_update(float* p, const float* g, float* m, floa
 	float beta1, float beta2, float stepSize, float biasCorrection2, float weightDecay, float eps, float maxNorm) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= n) return;
-	float coefficient = maxNorm / (norm[0] + 1e-6f);
-	if (coefficient > 1.0f) coefficient = 1.0f;
+	// A non-positive maxNorm disables clipping, like the CPU optimizer does.
+	float coefficient = maxNorm > 0.0f ? fminf(1.0f, maxNorm / (norm[0] + 1e-6f)) : 1.0f;
 	float grad = g[i] * coefficient;
 	m[i] = beta1 * m[i] + (1.0f - beta1) * grad;
 	v[i] = beta2 * v[i] + (1.0f - beta2) * grad * grad;
@@ -82,7 +82,8 @@ func SqrtScalar(x *cuda.Buffer) error {
 }
 
 // AdamWUpdate applies one AdamW step to p from g, updating the moment buffers
-// m and v and clipping the gradient by the global norm in norm[0].
+// m and v and clipping the gradient by the global norm in norm[0]. A
+// non-positive maxNorm disables the clipping.
 func AdamWUpdate(p, g, m, v, norm *cuda.Buffer, count int, beta1, beta2, stepSize, biasCorrection2, weightDecay, eps, maxNorm float32) error {
 	set, err := optimKernels()
 	if err != nil {

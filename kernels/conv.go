@@ -190,8 +190,8 @@ func ToHBT(in, out *cuda.Buffer, batch, channels, length int) error {
 	return set.toHBT.Launch(elementGrid(channels*batch*length), [3]int{256, 1, 1}, 0, nil, args)
 }
 
-// RowSum accumulates out[r] += sum_c x[r,c] for a [rows,cols] matrix. out must
-// be zero before the call.
+// RowSum accumulates out[r] += sum_c x[r,c] for a [rows,cols] matrix. The
+// caller zeroes out before the first accumulation.
 func RowSum(x, out *cuda.Buffer, rows, cols int) error {
 	set, err := convKernels()
 	if err != nil {
@@ -267,15 +267,16 @@ func Conv1dForwardTo(blas *cuda.Blas, x, weight, conv, columns *cuda.Buffer, bat
 }
 
 // ConvWeightGradGemm accumulates the convolution weight gradient from the
-// columns gathered by the forward pass: dw += dy*columns^T with dy
-// [outChannels, batch*length].
+// columns gathered by the forward pass: dw += dy*columns with dy
+// [outChannels, batch*length] and columns [batch*length, channels*kernel]. The
+// caller zeroes dw before the first accumulation.
 func ConvWeightGradGemm(blas *cuda.Blas, dy, columns, dw *cuda.Buffer, batch, channels, length, outChannels, kernel int) error {
 	if blas == nil {
 		return fmt.Errorf("cuda: ConvWeightGradGemm requires a cuBLAS handle")
 	}
 	columnCount := channels * kernel
 	return blas.SgemmRowMajor(outChannels, columnCount, batch*length, 1,
-		dy.Pointer(), batch*length, columns.Pointer(), columnCount, 0, dw.Pointer(), columnCount)
+		dy.Pointer(), batch*length, columns.Pointer(), columnCount, 1, dw.Pointer(), columnCount)
 }
 
 // ConvInputGrad accumulates the input gradient from dy [outChannels,

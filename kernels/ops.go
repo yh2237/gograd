@@ -1,8 +1,10 @@
 package kernels
 
 import (
-	"github.com/yh2237/gograd/cuda"
+	"fmt"
 	"unsafe"
+
+	"github.com/yh2237/gograd/cuda"
 )
 
 const opsKernelSource = `
@@ -87,6 +89,9 @@ func opsKernels() (*opsKernelSet, error) {
 
 // Activation applies ReLU (0), LeakyReLU (1), or GELU (2), or their derivatives.
 func Activation(x, grad, out *cuda.Buffer, count, kind int, slope float32, backward bool) error {
+	if backward && grad == nil {
+		return fmt.Errorf("kernels: activation backward requires a gradient buffer")
+	}
 	set, err := opsKernels()
 	if err != nil {
 		return err
@@ -104,7 +109,13 @@ func Activation(x, grad, out *cuda.Buffer, count, kind int, slope float32, backw
 	return set.activation.Launch(elementGrid(count), [3]int{256, 1, 1}, 0, nil, args)
 }
 
+// elementGrid maps an element count to a launch grid. cuLaunchKernel rejects
+// a zero-sized grid, so an empty tensor still gets one block; the kernels
+// guard every element against the count.
 func elementGrid(count int) [3]int {
+	if count <= 0 {
+		return [3]int{1, 1, 1}
+	}
 	return [3]int{(count + 255) / 256, 1, 1}
 }
 

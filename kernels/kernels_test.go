@@ -190,7 +190,8 @@ func TestTranspose12(t *testing.T) {
 }
 
 // referenceConv1dTimeMajor returns y[o, b*length+t] for time-major
-// x [batch,length,channels] without bias.
+// x [batch,length,channels] without bias. The tap offset is the centered one
+// the im2col kernel uses.
 func referenceConv1dTimeMajor(x, weight []float32, batch, channels, length, outChannels, kernel, dilation int) []float32 {
 	out := make([]float32, outChannels*batch*length)
 	for o := 0; o < outChannels; o++ {
@@ -199,7 +200,7 @@ func referenceConv1dTimeMajor(x, weight []float32, batch, channels, length, outC
 				sum := float32(0)
 				for c := 0; c < channels; c++ {
 					for k := 0; k < kernel; k++ {
-						source := t - dilation + k*dilation
+						source := t - (kernel/2)*dilation + k*dilation
 						if source < 0 || source >= length {
 							continue
 						}
@@ -222,47 +223,67 @@ func TestConv1dForward(t *testing.T) {
 	if err := cuda.SetDevice(0); err != nil {
 		t.Fatal(err)
 	}
-	const batch, channels, length, outChannels, kernel, dilation = 2, 3, 8, 4, 3, 2
-	x := make([]float32, batch*length*channels)
-	for i := range x {
-		x[i] = float32(math.Sin(float64(i) * 0.7))
-	}
-	weight := make([]float32, outChannels*channels*kernel)
-	for i := range weight {
-		weight[i] = float32(math.Cos(float64(i) * 0.3))
-	}
-	want := referenceConv1dTimeMajor(x, weight, batch, channels, length, outChannels, kernel, dilation)
+	const batch, channels, length, outChannels = 2, 3, 8, 4
+	for _, shape := range []struct{ kernel, dilation int }{
+		{3, 2}, {3, 1}, {4, 1}, {5, 2}, {1, 1}, {2, 1},
+	} {
+		kernel, dilation := shape.kernel, shape.dilation
+		t.Run("kernel"+itoa(kernel)+"_dilation"+itoa(dilation), func(t *testing.T) {
+			x := make([]float32, batch*length*channels)
+			for i := range x {
+				x[i] = float32(math.Sin(float64(i) * 0.7))
+			}
+			weight := make([]float32, outChannels*channels*kernel)
+			for i := range weight {
+				weight[i] = float32(math.Cos(float64(i) * 0.3))
+			}
+			want := referenceConv1dTimeMajor(x, weight, batch, channels, length, outChannels, kernel, dilation)
 
-	deviceX := upload(t, x)
-	deviceWeight := upload(t, weight)
-	columns, err := cuda.Alloc(channels * kernel * batch * length * 4)
-	if err != nil {
-		t.Fatal(err)
-	}
-	conv, err := cuda.Alloc(outChannels * batch * length * 4)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer deviceX.Free()
-	defer deviceWeight.Free()
-	defer columns.Free()
-	defer conv.Free()
+			deviceX := upload(t, x)
+			deviceWeight := upload(t, weight)
+			columns, err := cuda.Alloc(channels * kernel * batch * length * 4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			conv, err := cuda.Alloc(outChannels * batch * length * 4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer deviceX.Free()
+			defer deviceWeight.Free()
+			defer columns.Free()
+			defer conv.Free()
 
-	blas, err := cuda.NewBlas()
-	if err != nil {
-		t.Fatal(err)
+			blas, err := cuda.NewBlas()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer blas.Destroy()
+			if err := Conv1dForwardTo(blas, deviceX, deviceWeight, conv, columns, batch, channels, length, outChannels, kernel, dilation); err != nil {
+				t.Fatal(err)
+			}
+			if err := cuda.Synchronize(); err != nil {
+				t.Fatal(err)
+			}
+			got := download(t, conv, len(want))
+			for i := range want {
+				if math.Abs(float64(got[i]-want[i])) > 1e-4*math.Max(1, math.Abs(float64(want[i]))) {
+					t.Fatalf("conv[%d]: got %v want %v", i, got[i], want[i])
+				}
+			}
+		})
 	}
-	defer blas.Destroy()
-	if err := Conv1dForwardTo(blas, deviceX, deviceWeight, conv, columns, batch, channels, length, outChannels, kernel, dilation); err != nil {
-		t.Fatal(err)
+}
+
+// itoa formats a small non-negative integer for subtest names.
+func itoa(v int) string {
+	if v == 0 {
+		return "0"
 	}
-	if err := cuda.Synchronize(); err != nil {
-		t.Fatal(err)
+	digits := ""
+	for v > 0 {
+		digits = string(rune('0'+v%10)) + digits
+		v /= 10
 	}
-	got := download(t, conv, len(want))
-	for i := range want {
-		if math.Abs(float64(got[i]-want[i])) > 1e-4*math.Max(1, math.Abs(float64(want[i]))) {
-			t.Fatalf("conv[%d]: got %v want %v", i, got[i], want[i])
-		}
-	}
+	return digits
 }

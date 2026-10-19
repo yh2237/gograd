@@ -45,7 +45,8 @@ extern "C" __global__ void conv_weight_grad_partial(const float* x, const float*
 	int o = ock / (kernel * channels);
 	float sum = 0.0f;
 	for (int t = 0; t < length; t++) {
-		int src = t - dilation + k * dilation;
+		// The same centered tap offset the forward im2col uses.
+		int src = t - (kernel / 2) * dilation + k * dilation;
 		if (src < 0 || src >= length) continue;
 		sum += dy[(b * outChannels + o) * length + t] * x[(b * channels + c) * length + src];
 	}
@@ -141,8 +142,8 @@ func AddPair(dst, a, b *cuda.Buffer, count int) error {
 	return set.addPair.Launch(elementGrid(count), [3]int{256, 1, 1}, 0, nil, args)
 }
 
-// ColumnSum accumulates out[c] += sum_r x[r,c] for a [rows,cols] matrix. out
-// must be zero before the call.
+// ColumnSum accumulates out[c] += sum_r x[r,c] for a [rows,cols] matrix. The
+// caller zeroes out before the first accumulation.
 func ColumnSum(x, out *cuda.Buffer, rows, cols int) error {
 	set, err := backwardKernels()
 	if err != nil {
