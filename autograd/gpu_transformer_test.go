@@ -5,6 +5,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/yh2237/gograd/directml"
 	"github.com/yh2237/gograd/gpu"
 	"github.com/yh2237/gograd/tensor"
 	"github.com/yh2237/gograd/vulkan"
@@ -87,6 +88,7 @@ func inferenceLeakCheck(t *testing.T, device tensor.Device) {
 	t.Helper()
 	live, _, _ := inferenceFixture.snapshot()
 	stats := vulkan.MemoryStats()
+	dmlStats := directml.MemoryStats()
 	t.Cleanup(func() {
 		if device == fixtureDevice {
 			if after, _, _ := inferenceFixture.snapshot(); after != live {
@@ -95,6 +97,10 @@ func inferenceLeakCheck(t *testing.T, device tensor.Device) {
 		} else if device == tensor.Vulkan {
 			if after := vulkan.MemoryStats(); after.LiveBytes != stats.LiveBytes || after.LiveBuffers != stats.LiveBuffers {
 				t.Errorf("Vulkan leaked: %+v -> %+v", stats, after)
+			}
+		} else if device == tensor.DirectML {
+			if after := directml.MemoryStats(); after.LiveBytes != dmlStats.LiveBytes || after.LiveBuffers != dmlStats.LiveBuffers {
+				t.Errorf("DirectML leaked: %+v -> %+v", dmlStats, after)
 			}
 		}
 	})
@@ -314,6 +320,7 @@ func TestInferenceGPUEncoderLayer(t *testing.T) {
 		}
 		live, _, downloads := inferenceFixture.snapshot()
 		stats := vulkan.MemoryStats()
+		dmlStats := directml.MemoryStats()
 		for i := 0; i < 3; i++ {
 			var y, ref *Tensor
 			c.NoGrad(func() { y = layer.Forward(x, nil, 0) })
@@ -338,10 +345,15 @@ func TestInferenceGPUEncoderLayer(t *testing.T) {
 					t.Fatal("encoder leaked intermediates")
 				}
 				downloads = reads
-			} else {
+			} else if device == tensor.Vulkan {
 				after := vulkan.MemoryStats()
 				if after.LiveBuffers != stats.LiveBuffers || after.LiveBytes != stats.LiveBytes {
 					t.Fatal("encoder leaked GPU intermediates")
+				}
+			} else {
+				after := directml.MemoryStats()
+				if after.LiveBuffers != dmlStats.LiveBuffers || after.LiveBytes != dmlStats.LiveBytes {
+					t.Fatal("encoder leaked DirectML intermediates")
 				}
 			}
 		}

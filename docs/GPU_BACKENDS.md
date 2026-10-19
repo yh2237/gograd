@@ -2,14 +2,14 @@
 
 ローカルの`notes/gpu-backend-plan.md`に沿って、M0の共通APIとCUDAアダプタ、
 M1のWindows/amd64向けVulkan基盤、M2のGEMMとview、M3のトランスフォーマー向け演算、
-M4のWindows/amd64向けDirectML基盤を実装した。LinuxのVulkanローダーとM5のDirectML拡張は未実装。
+M4のWindows/amd64向けDirectML基盤、M5のDirectML向けトランスフォーマー演算を実装した。LinuxのVulkanローダーは未実装。
 
 | デバイス | 実行環境 | 現在の範囲 |
 | --- | --- | --- |
 | CPU / CUDA | 従来どおり | 既存の推論・学習。CUDAの新アダプタも利用可 |
 | Vulkan | Windows/amd64、Vulkan 1.1以上の計算GPU | 基本演算、GEMM、view、正規化、Conv1d、構成演算による自己注意。推論のみ |
 | Vulkan | Linux、その他のOS/アーキテクチャ | スタブ。`Available() == false` |
-| DirectML | Windows/amd64、DirectMLとD3D12対応の計算GPU | 転送、Add / Mul / MulScalar、GEMMの転置4通り。推論のみ |
+| DirectML | Windows/amd64、DirectMLとD3D12対応の計算GPU | 基本演算、GEMM、view、正規化、Conv1d、構成演算による自己注意。推論のみ。erf式GELUはfeature level 5.1以上 |
 | DirectML | その他のOS/アーキテクチャ | スタブ。`Available() == false` |
 
 ## 実装した範囲
@@ -53,6 +53,19 @@ M4のWindows/amd64向けDirectML基盤を実装した。LinuxのVulkanローダ�
 - DirectMLのAdd / Mulは要素演算子、MulScalarはIdentity演算子のScaleBias、GEMMはDML_GEMMを使う。
   初回は演算子をコンパイルしてGPU上で初期化し、形・転置・スカラー値ごとに再利用する。
   キャッシュは最大64件かつtemporary / persistentリソースの合計256 MiBまで。`ReleaseOperators`で明示的に破棄できる。
+- M5ではDirectMLにも`gpu.ViewBackend` / `gpu.ViewMatMuler`を実装した。
+  offset=0かつrank 4以下のGEMMは、転置やゼロstrideのブロードキャストをテンソル記述子で直接読む。
+  それ以外のviewはGPU上で連続化し、rank 6までのバッチ軸をまとめてバッチGEMMを実行する。
+- DirectMLのGather / ScatterはD3D12のバッファ間コピーを使い、末尾の連続な範囲をまとめて記録する。
+  offsetが16バイト境界に揃わなくても扱える。Scatterは指定した要素だけを書き、viewの隙間にある別名の値を壊さない。
+  Concatも共通のScatter経路で実行する。CPUが扱うのはコピー位置のメタデータだけで、テンソル値は読み戻さない。
+- DirectMLのLayerNorm / GroupNormはMeanVarianceNormalizationで正規化した後、GPU上でチャネルごとの重みとbiasを適用する。
+  GroupNormは`[batch,groups,frames,channels_per_group]`のstride付き記述子で各グループを独立に正規化する。
+  Softmaxは行単位のDML_ACTIVATION_SOFTMAXを使う。
+- DirectMLのConv1dはDML_CONVOLUTIONのcross-correlationを使う。
+  入出力の`[batch,time,channels]`をstride付きNCHW記述子で表し、ホストでの並べ替えは行わない。
+- DirectMLのGELUには2つの経路がある。tanh近似はGPU上の積・スケール・加算・tanhで構成する。
+  erf式はfeature level 5.1以上のDML_ACTIVATION_GELUを使い、対応しない環境では`gpu.ErrUnsupported`を返す。
 
 ## 現時点の仕様と制約
 
@@ -69,8 +82,8 @@ M4のWindows/amd64向けDirectML基盤を実装した。LinuxのVulkanローダ�
   `Download`だけは先頭の一部を読み戻せる。
 - Conv1dは`[batch,time,in_channels]`、重みは`[out_channels,in_channels,kernel]`。
   biasはnilにできる。stride/dilationは正の値を明示する。
-- 共通の`Backend.GELU`はtanh近似。任意の`gpu.ExactGELUBackend`はerf式のGELUを表し、Vulkanが実装する。
-  `autograd.GELU(x, false)`をtanh近似へ読み替えることはない。erf自体は誤差上限1.5e-7の多項式近似を使う。
+- 共通の`Backend.GELU`はtanh近似。追加能力の`gpu.ExactGELUBackend`はerf式のGELUを表し、VulkanとDirectMLが実装する。
+  `autograd.GELU(x, false)`をtanh近似へ読み替えることはない。Vulkanのerf自体は誤差上限1.5e-7の多項式近似を使う。
   CUDAアダプタのGEMMはFP32で、既存のBF16設定を参照しない。
 - 新GPUの入力やパラメータの`RequiresGrad`は保持する。trueの入力を使うforwardには、
   その入力の`ExecutionContext.NoGrad`が必要。記録を要求した場合は出力を割り当てる前に拒否する。
@@ -92,15 +105,16 @@ M4のWindows/amd64向けDirectML基盤を実装した。LinuxのVulkanローダ�
   DLLはシステムディレクトリの`dxgi.dll` / `d3d12.dll` / `DirectML.dll`だけを読み込む。
   各submitでリソース状態の遷移、UAVバリア、フェンス待ちを行い、完了前にバッファ・記述子を再利用しない。
   `directml.DeviceInfo()`でアダプタとfeature levelを、`directml.Err()`で利用できない理由を取得できる。
-- DirectMLのM4では、autogradの連続な2D MatMul、同じ形の要素演算、Reshape、Detachを使える。
-  GEMMの`transA` / `transB`はバックエンドAPIで利用できるが、autogradの非連続view、バッチGEMM、
-  要素数を増やすブロードキャスト、正規化・GELU・Softmax・Conv1d・ConcatはM5の作業として残る。
-  これらの未対応経路は`gpu.ErrUnsupported`で、CPUへ戻して計算しない。`LinearLayer`もM5のview対応が必要。
+- DirectMLでもautogradの非連続view、バッチGEMM、ブロードキャスト、正規化、GELU、Softmax、Conv1d、Concatを使える。
+  既存の`LinearLayer`、評価モードの`TransformerEncoderLayer`にも接続した。
+  Encoderはerf式GELUを使うためfeature level 5.1以上が必要。未対応でも近似式やCPU計算へ暗黙には切り替えない。
+  Vulkanと同様に、LogSoftmaxとFlashAttentionは未対応、学習・統計更新・optimizerは明示的に拒否する。
 - `directml.MemoryStats()`はテンソルとステージングのリソースを数え、演算子内部のヒープは含めない。
   キャッシュ済み演算子の件数とtemporary / persistentリソースは`directml.CachedOperatorStats()`で別に確認できる。
   未キャッシュの一時的な演算子とドライバ内部の管理領域を含む、プロセス全体のVRAM量ではない。
 - 現在はsubmitごとにフェンスを待つ。CPUより速いことやM6の2倍という性能目標は、まだ主張しない。
   command bufferのまとめと性能調整は後続の作業。
+  特にDirectMLのtanh近似GELUは複数dispatch、複雑なviewは複数copyを使うため、M6での削減対象になる。
 - `vulkan.NewBackend()`は独立したdevice/queueを作る。独立したバックエンドの`Close()`は全バッファの解放後に行う。
   `autograd`が使う登録済みの既定バックエンドはプロセス寿命で、`Close()`できない。キャッシュは`ReleasePool()`で返せる。
 - DirectMLにも独立した`NewBackend` / `Close`と、既定バックエンドの`ReleasePool` / `ReleaseOperators`を用意した。
@@ -140,6 +154,7 @@ go run ./cmd/vulkan-infer -n 100003
 go run ./cmd/vulkan-infer -linear
 go run ./cmd/vulkan-infer -cpu-fallback
 go run ./cmd/directml-infer
+go run ./cmd/directml-infer -encoder
 go run ./cmd/directml-infer -m 7 -n 11 -k 13 -cpu-fallback
 ```
 
@@ -174,9 +189,11 @@ VulkanはRTX 3060 Ti、API 1.4.341、compute queue 2で検証した。
 Vulkanのテストは`-gcflags=all=-d=checkptr=2`でも成功した。
 GPU実機テストをスキップさせずに検証する場合は、`GOGRAD_REQUIRE_VULKAN=1`を設定する。
 DirectMLは同じRTX 3060 Ti、feature level 6.4で検証した。
-実機テストのスキップを禁止するには`GOGRAD_REQUIRE_DIRECTML=1`を設定する。
+利用不可を理由にした実機テストのスキップを禁止するには`GOGRAD_REQUIRE_DIRECTML=1`を設定する。
+共通のM5一致テストはerf式GELUまで含むため、feature level 5.1未満ならそのテスト群をスキップする。
 `cmd/directml-infer`の`[74,768] @ [768,768]`と要素演算のCPUとの差は0だった。
 DirectMLとautogradのDirectML経路は`-gcflags=all=-d=checkptr=2`でも検証した。
+`cmd/directml-infer -encoder`の`[2,17,16]`、4 heads、FFN幅48は最大絶対誤差3.58e-7、コサイン1.0だった。
 Linux/amd64とmacOS/arm64向けにも、cgoなしで`autograd`のテストバイナリをクロスコンパイルした。
 これらはスタブ経路のビルド確認で、GPUの実行確認ではない。
 Windows/386ではDirectML単独のスタブとドライバ不要テストも実行した。
@@ -205,9 +222,13 @@ DirectMLのM4では、0要素・部分サイズの要素演算、GEMMの転置4�
 バッファプールと演算子キャッシュの上限・明示的な解放を確認する。CPU一致は`atol=1e-5`、`rtol=1e-5`。
 autogradではGEMMからAdd / MulScalar / Reshapeをつなぎ、親を早期Closeしてから読み戻せることを確認する。
 所有権、二重解放、ドライバ失敗後の回収、未対応環境のスタブはドライバなしでも検証する。
+M5の一致テストはDirectMLでも実行する。3072列までのSoftmax / LayerNorm、GroupNorm、Conv1dの各オプション、
+rank 6のバッチbroadcastとviewの合成、非連続な部分書き込みを確認する。
+M3と同じConv1d＋自己注意＋FFNのコサインはDirectMLでも1.0で、既存Encoder層の反復実行後に使用中メモリが元へ戻ることも確認した。
+ドライバなしのテストでは、view実体化・近似GELU・正規化の途中失敗で一時バッファが残らないこと、
+erf式GELUのfeature制約がGPU dispatch前に判定され、バックエンドを利用不可にしないことを確認する。
 
 ## 残る作業
 
 1. M1のLinuxローダー。`dlopen`と関数ポインタ呼び出しを、cgoなしの呼出規約を含めて検証する。
-2. M5のDirectML拡張（view、バッチGEMM、正規化・活性化・Softmax・Conv1d・Concat）。
-3. M6の記録のまとめ、キャッシュ調整と実測ベンチマーク。
+2. M6の記録のまとめ、キャッシュ調整と実測ベンチマーク。

@@ -6,6 +6,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/yh2237/gograd/directml"
 	"github.com/yh2237/gograd/gpu"
 	"github.com/yh2237/gograd/tensor"
 	"github.com/yh2237/gograd/vulkan"
@@ -120,6 +121,22 @@ func inferenceTestDevices(t *testing.T, fn func(*testing.T, tensor.Device)) {
 			t.Skipf("Vulkan unavailable: %v", vulkan.Err())
 		}
 		fn(t, tensor.Vulkan)
+	})
+	t.Run("directml", func(t *testing.T) {
+		if !directml.Available() {
+			if os.Getenv("GOGRAD_REQUIRE_DIRECTML") == "1" {
+				t.Fatal(directml.Err())
+			}
+			t.Skipf("DirectML unavailable: %v", directml.Err())
+		}
+		info, err := directml.DeviceInfo()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.FeatureLevel < 0x5100 {
+			t.Skip("full M5 agreement suite requires native GELU (feature level 5.1)")
+		}
+		fn(t, tensor.DirectML)
 	})
 }
 

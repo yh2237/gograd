@@ -10,6 +10,7 @@ import (
 
 	"github.com/yh2237/gograd/autograd"
 	"github.com/yh2237/gograd/directml"
+	"github.com/yh2237/gograd/gpu"
 	"github.com/yh2237/gograd/tensor"
 )
 
@@ -24,6 +25,7 @@ func run() error {
 	n := flag.Int("n", 768, "output columns (1..2048)")
 	k := flag.Int("k", 768, "reduction dimension (1..2048)")
 	fallback := flag.Bool("cpu-fallback", false, "choose CPU before construction if DirectML is unavailable")
+	encoder := flag.Bool("encoder", false, "run a small batch-first TransformerEncoderLayer and compare with CPU")
 	flag.Parse()
 	for _, dim := range []int{*m, *n, *k} {
 		if dim < 1 || dim > 2048 {
@@ -43,8 +45,84 @@ func run() error {
 			return err
 		}
 		fmt.Printf("DirectML GPU: %s (feature level 0x%x)\n", info.Name, info.FeatureLevel)
+		if *encoder && info.FeatureLevel < 0x5100 {
+			return fmt.Errorf("%w: encoder requires native GELU (DirectML feature level 5.1)", gpu.ErrUnsupported)
+		}
+	}
+	if *encoder {
+		return inferEncoder(device)
 	}
 	return infer(device, *m, *n, *k)
+}
+
+func inferEncoder(device tensor.Device) error {
+	c, reference := autograd.NewExecutionContext(), autograd.NewExecutionContext()
+	layer, err := autograd.NewTransformerEncoderLayer(16, 4, 48, device)
+	if err != nil {
+		return err
+	}
+	for _, p := range layer.NamedParameters() {
+		defer p.Value.Close()
+	}
+	cpu, err := autograd.NewTransformerEncoderLayer(16, 4, 48, tensor.CPU)
+	if err != nil {
+		return err
+	}
+	for _, p := range cpu.NamedParameters() {
+		defer p.Value.Close()
+	}
+	layer.Training, layer.Attention.Training = false, false
+	cpu.Training, cpu.Attention.Training = false, false
+	if err := c.BindModule(&layer.Module); err != nil {
+		return err
+	}
+	if err := reference.BindModule(&cpu.Module); err != nil {
+		return err
+	}
+	data := make([]float32, 2*17*16)
+	for i := range data {
+		data[i] = float32(i%97-48) / 32
+	}
+	x, err := c.New(data, []int{2, 17, 16}, device, true)
+	if err != nil {
+		return err
+	}
+	defer x.Close()
+	cx, err := reference.New(data, []int{2, 17, 16}, tensor.CPU, true)
+	if err != nil {
+		return err
+	}
+	defer cx.Close()
+	var y, ref *autograd.Tensor
+	c.NoGrad(func() { y = layer.Forward(x, nil, 0) })
+	defer y.ReleaseGraph()
+	reference.NoGrad(func() { ref = cpu.Forward(cx, nil, 0) })
+	defer ref.ReleaseGraph()
+	values, err := y.ToHost()
+	if err != nil {
+		return err
+	}
+	var maxError, dot, xx, yy float64
+	for i, v := range values {
+		want := ref.Data[i]
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			return fmt.Errorf("non-finite encoder output at %d", i)
+		}
+		diff := math.Abs(float64(v - want))
+		maxError = max(maxError, diff)
+		if diff > 1e-4+1e-4*math.Abs(float64(want)) {
+			return fmt.Errorf("encoder CPU agreement failed at %d", i)
+		}
+		dot += float64(v) * float64(want)
+		xx += float64(v) * float64(v)
+		yy += float64(want) * float64(want)
+	}
+	cosine := dot / math.Sqrt(xx*yy)
+	fmt.Printf("device=%s encoder=[2,17,16] heads=4 ffn=48 max_abs_error=%.9g cosine=%.12f\n", device, maxError, cosine)
+	if math.IsNaN(cosine) || cosine < .999 {
+		return fmt.Errorf("encoder cosine agreement failed")
+	}
+	return nil
 }
 
 func infer(device tensor.Device, m, n, k int) error {

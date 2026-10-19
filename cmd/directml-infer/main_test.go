@@ -10,3 +10,9 @@ func TestCPUInferenceExample(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestCPUEncoderExample(t *testing.T) {
+	if err := inferEncoder(tensor.CPU); err != nil {
+		t.Fatal(err)
+	}
+}
