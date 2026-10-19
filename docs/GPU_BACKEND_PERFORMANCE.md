@@ -168,6 +168,63 @@ LayerNorm単体は変更後もCPU（0.1475 ms）より遅く、すべての演�
 ドライバ不要テストは近似GELUの全9段と正規化の全3段への失敗注入を含み、エラー伝搬とscratch回収を確認する。
 全リポジトリのstrict GPUテスト、`go vet ./...`、checkptr検査も成功した。
 
+## Vulkanのbias融合演算
+
+`gpu.FusedBiasBackend`を追加し、Vulkanの`BiasGELU`と`BiasResidual`を1 dispatch / submitへ融合した。
+いずれもbiasは1次元、入力の最後の軸に対応する。residualは入力と同じshapeが対象。
+それ以外の一般ブロードキャスト、能力未実装のバックエンド、`ErrUnsupported`は従来のGPU演算を合成する。
+実行エラーを隠したり、CPUへ計算を移したりしない。
+
+- 連続入力なら、従来の「bias展開のGather → Add → GELU / Add」の3 dispatchを1回に減らす。
+  `Alloc`の要求も、bias展開と中間値を含めた3回から最終出力の1回になる（実際の物理割当はpool再利用に依存する）。
+- 既存pointwise SPIR-Vに分岐を追加した。推論時のシェーダコンパイルや新しい外部依存はない。
+  residual用の4番目のdescriptorは、分岐を使わない演算にも有効なdummyを設定する。
+- GELUは従来と同じerf近似を使い、tanh近似へ変えない。残差加算の順序は`(x + bias) + residual`を保つ。
+- 転置やoffset付き入力は必要なものだけGPU上で連続化し、そのscratchを呼出し内で回収する。
+  CPU/CUDAの学習・BF16・既存の融合演算経路は変更していない。
+
+局所ベンチマークに`bias_gelu`（`[1,74,3072]`）と`bias_residual`（`[1,74,768]`）を追加した。
+既定の4 workloadは変更していない。
+
+```text
+go run ./cmd/gpu-infer-bench -workloads bias_gelu,bias_residual,ffn,encoder -warmup 2 -iters 7 -json
+```
+
+同じ測定環境・同期方法で、融合前後を別プロセスで7回ずつ測った。回帰テストと並行には実行していない。
+
+| Vulkan workload | 変更前 median / p95 | 変更後 median / p95 | 前後の中央値比 |
+| --- | ---: | ---: | ---: |
+| bias_gelu | 0.1850 / 0.2801 ms | 0.0771 / 0.1727 ms | 2.40x |
+| bias_residual | 0.2475 / 0.3471 ms | 0.2473 / 0.3459 ms | 1.00x |
+| ffn | 1.3367 / 1.6453 ms | 1.4333 / 2.3510 ms | 0.93x |
+| encoder | 39.8714 / 43.8014 ms | 36.1015 / 37.5938 ms | 1.10x |
+
+Vulkanの生サンプル（ms、実行順）:
+
+```text
+bias_gelu before:      0.2801,  0.1700,  0.1850,  0.1660,  0.1692,  0.2332,  0.2670
+bias_gelu after:       0.1727,  0.0906,  0.0682,  0.0609,  0.0634,  0.0771,  0.1290
+bias_residual before:  0.3471,  0.2061,  0.2475,  0.2288,  0.2179,  0.2506,  0.2825
+bias_residual after:   0.2639,  0.2473,  0.3459,  0.2578,  0.0600,  0.0547,  0.0573
+ffn before:           1.4126,  1.3547,  1.6453,  1.2359,  1.2323,  1.3367,  1.2515
+ffn after:            1.3905,  1.4333,  2.3510,  1.3340,  1.6692,  1.8738,  1.3195
+encoder before:      40.2656, 43.8014, 41.6598, 37.9244, 38.6950, 39.4888, 39.8714
+encoder after:       37.1714, 37.5938, 36.8934, 35.3774, 34.4226, 33.8998, 36.1015
+```
+
+最大絶対誤差はBiasGELUが`1.79e-7`、BiasResidualが0、FFNが`2.68e-7`、Encoderが`5.72e-6`で、変更前後で同じだった。
+コサイン類似度はすべて0.999以上。計測中に使用中バッファ数・バイト数が増えないことも確認した。
+Encoderのgraph解放後のpool cacheは`138,072,064`→`122,343,424` bytesとなった。
+これはその時点の再利用用cacheであり、ピークVRAMやプロセス全体のメモリ使用量ではない。
+
+**BiasGELU単体は短縮したが、BiasResidualとFFNの改善は今回の中央値からは確認できなかった。**
+Encoderの中央値は約9.5%短縮したものの、CPUも573.8→547.0 msと変動し、
+変更していないDirectMLも33.8→43.3 msと変動した。厳密な因果効果や、全環境での10%改善を主張するものではない。
+
+実機テストは0要素、端数workgroup、2次元dispatch、入力alias、出力alias拒否、加算順序、CPU一致を含む。
+ドライバ不要テストは能力による選択、`ErrUnsupported`での合成経路への復帰、単一dispatch・scratchなしの呼出し、
+実行失敗時の出力・連続化scratch回収を確認する。strict GPUテスト、`go vet ./...`、Vulkanを含むcheckptr検査も成功した。
+
 ## 残る制約
 
 - 上の速度は常駐データのsteady state。初期化・重み転送・演算子コンパイルを含む初回の高速化は主張しない。

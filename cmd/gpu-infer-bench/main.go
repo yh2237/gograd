@@ -81,7 +81,7 @@ func run(args []string, out io.Writer) error {
 	c := config{}
 	fs := flag.NewFlagSet("gpu-infer-bench", flag.ContinueOnError)
 	fs.StringVar(&c.Devices, "devices", "cpu,vulkan,directml", "comma-separated devices; no automatic CPU fallback")
-	fs.StringVar(&c.Workloads, "workloads", "gemm,projection,ffn,encoder", "gemm, projection, ffn, encoder, gelu (tanh approximation), layernorm")
+	fs.StringVar(&c.Workloads, "workloads", "gemm,projection,ffn,encoder", "gemm, projection, ffn, encoder, gelu (tanh approximation), layernorm, bias_gelu (erf), bias_residual")
 	fs.IntVar(&c.Size, "size", 768, "model width and square GEMM dimension")
 	fs.IntVar(&c.Hidden, "hidden", 3072, "feed-forward width")
 	fs.IntVar(&c.Heads, "heads", 12, "encoder attention heads")
@@ -204,7 +204,7 @@ func validate(c config) error {
 	for _, list := range []struct {
 		value string
 		valid []string
-	}{{c.Devices, []string{"cpu", "vulkan", "directml"}}, {c.Workloads, []string{"gemm", "projection", "ffn", "encoder", "gelu", "layernorm"}}} {
+	}{{c.Devices, []string{"cpu", "vulkan", "directml"}}, {c.Workloads, []string{"gemm", "projection", "ffn", "encoder", "gelu", "layernorm", "bias_gelu", "bias_residual"}}} {
 		seen := map[string]bool{}
 		for _, s := range strings.Split(list.value, ",") {
 			s = strings.TrimSpace(s)
@@ -293,6 +293,28 @@ func build(c config, name string, device tensor.Device) (_ *workload, err error)
 			return nil, err
 		}
 		forward = func() *autograd.Tensor { return autograd.GELU(x, true) }
+	case "bias_gelu", "bias_residual":
+		channels := c.Size
+		if name == "bias_gelu" {
+			channels = c.Hidden
+		}
+		x, err := newTensor([]int{c.Batch, c.Sequence, channels}, 1)
+		if err != nil {
+			return nil, err
+		}
+		bias, err := newTensor([]int{channels}, .1)
+		if err != nil {
+			return nil, err
+		}
+		if name == "bias_gelu" {
+			forward = func() *autograd.Tensor { return autograd.BiasGELU(x, bias) }
+		} else {
+			residual, err := newTensor([]int{c.Batch, c.Sequence, channels}, 1)
+			if err != nil {
+				return nil, err
+			}
+			forward = func() *autograd.Tensor { return autograd.BiasResidual(x, bias, residual) }
+		}
 	case "layernorm":
 		x, err := newTensor([]int{c.Batch, c.Sequence, c.Size}, 1)
 		if err != nil {

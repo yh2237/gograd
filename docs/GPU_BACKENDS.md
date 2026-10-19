@@ -3,7 +3,7 @@
 ローカルの`notes/gpu-backend-plan.md`に沿って、M0の共通APIとCUDAアダプタ、
 M1のWindows/amd64向けVulkan基盤、M2のGEMMとview、M3のトランスフォーマー向け演算、
 M4のWindows/amd64向けDirectML基盤、M5のDirectML向けトランスフォーマー演算を実装した。LinuxのVulkanローダーは未実装。
-M6では共通の推論ベンチマーク、DirectMLのviewコピー削減、複合演算内のcommand記録のまとめを追加した。計測条件と実測は[性能検証](GPU_BACKEND_PERFORMANCE.md)にまとめている。
+M6では共通の推論ベンチマーク、DirectMLのviewコピー削減と複合演算内のcommand記録のまとめ、Vulkanのbias融合演算を追加した。計測条件と実測は[性能検証](GPU_BACKEND_PERFORMANCE.md)にまとめている。
 
 | デバイス | 実行環境 | 現在の範囲 |
 | --- | --- | --- |
@@ -126,6 +126,12 @@ M6では共通の推論ベンチマーク、DirectMLのviewコピー削減、複
   初回の演算子初期化は別submit。バッチ内で繰り返す演算は独立したdescriptorスロットを使い、通常のcache上限に数える。
   バッチ準備中の演算子は退避せず、cacheに入らない演算子もフェンス完了まで保持する。
   forward全体のcommand記録のまとめ、融合演算、複雑なviewのcopy削減は引き続き改善対象。
+- Vulkanは追加能力の`gpu.FusedBiasBackend`を実装し、`BiasGELU`（erf式）と`BiasResidual`を
+  それぞれ1 dispatch / submitで実行する。biasの展開バッファと合成演算の中間出力を作らない。
+  biasは最後の軸に対応する1次元、residualは入力と同じshapeの場合に適用する。
+  非連続入力は必要なものだけGPU上で連続化する。それ以外のブロードキャストや能力未実装のバックエンドは従来のGPU合成経路を使う。
+  `ErrUnsupported`だけが合成経路への切替条件で、実行エラーは伝搬する。CPUへの切替ではない。
+  残差加算は`(x + bias) + residual`の順序を保ち、erf式をtanh式へ置き換えない。
 - `vulkan.NewBackend()`は独立したdevice/queueを作る。独立したバックエンドの`Close()`は全バッファの解放後に行う。
   `autograd`が使う登録済みの既定バックエンドはプロセス寿命で、`Close()`できない。キャッシュは`ReleasePool()`で返せる。
 - DirectMLにも独立した`NewBackend` / `Close`と、既定バックエンドの`ReleasePool` / `ReleaseOperators`を用意した。
@@ -169,6 +175,7 @@ go run ./cmd/directml-infer -encoder
 go run ./cmd/directml-infer -m 7 -n 11 -k 13 -cpu-fallback
 go run ./cmd/gpu-infer-bench -warmup 2 -iters 7 -json
 go run ./cmd/gpu-infer-bench -workloads gelu,layernorm,encoder -warmup 2 -iters 7 -json
+go run ./cmd/gpu-infer-bench -workloads bias_gelu,bias_residual,ffn,encoder -warmup 2 -iters 7 -json
 ```
 
 ## シェーダの再生成（開発者向け）
@@ -211,6 +218,7 @@ Linux/amd64とmacOS/arm64向けにも、cgoなしで`autograd`のテストバイ
 これらはスタブ経路のビルド確認で、GPUの実行確認ではない。
 Windows/386ではDirectML単独のスタブとドライバ不要テストも実行した。
 Windows/386の`autograd`は、既存のCUDAパッケージの2 GiB定数がintでoverflowするためビルドできない。
+同じCUDA依存を含むVulkanテストもWindows/386ではビルドできないが、`go build ./gpu ./vulkan`のスタブはビルドできる。
 今回のVulkanローダーもWindows/amd64のみを対象にしている。
 
 共通層はドライバなしで登録、並行検索、所有権、二重解放、サイズ検証をテストする。
@@ -246,10 +254,14 @@ M6のテストでは、aligned offset付きのGEMM / Add / Mulが入力を実体
 DirectMLのバッチ化は、cold時の初期化とwarm時のsubmit回数、descriptorスロットの再利用、
 満杯のcacheからの退避、cache上限を超えるバッチを実機で検証する。
 ドライバ不要テストでは複合演算の各段に失敗を注入し、エラー伝搬とscratch回収を確認する。
+Vulkanのbias融合は単一dispatch・scratchなしの呼出し、0要素、部分workgroup、2次元dispatch、入力のalias、
+出力のalias拒否、加算順序、CPU一致を検証する。autogradでも能力なし・`ErrUnsupported`時のGPU合成、
+転置・offset・Expand・rank 6、実行エラー時の出力と連続化scratchの回収を確認する。
 
 ## 残る作業
 
 1. M1のLinuxローダー。`dlopen`と関数ポインタ呼び出しを、cgoなしの呼出規約を含めて検証する。
 2. M6の残り：forward全体のcommand記録のまとめ、融合演算・cacheの追加調整とAMD / Intelでの実測。
    ベンチマーク、DirectMLの主要なviewコピー削減、近似GELUと正規化内部のバッチ化は実装済み。
+   Vulkanのerf式BiasGELU / BiasResidualの融合も実装済み。
    READMEは既存の未コミット変更を維持している。
