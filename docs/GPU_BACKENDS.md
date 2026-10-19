@@ -3,7 +3,7 @@
 ローカルの`notes/gpu-backend-plan.md`に沿って、M0の共通APIとCUDAアダプタ、
 M1のWindows/amd64向けVulkan基盤、M2のGEMMとview、M3のトランスフォーマー向け演算、
 M4のWindows/amd64向けDirectML基盤、M5のDirectML向けトランスフォーマー演算を実装した。LinuxのVulkanローダーは未実装。
-M6では共通の推論ベンチマークと、DirectMLのviewコピー削減を追加した。計測条件と実測は[性能検証](GPU_BACKEND_PERFORMANCE.md)にまとめている。
+M6では共通の推論ベンチマーク、DirectMLのviewコピー削減、複合演算内のcommand記録のまとめを追加した。計測条件と実測は[性能検証](GPU_BACKEND_PERFORMANCE.md)にまとめている。
 
 | デバイス | 実行環境 | 現在の範囲 |
 | --- | --- | --- |
@@ -121,8 +121,11 @@ M6では共通の推論ベンチマークと、DirectMLのviewコピー削減を
 - 現在はsubmitごとにフェンスを待つ。`gpu.Synchronizer`をVulkan / DirectMLに実装し、読み戻しなしで完了を確認できる。
   既存の各演算がmutex内でフェンスを待つため、Synchronizeは進行中の演算が終わるのを待ち、新しい空submitは増やさない。
   実測した常駐データの条件ではCPUより高速だったが、全GPU・全サイズでの速度や初回実行の高速化を保証しない。
-  command bufferのまとめと継続的な性能調整は後続の作業。
-  特にDirectMLのtanh近似GELUは複数dispatch、複雑なviewは複数copyを使うため、M6での削減対象になる。
+  DirectMLのtanh近似GELUは9 dispatch、LayerNorm / GroupNormは3 dispatchを1つのcommand listへ記録する。
+  warmup後はそれぞれ1回のsubmit / フェンス待ちになり、演算間の状態遷移とUAVバリアは維持する。
+  初回の演算子初期化は別submit。バッチ内で繰り返す演算は独立したdescriptorスロットを使い、通常のcache上限に数える。
+  バッチ準備中の演算子は退避せず、cacheに入らない演算子もフェンス完了まで保持する。
+  forward全体のcommand記録のまとめ、融合演算、複雑なviewのcopy削減は引き続き改善対象。
 - `vulkan.NewBackend()`は独立したdevice/queueを作る。独立したバックエンドの`Close()`は全バッファの解放後に行う。
   `autograd`が使う登録済みの既定バックエンドはプロセス寿命で、`Close()`できない。キャッシュは`ReleasePool()`で返せる。
 - DirectMLにも独立した`NewBackend` / `Close`と、既定バックエンドの`ReleasePool` / `ReleaseOperators`を用意した。
@@ -165,6 +168,7 @@ go run ./cmd/directml-infer
 go run ./cmd/directml-infer -encoder
 go run ./cmd/directml-infer -m 7 -n 11 -k 13 -cpu-fallback
 go run ./cmd/gpu-infer-bench -warmup 2 -iters 7 -json
+go run ./cmd/gpu-infer-bench -workloads gelu,layernorm,encoder -warmup 2 -iters 7 -json
 ```
 
 ## シェーダの再生成（開発者向け）
@@ -239,9 +243,13 @@ erf式GELUのfeature制約がGPU dispatch前に判定され、バックエンド
 M6のテストでは、aligned offset付きのGEMM / Add / Mulが入力を実体化しないこと、
 非対応レイアウトがGPU上の実体化へ戻ること、Gatherが負のゼロとNaN payloadを保つことも確認する。
 推論ベンチマークにはCPUだけで動くコマンド・集計・一致判定のテストを用意した。
+DirectMLのバッチ化は、cold時の初期化とwarm時のsubmit回数、descriptorスロットの再利用、
+満杯のcacheからの退避、cache上限を超えるバッチを実機で検証する。
+ドライバ不要テストでは複合演算の各段に失敗を注入し、エラー伝搬とscratch回収を確認する。
 
 ## 残る作業
 
 1. M1のLinuxローダー。`dlopen`と関数ポインタ呼び出しを、cgoなしの呼出規約を含めて検証する。
-2. M6の残り：command記録のまとめ、融合演算・cacheの追加調整とAMD / Intelでの実測。
-   ベンチマークとDirectMLの主要なviewコピー削減は実装済み。READMEは既存の未コミット変更を維持している。
+2. M6の残り：forward全体のcommand記録のまとめ、融合演算・cacheの追加調整とAMD / Intelでの実測。
+   ベンチマーク、DirectMLの主要なviewコピー削減、近似GELUと正規化内部のバッチ化は実装済み。
+   READMEは既存の未コミット変更を維持している。

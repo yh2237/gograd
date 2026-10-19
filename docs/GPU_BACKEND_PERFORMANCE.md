@@ -1,4 +1,4 @@
-# GPU推論の性能検証（M6 初期最適化）
+# GPU推論の性能検証（M6）
 
 ## 対象と測定方法
 
@@ -52,7 +52,7 @@ go run ./cmd/gpu-infer-bench -size 128 -hidden 512 -heads 4 -layers 1 -seq 74
 | ffn | `[1,74,768]` → Linear(3072) → bias + erf式GELU → Linear(768) + bias |
 | encoder | time-major Conv1d（kernel=3、stride=1、padding=1）→ 12層のpre-norm TransformerEncoderLayer |
 
-## 最終測定
+## viewコピー削減後の測定
 
 時間はms、倍率は同じworkloadのCPU中央値に対する値。
 
@@ -114,11 +114,65 @@ DirectML:  33.0404,  32.9921,  32.2440,  34.4442,  33.8297,  42.9216,  41.3080
 DirectMLの数秒規模のコピー記録が消えたことは、入力の実体化を省くドライバ不要テストでも確認している。
 上の最終測定表は別途7回測定したもので、比較用の3回測定から都合のよいサンプルを選んだものではない。
 
+## DirectML複合演算内のバッチ化
+
+viewコピー削減に続き、tanh近似GELUの9段とLayerNorm / GroupNormの3段を、それぞれ1つのcommand listへ記録するようにした。
+計算式とdispatch数は変えず、段ごとの状態遷移とUAVバリアを維持する。
+warmup後のsubmitとフェンス待ちはGELUが9回→1回、正規化が3回→1回になる。
+これは各API呼び出しの内部だけをまとめる処理で、forward全体を非同期実行するAPIではない。
+
+- cold時は全段の演算子コンパイルと初期化を完了してから実行用listを開く。初期化のsubmitは別途必要。
+- 同じ演算を繰り返す場合は、独立したdescriptor heap / binding tableを持つスロットを使う。
+  一つのheapを再バインドして、未実行のdispatchが参照するdescriptorを上書きしない。
+- スロットも通常のcache上限（64演算子、temporary / persistent合計256 MiB）に数える。
+  近似GELUのwarm cacheは従来の7演算子から9スロットになる。
+- バッチ準備中の演算子はpinして退避を防ぐ。上限を超えるものはcacheせず、実行フェンス完了後に解放する。
+  外部からの解放・別スレッドからの実行は、従来どおりbackendのmutexで直列化する。
+
+局所的な効果を測るため、`gelu`と`layernorm`をベンチマークの選択肢に追加した。既定の4 workloadは変更していない。
+
+```text
+go run ./cmd/gpu-infer-bench -workloads gelu,layernorm,encoder -warmup 2 -iters 7 -json
+```
+
+前述と同じ環境・shape・同期方法で、バッチ化前後を別プロセスで7回ずつ測定した。
+`gelu`は`[1,74,3072]`のtanh近似、`layernorm`は`[1,74,768]`の最後の軸を正規化する。
+
+| DirectML workload | 変更前 median / p95 | 変更後 median / p95 | 前後の中央値比 |
+| --- | ---: | ---: | ---: |
+| gelu | 0.8369 / 1.3339 ms | 0.1851 / 0.9337 ms | 4.52x |
+| layernorm | 0.3169 / 0.4068 ms | 0.2495 / 0.2770 ms | 1.27x |
+| encoder | 34.7472 / 36.8871 ms | 35.2579 / 37.8502 ms | 0.99x |
+
+DirectMLの生サンプル（ms、実行順）:
+
+```text
+gelu before:      0.8590,  0.8369,  0.9156,  1.3339,  0.7268,  0.8280,  0.7786
+gelu after:       0.3587,  0.9337,  0.2049,  0.1851,  0.1637,  0.1748,  0.1712
+layernorm before: 0.4068,  0.3923,  0.3529,  0.3169,  0.2999,  0.2647,  0.2534
+layernorm after:  0.2106,  0.2661,  0.2622,  0.2770,  0.2495,  0.2137,  0.2360
+encoder before:  33.5330, 34.7472, 31.4275, 36.8871, 34.2618, 34.8019, 35.7983
+encoder after:   34.6284, 36.9622, 35.2579, 35.2272, 35.2707, 33.6217, 37.8502
+```
+
+最大絶対誤差は近似GELUが`4.77e-7`、LayerNormが`8.34e-7`、Encoderが`8.11e-6`で、変更前後で同じだった。
+コサイン類似度もすべて0.999以上。計測中の使用中バッファ数・バイト数の増加はなかった。
+
+**Encoder全体の改善は、この測定では確認できなかった。** Encoderはerf式GELUを使うため、近似GELUのバッチ化は適用されない。
+正規化のsubmit削減は適用されるが、この実行ではCPUのEncoder中央値も532.0→552.7 ms、
+変更していないVulkanも35.9→40.6 msと変動した。単一演算の中央値比をEncoderの改善率として扱わない。
+LayerNorm単体は変更後もCPU（0.1475 ms）より遅く、すべての演算がCPUより速いとは主張しない。
+
+検証にはwarm時のsubmitが1回であること、cold時の初期化回数、cache満杯時のpin、64スロットを超えるバッチ、
+繰り返し実行とcache解放後の再構築を確認する実機テストを追加した。
+ドライバ不要テストは近似GELUの全9段と正規化の全3段への失敗注入を含み、エラー伝搬とscratch回収を確認する。
+全リポジトリのstrict GPUテスト、`go vet ./...`、checkptr検査も成功した。
+
 ## 残る制約
 
 - 上の速度は常駐データのsteady state。初期化・重み転送・演算子コンパイルを含む初回の高速化は主張しない。
-- まだ各演算のsubmitごとにフェンスを待つ。複数演算の記録をまとめる処理は未実装。
-- DirectMLのtanh近似GELUは複数dispatch。融合演算やcacheの調整余地も残る。
+- まだ各submitでフェンスを待つ。DirectMLの近似GELUと正規化内部はバッチ化したが、forward全体の記録のまとめは未実装。
+- DirectMLのtanh近似GELUは1つのcommand list内で複数dispatch。カーネル融合やcacheの調整余地も残る。
 - GPUのmemory統計はgraph解放後でも入力と重みが常駐した状態を表す。プロセス全体のVRAM量ではない。
 - LinuxのVulkanローダー、AMD / Intelでの実機検証、READMEへの統合は別作業。
   READMEにある既存の未コミット変更は、この性能検証のコミットへ混ぜていない。
