@@ -2,7 +2,6 @@ package kernels
 
 import (
 	"github.com/yh2237/gograd/cuda"
-	"sync"
 	"unsafe"
 )
 
@@ -58,19 +57,13 @@ type opsKernelSet struct {
 	activation *cuda.Kernel
 }
 
-var (
-	opsProgramOnce sync.Once
-	opsProgram     *cuda.Program
-	opsSet         *opsKernelSet
-	opsProgramErr  error
-)
+var opsCache cuda.DeviceCache[*opsKernelSet]
 
 func opsKernels() (*opsKernelSet, error) {
-	opsProgramOnce.Do(func() {
+	return opsCache.Get(func() (*opsKernelSet, error) {
 		program, err := cuda.Compile(opsKernelSource)
 		if err != nil {
-			opsProgramErr = err
-			return
+			return nil, err
 		}
 		set := &opsKernelSet{}
 		for name, target := range map[string]**cuda.Kernel{
@@ -83,14 +76,13 @@ func opsKernels() (*opsKernelSet, error) {
 		} {
 			kernel, err := program.Function(name)
 			if err != nil {
-				opsProgramErr = err
-				return
+				_ = program.Close()
+				return nil, err
 			}
 			*target = kernel
 		}
-		opsProgram, opsSet = program, set
+		return set, nil
 	})
-	return opsSet, opsProgramErr
 }
 
 // Activation applies ReLU (0), LeakyReLU (1), or GELU (2), or their derivatives.

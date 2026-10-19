@@ -1,7 +1,6 @@
 package autograd
 
 import (
-	"sync"
 	"unsafe"
 
 	"github.com/yh2237/gograd/cuda"
@@ -43,30 +42,15 @@ extern "C" __global__ void c2_bias_grad(const float* g,float* db,C2Spec s,int ba
 }
 `
 
-var conv2dOnce sync.Once
-var conv2dProgram *cuda.Program
-var conv2dKernels map[string]*cuda.Kernel
-var conv2dCompileErr error
+var conv2dCache cuda.KernelCache
 
 func launchConv2d(name string, n int, args ...unsafe.Pointer) {
-	conv2dOnce.Do(func() {
-		conv2dProgram, conv2dCompileErr = cuda.Compile(conv2dSource)
-		if conv2dCompileErr != nil {
-			return
-		}
-		conv2dKernels = make(map[string]*cuda.Kernel)
-		for _, key := range []string{"c2_columns", "c2_col2im", "c2_output", "c2_upstream", "c2_bias_grad"} {
-			conv2dKernels[key], conv2dCompileErr = conv2dProgram.Function(key)
-			if conv2dCompileErr != nil {
-				return
-			}
-		}
-	})
-	if conv2dCompileErr != nil {
-		panic(conv2dCompileErr)
+	functions, err := conv2dCache.Get(conv2dSource, "c2_columns", "c2_col2im", "c2_output", "c2_upstream", "c2_bias_grad")
+	if err != nil {
+		panic(err)
 	}
 	timedGPU(name, func() error {
-		return conv2dKernels[name].Launch([3]int{(n + 255) / 256, 1, 1}, [3]int{256, 1, 1}, 0, nil, args)
+		return functions[name].Launch([3]int{(n + 255) / 256, 1, 1}, [3]int{256, 1, 1}, 0, nil, args)
 	})
 }
 

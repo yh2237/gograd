@@ -261,7 +261,11 @@ func gpuReduce(a *Tensor, s []int, selected []bool, mean bool) *Tensor {
 		scale = 1 / float32(a.Numel()/numel(s))
 	}
 	ap, yp := ptr(a.buf), ptr(out)
-	launch("reduce_f", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&d1), unsafe.Pointer(&d2), unsafe.Pointer(&rs[0]), unsafe.Pointer(&rs[1]), unsafe.Pointer(&rs[2]), unsafe.Pointer(&scale))
+	if numel(s) == 1 {
+		launchScalarReduce(ap, yp, n, scale)
+	} else {
+		launch("reduce_f", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&d1), unsafe.Pointer(&d2), unsafe.Pointer(&rs[0]), unsafe.Pointer(&rs[1]), unsafe.Pointer(&rs[2]), unsafe.Pointer(&scale))
+	}
 	return resultGPU(out, s, []*Tensor{a}, func(g *cuda.Buffer) {
 		dx := ptr(a.ensureGradGPU())
 		if dx == 0 {
@@ -292,7 +296,11 @@ func gpuReduceND(a *Tensor, s []int, selected []bool, mean bool) *Tensor {
 		panic(err)
 	}
 	ap, yp := ptr(a.buf), ptr(out)
-	launch("reduce_nd_f", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&shape), unsafe.Pointer(&mapped), unsafe.Pointer(&scale))
+	if numel(s) == 1 {
+		launchScalarReduce(ap, yp, n, scale)
+	} else {
+		launch("reduce_nd_f", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&shape), unsafe.Pointer(&mapped), unsafe.Pointer(&scale))
+	}
 	return resultGPU(out, s, []*Tensor{a}, func(g *cuda.Buffer) {
 		dx := ptr(a.ensureGradGPU())
 		if dx == 0 {
@@ -302,6 +310,10 @@ func gpuReduceND(a *Tensor, s []int, selected []bool, mean bool) *Tensor {
 		launch("reduce_nd_b", int(n), unsafe.Pointer(&gp), unsafe.Pointer(&dx), unsafe.Pointer(&n), unsafe.Pointer(&shape), unsafe.Pointer(&mapped), unsafe.Pointer(&scale))
 	})
 }
+func launchScalarReduce(x, y uintptr, n int32, scale float32) {
+	launch("reduce_scalar_f", min(int(n), 256*256), unsafe.Pointer(&x), unsafe.Pointer(&y), unsafe.Pointer(&n), unsafe.Pointer(&scale))
+}
+
 func gpuGroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
 	s := x.Shape
 	bs, t, c := s[0], s[1], s[2]

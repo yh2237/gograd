@@ -1,7 +1,6 @@
 package kernels
 
 import (
-	"sync"
 	"unsafe"
 
 	"github.com/yh2237/gograd/cuda"
@@ -19,22 +18,13 @@ extern "C" __global__ void masked_loss(const float* pred, const float* target, c
 }
 `
 
-var maskedOnce sync.Once
-var maskedKernel *cuda.Kernel
-var maskedErr error
+var maskedCache cuda.KernelCache
 
 // MaskedLoss writes a weighted loss scalar and the gradient on the device.
 func MaskedLoss(pred, target, frame, channel, grad, loss *cuda.Buffer, count, channels int, l1 bool, invDenom float32) error {
-	maskedOnce.Do(func() {
-		p, err := cuda.Compile(maskedSource)
-		if err != nil {
-			maskedErr = err
-			return
-		}
-		maskedKernel, maskedErr = p.Function("masked_loss")
-	})
-	if maskedErr != nil {
-		return maskedErr
+	functions, err := maskedCache.Get(maskedSource, "masked_loss")
+	if err != nil {
+		return err
 	}
 	p, t, f, g, l := pred.Pointer(), target.Pointer(), frame.Pointer(), grad.Pointer(), loss.Pointer()
 	var c uintptr
@@ -49,5 +39,5 @@ func MaskedLoss(pred, target, frame, channel, grad, loss *cuda.Buffer, count, ch
 		has = 1
 	}
 	args := []unsafe.Pointer{unsafe.Pointer(&p), unsafe.Pointer(&t), unsafe.Pointer(&f), unsafe.Pointer(&c), unsafe.Pointer(&g), unsafe.Pointer(&l), unsafe.Pointer(&n), unsafe.Pointer(&ch), unsafe.Pointer(&l1v), unsafe.Pointer(&invDenom), unsafe.Pointer(&has)}
-	return maskedKernel.Launch(elementGrid(count), [3]int{256, 1, 1}, 0, nil, args)
+	return functions["masked_loss"].Launch(elementGrid(count), [3]int{256, 1, 1}, 0, nil, args)
 }

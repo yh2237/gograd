@@ -2,7 +2,6 @@ package kernels
 
 import (
 	"fmt"
-	"sync"
 	"unsafe"
 
 	"github.com/yh2237/gograd/cuda"
@@ -119,18 +118,13 @@ type convKernelSet struct {
 	col2imStride     *cuda.Kernel
 }
 
-var (
-	convProgramOnce sync.Once
-	convSet         *convKernelSet
-	convProgramErr  error
-)
+var convCache cuda.DeviceCache[*convKernelSet]
 
 func convKernels() (*convKernelSet, error) {
-	convProgramOnce.Do(func() {
+	return convCache.Get(func() (*convKernelSet, error) {
 		program, err := cuda.Compile(convKernelSource)
 		if err != nil {
-			convProgramErr = err
-			return
+			return nil, err
 		}
 		set := &convKernelSet{}
 		for name, target := range map[string]**cuda.Kernel{
@@ -144,14 +138,13 @@ func convKernels() (*convKernelSet, error) {
 		} {
 			kernel, err := program.Function(name)
 			if err != nil {
-				convProgramErr = err
-				return
+				_ = program.Close()
+				return nil, err
 			}
 			*target = kernel
 		}
-		convSet = set
+		return set, nil
 	})
-	return convSet, convProgramErr
 }
 
 // Im2col gathers symmetric dilated patches from time-major x [batch,length,

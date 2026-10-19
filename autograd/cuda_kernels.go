@@ -97,6 +97,15 @@ extern "C" __global__ void binary_nd_bf16_f(const float* a,const float* b,float*
 extern "C" __global__ void binary_nd_b(const float* a,const float* b,const float* g,float* da,float* db,int n,Axes6 shape,Axes6 as,Axes6 bs,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;int ai=view_index(i,shape,as,0),bi=view_index(i,shape,bs,0);float x=a[ai],z=b[bi],up=g[i];if(da)atomicAdd(&da[ai],up*(op==2?z:op==3?1.0f/z:1.0f));if(db)atomicAdd(&db[bi],up*(op==0?1.0f:op==1?-1.0f:op==2?x:-x/(z*z)));}
 extern "C" __global__ void reduce_nd_f(const float* x,float* y,int n,Axes6 shape,Axes6 map,float scale){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)atomicAdd(&y[view_index(i,shape,map,0)],x[i]*scale);}
 extern "C" __global__ void reduce_nd_b(const float* g,float* dx,int n,Axes6 shape,Axes6 map,float scale){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)dx[i]+=g[view_index(i,shape,map,0)]*scale;}
+// Scalar reductions use at most 256 block atomics rather than one per element.
+// The grid-stride loop requires no scratch allocations, including in capture.
+extern "C" __global__ void reduce_scalar_f(const float* x,float* y,int n,float scale){
+ __shared__ float sums[256];float sum=0;
+ for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=blockDim.x*gridDim.x)sum+=x[i];
+ sums[threadIdx.x]=sum;__syncthreads();
+ for(int step=128;step>0;step>>=1){if(threadIdx.x<step)sums[threadIdx.x]+=sums[threadIdx.x+step];__syncthreads();}
+ if(threadIdx.x==0)atomicAdd(y,sums[0]*scale);
+}
 __device__ float warp_sum(float x){for(int delta=16;delta>0;delta>>=1)x+=__shfl_down_sync(0xffffffff,x,delta);return __shfl_sync(0xffffffff,x,0);}
 __device__ float warp_max(float x){for(int delta=16;delta>0;delta>>=1)x=fmaxf(x,__shfl_down_sync(0xffffffff,x,delta));return __shfl_sync(0xffffffff,x,0);}
 extern "C" __global__ void softmax_f(const float* x,float* y,int rows,int dim,int inner,int logmode){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int o=row/inner,j=row%inner,base=o*dim*inner+j;float mx=-3.402823466e38f;for(int k=lane;k<dim;k+=32)mx=fmaxf(mx,x[base+k*inner]);mx=warp_max(mx);float sum=0;for(int k=lane;k<dim;k+=32)sum+=expf(x[base+k*inner]-mx);sum=warp_sum(sum);float ls=logf(sum);for(int k=lane;k<dim;k+=32){int idx=base+k*inner;y[idx]=logmode?x[idx]-mx-ls:expf(x[idx]-mx)/sum;}}
@@ -168,11 +177,14 @@ extern "C" __global__ void layernorm_b(const float* x,const float* w,const float
 __device__ unsigned int dropout_hash(unsigned int i,unsigned int seed){unsigned int x=i^seed;x^=x>>16;x*=0x7feb352du;x^=x>>15;x*=0x846ca68bu;x^=x>>16;return x;}
 extern "C" __global__ void dropout_f(const float* x,float* y,int n,float p,unsigned int seed,unsigned int cutoff){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)y[i]=dropout_hash(i,seed)<cutoff?0.0f:x[i]/(1.0f-p);}
 extern "C" __global__ void dropout_b(const float* g,float* dx,int n,float p,unsigned int seed,unsigned int cutoff){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)dx[i]+=dropout_hash(i,seed)<cutoff?0.0f:g[i]/(1.0f-p);}
-extern "C" __global__ void ce_f(const float* x,const int* target,float* acc,int rows,int classes,int ignore){int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=rows||target[row]==ignore)return;int base=row*classes;float mx=-3.402823466e38f;for(int j=0;j<classes;j++)mx=fmaxf(mx,x[base+j]);float sum=0;for(int j=0;j<classes;j++)sum+=expf(x[base+j]-mx);atomicAdd(&acc[0],mx+logf(sum)-x[base+target[row]]);atomicAdd(&acc[1],1.0f);}
+extern "C" __global__ void ce_f(const float* x,const int* target,float* acc,int rows,int classes,int ignore){int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=rows||target[row]==ignore)return;int base=row*classes;float mx=-3.402823466e38f;for(int j=0;j<classes;j++)mx=fmaxf(mx,x[base+j]);float sum=0;for(int j=0;j<classes;j++)sum+=expf(x[base+j]-mx);atomicAdd(&acc[0],(mx-x[base+target[row]])+logf(sum));atomicAdd(&acc[1],1.0f);}
+extern "C" __global__ void bce_logits_f(const float* x,const float* target,float* out,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=x[i];out[i]=fmaxf(z,0.0f)-z*target[i]+log1pf(expf(-fabsf(z)));}}
+extern "C" __global__ void bce_logits_b(const float* x,const float* target,const float* g,float* dx,float* dt,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=x[i],e=expf(-fabsf(z)),sig=z>=0.0f?1.0f/(1.0f+e):e/(1.0f+e);if(dx)dx[i]+=g[i]*(sig-target[i]);if(dt)dt[i]-=g[i]*z;}}
 extern "C" __global__ void ce_finish(const float* acc,float* y){y[0]=acc[0]/acc[1];}
 extern "C" __global__ void ce_b(const float* x,const int* target,const float* acc,const float* g,float* dx,int rows,int classes,int ignore){int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=rows||target[row]==ignore||acc[1]==0)return;int base=row*classes;float mx=-3.402823466e38f;for(int j=0;j<classes;j++)mx=fmaxf(mx,x[base+j]);float sum=0;for(int j=0;j<classes;j++)sum+=expf(x[base+j]-mx);float up=g[0]/acc[1];for(int j=0;j<classes;j++)dx[base+j]+=up*(expf(x[base+j]-mx)/sum-(j==target[row]?1.0f:0.0f));}
 extern "C" __global__ void graph_adam_inc(int* step){if(threadIdx.x==0&&blockIdx.x==0)step[0]++;}
-extern "C" __global__ void graph_adamw(float* p,const float* g,float* m,float* v,const int* step,int n,float b1,float b2,float lr,float wd,float eps){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;float grad=g[i];float mm=b1*m[i]+(1.0f-b1)*grad;float vv=b2*v[i]+(1.0f-b2)*grad*grad;m[i]=mm;v[i]=vv;float bc1=1.0f-powf(b1,(float)step[0]),bc2=1.0f-powf(b2,(float)step[0]);p[i]=p[i]*(1.0f-lr*wd)-lr*(mm/bc1)/(sqrtf(vv/bc2)+eps);}
+// wd is already the effective learning rate times the group's weight decay.
+extern "C" __global__ void graph_adamw(float* p,const float* g,float* m,float* v,const int* step,int n,float b1,float b2,float lr,float wd,float eps){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;float grad=g[i];float mm=b1*m[i]+(1.0f-b1)*grad;float vv=b2*v[i]+(1.0f-b2)*grad*grad;m[i]=mm;v[i]=vv;float bc1=1.0f-powf(b1,(float)step[0]),bc2=1.0f-powf(b2,(float)step[0]);p[i]=p[i]*(1.0f-wd)-lr*(mm/bc1)/(sqrtf(vv/bc2)+eps);}
 extern "C" __global__ void add_values(float* a,const float* b,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)a[i]+=b[i];}
 extern "C" __global__ void scalar_f(const float* a,float* out,int n,float value,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float x=a[i];out[i]=op==0?x+value:op==1?x-value:op==2?x*value:x/value;}}
 extern "C" __global__ void scalar_b(const float* g,float* da,int n,float value,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)da[i]+=g[i]*(op==2?value:op==3?1.0f/value:1.0f);}
@@ -200,7 +212,18 @@ extern "C" __global__ void embedding_f(const float* w,const int* ids,float* out,
 extern "C" __global__ void embedding_b(const float* g,const int* ids,float* dw,int n,int dim,int padding){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n&&ids[i/dim]!=padding)atomicAdd(&dw[ids[i/dim]*dim+i%dim],g[i]);}
 extern "C" __global__ void reduce_f(const float* x,float* y,int n,int d1,int d2,int r0,int r1,int r2,float scale){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){int j=(i/(d1*d2))*r0+((i/d2)%d1)*r1+(i%d2)*r2;atomicAdd(&y[j],x[i]*scale);}}
 extern "C" __global__ void reduce_b(const float* g,float* dx,int n,int d1,int d2,int r0,int r1,int r2,float scale){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){int j=(i/(d1*d2))*r0+((i/d2)%d1)*r1+(i%d2)*r2;dx[i]+=g[j]*scale;}}
-extern "C" __global__ void group_stats(const float* x,float* stats,int batch,int time,int channels,int groups,float eps){int q=blockIdx.x;if(q>=batch*groups)return;int n=q/groups,gr=q%groups,cg=channels/groups,count=time*cg;__shared__ float sums[256],squares[256];float sum=0,sq=0;for(int k=threadIdx.x;k<count;k+=blockDim.x){int at=k/cg,ch=gr*cg+k%cg;float v=x[(n*time+at)*channels+ch];sum+=v;sq+=v*v;}sums[threadIdx.x]=sum;squares[threadIdx.x]=sq;__syncthreads();for(int step=128;step>0;step>>=1){if(threadIdx.x<step){sums[threadIdx.x]+=sums[threadIdx.x+step];squares[threadIdx.x]+=squares[threadIdx.x+step];}__syncthreads();}if(threadIdx.x==0){float mean=sums[0]/count,var=fmaxf(squares[0]/count-mean*mean,0.0f);stats[q*4]=mean;stats[q*4+1]=rsqrtf(var+eps);}}
+extern "C" __global__ void group_stats(const float* x,float* stats,int batch,int time,int channels,int groups,float eps){
+ int q=blockIdx.x;if(q>=batch*groups)return;int n=q/groups,gr=q%groups,cg=channels/groups,count=time*cg;
+ __shared__ float sums[256];float sum=0;
+ for(int k=threadIdx.x;k<count;k+=blockDim.x){int at=k/cg,ch=gr*cg+k%cg;sum+=x[(n*time+at)*channels+ch];}
+ sums[threadIdx.x]=sum;__syncthreads();
+ for(int step=128;step>0;step>>=1){if(threadIdx.x<step)sums[threadIdx.x]+=sums[threadIdx.x+step];__syncthreads();}
+ float mean=sums[0]/count;__syncthreads();
+ float ss=0;for(int k=threadIdx.x;k<count;k+=blockDim.x){int at=k/cg,ch=gr*cg+k%cg;float d=x[(n*time+at)*channels+ch]-mean;ss+=d*d;}
+ sums[threadIdx.x]=ss;__syncthreads();
+ for(int step=128;step>0;step>>=1){if(threadIdx.x<step)sums[threadIdx.x]+=sums[threadIdx.x+step];__syncthreads();}
+ if(threadIdx.x==0){stats[q*4]=mean;stats[q*4+1]=rsqrtf(sums[0]/count+eps);}
+}
 extern "C" __global__ void group_f(const float* x,const float* w,const float* b,const float* stats,float* out,int n,int time,int channels,int groups){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){int ch=i%channels,gr=ch/(channels/groups),sample=i/(time*channels),q=sample*groups+gr;out[i]=(x[i]-stats[q*4])*stats[q*4+1]*w[ch]+b[ch];}}
 extern "C" __global__ void group_backstats(const float* x,const float* w,const float* g,float* stats,int time,int channels,int groups){int q=blockIdx.x;int sample=q/groups,gr=q%groups,cg=channels/groups,count=time*cg;__shared__ float sums[256],sumn[256];float a=0,b=0,mean=stats[q*4],inv=stats[q*4+1];for(int k=threadIdx.x;k<count;k+=blockDim.x){int at=k/cg,ch=gr*cg+k%cg,i=(sample*time+at)*channels+ch;float z=g[i]*w[ch];a+=z;b+=z*(x[i]-mean)*inv;}sums[threadIdx.x]=a;sumn[threadIdx.x]=b;__syncthreads();for(int step=128;step>0;step>>=1){if(threadIdx.x<step){sums[threadIdx.x]+=sums[threadIdx.x+step];sumn[threadIdx.x]+=sumn[threadIdx.x+step];}__syncthreads();}if(threadIdx.x==0){stats[q*4+2]=sums[0];stats[q*4+3]=sumn[0];}}
 extern "C" __global__ void group_b(const float* x,const float* w,const float* g,const float* stats,float* dx,float* dw,float* db,int n,int time,int channels,int groups){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){int ch=i%channels,gr=ch/(channels/groups),sample=i/(time*channels),q=sample*groups+gr,count=time*(channels/groups);float norm=(x[i]-stats[q*4])*stats[q*4+1];if(dx)dx[i]+=stats[q*4+1]*(count*g[i]*w[ch]-stats[q*4+2]-norm*stats[q*4+3])/count;if(dw)atomicAdd(&dw[ch],g[i]*norm);if(db)atomicAdd(&db[ch],g[i]);}}
@@ -212,29 +235,14 @@ extern "C" __global__ void global_norm_parts(const unsigned long long* ptrs,cons
 extern "C" __global__ void scale_all_grads(const unsigned long long* ptrs,const int* sizes,const float* norm,int count,float maxNorm){int p=blockIdx.x;if(p>=count)return;float* g=(float*)ptrs[p];int n=sizes[p];float f=fminf(1.0f,maxNorm/(norm[0]+1e-6f));for(int i=threadIdx.x;i<n;i+=blockDim.x)g[i]*=f;}
 `
 
-var graphOnce sync.Once
-var graphProgram *cuda.Program
-var graphKernels map[string]*cuda.Kernel
-var graphErr error
+var graphCache cuda.KernelCache
 
 func graphKernel(name string) *cuda.Kernel {
-	graphOnce.Do(func() {
-		graphProgram, graphErr = cuda.Compile(graphSource)
-		if graphErr != nil {
-			return
-		}
-		graphKernels = map[string]*cuda.Kernel{}
-		for _, n := range []string{"copy_values", "f32_to_bf16", "set_one", "write_clip_entry", "view_gather", "view_gather_bf16", "view_scatter", "binary_nd_f", "binary_nd_bf16_f", "binary_nd_b", "reduce_nd_f", "reduce_nd_b", "softmax_f", "softmax_b", "attn_softmax_f", "attn_softmax_b", "flash_attention_tiled_f", "flash_attention_tiled_b", "layernorm_f", "layernorm_b", "layernorm_bf16_f", "bias_gelu_f", "bias_gelu_bf16_f", "bias_gelu_b", "bias_residual_f", "bias_residual_bf16_f", "bias_residual_b", "dropout_f", "dropout_b", "ce_f", "ce_finish", "ce_b", "graph_adam_inc", "graph_adamw", "add_values", "scalar_f", "scalar_b", "binary_f", "binary_b", "binary_bf16_f", "unary_f", "unary_b", "permute_f", "permute_b", "concat_f", "concat_b", "slice_f", "slice_b", "embedding_f", "embedding_b", "reduce_f", "reduce_b", "group_stats", "group_f", "group_backstats", "group_b", "masked_f", "masked_finish", "masked_b", "scale_grad", "global_norm_parts", "scale_all_grads"} {
-			graphKernels[n], graphErr = graphProgram.Function(n)
-			if graphErr != nil {
-				return
-			}
-		}
-	})
-	if graphErr != nil {
-		panic(graphErr)
+	functions, err := graphCache.Get(graphSource, "reduce_scalar_f", "copy_values", "f32_to_bf16", "set_one", "write_clip_entry", "view_gather", "view_gather_bf16", "view_scatter", "binary_nd_f", "binary_nd_bf16_f", "binary_nd_b", "reduce_nd_f", "reduce_nd_b", "softmax_f", "softmax_b", "attn_softmax_f", "attn_softmax_b", "flash_attention_tiled_f", "flash_attention_tiled_b", "layernorm_f", "layernorm_b", "layernorm_bf16_f", "bias_gelu_f", "bias_gelu_bf16_f", "bias_gelu_b", "bias_residual_f", "bias_residual_bf16_f", "bias_residual_b", "dropout_f", "dropout_b", "ce_f", "ce_finish", "ce_b", "bce_logits_f", "bce_logits_b", "graph_adam_inc", "graph_adamw", "add_values", "scalar_f", "scalar_b", "binary_f", "binary_b", "binary_bf16_f", "unary_f", "unary_b", "binary_bf16_f", "permute_f", "permute_b", "concat_f", "concat_b", "slice_f", "slice_b", "embedding_f", "embedding_b", "reduce_f", "reduce_b", "group_stats", "group_f", "group_backstats", "group_b", "masked_f", "masked_finish", "masked_b", "scale_grad", "global_norm_parts", "scale_all_grads")
+	if err != nil {
+		panic(err)
 	}
-	return graphKernels[name]
+	return functions[name]
 }
 func launch(name string, n int, args ...unsafe.Pointer) {
 	if n <= 0 {

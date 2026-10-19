@@ -1,7 +1,6 @@
 package autograd
 
 import (
-	"sync"
 	"unsafe"
 
 	"github.com/yh2237/gograd/cuda"
@@ -19,30 +18,15 @@ extern "C" __global__ void sgd_mark(float* initialized){if(threadIdx.x==0&&block
 extern "C" __global__ void sgd_step(int* step){if(threadIdx.x==0&&blockIdx.x==0)step[0]+=1;}
 `
 
-var sgdOnce sync.Once
-var sgdProgram *cuda.Program
-var sgdKernels map[string]*cuda.Kernel
-var sgdCompileErr error
+var sgdCache cuda.KernelCache
 
 func launchSGD(name string, n int, args ...unsafe.Pointer) {
-	sgdOnce.Do(func() {
-		sgdProgram, sgdCompileErr = cuda.Compile(sgdSource)
-		if sgdCompileErr != nil {
-			return
-		}
-		sgdKernels = make(map[string]*cuda.Kernel)
-		for _, key := range []string{"sgd_update", "sgd_mark", "sgd_step"} {
-			sgdKernels[key], sgdCompileErr = sgdProgram.Function(key)
-			if sgdCompileErr != nil {
-				return
-			}
-		}
-	})
-	if sgdCompileErr != nil {
-		panic(sgdCompileErr)
+	functions, err := sgdCache.Get(sgdSource, "sgd_update", "sgd_mark", "sgd_step")
+	if err != nil {
+		panic(err)
 	}
 	timedGPU(name, func() error {
-		return sgdKernels[name].Launch([3]int{(n + 255) / 256, 1, 1}, [3]int{256, 1, 1}, 0, nil, args)
+		return functions[name].Launch([3]int{(n + 255) / 256, 1, 1}, [3]int{256, 1, 1}, 0, nil, args)
 	})
 }
 func sgdFreeStorage(buffers, flags []*cuda.Buffer) {

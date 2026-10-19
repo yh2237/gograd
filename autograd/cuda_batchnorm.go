@@ -1,7 +1,6 @@
 package autograd
 
 import (
-	"sync"
 	"unsafe"
 
 	"github.com/yh2237/gograd/cuda"
@@ -48,30 +47,15 @@ extern "C" __global__ void bn_dx(const float* x,const float* g,const float* weig
 }
 `
 
-var batchNormOnce sync.Once
-var batchNormProgram *cuda.Program
-var batchNormKernels map[string]*cuda.Kernel
-var batchNormCompileErr error
+var batchNormCache cuda.KernelCache
 
 func launchBatchNorm(name string, grid, block int, args ...unsafe.Pointer) {
-	batchNormOnce.Do(func() {
-		batchNormProgram, batchNormCompileErr = cuda.Compile(batchNormSource)
-		if batchNormCompileErr != nil {
-			return
-		}
-		batchNormKernels = make(map[string]*cuda.Kernel)
-		for _, key := range []string{"bn_counter", "bn_stats", "bn_f", "bn_grad_stats", "bn_dx"} {
-			batchNormKernels[key], batchNormCompileErr = batchNormProgram.Function(key)
-			if batchNormCompileErr != nil {
-				return
-			}
-		}
-	})
-	if batchNormCompileErr != nil {
-		panic(batchNormCompileErr)
+	functions, err := batchNormCache.Get(batchNormSource, "bn_counter", "bn_stats", "bn_f", "bn_grad_stats", "bn_dx")
+	if err != nil {
+		panic(err)
 	}
 	timedGPU(name, func() error {
-		return batchNormKernels[name].Launch([3]int{grid, 1, 1}, [3]int{block, 1, 1}, 0, nil, args)
+		return functions[name].Launch([3]int{grid, 1, 1}, [3]int{block, 1, 1}, 0, nil, args)
 	})
 }
 

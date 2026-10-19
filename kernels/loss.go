@@ -3,7 +3,6 @@ package kernels
 import (
 	"github.com/yh2237/gograd/cuda"
 	"runtime"
-	"sync"
 	"unsafe"
 )
 
@@ -183,28 +182,14 @@ extern "C" __global__ void sequence_loss_grad(
 
 const sequenceLossBlock = 256
 
-var (
-	lossProgramOnce sync.Once
-	lossProgram     *cuda.Program
-	lossKernel      *cuda.Kernel
-	lossProgramErr  error
-)
+var lossCache cuda.KernelCache
 
 func lossKernels() (*cuda.Kernel, error) {
-	lossProgramOnce.Do(func() {
-		program, err := cuda.Compile(sequenceLossSource)
-		if err != nil {
-			lossProgramErr = err
-			return
-		}
-		kernel, err := program.Function("sequence_loss_grad")
-		if err != nil {
-			lossProgramErr = err
-			return
-		}
-		lossProgram, lossKernel = program, kernel
-	})
-	return lossKernel, lossProgramErr
+	functions, err := lossCache.Get(sequenceLossSource, "sequence_loss_grad")
+	if err != nil {
+		return nil, err
+	}
+	return functions["sequence_loss_grad"], nil
 }
 
 // SequenceLossGrad computes the masked loss and its gradient with respect to
@@ -215,9 +200,6 @@ func lossKernels() (*cuda.Kernel, error) {
 func SequenceLossGrad(predicted, target, mask, gradient, loss *cuda.Buffer, rows, time, totalValid, totalPairs int, bounded bool, low, high, deltaWeight float64) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	if !cuda.InCapture() {
-		_ = cuda.SetDevice(0)
-	}
 	kernel, err := lossKernels()
 	if err != nil {
 		return err

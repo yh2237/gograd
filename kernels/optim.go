@@ -2,7 +2,6 @@ package kernels
 
 import (
 	"github.com/yh2237/gograd/cuda"
-	"sync"
 	"unsafe"
 )
 
@@ -34,19 +33,13 @@ type optimKernelSet struct {
 	adamw      *cuda.Kernel
 }
 
-var (
-	optimProgramOnce sync.Once
-	optimProgram     *cuda.Program
-	optimSet         *optimKernelSet
-	optimErr         error
-)
+var optimCache cuda.DeviceCache[*optimKernelSet]
 
 func optimKernels() (*optimKernelSet, error) {
-	optimProgramOnce.Do(func() {
+	return optimCache.Get(func() (*optimKernelSet, error) {
 		program, err := cuda.Compile(optimKernelSource)
 		if err != nil {
-			optimErr = err
-			return
+			return nil, err
 		}
 		set := &optimKernelSet{}
 		for name, target := range map[string]**cuda.Kernel{
@@ -56,14 +49,13 @@ func optimKernels() (*optimKernelSet, error) {
 		} {
 			kernel, err := program.Function(name)
 			if err != nil {
-				optimErr = err
-				return
+				_ = program.Close()
+				return nil, err
 			}
 			*target = kernel
 		}
-		optimProgram, optimSet = program, set
+		return set, nil
 	})
-	return optimSet, optimErr
 }
 
 // SumSquares accumulates the sum of x[i]^2 into acc[0].

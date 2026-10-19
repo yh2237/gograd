@@ -24,11 +24,24 @@ type clipState struct {
 
 var (
 	clipMu     sync.Mutex
-	clipStates = map[uintptr]*clipState{}
+	clipStates = map[clipStateKey]*clipState{}
 )
 
+type clipStateKey struct {
+	thread uintptr
+	device int
+}
+
+func currentClipKey() clipStateKey {
+	device, err := cuda.CurrentDevice()
+	if err != nil {
+		panic(err)
+	}
+	return clipStateKey{cuda.ThreadID(), device}
+}
+
 func clipStateForThread() *clipState {
-	id := cuda.ThreadID()
+	id := currentClipKey()
 	clipMu.Lock()
 	defer clipMu.Unlock()
 	state := clipStates[id]
@@ -40,18 +53,29 @@ func clipStateForThread() *clipState {
 }
 
 func currentClipState() *clipState {
+	device, err := cuda.CurrentDevice()
+	if err != nil {
+		return nil
+	}
+	id := clipStateKey{cuda.ThreadID(), device}
 	clipMu.Lock()
 	defer clipMu.Unlock()
-	return clipStates[cuda.ThreadID()]
+	return clipStates[id]
 }
 
 func getClipPlan(params []Parameter) *clipPlan {
 	state := clipStateForThread()
-	addresses := make([]uintptr, len(params))
-	sizes := make([]int32, len(params))
-	for i, p := range params {
-		addresses[i] = p.Value.ensureGradGPU().Pointer()
-		sizes[i] = int32(p.Value.Numel())
+	addresses := make([]uintptr, 0, len(params))
+	sizes := make([]int32, 0, len(params))
+	for _, p := range params {
+		// Clipping observes gradients, it must not create them. In particular,
+		// manufacturing a zero gradient makes optimizers decay unused weights
+		// and initializes SGD momentum that should still be absent.
+		if p.Value == nil || p.Value.gradBuf == nil {
+			continue
+		}
+		addresses = append(addresses, p.Value.gradBuf.Pointer())
+		sizes = append(sizes, int32(p.Value.Numel()))
 	}
 	if old := state.plan; old != nil && len(old.ptrs) == len(addresses) {
 		equal := true
@@ -68,8 +92,14 @@ func getClipPlan(params []Parameter) *clipPlan {
 		}
 	}
 	if state.plan != nil {
-		state.plan.addresses.Free()
-		state.plan.sizes.Free()
+		if state.plan.addresses != nil {
+			state.plan.addresses.Free()
+			state.plan.sizes.Free()
+		}
+	}
+	if len(addresses) == 0 {
+		state.plan = &clipPlan{}
+		return state.plan
 	}
 	a := mustAlloc(len(addresses) * 2)
 	s := mustAlloc(len(sizes))
@@ -83,22 +113,22 @@ func getClipPlan(params []Parameter) *clipPlan {
 }
 func clipGPU(params []Parameter, maxNorm float32) {
 	state := clipStateForThread()
-	if state.norm != nil {
-		state.norm.Free()
+	if state.norm == nil {
+		state.norm = mustAlloc(1)
 	}
-	norm := mustAlloc(1)
+	norm := state.norm
 	if e := norm.Memset(0, 4); e != nil {
 		panic(e)
 	}
 	plan := getClipPlan(params)
 	ap, sp, np := ptr(plan.addresses), ptr(plan.sizes), ptr(norm)
-	count := int32(len(params))
-	launch("global_norm_parts", len(params)*256, unsafe.Pointer(&ap), unsafe.Pointer(&sp), unsafe.Pointer(&np), unsafe.Pointer(&count))
+	count := int32(len(plan.ptrs))
+	launch("global_norm_parts", int(count)*256, unsafe.Pointer(&ap), unsafe.Pointer(&sp), unsafe.Pointer(&np), unsafe.Pointer(&count))
 	if e := kernels.SqrtScalar(norm); e != nil {
 		panic(e)
 	}
 	if maxNorm > 0 {
-		launch("scale_all_grads", len(params)*256, unsafe.Pointer(&ap), unsafe.Pointer(&sp), unsafe.Pointer(&np), unsafe.Pointer(&count), unsafe.Pointer(&maxNorm))
+		launch("scale_all_grads", int(count)*256, unsafe.Pointer(&ap), unsafe.Pointer(&sp), unsafe.Pointer(&np), unsafe.Pointer(&count), unsafe.Pointer(&maxNorm))
 	}
 	state.norm = norm
 }

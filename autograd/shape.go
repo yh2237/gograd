@@ -176,14 +176,23 @@ func Concat(axis int, inputs ...*Tensor) *Tensor {
 	if inferenceDevice(inputs[0].Device) {
 		return inferenceConcat(axis, inputs...)
 	}
+	if axis < 0 {
+		axis += len(inputs[0].Shape)
+	}
+	if axis < 0 || axis >= len(inputs[0].Shape) {
+		panic("autograd: invalid concat axis")
+	}
+	// Variadic arguments may alias a caller-owned slice. Keep our compact
+	// handles and backward dependencies independent of later caller edits.
+	inputs = append([]*Tensor(nil), inputs...)
 	same(inputs[0], inputs[1:]...)
 	s := append([]int(nil), inputs[0].Shape...)
-	if axis < 0 {
-		axis += len(s)
-	}
 	s[axis] = 0
 	for _, x := range inputs {
 		same(inputs[0], x)
+		if len(x.Shape) != len(s) {
+			panic("autograd: concat shape")
+		}
 		for i, d := range x.Shape {
 			if i != axis && d != s[i] {
 				panic("autograd: concat shape")
@@ -197,6 +206,14 @@ func Concat(axis int, inputs ...*Tensor) *Tensor {
 	if dispatchBackend("concat", inputs[0].Device) {
 		out := inputs[0]
 		for _, p := range inputs[1:] {
+			if out == p {
+				// concat_b writes each occurrence from different threads. A
+				// zero-copy identity gives duplicates distinct adjoint buffers,
+				// then accumulates them into the shared parent in graph order.
+				if _, recording := graphRecording([]*Tensor{p}); recording {
+					p = makeView(p, p.Shape, p.Strides, p.Offset)
+				}
+			}
 			out = gpuConcat(axis, out, p)
 		}
 		return out
@@ -204,29 +221,31 @@ func Concat(axis int, inputs ...*Tensor) *Tensor {
 	v := cpuAlloc(numel(s))
 	outer := numel(s[:axis])
 	inner := numel(s[axis+1:])
+	width := s[axis] * inner
+	sizes, offsets := make([]int, len(inputs)), make([]int, len(inputs))
+	offset := 0
+	for i, x := range inputs {
+		sizes[i], offsets[i] = x.Shape[axis]*inner, offset
+		offset += sizes[i]
+	}
 	for o := 0; o < outer; o++ {
-		off := 0
-		for _, x := range inputs {
-			size := x.Shape[axis] * inner
-			copy(v[o*s[axis]*inner+off:], x.Data[o*size:(o+1)*size])
-			off += size
+		for i, x := range inputs {
+			size := sizes[i]
+			copy(v[o*width+offsets[i]:], x.Data[o*size:(o+1)*size])
 		}
 	}
 	return result(v, s, inputs, func(g []float32) {
-		for _, x := range inputs {
-			dx := make([]float32, len(x.Data))
+		for i, x := range inputs {
+			if !x.RequiresGrad {
+				continue
+			}
+			dx := cpuAlloc(outer * sizes[i])
 			for o := 0; o < outer; o++ {
-				off := 0
-				for _, p := range inputs {
-					if p == x {
-						size := x.Shape[axis] * inner
-						copy(dx[o*size:(o+1)*size], g[o*s[axis]*inner+off:])
-						break
-					}
-					off += p.Shape[axis] * inner
-				}
+				size := sizes[i]
+				copy(dx[o*size:(o+1)*size], g[o*width+offsets[i]:])
 			}
 			x.addGrad(dx)
+			cpuRelease(dx)
 		}
 	})
 }
@@ -394,6 +413,9 @@ func EmbeddingWithPadding(weight *Tensor, ids []int, shape []int, paddingIdx int
 	if paddingIdx < -1 || paddingIdx >= weight.Shape[0] {
 		panic("autograd: padding index")
 	}
+	// Host metadata belongs to the caller, not the saved backward state.
+	ids = append([]int(nil), ids...)
+	shape = append([]int(nil), shape...)
 	dim := weight.Shape[1]
 	s := append(append([]int(nil), shape...), dim)
 	if useCUDA {

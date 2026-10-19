@@ -1,7 +1,6 @@
 package autograd
 
 import (
-	"sync"
 	"unsafe"
 
 	"github.com/yh2237/gograd/cuda"
@@ -60,30 +59,15 @@ extern "C" __global__ void pool2d_b(const float* g,const int* indices,float* dx,
 }
 `
 
-var pool2dOnce sync.Once
-var pool2dProgram *cuda.Program
-var pool2dKernels map[string]*cuda.Kernel
-var pool2dCompileErr error
+var pool2dCache cuda.KernelCache
 
 func launchPool2d(name string, n int, args ...unsafe.Pointer) {
-	pool2dOnce.Do(func() {
-		pool2dProgram, pool2dCompileErr = cuda.Compile(pool2dSource)
-		if pool2dCompileErr != nil {
-			return
-		}
-		pool2dKernels = make(map[string]*cuda.Kernel)
-		for _, key := range []string{"pool2d_f", "pool2d_b"} {
-			pool2dKernels[key], pool2dCompileErr = pool2dProgram.Function(key)
-			if pool2dCompileErr != nil {
-				return
-			}
-		}
-	})
-	if pool2dCompileErr != nil {
-		panic(pool2dCompileErr)
+	functions, err := pool2dCache.Get(pool2dSource, "pool2d_f", "pool2d_b")
+	if err != nil {
+		panic(err)
 	}
 	timedGPU(name, func() error {
-		return pool2dKernels[name].Launch([3]int{(n + 255) / 256, 1, 1}, [3]int{256, 1, 1}, 0, nil, args)
+		return functions[name].Launch([3]int{(n + 255) / 256, 1, 1}, [3]int{256, 1, 1}, 0, nil, args)
 	})
 }
 

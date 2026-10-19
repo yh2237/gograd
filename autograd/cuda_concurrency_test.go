@@ -179,6 +179,8 @@ func TestClipPlanFollowsParameterAddresses(t *testing.T) {
 	defer ctx.Close()
 	first := Parameter{Name: "first", Value: conv2dTestTensor(t, []float32{1, 2, 3}, []int{3}, tensor.CUDA, true)}
 	second := Parameter{Name: "second", Value: conv2dTestTensor(t, []float32{4, 5}, []int{2}, tensor.CUDA, true)}
+	first.Value.ensureGradGPU()
+	second.Value.ensureGradGPU()
 	plan := getClipPlan([]Parameter{first})
 	if len(plan.ptrs) != 1 {
 		t.Fatalf("plan has %d pointers", len(plan.ptrs))
@@ -222,11 +224,13 @@ func TestClipPlanChecksElementCounts(t *testing.T) {
 	defer ctx.Close()
 	// Both shapes round into the same size class, so the pool can reuse the block.
 	first := conv2dTestTensor(t, []float32{1, 2, 3}, []int{3}, tensor.CUDA, true)
+	first.ensureGradGPU()
 	plan := getClipPlan([]Parameter{{Name: "first", Value: first}})
 	address := plan.ptrs[0]
 	first.Close()
 	second := conv2dTestTensor(t, []float32{9, 8}, []int{2}, tensor.CUDA, true)
-	if second.buf.Pointer() != address {
+	second.ensureGradGPU()
+	if second.gradBuf.Pointer() != address {
 		t.Skip("pool did not reuse the address; nothing to compare")
 	}
 	rebuilt := getClipPlan([]Parameter{{Name: "second", Value: second}})

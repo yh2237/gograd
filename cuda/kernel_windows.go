@@ -164,8 +164,8 @@ func compileModule(source string) (uintptr, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := SetDevice(0); err == nil {
-		_ = initializeContext()
+	if err := initializeContext(); err != nil {
+		return 0, err
 	}
 	device, err := CurrentDevice()
 	if err != nil {

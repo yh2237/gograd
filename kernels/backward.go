@@ -1,7 +1,6 @@
 package kernels
 
 import (
-	"sync"
 	"unsafe"
 
 	"github.com/yh2237/gograd/cuda"
@@ -70,18 +69,13 @@ type backwardKernelSet struct {
 	sumOverBatch   *cuda.Kernel
 }
 
-var (
-	backwardProgramOnce sync.Once
-	backwardSet         *backwardKernelSet
-	backwardErr         error
-)
+var backwardCache cuda.DeviceCache[*backwardKernelSet]
 
 func backwardKernels() (*backwardKernelSet, error) {
-	backwardProgramOnce.Do(func() {
+	return backwardCache.Get(func() (*backwardKernelSet, error) {
 		program, err := cuda.Compile(backwardKernelSource)
 		if err != nil {
-			backwardErr = err
-			return
+			return nil, err
 		}
 		set := &backwardKernelSet{}
 		for name, target := range map[string]**cuda.Kernel{
@@ -94,14 +88,13 @@ func backwardKernels() (*backwardKernelSet, error) {
 		} {
 			kernel, err := program.Function(name)
 			if err != nil {
-				backwardErr = err
-				return
+				_ = program.Close()
+				return nil, err
 			}
 			*target = kernel
 		}
-		backwardSet = set
+		return set, nil
 	})
-	return backwardSet, backwardErr
 }
 
 func int32Args(values ...int32) []unsafe.Pointer {

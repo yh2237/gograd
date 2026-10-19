@@ -263,8 +263,10 @@ func CrossEntropy(logits *Tensor, targets []int, ignoreIndex int) *Tensor {
 			ids[i] = int32(id)
 		}
 		idBuf := mustAlloc(rows)
-		if err := idBuf.CopyFromHost(unsafe.Slice((*byte)(unsafe.Pointer(&ids[0])), rows*4)); err != nil {
-			panic(err)
+		if rows > 0 {
+			if err := idBuf.CopyFromHost(unsafe.Slice((*byte)(unsafe.Pointer(&ids[0])), rows*4)); err != nil {
+				panic(err)
+			}
 		}
 		acc := mustAlloc(2)
 		if err := acc.Memset(0, acc.Size()); err != nil {
@@ -284,6 +286,8 @@ func CrossEntropy(logits *Tensor, targets []int, ignoreIndex int) *Tensor {
 		res.aux = []*cuda.Buffer{idBuf, acc}
 		return res
 	}
+	// The caller may reuse its host target buffer before backward.
+	targets = append([]int(nil), targets...)
 	count := 0
 	var loss float32
 	for row, id := range targets {
@@ -299,7 +303,7 @@ func CrossEntropy(logits *Tensor, targets []int, ignoreIndex int) *Tensor {
 		for j := 0; j < classes; j++ {
 			sum += float32(math.Exp(float64(logits.Data[base+j] - mx)))
 		}
-		loss += mx + float32(math.Log(float64(sum))) - logits.Data[base+id]
+		loss += (mx - logits.Data[base+id]) + float32(math.Log(float64(sum)))
 		count++
 	}
 	if count > 0 {
@@ -323,10 +327,11 @@ func CrossEntropy(logits *Tensor, targets []int, ignoreIndex int) *Tensor {
 				}
 				var sum float32
 				for j := 0; j < classes; j++ {
-					sum += float32(math.Exp(float64(logits.Data[base+j] - mx)))
+					dx[base+j] = float32(math.Exp(float64(logits.Data[base+j] - mx)))
+					sum += dx[base+j]
 				}
 				for j := 0; j < classes; j++ {
-					dx[base+j] = g[0] / float32(count) * float32(math.Exp(float64(logits.Data[base+j]-mx))) / sum
+					dx[base+j] *= g[0] / float32(count) / sum
 				}
 				dx[base+id] -= g[0] / float32(count)
 			}
