@@ -81,7 +81,7 @@ func run(args []string, out io.Writer) error {
 	c := config{}
 	fs := flag.NewFlagSet("gpu-infer-bench", flag.ContinueOnError)
 	fs.StringVar(&c.Devices, "devices", "cpu,vulkan,directml", "comma-separated devices; no automatic CPU fallback")
-	fs.StringVar(&c.Workloads, "workloads", "gemm,projection,ffn,encoder", "gemm, projection, ffn, encoder")
+	fs.StringVar(&c.Workloads, "workloads", "gemm,projection,ffn,encoder", "gemm, projection, ffn, encoder, gelu (tanh approximation), layernorm")
 	fs.IntVar(&c.Size, "size", 768, "model width and square GEMM dimension")
 	fs.IntVar(&c.Hidden, "hidden", 3072, "feed-forward width")
 	fs.IntVar(&c.Heads, "heads", 12, "encoder attention heads")
@@ -204,7 +204,7 @@ func validate(c config) error {
 	for _, list := range []struct {
 		value string
 		valid []string
-	}{{c.Devices, []string{"cpu", "vulkan", "directml"}}, {c.Workloads, []string{"gemm", "projection", "ffn", "encoder"}}} {
+	}{{c.Devices, []string{"cpu", "vulkan", "directml"}}, {c.Workloads, []string{"gemm", "projection", "ffn", "encoder", "gelu", "layernorm"}}} {
 		seen := map[string]bool{}
 		for _, s := range strings.Split(list.value, ",") {
 			s = strings.TrimSpace(s)
@@ -287,6 +287,26 @@ func build(c config, name string, device tensor.Device) (_ *workload, err error)
 			h := autograd.BiasGELU(autograd.MatMul(x, autograd.Transpose(w1, 0, 1)), b1)
 			return autograd.Add(autograd.MatMul(h, autograd.Transpose(w2, 0, 1)), b2)
 		}
+	case "gelu":
+		x, err := newTensor([]int{c.Batch, c.Sequence, c.Hidden}, 3)
+		if err != nil {
+			return nil, err
+		}
+		forward = func() *autograd.Tensor { return autograd.GELU(x, true) }
+	case "layernorm":
+		x, err := newTensor([]int{c.Batch, c.Sequence, c.Size}, 1)
+		if err != nil {
+			return nil, err
+		}
+		weight, err := newTensor([]int{c.Size}, 1)
+		if err != nil {
+			return nil, err
+		}
+		bias, err := newTensor([]int{c.Size}, .1)
+		if err != nil {
+			return nil, err
+		}
+		forward = func() *autograd.Tensor { return autograd.LayerNorm(x, weight, bias, 1e-5) }
 	case "encoder":
 		x, err := newTensor([]int{c.Batch, c.Sequence, c.Channels}, 1)
 		if err != nil {

@@ -17,7 +17,7 @@ func TestCPUWorkloads(t *testing.T) {
 	if err := validate(c); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"gemm", "projection", "ffn", "encoder"} {
+	for _, name := range []string{"gemm", "projection", "ffn", "encoder", "gelu", "layernorm"} {
 		t.Run(name, func(t *testing.T) {
 			want, err := reference(c, name)
 			if err != nil {
