@@ -231,5 +231,5 @@ Encoderの中央値は約9.5%短縮したものの、CPUも573.8→547.0 msと�
 - まだ各submitでフェンスを待つ。DirectMLの近似GELUと正規化内部はバッチ化したが、forward全体の記録のまとめは未実装。
 - DirectMLのtanh近似GELUは1つのcommand list内で複数dispatch。カーネル融合やcacheの調整余地も残る。
 - GPUのmemory統計はgraph解放後でも入力と重みが常駐した状態を表す。プロセス全体のVRAM量ではない。
-- LinuxのVulkanローダー、AMD / Intelでの実機検証、READMEへの統合は別作業。
+- LinuxのVulkanローダーは実装したが、Linuxでの実GPU計算・性能検証、AMD / Intelでの実機検証、READMEへの統合は別作業。
   READMEにある既存の未コミット変更は、この性能検証のコミットへ混ぜていない。

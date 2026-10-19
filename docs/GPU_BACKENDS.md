@@ -2,14 +2,16 @@
 
 ローカルの`notes/gpu-backend-plan.md`に沿って、M0の共通APIとCUDAアダプタ、
 M1のWindows/amd64向けVulkan基盤、M2のGEMMとview、M3のトランスフォーマー向け演算、
-M4のWindows/amd64向けDirectML基盤、M5のDirectML向けトランスフォーマー演算を実装した。LinuxのVulkanローダーは未実装。
+M4のWindows/amd64向けDirectML基盤、M5のDirectML向けトランスフォーマー演算を実装した。
+Linux/amd64にもcgoなしのVulkanローダーを実装した。ただしLinuxでの実GPU計算は未検証。条件と検証範囲は[Linux版Vulkan](GPU_LINUX.md)を参照。
 M6では共通の推論ベンチマーク、DirectMLのviewコピー削減と複合演算内のcommand記録のまとめ、Vulkanのbias融合演算を追加した。計測条件と実測は[性能検証](GPU_BACKEND_PERFORMANCE.md)にまとめている。
 
 | デバイス | 実行環境 | 現在の範囲 |
 | --- | --- | --- |
 | CPU / CUDA | 従来どおり | 既存の推論・学習。CUDAの新アダプタも利用可 |
 | Vulkan | Windows/amd64、Vulkan 1.1以上の計算GPU | 基本演算、GEMM、view、正規化、Conv1d、構成演算による自己注意。推論のみ |
-| Vulkan | Linux、その他のOS/アーキテクチャ | スタブ。`Available() == false` |
+| Vulkan | Linux/amd64 | ローダーと演算経路を実装。Windowsと共有する推論機能。実GPU計算は未検証 |
+| Vulkan | その他のOS/アーキテクチャ（Linux/arm64、Androidを含む） | スタブ。`Available() == false` |
 | DirectML | Windows/amd64、DirectMLとD3D12対応の計算GPU | 基本演算、GEMM、view、正規化、Conv1d、構成演算による自己注意。推論のみ。erf式GELUはfeature level 5.1以上 |
 | DirectML | その他のOS/アーキテクチャ | スタブ。`Available() == false` |
 
@@ -27,6 +29,9 @@ M6では共通の推論ベンチマーク、DirectMLのviewコピー削減と複
 - 非CPU/CUDAデバイスでのbackward、AdamW、SGD、勾配クリップを明示的に拒否する。
 - 未接続のデバイスの演算を、CPUやCUDAとして誤って実行しない。
 - Vulkanのヘッドレスinstance/device/compute queueを実装。discrete GPUとcompute-only queueを優先し、CPU型のソフトウェアデバイスは選ばない。
+- Windows/Linux amd64でABI型・デバイス選択・バッファ・command記録・シェーダを共有する。
+  Windowsの呼出しは標準の`syscall`、Linuxは`purego v0.11.2`の`dlopen` / SysV関数呼出しを使う。
+  LinuxでもビルドにcgoやCコンパイラは不要。ただし標準のlibc / libdlとVulkanローダー・ICDが実行時に必要。
 - device-localバッファとhost-visible/coherentなステージングバッファ、転送とバリア、フェンスを実装。
 - 埋め込みSPIR-VでAdd / Mul / MulScalarを実装。中間結果はGPU上に留まる。
 - `autograd.Tensor`のNew / Zeros / ToHost / CopyFrom / Detach / Reshapeを共通バッファへ接続。
@@ -214,12 +219,16 @@ DirectMLは同じRTX 3060 Ti、feature level 6.4で検証した。
 `cmd/directml-infer`の`[74,768] @ [768,768]`と要素演算のCPUとの差は0だった。
 DirectMLとautogradのDirectML経路は`-gcflags=all=-d=checkptr=2`でも検証した。
 `cmd/directml-infer -encoder`の`[2,17,16]`、4 heads、FFN幅48は最大絶対誤差3.58e-7、コサイン1.0だった。
-Linux/amd64とmacOS/arm64向けにも、cgoなしで`autograd`のテストバイナリをクロスコンパイルした。
-これらはスタブ経路のビルド確認で、GPUの実行確認ではない。
+macOS/arm64とLinux/arm64では、cgoなしのスタブ経路のテストバイナリをクロスコンパイルした。
+Linux/amd64はWSL2 Debian、Go 1.25.0、glibc 2.41で`CGO_ENABLED=0`の全テストと`go vet ./...`が成功した。
+Linuxの関数呼出しは10引数・64 bit値・スタックalignment・並行呼出し・GCを専用のnative ABIテストで検証した。
+checkptr検査、CコンパイラのあるWSL上での選択したテストの`-race`検査も成功した。
+WSLで列挙できたのはllvmpipe（CPU型、Vulkan 1.4.305）だけで、GPUとして選ばず`Available() == false`を返す。
+したがってLinuxのGPU一致テストはスキップしており、Linux上でGPU計算が成功したという検証ではない。
 Windows/386ではDirectML単独のスタブとドライバ不要テストも実行した。
 Windows/386の`autograd`は、既存のCUDAパッケージの2 GiB定数がintでoverflowするためビルドできない。
 同じCUDA依存を含むVulkanテストもWindows/386ではビルドできないが、`go build ./gpu ./vulkan`のスタブはビルドできる。
-今回のVulkanローダーもWindows/amd64のみを対象にしている。
+Vulkanのnativeローダーの対象はWindows/amd64とLinux/amd64。Linux/arm64などは引き続きスタブ。
 
 共通層はドライバなしで登録、並行検索、所有権、二重解放、サイズ検証をテストする。
 CUDAが利用できる場合は全アダプタ演算をCPUと照合する。ゼロサイズ、GEMMの転置、
@@ -260,7 +269,7 @@ Vulkanのbias融合は単一dispatch・scratchなしの呼出し、0要素、部
 
 ## 残る作業
 
-1. M1のLinuxローダー。`dlopen`と関数ポインタ呼び出しを、cgoなしの呼出規約を含めて検証する。
+1. Linux/amd64の実GPUで、転送・全演算・Encoder一致と性能を検証する。ローダーと呼出規約のテストは実装済み。
 2. M6の残り：forward全体のcommand記録のまとめ、融合演算・cacheの追加調整とAMD / Intelでの実測。
    ベンチマーク、DirectMLの主要なviewコピー削減、近似GELUと正規化内部のバッチ化は実装済み。
    Vulkanのerf式BiasGELU / BiasResidualの融合も実装済み。
