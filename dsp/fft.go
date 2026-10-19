@@ -35,7 +35,8 @@ func NewFFT(n int) (*FFT, error) {
 		angle := 2 * math.Pi * float64(k) / float64(n)
 		f.cos[k], f.sin[k] = math.Cos(angle), math.Sin(angle)
 	}
-	for i := range f.rev {
+	// rev[0] is already zero; skipping it also avoids shifting by -1 for n=1.
+	for i := 1; i < n; i++ {
 		f.rev[i] = f.rev[i>>1]>>1 | (i&1)<<(log2-1)
 	}
 	return f, nil
