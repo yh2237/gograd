@@ -117,7 +117,7 @@ func (b *Backend) LayerNorm(out, a, weight, bias *gpu.Buffer, rows, cols int, ep
 	if cols == 0 || !validEps(eps) {
 		return gpu.ErrInvalidArgument
 	}
-	return b.normalization(out, a, weight, bias, n, cols, compactLayout(uint32(rows), 1, 1, uint32(cols)), eps)
+	return b.normalization(out, a, weight, bias, n, cols, compactLayout(uint32(rows), 1, 1, uint32(cols)), cols, eps)
 }
 func (b *Backend) GroupNorm(out, a, weight, bias *gpu.Buffer, batch, frames, channels, groups int, eps float32) error {
 	n, err := gpu.Elements(batch, frames, channels)
@@ -128,10 +128,12 @@ func (b *Backend) GroupNorm(out, a, weight, bias *gpu.Buffer, batch, frames, cha
 		return gpu.ErrInvalidArgument
 	}
 	layout := tensorLayout{sizes: [4]uint32{uint32(batch), uint32(groups), uint32(frames), uint32(channels / groups)}, strides: [4]uint32{uint32(frames * channels), uint32(channels / groups), uint32(channels), 1}}
-	return b.normalization(out, a, weight, bias, n, channels, layout, eps)
+	return b.normalization(out, a, weight, bias, n, channels, layout, frames*(channels/groups), eps)
 }
 
-func (b *Backend) normalization(out, a, weight, bias *gpu.Buffer, n, channels int, layout tensorLayout, eps float32) error {
+// normalization applies a normalization followed by the per-channel affine
+// transform. reduced is the number of elements that form one group.
+func (b *Backend) normalization(out, a, weight, bias *gpu.Buffer, n, channels int, layout tensorLayout, reduced int, eps float32) error {
 	if err := b.lock(); err != nil {
 		return err
 	}
@@ -171,6 +173,14 @@ func (b *Backend) normalization(out, a, weight, bias *gpu.Buffer, n, channels in
 	flat := compactLayout(1, 1, uint32(n/channels), uint32(channels))
 	affine := flat
 	affine.strides = [4]uint32{0, 0, 0, 1}
+	if reduced == 1 {
+		// A group with a single element normalizes to zero, so the result is
+		// the bias alone. The normalization operator is not used here: some
+		// DirectML implementations report a NaN variance for a one-element
+		// group, which would poison the whole tensor.
+		key := opKey{kind: opIdentity, n: n, aLayout: affine, yLayout: flat}
+		return b.fail(b.driver.executeAt(key, y, resourceBinding{v, 0}))
+	}
 	key := opKey{kind: opMul, n: n, aLayout: flat, bLayout: affine, yLayout: flat}
 	addKey := key
 	addKey.kind = opAdd

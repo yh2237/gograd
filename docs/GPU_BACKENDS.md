@@ -98,6 +98,8 @@ go vet ./...
 
 GPUが利用できない環境では実機テストをスキップする。スキップを禁止するには`GOGRAD_REQUIRE_VULKAN=1` / `GOGRAD_REQUIRE_DIRECTML=1`を設定する。DirectMLのerf式GELUを含む一致テストはfeature level 5.1未満でスキップする。
 
+`GOGRAD_DIRECTML_SOFTWARE=1`はDirectMLのソフトウェアラスタライザ（WARP）を選びます。GPUを持たないCIランナーと同じ実装で動作を確認するための切替です。WARPは1要素のグループの正規化でNaNを返すため、その場合はbiasだけを返す経路を使います。
+
 Windows/amd64、`CGO_ENABLED=0`、RTX 3060 Tiで全テストとcheckptr検査が成功した。Vulkan APIは1.4.341、compute queueは2、DirectML feature levelは6.4。Conv1d・自己注意・FFNの構成とEncoderをCPUと照合し、コサイン0.999以上と、反復後の使用中GPUメモリの回復を確認している。
 
 推論例のCPUとの最大絶対誤差は次のとおり。

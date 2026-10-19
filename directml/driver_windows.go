@@ -4,6 +4,7 @@ package directml
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"syscall"
 	"unsafe"
@@ -65,6 +66,10 @@ func openDriver() (_ driver, err error) {
 	}
 	defer release(factory)
 	var best uint64
+	// GOGRAD_DIRECTML_SOFTWARE selects the software rasterizer instead of a
+	// hardware adapter. It exists to reproduce the behaviour of machines
+	// without a GPU, which is what the CI runners use.
+	software := os.Getenv("GOGRAD_DIRECTML_SOFTWARE") == "1"
 	for i := 0; i < 256; i++ {
 		var adapter *object
 		r := call(factory, 12, uintptr(i), uintptr(unsafe.Pointer(&adapter)))
@@ -79,10 +84,10 @@ func openDriver() (_ driver, err error) {
 			release(adapter)
 			return nil, err
 		}
-		if desc.Flags&2 != 0 {
+		if (desc.Flags&2 != 0) != software {
 			release(adapter)
 			continue
-		} // Never use WARP/software.
+		} // Never use WARP/software unless it was requested explicitly.
 		var dev, ml *object
 		r, _, _ = createD3D.Call(uintptr(unsafe.Pointer(adapter)), 0xb000, uintptr(unsafe.Pointer(iidD3DDevice)), uintptr(unsafe.Pointer(&dev)))
 		release(adapter)

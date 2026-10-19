@@ -21,4 +21,20 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test ./...
-      - run: gofmt -l .
+      # The software rasterizer is what a runner without a GPU uses. It
+      # exercises the DirectML paths that a hardware adapter handles
+      # differently.
+      - name: test (directml software adapter)
+        if: matrix.os == 'windows-latest'
+        env:
+          GOGRAD_DIRECTML_SOFTWARE: "1"
+        run: go test ./directml
+      - name: gofmt
+        shell: bash
+        run: |
+          files=$(gofmt -l .)
+          if [ -n "$files" ]; then
+            echo "unformatted files:"
+            echo "$files"
+            exit 1
+          fi
