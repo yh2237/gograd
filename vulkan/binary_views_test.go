@@ -97,34 +97,3 @@ func TestVulkanBinaryViewsRejectsMismatch(t *testing.T) {
 		t.Fatal("mismatched view shapes were accepted")
 	}
 }
-
-// TestVulkanGatherContiguousView checks the copy path of a compact view, which
-// replaces the index arithmetic of the view shader.
-func TestVulkanGatherContiguousView(t *testing.T) {
-	b := testBackend(t)
-	data := make([]float32, 24)
-	for i := range data {
-		data[i] = float32(i)
-	}
-	base := testUpload(t, b, data)
-	for _, v := range []gpu.View{
-		{Buffer: base, Shape: []int{2, 3}, Strides: []int{3, 1}},
-		{Buffer: base, Shape: []int{2, 3}, Strides: []int{3, 1}, Offset: 4},
-		{Buffer: base, Shape: []int{2, 1, 3}, Strides: []int{3, 0, 1}},
-		{Buffer: base, Shape: []int{4}, Strides: []int{1}, Offset: 6},
-	} {
-		n, err := v.Validate(b)
-		if err != nil {
-			t.Fatal(err)
-		}
-		out := testAlloc(t, b, n)
-		want := make([]float32, n)
-		for i := range want {
-			want[i] = data[viewIndex(i, v.Shape, v.Strides, v.Offset)]
-		}
-		if err := b.Gather(out, v); err != nil {
-			t.Fatal(err)
-		}
-		checkValues(t, b, out, want)
-	}
-}

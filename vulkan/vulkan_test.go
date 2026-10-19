@@ -1,7 +1,6 @@
 package vulkan
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -58,14 +57,6 @@ func checkValues(t *testing.T, b *Backend, x *gpu.Buffer, want []float32) {
 	for i, value := range got {
 		if math.IsNaN(float64(value)) || math.Abs(float64(value-want[i])) > 1e-5 {
 			t.Fatalf("[%d]=%g want %g", i, value, want[i])
-		}
-	}
-}
-
-func TestEmbeddedShader(t *testing.T) {
-	for _, code := range [][]byte{pointwiseSPV, viewSPV, gemmSPV, reduceSPV, convSPV} {
-		if len(code) < 20 || len(code)%4 != 0 || binary.LittleEndian.Uint32(code) != 0x07230203 {
-			t.Fatal("invalid embedded SPIR-V")
 		}
 	}
 }

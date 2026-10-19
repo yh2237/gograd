@@ -1,6 +1,7 @@
 package autograd
 
 import (
+	"math"
 	"testing"
 
 	"github.com/yh2237/gograd/tensor"
@@ -33,48 +34,30 @@ func TestAuditGradAccumulatorKeepsLossReadable(t *testing.T) {
 	if len(after) != len(before) || after[0] != before[0] {
 		t.Fatalf("loss changed after the backward: %v, want %v", after, before)
 	}
+	// The accumulated gradient must still match a plain backward of the same
+	// loss on an identical model.
+	twin := newAccumulateModel(t, tensor.CPU)
+	twinExecution := NewExecutionContext()
+	twin.bind(t, twinExecution)
+	twinLoss := twin.loss(t, twinExecution, tensor.CPU, 0, 2)
+	if err := twinLoss.Backward(); err != nil {
+		t.Fatal(err)
+	}
+	twinLoss.ReleaseGraph()
+	accumulated := accumulateGradients(t, model.root)
+	direct := accumulateGradients(t, twin.root)
+	if len(accumulated) != len(direct) {
+		t.Fatalf("gradient count %d != %d", len(accumulated), len(direct))
+	}
+	// The accumulator scales every micro-batch by 1/groups.
+	for i := range accumulated {
+		want := direct[i] / 2
+		if diff := math.Abs(float64(accumulated[i] - want)); diff > 1e-5 {
+			t.Fatalf("gradient[%d]=%v, direct backward gave %v", i, accumulated[i], want)
+		}
+	}
 	loss.ReleaseGraph()
 	if _, err := loss.ToHost(); err == nil {
 		t.Fatal("released loss is still readable")
-	}
-}
-
-// TestAuditGradAccumulatorGradientUnchanged checks that keeping the loss
-// readable does not change the accumulated gradient.
-func TestAuditGradAccumulatorGradientUnchanged(t *testing.T) {
-	model := newAccumulateModel(t, tensor.CPU)
-	execution := NewExecutionContext()
-	model.bind(t, execution)
-	accumulator, err := NewGradAccumulator(2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for micro := 0; micro < 2; micro++ {
-		loss := model.loss(t, execution, tensor.CPU, micro*2, micro*2+2)
-		complete, err := accumulator.Backward(loss)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if wantComplete := micro == 1; complete != wantComplete {
-			t.Fatalf("micro-batch %d complete=%v, want %v", micro, complete, wantComplete)
-		}
-		loss.ReleaseGraph()
-	}
-	gradients := accumulateGradients(t, model.root)
-	if len(gradients) == 0 {
-		t.Fatal("no gradients were accumulated")
-	}
-	nonZero := false
-	for i, g := range gradients {
-		if g != 0 {
-			nonZero = true
-			continue
-		}
-		if i >= len(gradients) {
-			t.Fatalf("gradient[%d] out of range", i)
-		}
-	}
-	if !nonZero {
-		t.Fatal("every accumulated gradient is zero")
 	}
 }

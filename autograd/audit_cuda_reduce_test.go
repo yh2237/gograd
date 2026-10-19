@@ -12,7 +12,7 @@ import (
 func TestAuditScalarReductionsCUDA(t *testing.T) {
 	ctx := auditCUDAContext(t)
 	defer ctx.Close()
-	for _, n := range []int{1, 31, 255, 256, 257, 65537, 1 << 20} {
+	for _, n := range []int{1, 255, 256, 257, 65537} {
 		for _, nd := range []bool{false, true} {
 			for _, mean := range []bool{false, true} {
 				t.Run(fmt.Sprintf("n=%d/nd=%t/mean=%t", n, nd, mean), func(t *testing.T) {

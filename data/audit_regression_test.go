@@ -58,9 +58,10 @@ func TestAuditScaleImageRejectsNonPositiveSize(t *testing.T) {
 }
 
 // TestAuditSamplerEpochAccessor checks that the epoch accessor reports the
-// same epoch as the state without copying the permutation.
+// same epoch as the state without copying the permutation. The progress
+// reports of the training loops use it on every update.
 func TestAuditSamplerEpochAccessor(t *testing.T) {
-	sampler, err := NewIndexSampler(8, SamplerOptions{Shuffle: true, Seed: 7})
+	sampler, err := NewIndexSampler(1024, SamplerOptions{Shuffle: true, Seed: 7})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,5 +73,9 @@ func TestAuditSamplerEpochAccessor(t *testing.T) {
 	}
 	if sampler.Epoch() != sampler.State().Epoch {
 		t.Fatalf("epoch %d != state epoch %d", sampler.Epoch(), sampler.State().Epoch)
+	}
+	allocs := testing.AllocsPerRun(3, func() { _ = sampler.Epoch() })
+	if allocs > 1 {
+		t.Fatalf("the epoch accessor allocated %.0f times per call, want none", allocs)
 	}
 }

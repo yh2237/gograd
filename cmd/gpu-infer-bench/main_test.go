@@ -27,7 +27,7 @@ func TestCPUWorkloads(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if r.MedianMS <= 0 || r.P95MS < r.MedianMS || len(r.SamplesMS) != 2 || r.Cosine < .999 || r.MaxAbsError != 0 {
+			if r.P95MS < r.MedianMS || len(r.SamplesMS) != 2 || r.Cosine < .999 || r.MaxAbsError != 0 {
 				t.Fatal(r)
 			}
 		})

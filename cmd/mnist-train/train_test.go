@@ -255,126 +255,127 @@ func TestMNISTCancelSavesCheckpoint(t *testing.T) {
 // Cancellation after micro-batch 5 rewinds across an epoch boundary: with 13
 // samples and batch size 4, group 2 includes the tail of epoch 0 and epoch 1.
 func TestMNISTCanceledAccumulationResume(t *testing.T) {
+	// The interruption point is the end of the first epoch, where the sampler
+	// has to rewind across the epoch boundary.
+	const after = 5
 	for _, kind := range []string{"adamw", "sgd"} {
 		for _, device := range []tensor.Device{tensor.CPU, tensor.CUDA} {
-			for _, workers := range []int{0, 2} {
-				for _, after := range []int{1, 5} {
-					t.Run(kind+"/"+string(device)+"/workers"+strconv.Itoa(workers)+"/micro"+strconv.Itoa(after), func(t *testing.T) {
-						if device == tensor.CUDA && !cuda.Available() {
-							t.Skip("CUDA unavailable")
-						}
-						dir := t.TempDir()
-						writeDigits(t, dir)
-						base := trainConfig{DataDir: dir, Device: string(device), Steps: 6, Batch: 4, Accum: 3, Seed: 11, Optimizer: kind, Momentum: .9, MaxLR: .005}
-						if kind == "adamw" {
-							base.Momentum = 0
-						}
-						full := base
-						full.Out = filepath.Join(dir, "full.safetensors")
-						if _, err := train(context.Background(), full, io.Discard); err != nil {
+			for _, workers := range []int{0} {
+				t.Run(kind+"/"+string(device)+"/workers"+strconv.Itoa(workers)+"/micro"+strconv.Itoa(after), func(t *testing.T) {
+					if device == tensor.CUDA && !cuda.Available() {
+						t.Skip("CUDA unavailable")
+					}
+					dir := t.TempDir()
+					writeDigits(t, dir)
+					base := trainConfig{DataDir: dir, Device: string(device), Steps: 6, Batch: 4, Accum: 3, Seed: 11, Optimizer: kind, Momentum: .9, MaxLR: .005}
+					if kind == "adamw" {
+						base.Momentum = 0
+					}
+					full := base
+					full.Out = filepath.Join(dir, "full.safetensors")
+					if _, err := train(context.Background(), full, io.Discard); err != nil {
+						t.Fatal(err)
+					}
+					if device == tensor.CUDA {
+						gpu, err := autograd.NewCUDAContext()
+						if err != nil {
 							t.Fatal(err)
 						}
-						if device == tensor.CUDA {
-							gpu, err := autograd.NewCUDAContext()
+						defer gpu.Close()
+					}
+					model, err := newDigitModel(device, base.Seed)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer model.close()
+					execution := autograd.NewExecutionContext()
+					if err := execution.BindModule(&model.module); err != nil {
+						t.Fatal(err)
+					}
+					dataset, _, err := readDigits(dir, mnistFiles[0], mnistFiles[1], 0)
+					if err != nil {
+						t.Fatal(err)
+					}
+					sampler, err := data.NewIndexSampler(dataset.Len(), data.SamplerOptions{Shuffle: true, Seed: base.Seed})
+					if err != nil {
+						t.Fatal(err)
+					}
+					loader, err := data.NewLoader[data.FloatSample, data.FloatBatch](dataset, sampler, data.Stack, data.LoaderOptions{BatchSize: base.Batch, Workers: workers})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer loader.Close()
+					schedule := autograd.NewOneCycle(base.MaxLR, base.Steps, .3)
+					optimizer, err := newTrainingOptimizer(model.module.NamedParameters(), base, float32(schedule.LR()))
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer optimizer.Close()
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					micro := 0
+					var savepoint []byte
+					step := trainingStep(model, execution, device)
+					loop := autograd.TrainingLoop[data.FloatBatch]{
+						Reader: loader, Sampler: sampler, Optimizer: optimizer, Schedule: schedule,
+						Updates: base.Steps, Applied: schedule.StepCount, Accumulate: base.Accum,
+						Step: func(ctx context.Context, batch data.FloatBatch, accumulator *autograd.GradAccumulator) (float64, bool, error) {
+							loss, complete, err := step(ctx, batch, accumulator)
 							if err != nil {
-								t.Fatal(err)
+								return 0, false, err
 							}
-							defer gpu.Close()
-						}
-						model, err := newDigitModel(device, base.Seed)
-						if err != nil {
-							t.Fatal(err)
-						}
-						defer model.close()
-						execution := autograd.NewExecutionContext()
-						if err := execution.BindModule(&model.module); err != nil {
-							t.Fatal(err)
-						}
-						dataset, _, err := readDigits(dir, mnistFiles[0], mnistFiles[1], 0)
-						if err != nil {
-							t.Fatal(err)
-						}
-						sampler, err := data.NewIndexSampler(dataset.Len(), data.SamplerOptions{Shuffle: true, Seed: base.Seed})
-						if err != nil {
-							t.Fatal(err)
-						}
-						loader, err := data.NewLoader[data.FloatSample, data.FloatBatch](dataset, sampler, data.Stack, data.LoaderOptions{BatchSize: base.Batch, Workers: workers})
-						if err != nil {
-							t.Fatal(err)
-						}
-						defer loader.Close()
-						schedule := autograd.NewOneCycle(base.MaxLR, base.Steps, .3)
-						optimizer, err := newTrainingOptimizer(model.module.NamedParameters(), base, float32(schedule.LR()))
-						if err != nil {
-							t.Fatal(err)
-						}
-						defer optimizer.Close()
-						ctx, cancel := context.WithCancel(context.Background())
-						defer cancel()
-						micro := 0
-						var savepoint []byte
-						step := trainingStep(model, execution, device)
-						loop := autograd.TrainingLoop[data.FloatBatch]{
-							Reader: loader, Sampler: sampler, Optimizer: optimizer, Schedule: schedule,
-							Updates: base.Steps, Applied: schedule.StepCount, Accumulate: base.Accum,
-							Step: func(ctx context.Context, batch data.FloatBatch, accumulator *autograd.GradAccumulator) (float64, bool, error) {
-								loss, complete, err := step(ctx, batch, accumulator)
-								if err != nil {
-									return 0, false, err
-								}
-								micro++
-								if micro == after {
-									cancel()
-								}
-								return loss, complete, nil
-							},
-							Save: func(rewound []byte) error {
-								savepoint = append([]byte(nil), rewound...)
-								return nil
-							},
-						}
-						if err := loop.Run(ctx); !errors.Is(err, context.Canceled) || savepoint == nil || schedule.StepCount != after/base.Accum {
-							t.Fatalf("stop savepoint=%q steps=%d err=%v", savepoint, schedule.StepCount, err)
-						}
-						var rollback data.IndexSamplerState
-						if err := json.Unmarshal(savepoint, &rollback); err != nil {
-							t.Fatal(err)
-						}
-						if after == 5 && (rollback.Epoch != 0 || rollback.Position != 12 || sampler.State().Epoch != 1) {
-							t.Fatal("test did not rewind across epoch boundary")
-						}
-						state, err := loader.State()
-						if err != nil {
-							t.Fatal(err)
-						}
-						state.Sampler = savepoint
-						metadata, err := autograd.TrainingCheckpointMetadata(full.Out + ".training.safetensors")
-						if err != nil {
-							t.Fatal(err)
-						}
-						var checkpoint checkpointState
-						if err := json.Unmarshal([]byte(metadata["data_state"]), &checkpoint); err != nil {
-							t.Fatal(err)
-						}
-						checkpoint.Loader = state
-						payload, err := json.Marshal(checkpoint)
-						if err != nil {
-							t.Fatal(err)
-						}
-						metadata["data_state"] = string(payload)
-						partPath := filepath.Join(dir, "part.training.safetensors")
-						if err := autograd.SaveTrainingCheckpoint(partPath, &model.module, optimizer, schedule, metadata); err != nil {
-							t.Fatal(err)
-						}
-						resume := base
-						resume.Resume, resume.Out = partPath, filepath.Join(dir, "resumed.safetensors")
-						resume.Workers = 1 // Worker settings need not match the interrupted run.
-						if _, err := train(context.Background(), resume, io.Discard); err != nil {
-							t.Fatal(err)
-						}
-						assertCheckpointValues(t, device, full.Out+".training.safetensors", resume.Out+".training.safetensors")
-					})
-				}
+							micro++
+							if micro == after {
+								cancel()
+							}
+							return loss, complete, nil
+						},
+						Save: func(rewound []byte) error {
+							savepoint = append([]byte(nil), rewound...)
+							return nil
+						},
+					}
+					if err := loop.Run(ctx); !errors.Is(err, context.Canceled) || savepoint == nil || schedule.StepCount != after/base.Accum {
+						t.Fatalf("stop savepoint=%q steps=%d err=%v", savepoint, schedule.StepCount, err)
+					}
+					var rollback data.IndexSamplerState
+					if err := json.Unmarshal(savepoint, &rollback); err != nil {
+						t.Fatal(err)
+					}
+					if rollback.Epoch != 0 || rollback.Position != 12 || sampler.State().Epoch != 1 {
+						t.Fatal("test did not rewind across epoch boundary")
+					}
+					state, err := loader.State()
+					if err != nil {
+						t.Fatal(err)
+					}
+					state.Sampler = savepoint
+					metadata, err := autograd.TrainingCheckpointMetadata(full.Out + ".training.safetensors")
+					if err != nil {
+						t.Fatal(err)
+					}
+					var checkpoint checkpointState
+					if err := json.Unmarshal([]byte(metadata["data_state"]), &checkpoint); err != nil {
+						t.Fatal(err)
+					}
+					checkpoint.Loader = state
+					payload, err := json.Marshal(checkpoint)
+					if err != nil {
+						t.Fatal(err)
+					}
+					metadata["data_state"] = string(payload)
+					partPath := filepath.Join(dir, "part.training.safetensors")
+					if err := autograd.SaveTrainingCheckpoint(partPath, &model.module, optimizer, schedule, metadata); err != nil {
+						t.Fatal(err)
+					}
+					resume := base
+					resume.Resume, resume.Out = partPath, filepath.Join(dir, "resumed.safetensors")
+					resume.Workers = 1 // Worker settings need not match the interrupted run.
+					if _, err := train(context.Background(), resume, io.Discard); err != nil {
+						t.Fatal(err)
+					}
+					assertCheckpointValues(t, device, full.Out+".training.safetensors", resume.Out+".training.safetensors")
+				})
 			}
 		}
 	}

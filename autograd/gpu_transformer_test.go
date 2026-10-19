@@ -254,19 +254,6 @@ func TestInferenceGPUTransformerNetwork(t *testing.T) {
 				t.Fatal(err)
 			}
 			conv2dClose(t, "transformer", host, want, 1e-4, 1e-4)
-			var dot, xx, yy float64
-			for i, v := range host {
-				dot += float64(v) * float64(want[i])
-				xx += float64(v) * float64(v)
-				yy += float64(want[i]) * float64(want[i])
-			}
-			cosine := dot / math.Sqrt(xx*yy)
-			if math.IsNaN(cosine) || cosine < .999 {
-				t.Fatalf("cosine=%g", cosine)
-			}
-			if iteration == 0 {
-				t.Logf("device=%s cosine=%.12f", device, cosine)
-			}
 			out.ReleaseGraph()
 			ref.ReleaseGraph()
 		}

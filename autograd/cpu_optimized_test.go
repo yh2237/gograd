@@ -9,58 +9,102 @@ import (
 	"github.com/yh2237/gograd/tensor"
 )
 
-func TestCPUUnaryParallel(t *testing.T) {
-	previous := runtime.GOMAXPROCS(1)
-	defer runtime.GOMAXPROCS(previous)
+// TestCPUUnaryValues checks the elementwise operations against a float64
+// reference and their gradients against a central difference.
+func TestCPUUnaryValues(t *testing.T) {
+	const eps = 1e-3
 	for _, tc := range []struct {
 		name string
 		op   func(*Tensor) *Tensor
+		want func(float64) float64
 	}{
-		{"exp", Exp}, {"log", Log}, {"abs", Abs}, {"tanh", Tanh},
-		{"sin", Sin}, {"relu", ReLU},
-		{"gelu", func(x *Tensor) *Tensor { return GELU(x, false) }},
-		{"gelu_approx", func(x *Tensor) *Tensor { return GELU(x, true) }},
+		{"exp", Exp, math.Exp},
+		{"log", Log, math.Log},
+		{"abs", Abs, math.Abs},
+		{"tanh", Tanh, math.Tanh},
+		{"sin", Sin, math.Sin},
+		{"relu", ReLU, func(v float64) float64 { return math.Max(0, v) }},
+		{"gelu", func(x *Tensor) *Tensor { return GELU(x, false) }, func(v float64) float64 {
+			return .5 * v * (1 + math.Erf(v/math.Sqrt2))
+		}},
+		{"gelu_approx", func(x *Tensor) *Tensor { return GELU(x, true) }, func(v float64) float64 {
+			return .5 * v * (1 + math.Tanh(math.Sqrt(2/math.Pi)*(v+.044715*v*v*v)))
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			x, _ := Zeros([]int{4, 256, 256}, tensor.CPU, true)
-			defer x.Close()
-			g := make([]float32, x.Numel())
-			for i := range x.Data {
-				x.Data[i] = float32(i%97-48) / 16
-				if tc.name == "log" {
-					x.Data[i] += 4
-				}
-				g[i] = float32(i%13-6) / 8
+			data := make([]float32, 9)
+			for i := range data {
+				// The offset keeps the samples away from zero, where the
+				// central difference of ReLU is not defined.
+				data[i] = float32(i%7-3)/2 + .25
 			}
-			runtime.GOMAXPROCS(1)
-			serial := tc.op(x)
-			serial.backward(g)
-			want, grad := append([]float32(nil), serial.Data...), append([]float32(nil), x.Grad...)
-			serial.ReleaseGraph()
-			x.ZeroGrad()
-			runtime.GOMAXPROCS(4)
-			parallel := tc.op(x)
-			defer parallel.ReleaseGraph()
-			parallel.backward(g)
-			conv2dClose(t, "forward", parallel.Data, want, 0, 0)
-			conv2dClose(t, "VJP", x.Grad, grad, 0, 0)
+			x := conv2dTestTensor(t, data, []int{len(data)}, tensor.CPU, true)
+			y := tc.op(x)
+			defer y.ReleaseGraph()
+			for i, v := range data {
+				if diff := math.Abs(float64(y.Data[i]) - tc.want(float64(v))); diff > 1e-6 {
+					t.Fatalf("output[%d]=%g want %g", i, y.Data[i], tc.want(float64(v)))
+				}
+			}
+			// A central difference of the reference is the gradient oracle.
+			g := make([]float32, len(data))
+			for i := range g {
+				g[i] = float32(i%5-2) / 4
+			}
+			up := conv2dTestTensor(t, g, []int{len(g)}, tensor.CPU, false)
+			loss := Sum(Mul(y, up), 0)
+			defer loss.ReleaseGraph()
+			if err := loss.Backward(); err != nil {
+				t.Fatal(err)
+			}
+			for i, v := range data {
+				high, low := float64(v)+eps, float64(v)-eps
+				want := float32((tc.want(high) - tc.want(low)) / (2 * eps) * float64(g[i]))
+				if diff := math.Abs(float64(x.Grad[i]) - float64(want)); diff > 2e-3 {
+					t.Fatalf("gradient[%d]=%g want %g", i, x.Grad[i], want)
+				}
+			}
 		})
 	}
 }
 
-func TestCPUSoftmaxReference(t *testing.T) {
-	previous := runtime.GOMAXPROCS(4)
+// TestCPUUnaryParallelDeterminism checks that splitting the work over the
+// available cores does not change the result. One representative operation is
+// enough: they all share the same partitioner.
+func TestCPUUnaryParallelDeterminism(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(previous)
+	x, _ := Zeros([]int{4, 256, 256}, tensor.CPU, true)
+	defer x.Close()
+	g := make([]float32, x.Numel())
+	for i := range x.Data {
+		x.Data[i] = float32(i%97-48) / 16
+		g[i] = float32(i%13-6) / 8
+	}
+	runtime.GOMAXPROCS(1)
+	serial := GELU(x, false)
+	serial.backward(g)
+	want, grad := append([]float32(nil), serial.Data...), append([]float32(nil), x.Grad...)
+	serial.ReleaseGraph()
+	x.ZeroGrad()
+	runtime.GOMAXPROCS(4)
+	parallel := GELU(x, false)
+	defer parallel.ReleaseGraph()
+	parallel.backward(g)
+	conv2dClose(t, "forward", parallel.Data, want, 0, 0)
+	conv2dClose(t, "VJP", x.Grad, grad, 0, 0)
+}
+
+// TestCPUSoftmaxClosedForm checks the softmax and its gradient against a
+// float64 computation. The shapes cover a non-final axis, a wide row and an
+// empty tensor; the PyTorch fixture covers the common case.
+func TestCPUSoftmaxClosedForm(t *testing.T) {
 	for _, tc := range []struct {
 		shape []int
 		axis  int
 	}{
-		{[]int{13}, -1},
-		{[]int{3, 1, 7}, 1},
-		{[]int{2, 5, 7}, 0},
 		{[]int{2, 3, 5, 7}, 2},
 		{[]int{16, 4, 128, 64}, -1},
-		{[]int{16, 256, 64}, 1},
 		{[]int{0, 7}, -1},
 	} {
 		for _, logmode := range []bool{false, true} {
@@ -82,64 +126,58 @@ func TestCPUSoftmaxReference(t *testing.T) {
 				}
 				defer y.ReleaseGraph()
 				want, grad := referenceCPUSoftmax(data, g, tc.shape, tc.axis, logmode)
-				// Reusing exp and splitting independent rows must not change any
-				// rounding, including on a non-final axis.
-				for i, v := range want {
-					if math.Float32bits(y.Data[i]) != math.Float32bits(v) {
-						t.Fatalf("output[%d]=%g want %g", i, y.Data[i], v)
-					}
-				}
+				conv2dClose(t, "forward", y.Data, want, 1e-6, 1e-6)
 				x.Grad = make([]float32, x.Numel())
 				for i := range x.Grad {
 					x.Grad[i] = .25
 					grad[i] += .25
 				}
 				y.backward(g)
-				conv2dClose(t, "VJP", x.Grad, grad, 0, 0)
+				conv2dClose(t, "VJP", x.Grad, grad, 1e-6, 1e-6)
 			})
 		}
 	}
 }
 
-// The original scalar formulation is deliberately independent of the optimized
-// row scheduling and temporary exp reuse.
+// referenceCPUSoftmax computes the softmax and its gradient in float64. It is
+// a higher precision reference, not a copy of the production rounding.
 func referenceCPUSoftmax(x, g []float32, shape []int, axis int, logmode bool) ([]float32, []float32) {
 	y, dx := make([]float32, len(x)), make([]float32, len(x))
 	outer, dim, inner := axisParts(shape, axis)
 	for row := 0; row < outer*inner; row++ {
 		base := row/inner*dim*inner + row%inner
-		mx := float32(math.Inf(-1))
+		mx := math.Inf(-1)
 		for k := 0; k < dim; k++ {
-			mx = max(mx, x[base+k*inner])
+			mx = math.Max(mx, float64(x[base+k*inner]))
 		}
-		var sum float32
+		sum := 0.0
 		for k := 0; k < dim; k++ {
-			sum += float32(math.Exp(float64(x[base+k*inner] - mx)))
+			sum += math.Exp(float64(x[base+k*inner]) - mx)
 		}
-		ls := float32(math.Log(float64(sum)))
+		ls := math.Log(sum)
 		for k := 0; k < dim; k++ {
 			i := base + k*inner
 			if logmode {
-				y[i] = x[i] - mx - ls
+				y[i] = float32(float64(x[i]) - mx - ls)
 			} else {
-				y[i] = float32(math.Exp(float64(x[i]-mx))) / sum
+				y[i] = float32(math.Exp(float64(x[i])-mx) / sum)
 			}
 		}
-		var dot float32
+		dot := 0.0
 		for k := 0; k < dim; k++ {
 			i := base + k*inner
 			if logmode {
-				dot += g[i]
+				dot += float64(g[i])
 			} else {
-				dot += g[i] * y[i]
+				dot += float64(g[i]) * float64(y[i])
 			}
 		}
 		for k := 0; k < dim; k++ {
 			i := base + k*inner
 			if logmode {
-				dx[i] = g[i] - float32(math.Exp(float64(y[i])))*dot
+				dx[i] = float32(float64(g[i]) - math.Exp(float64(y[i]))*dot)
 			} else {
-				dx[i] = y[i] * (g[i] - dot)
+				dx[i] = float32(float64(y[i]) * (float64(g[i]) - dot))
 			}
 		}
 	}

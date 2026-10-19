@@ -74,6 +74,8 @@ func TestVulkanGatherScatter(t *testing.T) {
 		{Buffer: base, Shape: []int{2, 2}, Strides: []int{12, 4}, Offset: 5},
 		{Buffer: base, Offset: 3},
 		{Buffer: base, Shape: []int{0, 3}, Strides: []int{3, 1}, Offset: 24},
+		{Buffer: base, Shape: []int{2, 3}, Strides: []int{3, 1}},
+		{Buffer: base, Shape: []int{4}, Strides: []int{1}, Offset: 6},
 	} {
 		n, err := v.Validate(b)
 		if err != nil {

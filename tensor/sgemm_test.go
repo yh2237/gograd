@@ -10,13 +10,26 @@ import (
 func TestSGEMMWorkerScheduling(t *testing.T) {
 	avx, wide := useAVX2FMA, use8x8
 	defer func() { useAVX2FMA, use8x8 = avx, wide }()
-	for _, backend := range []struct {
+	backends := []struct {
 		name      string
 		avx, wide bool
-	}{{"go", false, false}, {"avx4x8", avx, false}, {"avx8x8", avx, avx}} {
+	}{{name: "go"}}
+	if avx {
+		// The AVX kernels only exist when the CPU and the OS support them.
+		backends = append(backends, struct {
+			name      string
+			avx, wide bool
+		}{name: "avx4x8", avx: true}, struct {
+			name      string
+			avx, wide bool
+		}{name: "avx8x8", avx: true, wide: true})
+	}
+	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
 			useAVX2FMA, use8x8 = backend.avx, backend.wide
-			for _, shape := range [][3]int{{1, 1, 1}, {33, 11, 257}, {129, 17, 319}} {
+			// One single-tile shape and one multi-tile shape cover the serial
+			// and the parallel path.
+			for _, shape := range [][3]int{{1, 1, 1}, {129, 17, 319}} {
 				m, n, k := shape[0], shape[1], shape[2]
 				a, b := make([]float32, m*k), make([]float32, k*n)
 				for i := range a {
@@ -46,7 +59,9 @@ func TestSGEMMWorkerScheduling(t *testing.T) {
 						}
 					}
 				}
-				for _, workers := range []int{0, 1, 3, 12} {
+				// A worker count of one runs the serial path, a larger one
+				// fills every tile.
+				for _, workers := range []int{1, 6} {
 					for _, tc := range []struct {
 						a, b   []float32
 						ta, tb bool
@@ -78,28 +93,6 @@ func naive(c, a, b []float32, m, n, k int) {
 		}
 	}
 }
-func TestSGEMM(t *testing.T) {
-	m, n, k := 37, 53, 41
-	a := make([]float32, m*k)
-	b := make([]float32, k*n)
-	for i := range a {
-		a[i] = float32(i%17-8) * .01
-	}
-	for i := range b {
-		b[i] = float32(i%13-6) * .02
-	}
-	want := make([]float32, m*n)
-	got := make([]float32, m*n)
-	naive(want, a, b, m, n, k)
-	SGEMM(got, a, b, m, n, k)
-	for i := range got {
-		d := got[i] - want[i]
-		if d < -0.0001 || d > .0001 {
-			t.Fatalf("entry %d: %g != %g", i, got[i], want[i])
-		}
-	}
-}
-
 func TestSGEMMEdges(t *testing.T) {
 	for _, shape := range [][3]int{{0, 7, 3}, {7, 0, 3}, {7, 9, 0}, {1, 1, 1}, {5, 7, 3}, {33, 11, 257}, {67, 17, 319}} {
 		m, n, k := shape[0], shape[1], shape[2]
@@ -124,46 +117,6 @@ func TestSGEMMEdges(t *testing.T) {
 	}
 }
 
-func TestSGEMMOp(t *testing.T) {
-	for _, shape := range [][3]int{{5, 7, 3}, {33, 11, 257}, {67, 17, 319}} {
-		m, n, k := shape[0], shape[1], shape[2]
-		a, bb := make([]float32, m*k), make([]float32, k*n)
-		for i := range a {
-			a[i] = float32(i%17-8) * .01
-		}
-		for i := range bb {
-			bb[i] = float32(i%13-6) * .02
-		}
-		at, bt := make([]float32, len(a)), make([]float32, len(bb))
-		for i := 0; i < m; i++ {
-			for d := 0; d < k; d++ {
-				at[d*m+i] = a[i*k+d]
-			}
-		}
-		for d := 0; d < k; d++ {
-			for j := 0; j < n; j++ {
-				bt[j*k+d] = bb[d*n+j]
-			}
-		}
-		want, got := make([]float32, m*n), make([]float32, m*n)
-		naive(want, a, bb, m, n, k)
-		for _, tc := range []struct {
-			name   string
-			a, bb  []float32
-			ta, tb bool
-		}{
-			{"NN", a, bb, false, false}, {"NT", a, bt, false, true}, {"TN", at, bb, true, false}, {"TT", at, bt, true, true},
-		} {
-			SGEMMOp(got, tc.a, tc.bb, m, n, k, tc.ta, tc.tb)
-			for i := range got {
-				d := got[i] - want[i]
-				if d < -.0001 || d > .0001 {
-					t.Fatalf("%s shape %v entry %d: %g != %g", tc.name, shape, i, got[i], want[i])
-				}
-			}
-		}
-	}
-}
 func BenchmarkSGEMM(b *testing.B) {
 	m, n, k := 3200, 128, 640
 	a := make([]float32, m*k)

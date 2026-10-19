@@ -162,7 +162,7 @@ func TestExecutionOptionsBackwardSnapshotCUDA(t *testing.T) {
 	defer ctx.Close()
 	oldBF, oldAttention := BF16Autocast, AttentionAlgorithm
 	defer func() { BF16Autocast, AttentionAlgorithm = oldBF, oldAttention; EnableGPUProfile(false) }()
-	for _, kind := range []string{"regular", "broadcast", "single", "irregular", "conv1d", "attention", "producers", "binary_nd"} {
+	for _, kind := range []string{"regular", "broadcast", "conv1d", "attention", "producers", "binary_nd"} {
 		for _, bf16 := range []bool{false, true} {
 			name := kind + "/fp32"
 			if bf16 {

@@ -1,6 +1,7 @@
 package kernels
 
 import (
+	"fmt"
 	"math"
 	"runtime"
 	"testing"
@@ -45,38 +46,10 @@ func loadErrorText() string {
 	return ""
 }
 
-const testKernelSource = `
-extern "C" __global__ void vec_add(const float* a, const float* b, float* out, int n) {
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i < n) out[i] = a[i] + b[i];
-}
-extern "C" __global__ void apply_tanh(const float* x, float* out, int n) {
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i < n) out[i] = tanhf(x[i]);
-}
-`
-
-func launchUnary(t *testing.T, kernel *cuda.Kernel, input *cuda.Buffer, n int) *cuda.Buffer {
-	t.Helper()
-	output, err := cuda.Alloc(n * 4)
-	if err != nil {
-		t.Fatal(err)
-	}
-	inputAddress := input.Pointer()
-	outputAddress := output.Pointer()
-	size := int32(n)
-	args := []unsafe.Pointer{unsafe.Pointer(&inputAddress), unsafe.Pointer(&outputAddress), unsafe.Pointer(&size)}
-	grid := [3]int{(n + 255) / 256, 1, 1}
-	if err := kernel.Launch(grid, [3]int{256, 1, 1}, 0, nil, args); err != nil {
-		t.Fatal(err)
-	}
-	if err := cuda.Synchronize(); err != nil {
-		t.Fatal(err)
-	}
-	return output
-}
-
-func TestKernelVectorAdd(t *testing.T) {
+// TestElementwiseKernels checks the library elementwise kernels against
+// closed-form values. The kernels are compiled and launched through the same
+// path as the rest of the package.
+func TestElementwiseKernels(t *testing.T) {
 	if !cuda.Available() {
 		t.Skip("cuda unavailable:", loadErrorText())
 	}
@@ -85,66 +58,42 @@ func TestKernelVectorAdd(t *testing.T) {
 	if err := cuda.SetDevice(0); err != nil {
 		t.Fatal(err)
 	}
-	kernel, err := cuda.LoadKernel(testKernelSource, "vec_add")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer kernel.Close()
-
-	a := []float32{1, 2, 3, 4, 5}
-	b := []float32{10, 20, 30, 40, 50}
-	deviceA := upload(t, a)
-	deviceB := upload(t, b)
-	output, err := cuda.Alloc(len(a) * 4)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer deviceA.Free()
-	defer deviceB.Free()
-	defer output.Free()
-
-	aAddr, bAddr, outAddr := deviceA.Pointer(), deviceB.Pointer(), output.Pointer()
-	size := int32(len(a))
-	args := []unsafe.Pointer{unsafe.Pointer(&aAddr), unsafe.Pointer(&bAddr), unsafe.Pointer(&outAddr), unsafe.Pointer(&size)}
-	if err := kernel.Launch([3]int{1, 1, 1}, [3]int{256, 1, 1}, 0, nil, args); err != nil {
-		t.Fatal(err)
-	}
-	if err := cuda.Synchronize(); err != nil {
-		t.Fatal(err)
-	}
-	got := download(t, output, len(a))
-	for i := range a {
-		if got[i] != a[i]+b[i] {
-			t.Errorf("add[%d]: got %v want %v", i, got[i], a[i]+b[i])
-		}
-	}
-}
-
-func TestKernelTanh(t *testing.T) {
-	if !cuda.Available() {
-		t.Skip("cuda unavailable:", loadErrorText())
-	}
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	if err := cuda.SetDevice(0); err != nil {
-		t.Fatal(err)
-	}
-	kernel, err := cuda.LoadKernel(testKernelSource, "apply_tanh")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer kernel.Close()
-
 	input := []float32{-2, -0.5, 0, 0.5, 2}
+	other := []float32{1, 2, 3, 4, 5}
 	deviceInput := upload(t, input)
 	defer deviceInput.Free()
-	output := launchUnary(t, kernel, deviceInput, len(input))
-	defer output.Free()
-	got := download(t, output, len(input))
+	deviceOther := upload(t, other)
+	defer deviceOther.Free()
+	tanhOut, err := cuda.Alloc(len(input) * 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tanhOut.Free()
+	if err := Tanh(deviceInput, tanhOut, len(input)); err != nil {
+		t.Fatal(err)
+	}
+	sumOut, err := cuda.Alloc(len(input) * 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sumOut.Free()
+	if err := AddPair(sumOut, deviceInput, deviceOther, len(input)); err != nil {
+		t.Fatal(err)
+	}
+	if err := cuda.Synchronize(); err != nil {
+		t.Fatal(err)
+	}
+	gotTanh := download(t, tanhOut, len(input))
+	for i, v := range input {
+		want := float32(math.Tanh(float64(v)))
+		if math.Abs(float64(gotTanh[i]-want)) > 1e-6 {
+			t.Errorf("tanh[%d]: got %v want %v", i, gotTanh[i], want)
+		}
+	}
+	gotSum := download(t, sumOut, len(input))
 	for i := range input {
-		want := float32(math.Tanh(float64(input[i])))
-		if math.Abs(float64(got[i]-want)) > 1e-6 {
-			t.Errorf("tanh[%d]: got %v want %v", i, got[i], want)
+		if gotSum[i] != input[i]+other[i] {
+			t.Errorf("add[%d]: got %v want %v", i, gotSum[i], input[i]+other[i])
 		}
 	}
 }
@@ -228,7 +177,7 @@ func TestConv1dForward(t *testing.T) {
 		{3, 2}, {3, 1}, {4, 1}, {5, 2}, {1, 1}, {2, 1},
 	} {
 		kernel, dilation := shape.kernel, shape.dilation
-		t.Run("kernel"+itoa(kernel)+"_dilation"+itoa(dilation), func(t *testing.T) {
+		t.Run(fmt.Sprintf("kernel%d_dilation%d", kernel, dilation), func(t *testing.T) {
 			x := make([]float32, batch*length*channels)
 			for i := range x {
 				x[i] = float32(math.Sin(float64(i) * 0.7))
@@ -273,17 +222,4 @@ func TestConv1dForward(t *testing.T) {
 			}
 		})
 	}
-}
-
-// itoa formats a small non-negative integer for subtest names.
-func itoa(v int) string {
-	if v == 0 {
-		return "0"
-	}
-	digits := ""
-	for v > 0 {
-		digits = string(rune('0'+v%10)) + digits
-		v /= 10
-	}
-	return digits
 }

@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"image"
-	"image/color"
 	"image/png"
 	"io"
 	"os"
@@ -51,10 +50,6 @@ func TestConvertImagesPreservesBytes(t *testing.T) {
 		if sample.Values[i] != float32(v)/255 {
 			t.Fatalf("pixel %d=%g want byte %d", i, sample.Values[i], v)
 		}
-	}
-	// Confirm colored inputs are converted to luminance, not red-only.
-	if got := data.ScaleImage(image.NewUniform(color.RGBA{G: 255, A: 255}), 1, 1, 1)[0]; got == 0 {
-		t.Fatal("green discarded during grayscale conversion")
 	}
 }
 

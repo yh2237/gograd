@@ -6,12 +6,9 @@ import (
 )
 
 const (
-	benchBatch       = 64
-	benchChannels    = 24
-	benchLength      = 200
-	benchOutChannels = 24
-	benchKernel      = 3
-	benchDilation    = 1
+	benchBatch    = 64
+	benchChannels = 24
+	benchLength   = 200
 )
 
 func benchSetup(b *testing.B) {

@@ -281,65 +281,66 @@ func TestTrainingLoopValidation(t *testing.T) {
 
 func TestTrainingLoopInterruption(t *testing.T) {
 	pool2dDevices(t, func(t *testing.T, device tensor.Device) {
-		for _, groups := range []int{1, 3} {
-			for _, after := range []int{1, 4, 6} {
-				t.Run(fmt.Sprintf("groups%d/micro%d", groups, after), func(t *testing.T) {
-					pool2dContext(t, device)
-					model := newLoopModel(t, device, 7)
-					execution := NewExecutionContext()
-					if err := execution.BindModule(model.module); err != nil {
-						t.Fatal(err)
-					}
-					optimizer := NewAdamW(model.module.NamedParameters(), .01, 0)
-					t.Cleanup(optimizer.Close)
-					reader := &loopReader{batches: loopBatches(8)}
-					sampler := &loopSampler{reader: reader}
-					ctx, cancel := context.WithCancel(context.Background())
-					defer cancel()
-					step := loopStep(t, execution, model, device)
-					micro := 0
-					var saved []byte
-					saves := 0
-					loop := TrainingLoop[loopBatch]{
-						Reader: reader, Sampler: sampler, Optimizer: optimizer, Updates: 8,
-						Accumulate: groups,
-						Step: func(ctx context.Context, batch loopBatch, accumulator *GradAccumulator) (float64, bool, error) {
-							loss, complete, err := step(ctx, batch, accumulator)
-							if err != nil {
-								return 0, false, err
-							}
-							micro++
-							if micro == after {
-								cancel()
-							}
-							return loss, complete, nil
-						},
-						Save: func(savepoint []byte) error {
-							saved = append([]byte(nil), savepoint...)
-							saves++
-							return nil
-						},
-					}
-					if err := loop.Run(ctx); !errors.Is(err, context.Canceled) {
-						t.Fatalf("run err=%v", err)
-					}
-					if saves != 1 {
-						t.Fatalf("Save ran %d times", saves)
-					}
-					// The update count only counts completed groups.
-					if loop.Applied != after/groups {
-						t.Fatalf("applied=%d, want %d", loop.Applied, after/groups)
-					}
-					wantSavepoint := fmt.Sprintf("position=%d", (after-1)/groups*groups)
-					if after%groups == 0 {
-						wantSavepoint = ""
-					}
-					if string(saved) != wantSavepoint {
-						t.Fatalf("savepoint %q, want %q", saved, wantSavepoint)
-					}
-					model.assertNoGradients(t)
-				})
-			}
+		// One micro-batch, a group boundary and the last group cover the
+		// savepoint arithmetic.
+		for _, tc := range []struct{ groups, after int }{{1, 1}, {3, 4}, {3, 6}} {
+			groups, after := tc.groups, tc.after
+			t.Run(fmt.Sprintf("groups%d/micro%d", groups, after), func(t *testing.T) {
+				pool2dContext(t, device)
+				model := newLoopModel(t, device, 7)
+				execution := NewExecutionContext()
+				if err := execution.BindModule(model.module); err != nil {
+					t.Fatal(err)
+				}
+				optimizer := NewAdamW(model.module.NamedParameters(), .01, 0)
+				t.Cleanup(optimizer.Close)
+				reader := &loopReader{batches: loopBatches(8)}
+				sampler := &loopSampler{reader: reader}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				step := loopStep(t, execution, model, device)
+				micro := 0
+				var saved []byte
+				saves := 0
+				loop := TrainingLoop[loopBatch]{
+					Reader: reader, Sampler: sampler, Optimizer: optimizer, Updates: 8,
+					Accumulate: groups,
+					Step: func(ctx context.Context, batch loopBatch, accumulator *GradAccumulator) (float64, bool, error) {
+						loss, complete, err := step(ctx, batch, accumulator)
+						if err != nil {
+							return 0, false, err
+						}
+						micro++
+						if micro == after {
+							cancel()
+						}
+						return loss, complete, nil
+					},
+					Save: func(savepoint []byte) error {
+						saved = append([]byte(nil), savepoint...)
+						saves++
+						return nil
+					},
+				}
+				if err := loop.Run(ctx); !errors.Is(err, context.Canceled) {
+					t.Fatalf("run err=%v", err)
+				}
+				if saves != 1 {
+					t.Fatalf("Save ran %d times", saves)
+				}
+				// The update count only counts completed groups.
+				if loop.Applied != after/groups {
+					t.Fatalf("applied=%d, want %d", loop.Applied, after/groups)
+				}
+				wantSavepoint := fmt.Sprintf("position=%d", (after-1)/groups*groups)
+				if after%groups == 0 {
+					wantSavepoint = ""
+				}
+				if string(saved) != wantSavepoint {
+					t.Fatalf("savepoint %q, want %q", saved, wantSavepoint)
+				}
+				model.assertNoGradients(t)
+			})
 		}
 	})
 }

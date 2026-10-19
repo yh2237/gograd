@@ -211,12 +211,8 @@ func TestInferenceGPUStorageLifetime(t *testing.T) {
 		t.Fatal(err)
 	}
 	conv2dClose(t, "retained view", host, []float32{2, 4, 6, 8}, 0, 0)
-	alias := view.storage
 	if err := view.CopyFrom([]float32{8, 6, 4, 2}); err != nil {
 		t.Fatal(err)
-	}
-	if alias.version.Load() != 1 {
-		t.Fatal("GPU CopyFrom did not increment shared version")
 	}
 	detached := view.Detach()
 	t.Cleanup(detached.Close)

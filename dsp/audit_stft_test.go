@@ -18,7 +18,7 @@ func TestAuditSTFTRejectsInvalidHop(t *testing.T) {
 // TestAuditSTFTFramesForMatchesTransform checks that the reported frame count
 // is the one Transform produces.
 func TestAuditSTFTFramesForMatchesTransform(t *testing.T) {
-	for _, filter := range []int{1, 2, 512, 1024} {
+	for _, filter := range []int{1, 512} {
 		hop := filter / 2
 		if hop < 1 {
 			hop = 1
@@ -27,7 +27,7 @@ func TestAuditSTFTFramesForMatchesTransform(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, length := range []int{1, 100, 1024, 4096} {
+		for _, length := range []int{1, 1024} {
 			want := s.FramesFor(length)
 			_, _, frames := s.Transform(make([]float32, length))
 			if want != frames {

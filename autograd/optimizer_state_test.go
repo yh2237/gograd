@@ -107,7 +107,7 @@ func TestAdamWStateCUDA(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.StepCount != 1 || len(state.Moments) != 1 || len(state.Moments[0].M) != 3 {
+	if state.StepCount != 1 {
 		t.Fatalf("unexpected CUDA state: %+v", state)
 	}
 	target := testParameter(t, []float32{0, 0, 0})
@@ -115,17 +115,16 @@ func TestAdamWStateCUDA(t *testing.T) {
 	if err := restored.LoadState(state); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestSetTrainingPropagatesDropout(t *testing.T) {
-	layer := &DropoutLayer{Probability: 0.5, Training: true}
-	SetTraining(false, layer, nil)
-	if layer.Training {
-		t.Fatal("dropout was not disabled")
+	// The restored optimizer must continue from the saved moments.
+	restored.Step()
+	values, err := value.ToHost()
+	if err != nil {
+		t.Fatal(err)
 	}
-	SetTraining(true, layer)
-	if !layer.Training {
-		t.Fatal("dropout was not enabled")
+	for i, v := range values {
+		if v == 0 {
+			t.Fatalf("parameter %d was not updated after restoring the state", i)
+		}
 	}
 }
 

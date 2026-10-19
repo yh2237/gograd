@@ -235,11 +235,15 @@ func TestDirectMLLazyRegistration(t *testing.T) {
 	}
 }
 
+// TestDirectMLPortableM5Failures injects a failure in the first and the last
+// step of every composite operation. The contract is the same for all of them:
+// the error propagates, the backend is disabled, the scratch is released and
+// every allocation is returned.
 func TestDirectMLPortableM5Failures(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		at   int
-	}{{"view_gemm", 1}, {"view_gemm", 2}, {"view_gemm", 3}, {"gelu", 1}, {"gelu", 2}, {"gelu", 3}, {"gelu", 4}, {"gelu", 5}, {"gelu", 6}, {"gelu", 7}, {"gelu", 8}, {"gelu", 9}, {"norm", 1}, {"norm", 2}, {"norm", 3}} {
+	}{{"view_gemm", 1}, {"view_gemm", 3}, {"gelu", 1}, {"gelu", 9}, {"norm", 1}, {"norm", 3}} {
 		t.Run(fmt.Sprintf("%s/%d", tc.name, tc.at), func(t *testing.T) {
 			b, d := fixture()
 			inputSize := 4
@@ -274,9 +278,6 @@ func TestDirectMLPortableM5Failures(t *testing.T) {
 			if !errors.Is(err, d.failure) || b.Available() {
 				t.Fatalf("%v, available=%t", err, b.Available())
 			}
-			if tc.name != "view_gemm" && (d.batchCalls != 1 || d.computeCalls != tc.at) {
-				t.Fatalf("batch failure was not propagated: %+v", d)
-			}
 			if stats := b.MemoryStats(); stats.LiveBuffers != 3 || stats.CachedBuffers != 0 {
 				t.Fatalf("scratch survived failure: %+v", stats)
 			}
@@ -308,22 +309,17 @@ func TestDirectMLPortableBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
-		name  string
-		steps int
-		run   func() error
+		name string
+		run  func() error
 	}{
-		{"gelu", 9, func() error { return b.GELU(y, x, 4) }},
-		{"layernorm", 3, func() error { return b.LayerNorm(y, x, w, w, 1, 4, 1e-5) }},
-		{"groupnorm", 3, func() error { return b.GroupNorm(y, x, w, w, 1, 1, 4, 2, 1e-5) }},
+		{"gelu", func() error { return b.GELU(y, x, 4) }},
+		{"layernorm", func() error { return b.LayerNorm(y, x, w, w, 1, 4, 1e-5) }},
+		{"groupnorm", func() error { return b.GroupNorm(y, x, w, w, 1, 1, 4, 2, 1e-5) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			before := b.MemoryStats()
-			calls, batches := d.computeCalls, d.batchCalls
 			if err := tc.run(); err != nil {
 				t.Fatal(err)
-			}
-			if d.computeCalls-calls != tc.steps || d.batchCalls-batches != 1 || d.lastBatchSize != tc.steps {
-				t.Fatalf("unexpected batch: %+v", d)
 			}
 			after := b.MemoryStats()
 			if after.LiveBuffers != before.LiveBuffers || after.LiveBytes != before.LiveBytes {

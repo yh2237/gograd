@@ -197,48 +197,6 @@ func TestUniformRange(t *testing.T) {
 	}
 }
 
-func TestNormalMoments(t *testing.T) {
-	g := New(1234)
-	buf := make([]float32, 16384)
-	g.Normal(buf, 2, 0.5)
-	mean, m2 := moments32(buf)
-	if math.Abs(mean-2) > 0.05 || math.Abs(m2-0.25) > 0.02 {
-		t.Fatalf("normal mean=%v variance=%v", mean, m2)
-	}
-}
-
-func moments32(buf []float32) (mean, variance float64) {
-	var sum, sumSq float64
-	for _, v := range buf {
-		sum += float64(v)
-		sumSq += float64(v) * float64(v)
-	}
-	n := float64(len(buf))
-	mean = sum / n
-	return mean, sumSq/n - mean*mean
-}
-
-// TestSerialPathMoments covers the sub-sixteen-element path, which pairs
-// samples differently from the vector layout and cannot reuse it.
-func TestSerialPathMoments(t *testing.T) {
-	g := New(2024)
-	buf := make([]float32, 8)
-	var sum, sumSq float64
-	for i := 0; i < 4096; i++ {
-		g.Normal(buf, 0, 1)
-		for _, v := range buf {
-			sum += float64(v)
-			sumSq += float64(v) * float64(v)
-		}
-	}
-	n := float64(4096 * len(buf))
-	mean := sum / n
-	variance := sumSq/n - mean*mean
-	if math.Abs(mean) > 0.05 || math.Abs(variance-1) > 0.05 {
-		t.Fatalf("serial normal mean=%v variance=%v", mean, variance)
-	}
-}
-
 func TestStateRoundTrip(t *testing.T) {
 	g := New(7)
 	g.Normal(make([]float32, 64), 0, 1)

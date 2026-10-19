@@ -8,25 +8,9 @@ import (
 	"github.com/yh2237/gograd/tensor"
 )
 
-// passThroughGrad behaves like an identity layer: it hands back the gradient
-// it received instead of allocating a new tensor.
-type passThroughGrad struct {
-	seen *tensor.Tensor
-}
-
-func (p *passThroughGrad) Parameters() []*tensor.Tensor { return nil }
-func (p *passThroughGrad) Gradients() []*tensor.Tensor  { return nil }
-func (p *passThroughGrad) ZeroGrad()                    {}
-func (p *passThroughGrad) Forward(_ *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, error) {
-	return x, nil
-}
-func (p *passThroughGrad) Backward(_ *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor, error) {
-	p.seen = grad
-	return grad, nil
-}
-
-// gradProbe records the gradient it receives and whether that tensor is still
-// usable. Sequential must not release a gradient that a later module reads.
+// gradProbe behaves like an identity layer: it returns the gradient it
+// received. It also records whether that gradient was still usable, which
+// catches a Sequential that releases a gradient another module still reads.
 type gradProbe struct {
 	seen  *tensor.Tensor
 	alive bool
@@ -41,11 +25,7 @@ func (p *gradProbe) Forward(_ *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, err
 func (p *gradProbe) Backward(_ *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor, error) {
 	p.seen = grad
 	p.alive = grad.Device() != tensor.CUDA || grad.Buffer() != nil
-	dx, err := tensor.ZerosOn(grad.Device(), grad.Shape()...)
-	if err != nil {
-		return nil, err
-	}
-	return dx, nil
+	return grad, nil
 }
 
 func auditAliasedLinear(t *testing.T, device tensor.Device, in, out int, weight []float32) *Linear {
@@ -65,9 +45,9 @@ func auditAliasedLinear(t *testing.T, device tensor.Device, in, out int, weight 
 	return linear
 }
 
-// TestAuditSequentialBackwardKeepsAliasedGradient covers a module that returns
-// the gradient it received. Sequential used to release that tensor before the
-// next module read it, which frees a live CUDA buffer.
+// TestAuditSequentialBackwardKeepsAliasedGradient covers a chain that
+// contains an identity module. Sequential must not release the gradient that
+// the identity handed back, because the next module still reads it.
 func TestAuditSequentialBackwardKeepsAliasedGradient(t *testing.T) {
 	t.Run("cpu", func(t *testing.T) {
 		auditSequentialAliasedGradient(t, tensor.CPU, nil)
@@ -80,13 +60,12 @@ func TestAuditSequentialBackwardKeepsAliasedGradient(t *testing.T) {
 
 func auditSequentialAliasedGradient(t *testing.T, device tensor.Device, blas *cuda.Blas) {
 	t.Helper()
-	// The probe runs last in the backward pass, so it observes the gradient
-	// that the identity module handed back.
+	first := auditAliasedLinear(t, device, 2, 2, []float32{1, 0, 0, 1})
+	defer first.Close()
 	probe := &gradProbe{}
-	pass := &passThroughGrad{}
 	second := auditAliasedLinear(t, device, 2, 1, []float32{1, 1})
 	defer second.Close()
-	seq := &Sequential{Modules: []Module{probe, pass, second}}
+	seq := &Sequential{Modules: []Module{first, probe, second}}
 	x, err := tensor.FromHostOn(device, []int{1, 2}, []float32{2, 3})
 	if err != nil {
 		t.Fatal(err)
@@ -114,55 +93,9 @@ func auditSequentialAliasedGradient(t *testing.T, device tensor.Device, blas *cu
 	if !probe.alive {
 		t.Fatal("sequential backward released a gradient that is still in use")
 	}
-	if pass.seen == nil {
+	if probe.seen == nil {
 		t.Fatal("identity module did not receive a gradient")
 	}
-}
-
-// TestAuditSequentialAliasedGradientValues checks the numeric result of a
-// chain that contains an identity module.
-func TestAuditSequentialAliasedGradientValues(t *testing.T) {
-	t.Run("cpu", func(t *testing.T) {
-		auditSequentialAliasedValues(t, tensor.CPU, nil)
-	})
-	t.Run("cuda", func(t *testing.T) {
-		blas := auditCUDA(t)
-		auditSequentialAliasedValues(t, tensor.CUDA, blas)
-	})
-}
-
-func auditSequentialAliasedValues(t *testing.T, device tensor.Device, blas *cuda.Blas) {
-	t.Helper()
-	first := auditAliasedLinear(t, device, 2, 2, []float32{1, 0, 0, 1})
-	defer first.Close()
-	pass := &passThroughGrad{}
-	second := auditAliasedLinear(t, device, 2, 1, []float32{1, 1})
-	defer second.Close()
-	seq := &Sequential{Modules: []Module{first, pass, second}}
-	x, err := tensor.FromHostOn(device, []int{1, 2}, []float32{2, 3})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer x.Close()
-	out, err := seq.Forward(blas, x)
-	if err != nil {
-		t.Fatal(err)
-	}
-	values, err := out.ToHost()
-	if err != nil {
-		t.Fatal(err)
-	}
-	auditCompare(t, "forward", values, []float32{5})
-	grad, err := tensor.FromHostOn(device, []int{1, 1}, []float32{1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer grad.Close()
-	dx, err := seq.Backward(blas, grad)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer dx.Close()
 	gradient, err := dx.ToHost()
 	if err != nil {
 		t.Fatal(err)

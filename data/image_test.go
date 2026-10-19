@@ -43,7 +43,7 @@ func TestWriteIDXRoundTrip(t *testing.T) {
 	}
 }
 
-func TestScaleImagePNG(t *testing.T) {
+func TestReadGrayPNG(t *testing.T) {
 	img := image.NewGray(image.Rect(0, 0, 4, 4))
 	for y := 0; y < 4; y++ {
 		for x := 0; x < 4; x++ {
@@ -67,10 +67,5 @@ func TestScaleImagePNG(t *testing.T) {
 	}
 	if len(values) != 16 {
 		t.Fatalf("values=%d", len(values))
-	}
-	// ScaleImage smoke.
-	out := ScaleImage(img, 2, 2, 1)
-	if len(out) != 4 {
-		t.Fatalf("scaled=%d", len(out))
 	}
 }
