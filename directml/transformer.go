@@ -77,26 +77,21 @@ func (b *Backend) GELU(out, a *gpu.Buffer, n int) error {
 		return err
 	}
 	defer b.put(v)
-	scalar := func(out, in *allocation, scale, bias float32) error {
-		return b.driver.execute(opKey{kind: opScalar, n: n, scalar: math.Float32bits(scale), bias: math.Float32bits(bias)}, out, in)
+	scalar := func(out, in *allocation, scale, bias float32) dispatch {
+		return dispatch{opKey{kind: opScalar, n: n, scalar: math.Float32bits(scale), bias: math.Float32bits(bias)}, out, []*allocation{in}}
 	}
-	steps := []func() error{
-		func() error { return b.driver.execute(opKey{kind: opMul, n: n}, u, x, x) },
-		func() error { return b.driver.execute(opKey{kind: opMul, n: n}, v, u, x) },
-		func() error { return scalar(u, v, .044715, 0) },
-		func() error { return b.driver.execute(opKey{kind: opAdd, n: n}, v, x, u) },
-		func() error { return scalar(u, v, float32(math.Sqrt(2/math.Pi)), 0) },
-		func() error { return b.driver.execute(opKey{kind: opTanh, n: n}, v, u) },
-		func() error { return scalar(u, v, 1, 1) },
-		func() error { return b.driver.execute(opKey{kind: opMul, n: n}, v, x, u) },
-		func() error { return scalar(y, v, .5, 0) },
+	steps := []dispatch{
+		{opKey{kind: opMul, n: n}, u, []*allocation{x, x}},
+		{opKey{kind: opMul, n: n}, v, []*allocation{u, x}},
+		scalar(u, v, .044715, 0),
+		{opKey{kind: opAdd, n: n}, v, []*allocation{x, u}},
+		scalar(u, v, float32(math.Sqrt(2/math.Pi)), 0),
+		{opKey{kind: opTanh, n: n}, v, []*allocation{u}},
+		scalar(u, v, 1, 1),
+		{opKey{kind: opMul, n: n}, v, []*allocation{x, u}},
+		scalar(y, v, .5, 0),
 	}
-	for _, step := range steps {
-		if err := b.fail(step()); err != nil {
-			return err
-		}
-	}
-	return nil
+	return b.fail(b.driver.executeBatch(steps))
 }
 
 func (b *Backend) Softmax(out, a *gpu.Buffer, rows, cols int) error {
@@ -173,18 +168,17 @@ func (b *Backend) normalization(out, a, weight, bias *gpu.Buffer, n, channels in
 		return err
 	}
 	defer b.put(scaled)
-	if err := b.fail(b.driver.execute(opKey{kind: opNorm, n: n, scalar: math.Float32bits(eps), aLayout: layout, yLayout: layout}, norm, x)); err != nil {
-		return err
-	}
 	flat := compactLayout(1, 1, uint32(n/channels), uint32(channels))
 	affine := flat
 	affine.strides = [4]uint32{0, 0, 0, 1}
 	key := opKey{kind: opMul, n: n, aLayout: flat, bLayout: affine, yLayout: flat}
-	if err := b.fail(b.driver.execute(key, scaled, norm, w)); err != nil {
-		return err
-	}
-	key.kind = opAdd
-	return b.fail(b.driver.execute(key, y, scaled, v))
+	addKey := key
+	addKey.kind = opAdd
+	return b.fail(b.driver.executeBatch([]dispatch{
+		{opKey{kind: opNorm, n: n, scalar: math.Float32bits(eps), aLayout: layout, yLayout: layout}, norm, []*allocation{x}},
+		{key, scaled, []*allocation{norm, w}},
+		{addKey, y, []*allocation{scaled, v}},
+	}))
 }
 
 func (b *Backend) Conv1d(out, input, weight, bias *gpu.Buffer, o gpu.Conv1dOptions) error {

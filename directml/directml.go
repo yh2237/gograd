@@ -48,6 +48,9 @@ type opKey struct {
 	aLayout, bLayout, yLayout tensorLayout
 	conv                      gpu.Conv1dOptions
 	hasBias                   bool
+	// Repeated operators in one command list need independent descriptors.
+	// Slots are reused across batches, and count against the usual cache limits.
+	bindingSlot int
 }
 
 // Four-dimensional descriptors cover the baseline DirectML feature level.
@@ -59,6 +62,13 @@ type tensorLayout struct{ sizes, strides [4]uint32 }
 type resourceBinding struct {
 	memory *allocation
 	offset uint64
+}
+
+// dispatch is internal: batches never outlive a single locked backend call.
+type dispatch struct {
+	key    opKey
+	out    *allocation
+	inputs []*allocation
 }
 
 const (
@@ -90,6 +100,7 @@ type driver interface {
 	copy(out, src *allocation, size uint64) error
 	execute(key opKey, out *allocation, inputs ...*allocation) error
 	executeAt(key opKey, out *allocation, inputs ...resourceBinding) error
+	executeBatch([]dispatch) error
 	copyView(out, src *allocation, v gpu.View, scatter bool) error
 	operatorStats() OperatorStats
 	releaseOperators()

@@ -218,6 +218,10 @@ func (d *nativeDriver) compile(key opKey) (_ *compiled, err error) {
 }
 
 func (d *nativeDriver) recordDispatch(op *compiled, dispatchable *object, resources ...*allocation) error {
+	return d.submit(d.dispatchCommands(op, dispatchable, resources...))
+}
+
+func (d *nativeDriver) dispatchCommands(op *compiled, dispatchable *object, resources ...*allocation) func() {
 	// All default buffers are explicitly returned to COMMON before submission
 	// completes. That avoids relying on implicit promotion/decay between lists.
 	var used []*allocation
@@ -233,7 +237,7 @@ func (d *nativeDriver) recordDispatch(op *compiled, dispatchable *object, resour
 			used = append(used, v)
 		}
 	}
-	return d.submit(func() {
+	return func() {
 		for _, v := range used {
 			d.transition(v, 0, stateUAV)
 		}
@@ -243,7 +247,7 @@ func (d *nativeDriver) recordDispatch(op *compiled, dispatchable *object, resour
 		for _, v := range used {
 			d.transition(v, stateUAV, 0)
 		}
-	})
+	}
 }
 
 func (d *nativeDriver) execute(key opKey, out *allocation, inputs ...*allocation) error {
@@ -255,12 +259,61 @@ func (d *nativeDriver) execute(key opKey, out *allocation, inputs ...*allocation
 }
 
 func (d *nativeDriver) executeAt(key opKey, out *allocation, inputs ...resourceBinding) error {
-	op := d.operators[key]
-	if op == nil {
-		var err error
-		op, err = d.compile(key)
+	op, owned, err := d.acquireOperator(key, nil)
+	if err != nil {
+		return err
+	}
+	if owned {
+		defer d.closeOperator(op)
+	}
+	return d.submit(d.bindDispatch(op, key, out, inputs))
+}
+
+// Preparation is deliberately separate from recording. Initializers submit and
+// wait on the same command allocator, so every cold compile must finish before
+// opening the execution list. Pinned operators cannot be evicted while preparing
+// later steps. Uncached operators are released only after submit has waited.
+func (d *nativeDriver) executeBatch(steps []dispatch) error {
+	if len(steps) == 0 {
+		return nil
+	}
+	pinned := make(map[*compiled]bool)
+	slots := make(map[opKey]int)
+	commands := make([]func(), 0, len(steps))
+	for _, step := range steps {
+		key := step.key
+		key.bindingSlot = slots[step.key]
+		slots[step.key]++
+		op, owned, err := d.acquireOperator(key, pinned)
 		if err != nil {
 			return err
+		}
+		if owned {
+			defer d.closeOperator(op)
+		}
+		pinned[op] = true
+		inputs := make([]resourceBinding, len(step.inputs))
+		for i, v := range step.inputs {
+			inputs[i].memory = v
+		}
+		commands = append(commands, d.bindDispatch(op, key, step.out, inputs))
+	}
+	return d.submit(func() {
+		for _, record := range commands {
+			record()
+		}
+	})
+}
+
+// owned means the caller must keep the operator alive until its fence completes
+// and then close it. Cache entries, including batch descriptor slots, remain
+// bounded even when every potential eviction candidate is pinned.
+func (d *nativeDriver) acquireOperator(key opKey, pinned map[*compiled]bool) (_ *compiled, owned bool, err error) {
+	op := d.operators[key]
+	if op == nil {
+		op, err = d.compile(key)
+		if err != nil {
+			return nil, false, err
 		}
 		var bytes uint64
 		if op.temporary != nil {
@@ -270,17 +323,27 @@ func (d *nativeDriver) executeAt(key opKey, out *allocation, inputs ...resourceB
 			bytes += op.persistent.allocated
 		}
 		if bytes > operatorCacheBytes {
-			defer d.closeOperator(op)
+			return op, true, nil
 		} else {
-			for len(d.order) > 0 {
+			for {
 				stats := d.operatorStats()
 				if len(d.order) < maxCachedOperators && stats.TemporaryBytes+stats.PersistentBytes+bytes <= operatorCacheBytes {
 					break
 				}
-				old := d.order[0]
+				index := -1
+				for i, k := range d.order {
+					if !pinned[d.operators[k]] {
+						index = i
+						break
+					}
+				}
+				if index < 0 {
+					return op, true, nil
+				}
+				old := d.order[index]
 				d.closeOperator(d.operators[old])
 				delete(d.operators, old)
-				d.order = d.order[1:]
+				d.order = append(d.order[:index], d.order[index+1:]...)
 			}
 			if d.operators == nil {
 				d.operators = make(map[opKey]*compiled)
@@ -289,6 +352,13 @@ func (d *nativeDriver) executeAt(key opKey, out *allocation, inputs ...resourceB
 			d.order = append(d.order, key)
 		}
 	}
+	return op, false, nil
+}
+
+// Binding writes shader-visible descriptors immediately. Each repeated key in
+// a batch uses a separate cached slot so later bindings cannot overwrite an
+// earlier dispatch's descriptors before the GPU has consumed them.
+func (d *nativeDriver) bindDispatch(op *compiled, key opKey, out *allocation, inputs []resourceBinding) func() {
 	if key.kind == opScalar || key.kind == opIdentity {
 		inputs = inputs[:1]
 	}
@@ -315,5 +385,5 @@ func (d *nativeDriver) executeAt(key opKey, out *allocation, inputs ...resourceB
 	for _, v := range inputs {
 		resources = append(resources, v.memory)
 	}
-	return d.recordDispatch(op, op.operator, resources...)
+	return d.dispatchCommands(op, op.operator, resources...)
 }

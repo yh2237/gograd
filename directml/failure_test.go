@@ -16,6 +16,7 @@ type testDriver struct {
 	computeCalls, failAt                        int
 	lastKey                                     opKey
 	lastOffsets                                 [3]uint64
+	batchCalls, lastBatchSize                   int
 }
 
 func (*testDriver) info() Info { return Info{Name: "fixture", FeatureLevel: 0x1000} }
@@ -62,6 +63,16 @@ func (d *testDriver) executeAt(key opKey, out *allocation, inputs ...resourceBin
 		}
 	}
 	return d.computeFailure()
+}
+func (d *testDriver) executeBatch(steps []dispatch) error {
+	d.batchCalls++
+	d.lastBatchSize = len(steps)
+	for _, step := range steps {
+		if err := d.execute(step.key, step.out, step.inputs...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (d *testDriver) copyView(out, src *allocation, v gpu.View, scatter bool) error {
 	return d.computeFailure()
@@ -228,7 +239,7 @@ func TestDirectMLPortableM5Failures(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		at   int
-	}{{"view_gemm", 1}, {"view_gemm", 2}, {"view_gemm", 3}, {"gelu", 1}, {"gelu", 6}, {"gelu", 9}, {"norm", 1}, {"norm", 2}, {"norm", 3}} {
+	}{{"view_gemm", 1}, {"view_gemm", 2}, {"view_gemm", 3}, {"gelu", 1}, {"gelu", 2}, {"gelu", 3}, {"gelu", 4}, {"gelu", 5}, {"gelu", 6}, {"gelu", 7}, {"gelu", 8}, {"gelu", 9}, {"norm", 1}, {"norm", 2}, {"norm", 3}} {
 		t.Run(fmt.Sprintf("%s/%d", tc.name, tc.at), func(t *testing.T) {
 			b, d := fixture()
 			inputSize := 4
@@ -263,6 +274,9 @@ func TestDirectMLPortableM5Failures(t *testing.T) {
 			if !errors.Is(err, d.failure) || b.Available() {
 				t.Fatalf("%v, available=%t", err, b.Available())
 			}
+			if tc.name != "view_gemm" && (d.batchCalls != 1 || d.computeCalls != tc.at) {
+				t.Fatalf("batch failure was not propagated: %+v", d)
+			}
 			if stats := b.MemoryStats(); stats.LiveBuffers != 3 || stats.CachedBuffers != 0 {
 				t.Fatalf("scratch survived failure: %+v", stats)
 			}
@@ -276,6 +290,55 @@ func TestDirectMLPortableM5Failures(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestDirectMLPortableBatches(t *testing.T) {
+	b, d := fixture()
+	x, err := b.Alloc(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := b.Alloc(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	y, err := b.Alloc(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name  string
+		steps int
+		run   func() error
+	}{
+		{"gelu", 9, func() error { return b.GELU(y, x, 4) }},
+		{"layernorm", 3, func() error { return b.LayerNorm(y, x, w, w, 1, 4, 1e-5) }},
+		{"groupnorm", 3, func() error { return b.GroupNorm(y, x, w, w, 1, 1, 4, 2, 1e-5) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := b.MemoryStats()
+			calls, batches := d.computeCalls, d.batchCalls
+			if err := tc.run(); err != nil {
+				t.Fatal(err)
+			}
+			if d.computeCalls-calls != tc.steps || d.batchCalls-batches != 1 || d.lastBatchSize != tc.steps {
+				t.Fatalf("unexpected batch: %+v", d)
+			}
+			after := b.MemoryStats()
+			if after.LiveBuffers != before.LiveBuffers || after.LiveBytes != before.LiveBytes {
+				t.Fatal("scratch not returned", before, after)
+			}
+		})
+	}
+	x.Close()
+	w.Close()
+	y.Close()
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if d.allocated != d.freed {
+		t.Fatal("batch scratch leaked")
 	}
 }
 
