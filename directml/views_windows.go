@@ -3,6 +3,8 @@
 package directml
 
 import (
+	"fmt"
+
 	"github.com/yh2237/gograd/gpu"
 	"unsafe"
 )
@@ -18,6 +20,12 @@ func (d *nativeDriver) copyView(out, src *allocation, v gpu.View, scatter bool) 
 			break
 		}
 		run *= v.Shape[i]
+	}
+	// A view whose innermost axis is not contiguous needs one copy region per
+	// element. The command list would grow with the element count, so a very
+	// strided view is rejected instead of allocating a huge command list.
+	if regions := (n + run - 1) / run; regions > maxCopyRegions {
+		return fmt.Errorf("%w: DirectML scatter of %d elements needs %d copy regions", gpu.ErrUnsupported, n, regions)
 	}
 	return d.submit(func() {
 		d.transition(src, 0, stateCopySource)

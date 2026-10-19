@@ -6,6 +6,11 @@ import (
 )
 
 var _ gpu.ViewBackend = (*Backend)(nil)
+
+// maxCopyRegions bounds the command list of a strided copy. Every region
+// costs a few dozen bytes of command data.
+const maxCopyRegions = 1 << 20
+
 var _ gpu.ViewMatMuler = (*Backend)(nil)
 var _ gpu.ViewBinaryBackend = (*Backend)(nil)
 
