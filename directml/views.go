@@ -44,14 +44,48 @@ func (b *Backend) copyView(linear *gpu.Buffer, v gpu.View, scatter bool) error {
 }
 
 func (b *Backend) gatherLocked(out, src *allocation, v gpu.View) error {
-	if v.Offset%4 == 0 && len(v.Shape) <= 4 && !v.Compact() {
+	if len(v.Shape) <= 4 && !v.Compact() {
 		a := viewLayout(v)
 		s := a.sizes
 		y := compactLayout(s[0], s[1], s[2], s[3])
 		n, _ := gpu.Elements(v.Shape...)
-		return b.fail(b.driver.executeAt(opKey{kind: opIdentity, n: n, aLayout: a, yLayout: y}, out, resourceBinding{src, uint64(v.Offset) * 4}))
+		key := opKey{kind: opIdentity, n: n, aLayout: a, yLayout: y}
+		if v.Offset%4 == 0 {
+			return b.fail(b.driver.executeAt(key, out, resourceBinding{src, uint64(v.Offset) * 4}))
+		}
+		if span := shiftedGatherSpan(v, n); span != 0 {
+			// Copy the bounding range once to an aligned allocation, then read
+			// its original strides with Identity. A transposed offset-one view
+			// otherwise records one CopyBufferRegion per element.
+			aligned, err := b.take(uint64(span)*4, heapDefault)
+			if err != nil {
+				return err
+			}
+			defer b.put(aligned)
+			flat := gpu.View{Buffer: v.Buffer, Shape: []int{span}, Strides: []int{1}, Offset: v.Offset}
+			if err := b.fail(b.driver.copyView(aligned, src, flat, false)); err != nil {
+				return err
+			}
+			return b.fail(b.driver.executeAt(key, out, resourceBinding{aligned, 0}))
+		}
 	}
 	return b.fail(b.driver.copyView(out, src, v, false))
+}
+
+// Bound extra memory for sparse views; small views are cheaper to copy directly.
+// The caller has already validated dimensions, strides, and the backing range.
+func shiftedGatherSpan(v gpu.View, n int) int {
+	if n < 256 {
+		return 0
+	}
+	span := uint64(1)
+	for i, dim := range v.Shape {
+		span += uint64(dim-1) * uint64(v.Strides[i])
+	}
+	if span > 16<<20 || span > uint64(n)*2 {
+		return 0
+	}
+	return int(span)
 }
 
 // materializeLocked copies only on the GPU. In particular, byte offsets need
