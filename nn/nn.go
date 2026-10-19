@@ -27,12 +27,13 @@ type Linear struct {
 	Weight *tensor.Tensor // [out,in]
 	Bias   *tensor.Tensor // [out]
 
-	gradWeight *tensor.Tensor
-	gradBias   *tensor.Tensor
-	input      *tensor.Tensor
-	rows       int
-	in         int
-	out        int
+	gradWeight        *tensor.Tensor
+	gradBias          *tensor.Tensor
+	weightGradScratch []float32 // reused CPU dY^T X workspace
+	input             *tensor.Tensor
+	rows              int
+	in                int
+	out               int
 }
 
 // NewLinear creates a Linear with PyTorch-like uniform initialization.
@@ -90,6 +91,7 @@ func (l *Linear) Close() {
 	l.Bias.Close()
 	l.gradWeight.Close()
 	l.gradBias.Close()
+	l.weightGradScratch = nil
 }
 
 // Forward computes y = x*W^T + b.
@@ -137,13 +139,30 @@ func (l *Linear) Backward(blas *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor,
 	if grad.Device() == tensor.CPU {
 		tensor.SGEMM(dx.Data(), grad.Data(), l.Weight.Data(), l.rows, l.in, l.out)
 		// dW = dY^T X; parameter gradients accumulate until ZeroGrad.
+		if l.rows*l.in*l.out <= 256 {
+			// Packing dominates these tiny products; keep the direct update.
+			for r := 0; r < l.rows; r++ {
+				for o := 0; o < l.out; o++ {
+					g := grad.Data()[r*l.out+o]
+					l.gradBias.Data()[o] += g
+					for i := 0; i < l.in; i++ {
+						l.gradWeight.Data()[o*l.in+i] += g * l.input.Data()[r*l.in+i]
+					}
+				}
+			}
+			return dx, nil
+		}
+		if len(l.weightGradScratch) != l.out*l.in {
+			l.weightGradScratch = make([]float32, l.out*l.in)
+		}
+		tensor.SGEMMOp(l.weightGradScratch, grad.Data(), l.input.Data(), l.out, l.in, l.rows, true, false)
+		for i, v := range l.weightGradScratch {
+			l.gradWeight.Data()[i] += v
+		}
 		for r := 0; r < l.rows; r++ {
 			for o := 0; o < l.out; o++ {
 				g := grad.Data()[r*l.out+o]
 				l.gradBias.Data()[o] += g
-				for i := 0; i < l.in; i++ {
-					l.gradWeight.Data()[o*l.in+i] += g * l.input.Data()[r*l.in+i]
-				}
 			}
 		}
 		return dx, nil
@@ -152,7 +171,7 @@ func (l *Linear) Backward(blas *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor,
 		dx.Close()
 		return nil, err
 	}
-	if err := blas.SgemmRowMajorTransposeA(l.out, l.in, l.rows, 1, grad.Buffer().Pointer(), l.out, l.input.Buffer().Pointer(), l.in, 0, l.gradWeight.Buffer().Pointer(), l.in); err != nil {
+	if err := blas.SgemmRowMajorTransposeA(l.out, l.in, l.rows, 1, grad.Buffer().Pointer(), l.out, l.input.Buffer().Pointer(), l.in, 1, l.gradWeight.Buffer().Pointer(), l.in); err != nil {
 		dx.Close()
 		return nil, err
 	}
@@ -166,6 +185,18 @@ func (l *Linear) Backward(blas *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor,
 // Tanh applies the elementwise hyperbolic tangent.
 type Tanh struct {
 	output *tensor.Tensor
+}
+
+func (t *Tanh) ownsActivation(y *tensor.Tensor) bool { return t.output == y }
+
+// CloseActivations releases the output retained for backward.
+func (t *Tanh) CloseActivations() { t.closeActivationsExcept(nil) }
+
+func (t *Tanh) closeActivationsExcept(keep *tensor.Tensor) {
+	if t.output != nil && t.output != keep {
+		t.output.Close()
+	}
+	t.output = nil
 }
 
 // Parameters returns nil.
@@ -220,6 +251,17 @@ type Sequential struct {
 	output *tensor.Tensor
 }
 
+// ownsActivation reports whether a module's cleanup owns its returned output.
+// Other modules transfer their output to the enclosing container or caller.
+func ownsActivation(m Module, y *tensor.Tensor) bool {
+	owner, ok := m.(interface{ ownsActivation(*tensor.Tensor) bool })
+	return ok && owner.ownsActivation(y)
+}
+
+func (s *Sequential) ownsActivation(y *tensor.Tensor) bool {
+	return len(s.Modules) != 0 && s.output == y
+}
+
 // Parameters returns the parameters of every module.
 func (s *Sequential) Parameters() []*tensor.Tensor {
 	var params []*tensor.Tensor
@@ -245,17 +287,24 @@ func (s *Sequential) ZeroGrad() {
 	}
 }
 
-// Forward runs the modules in order.
+// Forward releases the previous pass's activations, then runs the modules in order.
+// A tensor supplied as the new input is caller-owned and survives the cleanup
+// even when it was the previous pass's output.
 func (s *Sequential) Forward(blas *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, error) {
-	s.saved = s.saved[:0]
+	s.closeActivationsExcept(x)
 	current := x
 	for _, m := range s.Modules {
 		next, err := m.Forward(blas, current)
+		if next != nil && next != current && next != x && !ownsActivation(m, next) {
+			s.saved = append(s.saved, next)
+		}
 		if err != nil {
+			s.CloseActivations()
 			return nil, err
 		}
-		if current != x {
-			s.saved = append(s.saved, current)
+		if next == nil {
+			s.CloseActivations()
+			return nil, fmt.Errorf("nn: module %T returned nil output", m)
 		}
 		current = next
 	}
@@ -281,24 +330,28 @@ func (s *Sequential) Backward(blas *cuda.Blas, grad *tensor.Tensor) (*tensor.Ten
 
 // CloseActivations releases the tensors saved by the last forward pass. Call it
 // after Backward.
-func (s *Sequential) CloseActivations() {
+func (s *Sequential) CloseActivations() { s.closeActivationsExcept(nil) }
+
+func (s *Sequential) closeActivationsExcept(keep *tensor.Tensor) {
 	for _, m := range s.Modules {
-		if c, ok := m.(interface{ CloseActivations() }); ok {
+		if c, ok := m.(interface{ closeActivationsExcept(*tensor.Tensor) }); ok {
+			c.closeActivationsExcept(keep)
+		} else if c, ok := m.(interface{ CloseActivations() }); ok {
 			c.CloseActivations()
 		}
 	}
 	for _, t := range s.saved {
-		t.Close()
+		if t != keep {
+			t.Close()
+		}
 	}
 	s.saved = nil
-	if s.output != nil {
-		s.output.Close()
-		s.output = nil
-	}
+	s.output = nil
 }
 
 // Close releases the parameters and gradients of every module.
 func (s *Sequential) Close() {
+	s.CloseActivations()
 	for _, m := range s.Modules {
 		if closer, ok := m.(interface{ Close() }); ok {
 			closer.Close()

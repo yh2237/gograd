@@ -70,9 +70,20 @@ func (c *Conv1d) Parameters() []*tensor.Tensor { return []*tensor.Tensor{c.Weigh
 func (c *Conv1d) Gradients() []*tensor.Tensor  { return []*tensor.Tensor{c.gradWeight, c.gradBias} }
 func (c *Conv1d) ZeroGrad()                    { _ = c.gradWeight.Zero(); _ = c.gradBias.Zero() }
 func (c *Conv1d) Close() {
+	c.CloseActivations()
 	for _, t := range []*tensor.Tensor{c.Weight, c.Bias, c.gradWeight, c.gradBias} {
 		t.Close()
 	}
+}
+
+// CloseActivations releases convolution workspaces retained for backward.
+func (c *Conv1d) CloseActivations() {
+	if c.deviceColumns != nil {
+		c.deviceColumns.Close()
+		c.deviceColumns = nil
+	}
+	c.columns = nil
+	c.input = nil
 }
 func (c *Conv1d) Forward(blas *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, error) {
 	s := x.Shape()
@@ -230,7 +241,7 @@ func (c *Conv1d) backwardCUDA(blas *cuda.Blas, grad *tensor.Tensor, shape []int,
 		return nil, err
 	}
 	defer dcols.Close()
-	err = blas.SgemmRowMajorTransposeA(c.Out, k, rows, 1, grad.Buffer().Pointer(), c.Out, c.deviceColumns.Buffer().Pointer(), k, 0, c.gradWeight.Buffer().Pointer(), k)
+	err = blas.SgemmRowMajorTransposeA(c.Out, k, rows, 1, grad.Buffer().Pointer(), c.Out, c.deviceColumns.Buffer().Pointer(), k, 1, c.gradWeight.Buffer().Pointer(), k)
 	if err == nil {
 		err = kernels.ColumnSum(grad.Buffer(), c.gradBias.Buffer(), rows, c.Out)
 	}
@@ -386,23 +397,46 @@ func activationCUDA(a *activation, x, grad *tensor.Tensor, kind int, slope float
 }
 
 // Residual computes x + F(x), requiring equal input and output shapes.
-type Residual struct{ Inner Module }
+type Residual struct {
+	Inner       Module
+	innerOutput *tensor.Tensor // only outputs not owned by Inner's cleanup
+}
 
 func (r *Residual) Parameters() []*tensor.Tensor { return r.Inner.Parameters() }
 func (r *Residual) Gradients() []*tensor.Tensor  { return r.Inner.Gradients() }
 func (r *Residual) ZeroGrad()                    { r.Inner.ZeroGrad() }
 func (r *Residual) Close() {
+	r.CloseActivations()
 	if c, ok := r.Inner.(interface{ Close() }); ok {
 		c.Close()
 	}
 }
 func (r *Residual) Forward(blas *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, error) {
+	r.CloseActivations()
 	y, err := r.Inner.Forward(blas, x)
+	if y != nil && y != x && !ownsActivation(r.Inner, y) {
+		r.innerOutput = y
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			r.CloseActivations()
+		}
+	}()
 	if err != nil {
 		return nil, err
 	}
-	if y.Numel() != x.Numel() {
+	if y == nil {
+		return nil, fmt.Errorf("nn: residual inner returned nil output")
+	}
+	xs, ys := x.Shape(), y.Shape()
+	if x.Device() != y.Device() || len(xs) != len(ys) {
 		return nil, fmt.Errorf("nn: residual shape mismatch")
+	}
+	for i := range xs {
+		if xs[i] != ys[i] {
+			return nil, fmt.Errorf("nn: residual shape mismatch")
+		}
 	}
 	if x.Device() == tensor.CUDA {
 		sum, err := tensor.NewOn(tensor.CUDA, x.Shape()...)
@@ -413,6 +447,7 @@ func (r *Residual) Forward(blas *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, e
 			sum.Close()
 			return nil, err
 		}
+		ok = true
 		return sum, nil
 	}
 	xv, err := values(x)
@@ -427,7 +462,9 @@ func (r *Residual) Forward(blas *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, e
 	for i := range sum {
 		sum[i] = yv[i] + xv[i]
 	}
-	return output(x.Device(), x.Shape(), sum)
+	result, err := output(x.Device(), x.Shape(), sum)
+	ok = err == nil
+	return result, err
 }
 func (r *Residual) Backward(blas *cuda.Blas, g *tensor.Tensor) (*tensor.Tensor, error) {
 	dx, err := r.Inner.Backward(blas, g)
@@ -453,8 +490,16 @@ func (r *Residual) Backward(blas *cuda.Blas, g *tensor.Tensor) (*tensor.Tensor, 
 	}
 	return dx, err
 }
-func (r *Residual) CloseActivations() {
-	if c, ok := r.Inner.(interface{ CloseActivations() }); ok {
+func (r *Residual) CloseActivations() { r.closeActivationsExcept(nil) }
+
+func (r *Residual) closeActivationsExcept(keep *tensor.Tensor) {
+	if c, ok := r.Inner.(interface{ closeActivationsExcept(*tensor.Tensor) }); ok {
+		c.closeActivationsExcept(keep)
+	} else if c, ok := r.Inner.(interface{ CloseActivations() }); ok {
 		c.CloseActivations()
 	}
+	if r.innerOutput != nil && r.innerOutput != keep {
+		r.innerOutput.Close()
+	}
+	r.innerOutput = nil
 }
