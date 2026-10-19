@@ -131,6 +131,9 @@ func (l *Linear) Forward(blas *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, err
 
 // Backward accumulates dW and db and returns dX.
 func (l *Linear) Backward(blas *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor, error) {
+	if l.input == nil {
+		return nil, fmt.Errorf("nn: Linear backward before forward")
+	}
 	shape := l.input.Shape()
 	dx, err := tensor.NewOn(grad.Device(), shape...)
 	if err != nil {
@@ -228,6 +231,9 @@ func (t *Tanh) Forward(blas *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, error
 
 // Backward returns dX = grad * (1 - out^2).
 func (t *Tanh) Backward(blas *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor, error) {
+	if t.output == nil {
+		return nil, fmt.Errorf("nn: Tanh backward before forward")
+	}
 	dx, err := tensor.ZerosOn(grad.Device(), grad.Shape()...)
 	if err != nil {
 		return nil, err
@@ -473,8 +479,12 @@ func (o *AdamW) Close() {
 }
 
 // MSE returns the mean squared error and its gradient with respect to
-// predicted.
+// predicted. Mismatched or empty inputs return a zero loss and no gradient
+// instead of panicking.
 func MSE(predicted, target []float32) (float64, []float32) {
+	if len(predicted) != len(target) || len(predicted) == 0 {
+		return 0, nil
+	}
 	gradient := make([]float32, len(predicted))
 	total := 0.0
 	for i := range predicted {

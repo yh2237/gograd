@@ -210,22 +210,32 @@ func FitStandardizer(samples []RegressionSample) (Standardizer, error) {
 		return Standardizer{}, fmt.Errorf("data: samples need at least one feature")
 	}
 	mean := make([]float64, features)
-	square := make([]float64, features)
 	for _, sample := range samples {
 		if len(sample.Features) != features {
 			return Standardizer{}, fmt.Errorf("data: inconsistent feature counts")
 		}
 		for i, value := range sample.Features {
-			v := float64(value)
-			mean[i] += v
-			square[i] += v * v
+			mean[i] += float64(value)
 		}
 	}
 	count := float64(len(samples))
+	for i := range mean {
+		mean[i] /= count
+	}
+	// The variance is accumulated about the mean. The one-pass formula
+	// E[x^2]-E[x]^2 loses every significant digit when the mean is large
+	// compared with the spread.
+	square := make([]float64, features)
+	for _, sample := range samples {
+		for i, value := range sample.Features {
+			difference := float64(value) - mean[i]
+			square[i] += difference * difference
+		}
+	}
 	standardizer := Standardizer{Mean: make([]float32, features), Std: make([]float32, features)}
 	for i := range mean {
-		m := mean[i] / count
-		variance := square[i]/count - m*m
+		m := mean[i]
+		variance := square[i] / count
 		if variance < 0 {
 			variance = 0
 		}
@@ -253,7 +263,8 @@ func (s Standardizer) Apply(sample RegressionSample) RegressionSample {
 // ApplyBatch standardizes a collated batch in place, which is what training and
 // evaluation loops want before transferring the batch to a device.
 func (s Standardizer) ApplyBatch(batch *RegressionBatch) error {
-	if batch == nil || len(batch.Shape) != 2 || batch.Shape[1] != len(s.Mean) {
+	if batch == nil || len(batch.Shape) != 2 || batch.Shape[1] != len(s.Mean) ||
+		batch.Shape[0] < 0 || len(batch.Values) != batch.Shape[0]*batch.Shape[1] {
 		return fmt.Errorf("data: batch features do not match the standardizer")
 	}
 	for row := 0; row < batch.Shape[0]; row++ {

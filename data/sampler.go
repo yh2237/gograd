@@ -93,6 +93,11 @@ func (s *IndexSampler) NextEpoch() error {
 	s.resetOrder()
 	return nil
 }
+
+// Epoch reports the current epoch counter. It does not copy the permutation,
+// so it is cheap enough for a progress report.
+func (s *IndexSampler) Epoch() uint64 { return s.epoch }
+
 func (s *IndexSampler) State() IndexSamplerState {
 	random, _ := s.source.MarshalBinary()
 	return IndexSamplerState{1, s.size, s.position, s.options.Shuffle, s.options.Seed, s.epoch, slices.Clone(s.order), random}

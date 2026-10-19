@@ -239,9 +239,13 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 		Step: trainingStep(m, execution, device),
 		Report: func(update int, loss float64) {
 			stats.TrainLoss = float32(loss)
-			fmt.Fprintf(log, "device=%s step=%d train_loss=%.6f epoch=%d\n", device, update, loss, sampler.State().Epoch)
+			fmt.Fprintf(log, "device=%s step=%d train_loss=%.6f epoch=%d\n", device, update, loss, sampler.Epoch())
 		},
 		Save: func(savepoint []byte) error {
+			if c.Checkpoint == "" {
+				// Without an output path there is no checkpoint to write.
+				return nil
+			}
 			state, err := loader.State()
 			if err != nil {
 				return err

@@ -26,6 +26,10 @@ func main() {
 	profile := flag.String("cpuprofile", "", "write CPU profile")
 	lossKind := flag.String("loss", "l1", "l1 or mse")
 	flag.Parse()
+	if *hidden < 1 || *batch < 1 || *frames < 1 || *steps < 1 || *kernel < 1 || *kernel%2 == 0 {
+		fmt.Fprintln(os.Stderr, "nn-conv-train: hidden, batch, time and steps must be positive and the kernel must be odd")
+		os.Exit(2)
+	}
 	if *profile != "" {
 		f, err := os.Create(*profile)
 		if err != nil {

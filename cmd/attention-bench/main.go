@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"os"
 
 	"github.com/yh2237/gograd/autograd"
 	"github.com/yh2237/gograd/cuda"
@@ -20,6 +21,10 @@ func main() {
 	flag.Parse()
 	if *algorithm != "flash" && *algorithm != "materialized" {
 		panic("invalid algorithm")
+	}
+	if *seq < 1 || *heads < 1 || *dim < 1 || *warmup < 0 {
+		fmt.Fprintln(os.Stderr, "attention-bench: seq, heads and dim must be positive")
+		os.Exit(2)
 	}
 	ctx, e := autograd.NewCUDAContext()
 	if e != nil {
@@ -38,10 +43,22 @@ func main() {
 		return a
 	}
 	shape := []int{1, *heads, *seq, *dim}
-	q, _ := autograd.New(data(), shape, tensor.CUDA, true)
-	k, _ := autograd.New(data(), shape, tensor.CUDA, true)
-	v, _ := autograd.New(data(), shape, tensor.CUDA, true)
-	up, _ := autograd.New(data(), shape, tensor.CUDA, false)
+	q, e := autograd.New(data(), shape, tensor.CUDA, true)
+	if e != nil {
+		panic(e)
+	}
+	k, e := autograd.New(data(), shape, tensor.CUDA, true)
+	if e != nil {
+		panic(e)
+	}
+	v, e := autograd.New(data(), shape, tensor.CUDA, true)
+	if e != nil {
+		panic(e)
+	}
+	up, e := autograd.New(data(), shape, tensor.CUDA, false)
+	if e != nil {
+		panic(e)
+	}
 	defer q.Close()
 	defer k.Close()
 	defer v.Close()

@@ -344,7 +344,7 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 		Step: trainingStep(model, execution, device),
 		Report: func(update int, loss float64) {
 			stats.TrainLoss = loss
-			fmt.Fprintf(log, "device=%s step=%d train_mse=%.6f epoch=%d\n", device, update, loss, sampler.State().Epoch)
+			fmt.Fprintf(log, "device=%s step=%d train_mse=%.6f epoch=%d\n", device, update, loss, sampler.Epoch())
 		},
 		Save: func([]byte) error {
 			loaderState, err := loader.State()

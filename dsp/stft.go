@@ -1,6 +1,9 @@
 package dsp
 
-import "math"
+import (
+	"fmt"
+	"math"
+)
 
 // HannPeriodic returns the periodic Hann window torch.hann_window(n) uses. The
 // reference builds it once and shares it between the transform and its inverse,
@@ -35,6 +38,11 @@ func NewSTFT(filterLength, hopLength int) (*STFT, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A hop of zero divides by zero while the frames are counted, and a
+	// negative hop makes the frame count negative.
+	if hopLength < 1 || hopLength > filterLength {
+		return nil, fmt.Errorf("dsp: invalid STFT hop %d for filter length %d", hopLength, filterLength)
+	}
 	window := HannPeriodic(filterLength)
 	windowSq := make([]float32, len(window))
 	for i, v := range window {
@@ -49,7 +57,8 @@ func (s *STFT) Bins() int { return s.fft.Bins() }
 // FramesFor reports how many frames Transform produces for a block of length
 // samples, including the reflect centring torch.stft adds.
 func (s *STFT) FramesFor(length int) int {
-	return 1 + padLength(length, len(s.window))/s.hop
+	padded := padLength(length, len(s.window)) + 2*s.center
+	return 1 + (padded-len(s.window))/s.hop
 }
 
 // Transform returns the frequency-major magnitude and phase of x and the frame

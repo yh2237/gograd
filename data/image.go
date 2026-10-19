@@ -103,8 +103,12 @@ func WriteIDX(imagesPath, labelsPath string, rows, cols int, images [][]byte, la
 }
 
 // ScaleImage resamples img to width/height by nearest neighbor. If channels is 3,
-// the result has 3 planes; otherwise a single grayscale plane.
+// the result has 3 planes; otherwise a single grayscale plane. A non-positive
+// size returns no pixels.
 func ScaleImage(img image.Image, width, height, channels int) []uint8 {
+	if img == nil || width <= 0 || height <= 0 {
+		return nil
+	}
 	minimum := img.Bounds().Min
 	srcH, srcW := img.Bounds().Dy(), img.Bounds().Dx()
 	if channels == 3 {
