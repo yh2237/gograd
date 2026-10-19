@@ -10,6 +10,9 @@ import (
 )
 
 func (d *vkDriver) alloc(size uint64, host bool) (_ *block, err error) {
+	if d.failure != nil {
+		return nil, d.failure
+	}
 	memory := &block{size: size, host: host}
 	defer func() {
 		if err != nil {
@@ -52,7 +55,11 @@ func (d *vkDriver) alloc(size uint64, host bool) (_ *block, err error) {
 	return memory, nil
 }
 
-func (d *vkDriver) free(memory *block) {
+func (d *vkDriver) free(memory *block) bool {
+	if d.pending {
+		d.quarantine = append(d.quarantine, memory)
+		return false
+	}
 	if memory.mapped != nil {
 		d.call("vkUnmapMemory", d.device, uintptr(memory.memory))
 		memory.mapped = nil
@@ -65,6 +72,7 @@ func (d *vkDriver) free(memory *block) {
 		d.call("vkFreeMemory", d.device, uintptr(memory.memory), 0)
 		memory.memory = 0
 	}
+	return true
 }
 
 func (d *vkDriver) write(memory *block, values []float32) {

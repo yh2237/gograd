@@ -3,14 +3,68 @@
 package vulkan
 
 import (
+	"fmt"
+	"testing"
+
 	"github.com/yh2237/gograd/gpu"
 	"github.com/yh2237/gograd/tensor"
-	"testing"
 )
 
 func TestVulkanABI(t *testing.T) {
 	if err := checkABI(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Count the real ABI queue calls, not a high-level wrapper's batch count. Keep
+// downloads outside the measured region and exercise both cold and warm calls.
+func TestVulkanConv1dSingleSubmission(t *testing.T) {
+	b := testBackend(t)
+	d := b.driver.(*vkDriver)
+	submits := 0
+	b.mu.Lock()
+	d.callHook = func(name string, args ...uintptr) uintptr {
+		if name == "vkQueueSubmit" {
+			submits++
+		}
+		return callNative(d.procs[name], args...)
+	}
+	b.mu.Unlock()
+	t.Cleanup(func() {
+		b.mu.Lock()
+		d.callHook = nil
+		b.mu.Unlock()
+	})
+	x := testUpload(t, b, []float32{1, 2, 3, 4})
+	w := testUpload(t, b, []float32{1, 2, -1, 1})
+	v := testUpload(t, b, []float32{.5, -.25})
+	out := testAlloc(t, b, 6)
+	o := gpu.Conv1dOptions{Batch: 1, InputLength: 4, InChannels: 1, OutChannels: 2, Kernel: 2, Stride: 1, Dilation: 1}
+	for _, bias := range []bool{false, true} {
+		t.Run(fmt.Sprint(bias), func(t *testing.T) {
+			var biasBuffer *gpu.Buffer
+			want := []float32{5, 1, 8, 1, 11, 1}
+			if bias {
+				biasBuffer = v
+				for i := range want {
+					if i%2 == 0 {
+						want[i] += .5
+					} else {
+						want[i] -= .25
+					}
+				}
+			}
+			for iteration := 0; iteration < 3; iteration++ {
+				before := submits
+				if err := b.Conv1d(out, x, w, biasBuffer, o); err != nil {
+					t.Fatal(err)
+				}
+				if submits-before != 1 {
+					t.Fatalf("iteration %d: got %d submissions, want 1", iteration, submits-before)
+				}
+				checkValues(t, b, out, want)
+			}
+		})
 	}
 }
 

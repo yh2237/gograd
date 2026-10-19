@@ -4,6 +4,7 @@ package vulkan
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"syscall"
 	"unsafe"
@@ -31,15 +32,17 @@ func (d *vkDriver) initPipeline() error {
 	if err := result("vkCreateDescriptorSetLayout", d.call("vkCreateDescriptorSetLayout", d.device, uintptr(unsafe.Pointer(&layout)), 0, uintptr(unsafe.Pointer(&d.descriptorLayout)))); err != nil {
 		return err
 	}
-	sizes := vkDescriptorPoolSize{Type: 7, Count: 4}
-	pool := vkDescriptorPoolCreateInfo{vkHeader: header(33), MaxSets: 1, SizeCount: 1, Sizes: &sizes}
+	sizes := vkDescriptorPoolSize{Type: 7, Count: 4 * uint32(len(d.descriptorSets))}
+	pool := vkDescriptorPoolCreateInfo{vkHeader: header(33), MaxSets: uint32(len(d.descriptorSets)), SizeCount: 1, Sizes: &sizes}
 	if err := result("vkCreateDescriptorPool", d.call("vkCreateDescriptorPool", d.device, uintptr(unsafe.Pointer(&pool)), 0, uintptr(unsafe.Pointer(&d.descriptorPool)))); err != nil {
 		return err
 	}
-	allocate := vkDescriptorAllocateInfo{vkHeader: header(34), Pool: d.descriptorPool, Count: 1, Layouts: &d.descriptorLayout}
-	if err := result("vkAllocateDescriptorSets", d.call("vkAllocateDescriptorSets", d.device, uintptr(unsafe.Pointer(&allocate)), uintptr(unsafe.Pointer(&d.descriptorSet)))); err != nil {
+	layouts := [3]uint64{d.descriptorLayout, d.descriptorLayout, d.descriptorLayout}
+	allocate := vkDescriptorAllocateInfo{vkHeader: header(34), Pool: d.descriptorPool, Count: uint32(len(layouts)), Layouts: &layouts[0]}
+	if err := result("vkAllocateDescriptorSets", d.call("vkAllocateDescriptorSets", d.device, uintptr(unsafe.Pointer(&allocate)), uintptr(unsafe.Pointer(&d.descriptorSets[0])))); err != nil {
 		return err
 	}
+	d.descriptorSet = d.descriptorSets[0]
 	push := vkPushRange{Stage: 0x20, Size: 128}
 	pipelineLayout := vkPipelineLayoutCreateInfo{vkHeader: header(30), SetLayoutCount: 1, SetLayouts: &d.descriptorLayout, PushCount: 1, PushRanges: &push}
 	if err := result("vkCreatePipelineLayout", d.call("vkCreatePipelineLayout", d.device, uintptr(unsafe.Pointer(&pipelineLayout)), 0, uintptr(unsafe.Pointer(&d.pipelineLayout)))); err != nil {
@@ -107,10 +110,17 @@ func (d *vkDriver) createCompute(shader uint64, specialization *vkSpecialization
 	return handle, err
 }
 
-// A fence is always waited before command buffers, descriptors or allocations
-// can be reused. On submission failure, drain the device before returning an
-// error to the pool layer; a lost device permits resource destruction as well.
-func (d *vkDriver) submit(record func()) error {
+// No command state or allocation can be reused until completion is established.
+// Failed emergency idle waits leave pending set, quarantining the entire device.
+func (d *vkDriver) submit(record func()) (err error) {
+	if d.failure != nil {
+		return d.failure
+	}
+	defer func() {
+		if err != nil {
+			d.failure = err
+		}
+	}()
 	if err := result("vkResetCommandBuffer", d.call("vkResetCommandBuffer", d.command, 0)); err != nil {
 		return err
 	}
@@ -126,15 +136,28 @@ func (d *vkDriver) submit(record func()) error {
 		return err
 	}
 	submit := vkSubmitInfo{vkHeader: header(4), CommandCount: 1, Commands: &d.command}
-	if err := result("vkQueueSubmit", d.call("vkQueueSubmit", d.queue, 1, uintptr(unsafe.Pointer(&submit)), uintptr(d.fence))); err != nil {
-		d.call("vkDeviceWaitIdle", d.device)
-		return err
+	d.pending = true
+	if code := d.call("vkQueueSubmit", d.queue, 1, uintptr(unsafe.Pointer(&submit)), uintptr(d.fence)); code != 0 {
+		return d.submissionFailure("vkQueueSubmit", code)
 	}
-	if err := result("vkWaitForFences", d.call("vkWaitForFences", d.device, 1, uintptr(unsafe.Pointer(&d.fence)), 1, ^uintptr(0))); err != nil {
-		d.call("vkDeviceWaitIdle", d.device)
-		return err
+	if code := d.call("vkWaitForFences", d.device, 1, uintptr(unsafe.Pointer(&d.fence)), 1, ^uintptr(0)); code != 0 {
+		return d.submissionFailure("vkWaitForFences", code)
 	}
+	d.pending = false
 	return nil
+}
+
+func (d *vkDriver) submissionFailure(op string, code uintptr) error {
+	err := result(op, code)
+	if int32(code) == -4 { // Confirmed VK_ERROR_DEVICE_LOST: destruction is safe.
+		d.pending = false
+		return err
+	}
+	idle := d.call("vkDeviceWaitIdle", d.device)
+	if idle == 0 || int32(idle) == -4 {
+		d.pending = false
+	}
+	return errors.Join(err, result("emergency vkDeviceWaitIdle", idle))
 }
 
 const (
@@ -206,18 +229,28 @@ func (d *vkDriver) pointwise(out, a, b *block, n, kind uint32, scalar float32) e
 }
 
 func (d *vkDriver) bindBuffers(out, a, b *block, outCount, aCount, bCount uint32) {
+	d.bindBuffersSet(d.descriptorSet, out, a, b, outCount, aCount, bCount)
+}
+
+func (d *vkDriver) bindBuffersSet(set uint64, out, a, b *block, outCount, aCount, bCount uint32) {
+	if d.failure != nil {
+		return
+	}
 	// Binding 3 is statically used by pointwise's fused residual branch. Bind a
 	// valid dummy even for other operations; a dynamic branch is not sufficient
 	// to leave a shader-visible descriptor uninitialized. Reductions override it.
 	infos := [4]vkDescriptorBufferInfo{{Buffer: a.buffer, Range: uint64(aCount) * 4}, {Buffer: b.buffer, Range: uint64(bCount) * 4}, {Buffer: out.buffer, Range: uint64(outCount) * 4}, {Buffer: a.buffer, Range: uint64(aCount) * 4}}
 	writes := [4]vkDescriptorWrite{}
 	for i := range writes {
-		writes[i] = vkDescriptorWrite{vkHeader: header(35), Set: d.descriptorSet, Binding: uint32(i), Count: 1, Type: 7, BufferInfo: &infos[i]}
+		writes[i] = vkDescriptorWrite{vkHeader: header(35), Set: set, Binding: uint32(i), Count: 1, Type: 7, BufferInfo: &infos[i]}
 	}
 	d.call("vkUpdateDescriptorSets", d.device, uintptr(len(writes)), uintptr(unsafe.Pointer(&writes[0])), 0, 0)
 }
 
 func (d *vkDriver) fusedBias(out, a, bias, residual *block, n, channels, kind uint32) error {
+	if d.failure != nil {
+		return d.failure
+	}
 	x, y, err := dispatchGrid(n, d.properties.MaxWorkGroupCount)
 	if err != nil {
 		return err
@@ -243,8 +276,12 @@ func (d *vkDriver) fusedBias(out, a, bias, residual *block, n, channels, kind ui
 }
 
 func (d *vkDriver) bindCompute(pipeline uint64, push unsafe.Pointer, size uintptr) {
+	d.bindComputeSet(d.descriptorSet, pipeline, push, size)
+}
+
+func (d *vkDriver) bindComputeSet(set, pipeline uint64, push unsafe.Pointer, size uintptr) {
 	d.call("vkCmdBindPipeline", d.command, 1, uintptr(pipeline))
-	d.call("vkCmdBindDescriptorSets", d.command, 1, uintptr(d.pipelineLayout), 0, 1, uintptr(unsafe.Pointer(&d.descriptorSet)), 0, 0)
+	d.call("vkCmdBindDescriptorSets", d.command, 1, uintptr(d.pipelineLayout), 0, 1, uintptr(unsafe.Pointer(&set)), 0, 0)
 	d.call("vkCmdPushConstants", d.command, uintptr(d.pipelineLayout), 0x20, 0, size, uintptr(push))
 }
 
@@ -282,6 +319,9 @@ func (d *vkDriver) gemm(out, a, b *block, outCount, aCount, bCount uint32, p gem
 }
 
 func (d *vkDriver) reduce(out, a, weight, bias *block, count, affineCount uint32, p reduceParams) error {
+	if d.failure != nil {
+		return d.failure
+	}
 	x, y, err := groupGrid(uint64(p.Rows), d.properties.MaxWorkGroupCount)
 	if err != nil {
 		return err
@@ -305,20 +345,53 @@ func (d *vkDriver) reduce(out, a, weight, bias *block, count, affineCount uint32
 	})
 }
 
-func (d *vkDriver) conv(out, src, bias *block, outCount, srcCount, biasCount uint32, p convParams) error {
-	x, y, err := dispatchGrid(p.N, d.properties.MaxWorkGroupCount)
+// Each dispatch owns an independent descriptor slot. Descriptor writes are not
+// command-buffer state: rewriting one set between recorded dispatches is unsafe.
+// Push constants, in contrast, are copied into the command stream by Vulkan.
+func (d *vkDriver) conv1d(b convBatch) error {
+	if d.failure != nil {
+		return d.failure
+	}
+	x, y, err := dispatchGrid(b.colCount, d.properties.MaxWorkGroupCount)
 	if err != nil {
 		return err
 	}
-	d.bindBuffers(out, src, bias, outCount, srcCount, biasCount)
-	return d.submit(func() {
-		d.before(src, accessShaderRead, stageCompute)
-		if bias != src {
-			d.before(bias, accessShaderRead, stageCompute)
+	gx, gy, err := groupGrid(uint64(b.gemm.Batch)*uint64(b.gemm.TilesPerMatrix), d.properties.MaxWorkGroupCount)
+	if err != nil {
+		return err
+	}
+	var bx, by uint32
+	if b.hasBias {
+		bx, by, err = dispatchGrid(b.outCount, d.properties.MaxWorkGroupCount)
+		if err != nil {
+			return err
 		}
-		d.before(out, accessShaderWrite, stageCompute)
-		d.bindCompute(d.convPipeline, unsafe.Pointer(&p), unsafe.Sizeof(p))
+	}
+	d.bindBuffersSet(d.descriptorSets[0], b.col, b.input, b.bias, b.colCount, b.inputCount, b.biasCount)
+	d.bindBuffersSet(d.descriptorSets[1], b.out, b.col, b.weight, b.outCount, b.colCount, b.weightCount)
+	if b.hasBias {
+		d.bindBuffersSet(d.descriptorSets[2], b.out, b.out, b.bias, b.outCount, b.outCount, b.biasCount)
+	}
+	return d.submit(func() {
+		d.before(b.input, accessShaderRead, stageCompute)
+		d.before(b.col, accessShaderWrite, stageCompute)
+		d.bindComputeSet(d.descriptorSets[0], d.convPipeline, unsafe.Pointer(&b.conv), unsafe.Sizeof(b.conv))
 		d.call("vkCmdDispatch", d.command, uintptr(x), uintptr(y), 1)
-		d.barrier(out, accessShaderWrite, accessShaderRead|accessShaderWrite|accessTransferRead, stageCompute, stageCompute|stageTransfer)
+		d.barrier(b.col, accessShaderWrite, accessShaderRead, stageCompute, stageCompute)
+
+		d.before(b.weight, accessShaderRead, stageCompute)
+		d.before(b.out, accessShaderWrite, stageCompute)
+		d.bindComputeSet(d.descriptorSets[1], d.gemmPipelines[b.variant], unsafe.Pointer(&b.gemm), unsafe.Sizeof(b.gemm))
+		d.call("vkCmdDispatch", d.command, uintptr(gx), uintptr(gy), 1)
+		if b.hasBias {
+			d.barrier(b.out, accessShaderWrite, accessShaderRead|accessShaderWrite, stageCompute, stageCompute)
+			d.before(b.bias, accessShaderRead, stageCompute)
+			p := b.conv
+			p.N, p.Kind = b.outCount, 1
+			// This pass is element-local; its in-place read/write is safe.
+			d.bindComputeSet(d.descriptorSets[2], d.convPipeline, unsafe.Pointer(&p), unsafe.Sizeof(p))
+			d.call("vkCmdDispatch", d.command, uintptr(bx), uintptr(by), 1)
+		}
+		d.barrier(b.out, accessShaderWrite, accessShaderRead|accessShaderWrite|accessTransferRead, stageCompute, stageCompute|stageTransfer)
 	})
 }

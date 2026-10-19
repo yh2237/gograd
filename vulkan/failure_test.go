@@ -20,7 +20,7 @@ func (d *failingDriver) alloc(size uint64, host bool) (*block, error) {
 	d.allocated++
 	return &block{size: size, allocated: size, host: host}, nil
 }
-func (d *failingDriver) free(*block)                          { d.freed++ }
+func (d *failingDriver) free(*block) bool                     { d.freed++; return true }
 func (*failingDriver) write(*block, []float32)                {}
 func (*failingDriver) read(*block, []float32)                 {}
 func (d *failingDriver) copy(out, src *block, n uint64) error { return d.failure }
@@ -31,12 +31,21 @@ func (d *failingDriver) pointwise(out, a, b *block, n, kind uint32, scalar float
 func (d *failingDriver) fusedBias(out, a, bias, residual *block, n, channels, kind uint32) error {
 	return d.computeFailure()
 }
-func (d *failingDriver) close() { d.closed++ }
+func (d *failingDriver) close() error { d.closed++; return nil }
 func (d *failingDriver) reduce(out, a, weight, bias *block, count, affineCount uint32, p reduceParams) error {
 	return d.computeFailure()
 }
-func (d *failingDriver) conv(out, src, bias *block, outCount, srcCount, biasCount uint32, p convParams) error {
-	return d.computeFailure()
+func (d *failingDriver) conv1d(p convBatch) error {
+	stages := 2
+	if p.hasBias {
+		stages++
+	}
+	for i := 0; i < stages; i++ {
+		if err := d.computeFailure(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (d *failingDriver) viewCopy(out, src *block, outCount, srcCount uint32, p viewParams) error {
 	return d.failure

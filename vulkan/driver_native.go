@@ -19,6 +19,7 @@ type vkDriver struct {
 	instance, physical, device, queue, command             uintptr
 	commandPool, fence                                     uint64
 	descriptorLayout, descriptorPool, descriptorSet        uint64
+	descriptorSets                                         [3]uint64
 	pipelineLayout, shader, pipeline                       uint64
 	viewShader, viewPipeline                               uint64
 	gemmShader                                             uint64
@@ -26,6 +27,12 @@ type vkDriver struct {
 	reduceShader, reducePipeline, convShader, convPipeline uint64
 	properties                                             Info
 	memory                                                 vkMemoryProperties
+	// pending means completion has not been established, even after an emergency
+	// wait. Never reset commands, update descriptors, free memory or unload while set.
+	pending    bool
+	failure    error
+	quarantine []*block
+	callHook   func(string, ...uintptr) uintptr // driver-free native tests
 }
 
 func result(op string, value uintptr) error {
@@ -37,6 +44,9 @@ func result(op string, value uintptr) error {
 
 //go:uintptrescapes
 func (d *vkDriver) call(name string, args ...uintptr) uintptr {
+	if d.callHook != nil {
+		return d.callHook(name, args...)
+	}
 	return callNative(d.procs[name], args...)
 }
 
@@ -196,9 +206,19 @@ func (d *vkDriver) selectPhysical() error {
 
 func (d *vkDriver) info() Info { return d.properties }
 
-func (d *vkDriver) close() {
+func (d *vkDriver) close() error {
 	if d.device != 0 {
-		d.call("vkDeviceWaitIdle", d.device)
+		if d.pending {
+			code := d.call("vkDeviceWaitIdle", d.device)
+			if code != 0 && int32(code) != -4 { // VK_ERROR_DEVICE_LOST also permits destruction.
+				return fmt.Errorf("%w: cleanup quarantined: %w", gpu.ErrUnavailable, result("vkDeviceWaitIdle", code))
+			}
+			d.pending = false
+		}
+		for _, memory := range d.quarantine {
+			d.free(memory)
+		}
+		d.quarantine = nil
 		for _, pipeline := range d.gemmPipelines {
 			if pipeline != 0 {
 				d.call("vkDestroyPipeline", d.device, uintptr(pipeline), 0)
@@ -230,4 +250,5 @@ func (d *vkDriver) close() {
 		d.library.close()
 		d.library = nil
 	}
+	return nil
 }

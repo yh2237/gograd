@@ -17,6 +17,17 @@ type convParams struct {
 	Stride, Padding, Dilation, Kind, OutChannels     uint32
 }
 
+// convBatch is a fixed, internal 2/3-dispatch batch. Its scratch and input blocks
+// stay owned by the caller until the single synchronous submission returns.
+type convBatch struct {
+	out, input, weight, bias, col                          *block
+	outCount, inputCount, weightCount, biasCount, colCount uint32
+	conv                                                   convParams
+	gemm                                                   gemmParams
+	variant                                                int
+	hasBias                                                bool
+}
+
 var _ gpu.ExactGELUBackend = (*Backend)(nil)
 
 func (b *Backend) GELU(out, a *gpu.Buffer, n int) error {
@@ -185,16 +196,9 @@ func (b *Backend) Conv1d(out, input, weight, bias *gpu.Buffer, o gpu.Conv1dOptio
 	}
 	defer b.put(col)
 	cp := convParams{N: uint32(colSize), InputLength: uint32(o.InputLength), InChannels: uint32(o.InChannels), Kernel: uint32(o.Kernel), OutputLength: uint32(length), Stride: uint32(o.Stride), Padding: uint32(o.Padding), Dilation: uint32(o.Dilation), OutChannels: uint32(o.OutChannels)}
-	if err := b.fail(b.driver.conv(col, x, v, uint32(colSize), uint32(xSize), uint32(biasCount), cp)); err != nil {
-		return err
-	}
-	if err := b.fail(b.driver.gemm(y, col, w, uint32(ySize), uint32(colSize), uint32(wSize), p, variant)); err != nil {
-		return err
-	}
-	if bias == nil {
-		return nil
-	}
-	cp.N, cp.Kind = uint32(ySize), 1
-	// This internal bias pass is element-local, so in-place access is safe.
-	return b.fail(b.driver.conv(y, y, v, uint32(ySize), uint32(ySize), uint32(biasCount), cp))
+	return b.fail(b.driver.conv1d(convBatch{
+		out: y, input: x, weight: w, bias: v, col: col,
+		outCount: uint32(ySize), inputCount: uint32(xSize), weightCount: uint32(wSize), biasCount: uint32(biasCount), colCount: uint32(colSize),
+		conv: cp, gemm: p, variant: variant, hasBias: bias != nil,
+	}))
 }

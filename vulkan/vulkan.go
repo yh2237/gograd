@@ -22,9 +22,12 @@ type Info struct {
 
 // AllocationStats counts backing allocations, including temporary staging
 // buffers. Cached memory is bounded and can be returned with ReleasePool.
+// Quarantined memory remains reserved until Close proves completion or device loss.
 type AllocationStats struct {
 	LiveBytes, CachedBytes, ReservedBytes uint64
 	LiveBuffers, CachedBuffers            int
+	QuarantinedBytes                      uint64
+	QuarantinedBuffers                    int
 	CacheLimitBytes                       uint64
 }
 
@@ -35,11 +38,11 @@ type block struct {
 }
 
 // All driver calls are serialized by Backend.mu, including queue, descriptors,
-// command pool and fence use. M1 waits at every submission; batching comes later.
+// command pool and fence use. Every public operation waits for completion.
 type driver interface {
 	info() Info
 	alloc(size uint64, host bool) (*block, error)
-	free(*block)
+	free(*block) bool // false transfers ownership to the driver's quarantine
 	write(*block, []float32)
 	read(*block, []float32)
 	copy(out, src *block, size uint64) error
@@ -49,8 +52,8 @@ type driver interface {
 	viewCopy(out, src *block, outCount, srcCount uint32, params viewParams) error
 	gemm(out, a, b *block, outCount, aCount, bCount uint32, params gemmParams, variant int) error
 	reduce(out, a, weight, bias *block, count, affineCount uint32, params reduceParams) error
-	conv(out, src, bias *block, outCount, srcCount, biasCount uint32, params convParams) error
-	close()
+	conv1d(convBatch) error
+	close() error
 }
 
 type poolKey struct {
@@ -159,8 +162,7 @@ func (b *Backend) MemoryStats() AllocationStats { b.mu.Lock(); defer b.mu.Unlock
 func (b *Backend) releasePoolLocked() {
 	for key, blocks := range b.pool {
 		for _, block := range blocks {
-			b.driver.free(block)
-			b.stats.ReservedBytes -= block.allocated
+			b.freeLocked(block)
 		}
 		delete(b.pool, key)
 	}
@@ -177,6 +179,8 @@ func (b *Backend) SetPoolCacheLimit(bytes uint64) {
 }
 
 // Close is for independent backends only. Live buffers must be closed first.
+// If failed work cannot be proven complete, Close retains quarantined resources
+// and returns an error. A later Close makes one more idle attempt; it never spins.
 func (b *Backend) Close() error {
 	if b.registered {
 		return fmt.Errorf("%w: registered Vulkan backend has process lifetime", gpu.ErrUnsupported)
@@ -192,15 +196,18 @@ func (b *Backend) Close() error {
 	}
 	b.releasePoolLocked()
 	if b.driver != nil {
-		b.driver.close()
+		if err := b.driver.close(); err != nil {
+			return err // Retain driver ownership; a subsequent Close may retry once.
+		}
 	}
+	b.stats.ReservedBytes, b.stats.QuarantinedBytes, b.stats.QuarantinedBuffers = 0, 0, 0
 	b.closed = true
 	return nil
 }
 
 func (b *Backend) fail(err error) error {
 	if err != nil {
-		b.err = fmt.Errorf("%w: Vulkan device failure: %v", gpu.ErrUnavailable, err)
+		b.err = fmt.Errorf("%w: Vulkan device failure: %w", gpu.ErrUnavailable, err)
 		b.releasePoolLocked()
 	}
 	return err
@@ -266,8 +273,16 @@ func (b *Backend) put(memory *block) {
 		b.stats.CachedBytes += memory.allocated
 		b.stats.CachedBuffers++
 	} else {
-		b.driver.free(memory)
+		b.freeLocked(memory)
+	}
+}
+
+func (b *Backend) freeLocked(memory *block) {
+	if b.driver.free(memory) {
 		b.stats.ReservedBytes -= memory.allocated
+	} else {
+		b.stats.QuarantinedBytes += memory.allocated
+		b.stats.QuarantinedBuffers++
 	}
 }
 func (b *Backend) native(buffer *gpu.Buffer, n int) (*block, error) {
