@@ -13,6 +13,18 @@ import (
 	"github.com/yh2237/gograd/tensor"
 )
 
+func sameShape(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // Module is a trainable layer.
 type Module interface {
 	Parameters() []*tensor.Tensor
@@ -43,6 +55,9 @@ func NewLinear(in, out int, rng *rand.Rand) (*Linear, error) {
 
 // NewLinearOn creates a Linear on device.
 func NewLinearOn(device tensor.Device, in, out int, rng *rand.Rand) (*Linear, error) {
+	if in < 1 || out < 1 {
+		return nil, fmt.Errorf("nn: invalid Linear dimensions")
+	}
 	weight := make([]float32, out*in)
 	bound := 1 / math.Sqrt(float64(in))
 	for i := range weight {
@@ -134,7 +149,15 @@ func (l *Linear) Backward(blas *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor,
 	if l.input == nil {
 		return nil, fmt.Errorf("nn: Linear backward before forward")
 	}
+	if grad == nil {
+		return nil, fmt.Errorf("nn: Linear backward requires a gradient")
+	}
 	shape := l.input.Shape()
+	outShape := append([]int(nil), shape...)
+	outShape[len(outShape)-1] = l.out
+	if grad.Device() != l.input.Device() || !sameShape(grad.Shape(), outShape) {
+		return nil, fmt.Errorf("nn: Linear gradient shape or device mismatch")
+	}
 	dx, err := tensor.NewOn(grad.Device(), shape...)
 	if err != nil {
 		return nil, err
@@ -234,6 +257,12 @@ func (t *Tanh) Backward(blas *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor, e
 	if t.output == nil {
 		return nil, fmt.Errorf("nn: Tanh backward before forward")
 	}
+	if grad == nil {
+		return nil, fmt.Errorf("nn: Tanh backward requires a gradient")
+	}
+	if grad.Device() != t.output.Device() || !sameShape(grad.Shape(), t.output.Shape()) {
+		return nil, fmt.Errorf("nn: Tanh gradient shape or device mismatch")
+	}
 	dx, err := tensor.ZerosOn(grad.Device(), grad.Shape()...)
 	if err != nil {
 		return nil, err
@@ -320,11 +349,17 @@ func (s *Sequential) Forward(blas *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor,
 
 // Backward runs the modules in reverse and returns the input gradient.
 func (s *Sequential) Backward(blas *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor, error) {
+	if grad == nil {
+		return nil, fmt.Errorf("nn: sequential backward requires a gradient")
+	}
 	current := grad
 	for i := len(s.Modules) - 1; i >= 0; i-- {
 		next, err := s.Modules[i].Backward(blas, current)
 		if err != nil {
 			return nil, err
+		}
+		if next == nil {
+			return nil, fmt.Errorf("nn: module %T returned nil gradient", s.Modules[i])
 		}
 		// A module may hand back the gradient it received. Releasing it here
 		// would free a buffer the next module still reads.
@@ -384,6 +419,14 @@ type AdamW struct {
 func NewAdamW(params, grads []*tensor.Tensor, learningRate, weightDecay, maxNorm float64) (*AdamW, error) {
 	if len(params) != len(grads) {
 		return nil, fmt.Errorf("nn: parameter and gradient counts differ")
+	}
+	for i := range params {
+		if params[i] == nil || grads[i] == nil {
+			return nil, fmt.Errorf("nn: nil parameter or gradient")
+		}
+		if params[i].Device() != grads[i].Device() || params[i].Numel() != grads[i].Numel() {
+			return nil, fmt.Errorf("nn: parameter and gradient shape or device mismatch")
+		}
 	}
 	device := tensor.CUDA
 	if len(params) > 0 {

@@ -467,9 +467,21 @@ func (r *Residual) Forward(blas *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, e
 	return result, err
 }
 func (r *Residual) Backward(blas *cuda.Blas, g *tensor.Tensor) (*tensor.Tensor, error) {
+	if g == nil {
+		return nil, fmt.Errorf("nn: residual backward requires a gradient")
+	}
 	dx, err := r.Inner.Backward(blas, g)
 	if err != nil {
 		return nil, err
+	}
+	if dx == nil {
+		return nil, fmt.Errorf("nn: residual inner returned nil gradient")
+	}
+	if dx.Device() != g.Device() || !sameShape(dx.Shape(), g.Shape()) {
+		if dx != g {
+			dx.Close()
+		}
+		return nil, fmt.Errorf("nn: residual gradient shape or device mismatch")
 	}
 	if dx.Device() == tensor.CUDA {
 		return dx, kernels.AddInto(dx.Buffer(), g.Buffer(), dx.Numel())
