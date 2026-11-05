@@ -12,6 +12,9 @@ import (
 type ParameterizedLayer interface{ StateModule() *Module }
 
 func layerParameter(shape []int, device tensor.Device, init func(int) float32) (*Tensor, error) {
+	if err := validateShape(shape); err != nil {
+		return nil, err
+	}
 	v := make([]float32, numel(shape))
 	for i := range v {
 		v[i] = init(i)
@@ -27,6 +30,9 @@ type EmbeddingLayer struct {
 }
 
 func NewEmbeddingLayer(count, width, paddingIdx int, device tensor.Device, rng *rand.Rand) (*EmbeddingLayer, error) {
+	if count < 1 || width < 1 || paddingIdx < -1 || paddingIdx >= count {
+		return nil, fmt.Errorf("autograd: invalid Embedding dimensions")
+	}
 	w, err := layerParameter([]int{count, width}, device, func(int) float32 { return float32(rng.NormFloat64()) })
 	if err != nil {
 		return nil, err
@@ -106,6 +112,9 @@ type LayerNormLayer struct {
 }
 
 func NewLayerNormLayer(width int, eps float32, device tensor.Device) (*LayerNormLayer, error) {
+	if width < 1 {
+		return nil, fmt.Errorf("autograd: invalid LayerNorm width")
+	}
 	w, e := layerParameter([]int{width}, device, func(int) float32 { return 1 })
 	if e != nil {
 		return nil, e

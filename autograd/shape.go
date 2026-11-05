@@ -10,6 +10,9 @@ import (
 
 func Reshape(a *Tensor, s ...int) *Tensor {
 	dispatchBackend("reshape", a.Device)
+	if err := validateShape(s); err != nil {
+		panic(err)
+	}
 	if inferenceDevice(a.Device) {
 		inferenceOperands(a)
 		if len(s) > 6 {
@@ -476,7 +479,7 @@ func MaskedLoss(pred, target *Tensor, mse bool) *Tensor {
 	useCUDA := dispatchBackend("masked_loss", pred.Device)
 	same(pred, target)
 	pred, target = pred.Contiguous(), target.Contiguous()
-	if len(pred.Shape) != 3 || numel(pred.Shape) != target.Numel() {
+	if len(pred.Shape) != 3 || pred.Shape[2] < 1 || numel(pred.Shape) != target.Numel() {
 		panic("autograd: loss shape")
 	}
 	if useCUDA {

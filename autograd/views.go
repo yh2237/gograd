@@ -164,6 +164,9 @@ func (t *Tensor) Contiguous() *Tensor {
 // Expand broadcasts singleton dimensions without copying storage.
 func Expand(a *Tensor, shape ...int) *Tensor {
 	dispatchBackend("expand", a.Device)
+	if err := validateShape(shape); err != nil {
+		panic(err)
+	}
 	if len(shape) < len(a.Shape) || len(shape) > 6 {
 		panic("autograd: expand rank")
 	}

@@ -68,6 +68,45 @@ func BenchmarkCPUSoftmax(b *testing.B) {
 	}
 }
 
+// BenchmarkCPUBinaryRankFour measures the rank-four elementwise path, which
+// uses the strided broadcast index rather than the small-rank index struct.
+// The right operand is frozen, matching a mask or constant multiplier.
+func BenchmarkCPUBinaryRankFour(b *testing.B) {
+	for _, tc := range []struct {
+		name  string
+		right []int
+	}{
+		{"equal", []int{4, 4, 64, 64}},
+		{"broadcast", []int{1, 1, 1, 64}},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			shape := []int{4, 4, 64, 64}
+			x, _ := Zeros(shape, tensor.CPU, true)
+			defer x.Close()
+			right, _ := Zeros(tc.right, tensor.CPU, false)
+			defer right.Close()
+			for i := range x.Data {
+				x.Data[i] = float32(i%17-8) / 16
+			}
+			for i := range right.Data {
+				right.Data[i] = float32(i%13-6) / 16
+			}
+			g := make([]float32, numel(shape))
+			for i := range g {
+				g[i] = 1
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				y := Mul(x, right)
+				y.backward(g)
+				y.ReleaseGraph()
+				x.ZeroGrad()
+			}
+		})
+	}
+}
+
 func BenchmarkCPUMatMul(b *testing.B) {
 	for _, tc := range []struct {
 		name string

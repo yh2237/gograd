@@ -7,6 +7,7 @@ import (
 	"github.com/yh2237/gograd/tensor"
 	"math"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -128,9 +129,25 @@ func strides(s []int) []int {
 	}
 	return out
 }
+
+// validateShape rejects dimensions that cannot describe storage. A negative
+// dimension can otherwise cancel another negative dimension in numel and pass
+// the element-count check.
+func validateShape(shape []int) error {
+	for _, d := range shape {
+		if d < 0 {
+			return errors.New("autograd: negative dimension")
+		}
+	}
+	return nil
+}
+
 func New(data []float32, shape []int, device tensor.Device, grad bool) (*Tensor, error) {
 	if inferenceDevice(device) {
 		return newInferenceTensor(data, shape, device, grad, false)
+	}
+	if err := validateShape(shape); err != nil {
+		return nil, err
 	}
 	if numel(shape) != len(data) {
 		return nil, errors.New("autograd: shape/data mismatch")
@@ -269,6 +286,9 @@ func Must(data []float32, shape []int, grad bool) *Tensor {
 func Zeros(shape []int, device tensor.Device, grad bool) (*Tensor, error) {
 	if inferenceDevice(device) {
 		return newInferenceTensor(nil, shape, device, grad, true)
+	}
+	if err := validateShape(shape); err != nil {
+		return nil, err
 	}
 	if device == tensor.CUDA {
 		buf, e := cuda.Alloc(numel(shape) * 4)
@@ -423,14 +443,19 @@ func bshape(a, b []int) []int {
 	return s
 }
 func bindex(flat int, out, src []int) int {
-	os := strides(out)
-	ss := strides(src)
+	return bindexStrided(flat, out, strides(out), src, strides(src))
+}
+
+// bindexStrided is bindex with the row-major strides hoisted out of the
+// element loop. The rank-four binary path calls it once per element, so the
+// stride vectors are computed once per operation instead.
+func bindexStrided(flat int, out, outStrides, src, srcStrides []int) int {
 	j := 0
 	d := len(out) - len(src)
 	for i := range src {
-		c := (flat / os[i+d]) % out[i+d]
+		c := (flat / outStrides[i+d]) % out[i+d]
 		if src[i] != 1 {
-			j += c * ss[i]
+			j += c * srcStrides[i]
 		}
 	}
 	return j
@@ -529,8 +554,19 @@ func binary(a, b *Tensor, f, da, db func(float32, float32) float32) *Tensor {
 			}
 		})
 	} else {
+		outStrides, aStrides, bStrides := strides(s), strides(a.Shape), strides(b.Shape)
+		// Equal shapes are the common rank-four case; their broadcast index is
+		// the identity, so skip the per-element division/modulo entirely.
+		aIdentity, bIdentity := slices.Equal(a.Shape, s), slices.Equal(b.Shape, s)
 		for i := range v {
-			v[i] = f(a.Data[bindex(i, s, a.Shape)], b.Data[bindex(i, s, b.Shape)])
+			ia, ib := i, i
+			if !aIdentity {
+				ia = bindexStrided(i, s, outStrides, a.Shape, aStrides)
+			}
+			if !bIdentity {
+				ib = bindexStrided(i, s, outStrides, b.Shape, bStrides)
+			}
+			v[i] = f(a.Data[ia], b.Data[ib])
 		}
 	}
 	return result(v, s, []*Tensor{a, b}, func(g []float32) {
@@ -579,8 +615,16 @@ func binary(a, b *Tensor, f, da, db func(float32, float32) float32) *Tensor {
 				}
 			}
 		} else {
+			outStrides, aStrides, bStrides := strides(s), strides(a.Shape), strides(b.Shape)
+			aIdentity, bIdentity := slices.Equal(a.Shape, s), slices.Equal(b.Shape, s)
 			for i, z := range g {
-				ia, ib := bindex(i, s, a.Shape), bindex(i, s, b.Shape)
+				ia, ib := i, i
+				if !aIdentity {
+					ia = bindexStrided(i, s, outStrides, a.Shape, aStrides)
+				}
+				if !bIdentity {
+					ib = bindexStrided(i, s, outStrides, b.Shape, bStrides)
+				}
 				x, y := a.Data[ia], b.Data[ib]
 				ag[ia] += z * da(x, y)
 				bg[ib] += z * db(x, y)
