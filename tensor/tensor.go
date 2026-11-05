@@ -15,6 +15,10 @@ type Tensor struct {
 	data   []float32
 	device Device
 	shape  []int
+	// owned is false for a Reshape view: the parent keeps the allocation, so
+	// closing the view must not return the shared buffer to the pool.
+	owned  bool
+	closed bool
 }
 
 // Device selects storage at construction time.
@@ -54,7 +58,7 @@ func NewOn(device Device, shape ...int) (*Tensor, error) {
 		}
 	}
 	if device == CPU {
-		return &Tensor{data: make([]float32, Numel(shape)), device: CPU, shape: append([]int(nil), shape...)}, nil
+		return &Tensor{data: make([]float32, Numel(shape)), device: CPU, shape: append([]int(nil), shape...), owned: true}, nil
 	}
 	if device != CUDA {
 		return nil, fmt.Errorf("tensor: unknown device %q", device)
@@ -63,7 +67,7 @@ func NewOn(device Device, shape ...int) (*Tensor, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Tensor{buf: buf, device: CUDA, shape: append([]int(nil), shape...)}, nil
+	return &Tensor{buf: buf, device: CUDA, shape: append([]int(nil), shape...), owned: true}, nil
 }
 
 // Zeros returns a zero-filled tensor.
@@ -111,17 +115,30 @@ func (t *Tensor) Shape() []int { return append([]int(nil), t.shape...) }
 // Numel returns the element count.
 func (t *Tensor) Numel() int { return Numel(t.shape) }
 
-// Buffer returns the underlying device buffer.
-func (t *Tensor) Buffer() *cuda.Buffer { return t.buf }
+// Buffer returns the underlying device buffer, or nil for CPU or closed tensors.
+func (t *Tensor) Buffer() *cuda.Buffer {
+	if t.closed {
+		return nil
+	}
+	return t.buf
+}
 
 // Device returns the storage device.
 func (t *Tensor) Device() Device { return t.device }
 
-// Data returns the CPU backing slice, or nil for CUDA tensors.
-func (t *Tensor) Data() []float32 { return t.data }
+// Data returns the CPU backing slice, or nil for CUDA or closed tensors.
+func (t *Tensor) Data() []float32 {
+	if t.closed {
+		return nil
+	}
+	return t.data
+}
 
 // ToHost downloads the tensor.
 func (t *Tensor) ToHost() ([]float32, error) {
+	if t.closed {
+		return nil, fmt.Errorf("tensor: tensor is closed")
+	}
 	if t.device == CPU {
 		return append([]float32(nil), t.data...), nil
 	}
@@ -134,6 +151,9 @@ func (t *Tensor) ToHost() ([]float32, error) {
 
 // CopyFrom uploads host data into the tensor.
 func (t *Tensor) CopyFrom(data []float32) error {
+	if t.closed {
+		return fmt.Errorf("tensor: tensor is closed")
+	}
 	if len(data) != t.Numel() {
 		return fmt.Errorf("tensor: data length %d does not match %d elements", len(data), t.Numel())
 	}
@@ -146,6 +166,9 @@ func (t *Tensor) CopyFrom(data []float32) error {
 
 // Zero clears the tensor.
 func (t *Tensor) Zero() error {
+	if t.closed {
+		return fmt.Errorf("tensor: tensor is closed")
+	}
 	if t.device == CPU {
 		clear(t.data)
 		return nil
@@ -153,20 +176,35 @@ func (t *Tensor) Zero() error {
 	return t.buf.Memset(0, t.buf.Size())
 }
 
-// Reshape returns a view with a new shape that shares the same buffer.
+// Reshape returns a view with a new shape that shares the same buffer. The
+// view borrows the allocation: closing it does not free the parent's buffer.
 func (t *Tensor) Reshape(shape ...int) (*Tensor, error) {
+	if t.closed {
+		return nil, fmt.Errorf("tensor: tensor is closed")
+	}
+	for _, d := range shape {
+		if d < 0 {
+			return nil, fmt.Errorf("tensor: negative dimension")
+		}
+	}
 	if Numel(shape) != t.Numel() {
 		return nil, fmt.Errorf("tensor: reshape element count mismatch")
 	}
 	return &Tensor{buf: t.buf, data: t.data, device: t.device, shape: append([]int(nil), shape...)}, nil
 }
 
-// Close returns the device memory to the pool.
+// Close ends this handle. A Reshape view borrows its parent's allocation, so
+// closing the view leaves the parent usable; closing the owner returns the
+// device memory to the pool.
 func (t *Tensor) Close() {
-	if t.buf != nil {
-		t.buf.Free()
-		t.buf = nil
+	if t.closed {
+		return
 	}
+	t.closed = true
+	if t.owned && t.buf != nil {
+		t.buf.Free()
+	}
+	t.buf = nil
 }
 
 func bytesOf(values []float32) []byte {
