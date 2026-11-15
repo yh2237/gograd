@@ -617,20 +617,24 @@ func cpuScalar(a *Tensor, value float32, op int) *Tensor {
 		}
 	})
 	return result(out, a.Shape, []*Tensor{a}, func(g []float32) {
-		dx := cpuAlloc(len(g))
+		if !a.RequiresGrad {
+			return
+		}
+		if a.Grad == nil {
+			a.Grad = make([]float32, a.Numel())
+		}
 		scale := float32(1)
 		if op == 2 {
 			scale = value
 		} else if op == 3 {
 			scale = 1 / value
 		}
+		grad := a.Grad
 		parallelFor(len(g), func(start, end int) {
 			for i := start; i < end; i++ {
-				dx[i] = g[i] * scale
+				grad[i] += g[i] * scale
 			}
 		})
-		a.addGrad(dx)
-		cpuRelease(dx)
 	})
 }
 func AddScalar(a *Tensor, v float32) *Tensor {
@@ -672,14 +676,18 @@ func unary(a *Tensor, f, d func(float32) float32) *Tensor {
 		}
 	})
 	return result(v, append([]int(nil), a.Shape...), []*Tensor{a}, func(g []float32) {
-		dx := cpuAlloc(len(g))
-		parallelFor(len(dx), func(start, end int) {
+		if !a.RequiresGrad {
+			return
+		}
+		if a.Grad == nil {
+			a.Grad = make([]float32, a.Numel())
+		}
+		grad := a.Grad
+		parallelFor(len(g), func(start, end int) {
 			for i := start; i < end; i++ {
-				dx[i] = g[i] * d(a.Data[i])
+				grad[i] += g[i] * d(a.Data[i])
 			}
 		})
-		a.addGrad(dx)
-		cpuRelease(dx)
 	})
 }
 func Exp(a *Tensor) *Tensor {

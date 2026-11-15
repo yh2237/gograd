@@ -87,7 +87,13 @@ func softmax(a *Tensor, axis int, logmode bool) *Tensor {
 		}
 	})
 	return result(v, a.Shape, []*Tensor{a}, func(g []float32) {
-		dx := cpuAlloc(a.Numel())
+		if !a.RequiresGrad {
+			return
+		}
+		if a.Grad == nil {
+			a.Grad = make([]float32, a.Numel())
+		}
+		grad := a.Grad
 		parallelForWork(outer*inner, dim, func(start, end int) {
 			for row := start; row < end; row++ {
 				base := (row/inner)*dim*inner + row%inner
@@ -103,15 +109,13 @@ func softmax(a *Tensor, axis int, logmode bool) *Tensor {
 				for k := 0; k < dim; k++ {
 					idx := base + k*inner
 					if logmode {
-						dx[idx] = g[idx] - float32(math.Exp(float64(v[idx])))*dot
+						grad[idx] += g[idx] - float32(math.Exp(float64(v[idx])))*dot
 					} else {
-						dx[idx] = v[idx] * (g[idx] - dot)
+						grad[idx] += v[idx] * (g[idx] - dot)
 					}
 				}
 			}
 		})
-		a.addGrad(dx)
-		cpuRelease(dx)
 	})
 }
 
