@@ -21,6 +21,7 @@ var operationRegistry = map[string]KernelPair{
 	"exp": {"unary", "unary_f/b"}, "log": {"unary", "unary_f/b"},
 	"abs": {"unary", "unary_f/b"}, "tanh": {"unary", "unary_f/b"}, "sin": {"unary", "unary_f/b"},
 	"relu": {"unary", "unary_f/b"}, "gelu": {"unary", "unary_f/b"},
+	"sqrt": {"unary", "unary_f/b"}, "sigmoid": {"unary", "unary_f/b"},
 	"reshape":    {"makeView", "view_gather/scatter"},
 	"permute":    {"makeView", "view_gather/scatter"},
 	"transpose":  {"makeView", "view_gather/scatter"},

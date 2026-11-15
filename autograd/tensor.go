@@ -729,6 +729,34 @@ func Sin(a *Tensor) *Tensor {
 	}
 	return unary(a, func(x float32) float32 { return float32(math.Sin(float64(x))) }, func(x float32) float32 { return float32(math.Cos(float64(x))) })
 }
+
+// Sqrt applies the square root elementwise. The derivative is infinite at zero,
+// matching the reference.
+func Sqrt(a *Tensor) *Tensor {
+	a = a.Contiguous()
+	if dispatchBackend("sqrt", a.Device) {
+		return gpuUnary(a, 8)
+	}
+	return unary(a, func(x float32) float32 { return float32(math.Sqrt(float64(x))) }, func(x float32) float32 {
+		return .5 / float32(math.Sqrt(float64(x)))
+	})
+}
+
+// Sigmoid applies the logistic function elementwise.
+func Sigmoid(a *Tensor) *Tensor {
+	a = a.Contiguous()
+	if dispatchBackend("sigmoid", a.Device) {
+		return gpuUnary(a, 9)
+	}
+	return unary(a, func(x float32) float32 { return sigmoid32(x) }, func(x float32) float32 {
+		s := sigmoid32(x)
+		return s * (1 - s)
+	})
+}
+
+func sigmoid32(x float32) float32 {
+	return float32(1 / (1 + math.Exp(-float64(x))))
+}
 func ReLU(a *Tensor) *Tensor {
 	a = a.Contiguous()
 	if dispatchBackend("relu", a.Device) {
