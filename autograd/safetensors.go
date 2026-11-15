@@ -33,6 +33,12 @@ func writeSafetensors(path string, entries map[string]safeTensorEntry, metadata 
 	sort.Strings(names)
 	header := make(map[string]safeHeader, len(names))
 	var raw bytes.Buffer
+	total := 0
+	for _, name := range names {
+		total += len(entries[name].Values) * 4
+	}
+	raw.Grow(total)
+	var scratch []byte
 	for _, name := range names {
 		entry := entries[name]
 		count, err := safeNumel(entry.Shape, len(entry.Values))
@@ -40,11 +46,16 @@ func writeSafetensors(path string, entries map[string]safeTensorEntry, metadata 
 			return fmt.Errorf("autograd: incompatible tensor %s", name)
 		}
 		start := raw.Len()
-		for _, v := range entry.Values {
-			if err := encodingbinary.Write(&raw, encodingbinary.LittleEndian, math.Float32bits(v)); err != nil {
-				return err
-			}
+		// Encode the payload in one pass; binary.Write would reflect on every
+		// four-byte element.
+		if cap(scratch) < len(entry.Values)*4 {
+			scratch = make([]byte, len(entry.Values)*4)
 		}
+		payload := scratch[:len(entry.Values)*4]
+		for i, v := range entry.Values {
+			encodingbinary.LittleEndian.PutUint32(payload[i*4:], math.Float32bits(v))
+		}
+		raw.Write(payload)
 		shape := make([]int, len(entry.Shape))
 		copy(shape, entry.Shape)
 		header[name] = safeHeader{"F32", shape, [2]int{start, raw.Len()}}

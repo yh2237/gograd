@@ -58,3 +58,23 @@ func TestPyTorchSafeTensorsRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+// BenchmarkSaveSafeTensors measures the host-side encode and atomic write of a
+// 4 MiB state dict, which dominates checkpoint time for large models.
+func BenchmarkSaveSafeTensors(b *testing.B) {
+	values := make([]float32, 1<<20)
+	for i := range values {
+		values[i] = float32(i)
+	}
+	w := Must(values, []int{1 << 20}, false)
+	defer w.Close()
+	m := &Module{Parameters: []Parameter{{Name: "weight", Value: w}}}
+	path := filepath.Join(b.TempDir(), "bench.safetensors")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := m.SaveSafeTensors(path); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
