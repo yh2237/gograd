@@ -85,16 +85,18 @@ func cpuBinaryOp(a, b *Tensor, op int) *Tensor {
 		localsA, localsB := make([][]float32, workers), make([][]float32, workers)
 		run := func(worker, start, end int) {
 			var da, db []float32
+			// Only a broadcast operand needs a per-worker partial; an identity
+			// operand writes disjoint indices, so the shared gradient is safe.
 			if a.RequiresGrad {
 				da = a.Grad
-				if !identity && workers > 1 {
+				if ai.kind != 1 && workers > 1 {
 					da = cpuAlloc(a.Numel())
 					localsA[worker] = da
 				}
 			}
 			if b.RequiresGrad {
 				db = b.Grad
-				if !identity && workers > 1 {
+				if bi.kind != 1 && workers > 1 {
 					db = cpuAlloc(b.Numel())
 					localsB[worker] = db
 				}
