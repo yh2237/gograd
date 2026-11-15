@@ -473,17 +473,23 @@ func (o *AdamW) Step() {
 		}
 		return
 	}
+	b1, b2, eps := o.Beta1, o.Beta2, o.Eps
+	oneMinusB1, oneMinusB2 := 1-b1, 1-b2
 	for n, p := range o.Params {
 		if len(p.Value.Grad) == 0 {
 			continue
 		}
 		stepSize, decay := o.groupScale(n)
-		for i, g := range p.Value.Grad {
-			o.M[n][i] = o.Beta1*o.M[n][i] + (1-o.Beta1)*g
-			o.V[n][i] = o.Beta2*o.V[n][i] + (1-o.Beta2)*g*g
-			p.Value.Data[i] *= 1 - decay
-			p.Value.Data[i] -= stepSize * (o.M[n][i] / bc1) / (float32(math.Sqrt(float64(o.V[n][i]/bc2))) + o.Eps)
-		}
+		m, v, data, grad := o.M[n], o.V[n], p.Value.Data, p.Value.Grad
+		parallelFor(len(grad), func(start, end int) {
+			for i := start; i < end; i++ {
+				g := grad[i]
+				mi := b1*m[i] + oneMinusB1*g
+				vi := b2*v[i] + oneMinusB2*g*g
+				m[i], v[i] = mi, vi
+				data[i] = data[i]*(1-decay) - stepSize*(mi/bc1)/(float32(math.Sqrt(float64(vi/bc2)))+eps)
+			}
+		})
 		p.Value.storage.version.Add(1)
 	}
 }
