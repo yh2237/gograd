@@ -108,19 +108,21 @@ func transposeViewCopy(dst, src []float32, shape []int, backward bool) {
 	rows, cols := shape[n-2], shape[n-1]
 	outer := numel(shape[:n-2])
 	tiles := (rows + 31) / 32
-	parallelFor(outer*tiles*cols, func(start, end int) {
-		// Split on (outer,row-tile,column), keeping each source span contiguous.
+	// One unit per (outer, row tile): each writes a contiguous block of dst rows,
+	// and the unit count is small enough to spread over the workers.
+	parallelForWork(outer*tiles, 32*cols, func(start, end int) {
 		for task := start; task < end; task++ {
-			o := task / (tiles * cols)
-			rem := task % (tiles * cols)
-			r0, c := rem/cols*32, rem%cols
+			o := task / tiles
+			r0 := (task % tiles) * 32
 			r1 := min(rows, r0+32)
 			base := o * rows * cols
 			for r := r0; r < r1; r++ {
-				if backward {
-					dst[base+c*rows+r] += src[base+r*cols+c]
-				} else {
-					dst[base+r*cols+c] = src[base+c*rows+r]
+				for c := 0; c < cols; c++ {
+					if backward {
+						dst[base+c*rows+r] += src[base+r*cols+c]
+					} else {
+						dst[base+r*cols+c] = src[base+c*rows+r]
+					}
 				}
 			}
 		}
