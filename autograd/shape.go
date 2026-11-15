@@ -5,6 +5,7 @@ import (
 	"github.com/yh2237/gograd/tensor"
 	"math"
 	"runtime"
+	"slices"
 	"sync"
 )
 
@@ -509,7 +510,7 @@ func MaskedLoss(pred, target *Tensor, mse bool) *Tensor {
 	useCUDA := dispatchBackend("masked_loss", pred.Device)
 	same(pred, target)
 	pred, target = pred.Contiguous(), target.Contiguous()
-	if len(pred.Shape) != 3 || pred.Shape[2] < 1 || numel(pred.Shape) != target.Numel() {
+	if len(pred.Shape) != 3 || pred.Shape[2] < 1 || !slices.Equal(pred.Shape, target.Shape) {
 		panic("autograd: loss shape")
 	}
 	if useCUDA {

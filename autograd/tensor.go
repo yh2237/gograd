@@ -446,9 +446,8 @@ func bindex(flat int, out, src []int) int {
 	return bindexStrided(flat, out, strides(out), src, strides(src))
 }
 
-// bindexStrided is bindex with the row-major strides hoisted out of the
-// element loop. The rank-four binary path calls it once per element, so the
-// stride vectors are computed once per operation instead.
+// bindexStrided is bindex with the row-major strides hoisted out of the loop
+// that walks the batch axis.
 func bindexStrided(flat int, out, outStrides, src, srcStrides []int) int {
 	j := 0
 	d := len(out) - len(src)

@@ -55,6 +55,21 @@ func TestAuditMaskedLossRejectsEmptyChannelAxis(t *testing.T) {
 	MaskedLoss(pred, target, false)
 }
 
+// The row walk indexes the target with the prediction's channel count, so a
+// target with the same element count but another shape must not be accepted.
+func TestAuditMaskedLossRejectsMismatchedTargetShape(t *testing.T) {
+	pred := Must(make([]float32, 24), []int{2, 3, 4}, true)
+	defer pred.Close()
+	target := Must(make([]float32, 24), []int{4, 3, 2}, false)
+	defer target.Close()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("MaskedLoss accepted a target with a different shape")
+		}
+	}()
+	MaskedLoss(pred, target, false)
+}
+
 // Dimensions that would panic on the first forward are rejected at construction.
 func TestAuditLayerConstructorsRejectInvalidDimensions(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))

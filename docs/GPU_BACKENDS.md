@@ -1,4 +1,4 @@
-# GPUバックエンド実装の進捗
+# GPUバックエンド
 
 VulkanとDirectMLは`autograd`から使うFP32推論バックエンド。学習はCPU/CUDAを使う。旧`tensor.Tensor` / `nn`はCPU/CUDA専用。
 
