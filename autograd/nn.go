@@ -376,6 +376,9 @@ func NewAdamWGroups(params []Parameter, lr float32, specs []ParameterGroupSpec) 
 }
 
 func newAdamW(params []Parameter, lr float32, specs []ParameterGroupSpec) (*AdamW, error) {
+	if err := validateLearningRate(lr); err != nil {
+		return nil, err
+	}
 	if err := checkTrainingDevices(params); err != nil {
 		return nil, err
 	}
@@ -383,10 +386,16 @@ func newAdamW(params []Parameter, lr float32, specs []ParameterGroupSpec) (*Adam
 	// host or on the device, and a mixed list would freeze the other device's
 	// parameters without reporting it.
 	var device tensor.Device
+	seenNames := make(map[string]bool, len(params))
 	for i, p := range params {
 		if p.Value == nil {
 			return nil, fmt.Errorf("autograd: AdamW needs parameter values")
 		}
+		// State is keyed by name, so a duplicate would silently swap moments.
+		if p.Name == "" || seenNames[p.Name] {
+			return nil, fmt.Errorf("autograd: AdamW needs distinct named parameters")
+		}
+		seenNames[p.Name] = true
 		if i == 0 {
 			device = p.Value.Device
 			continue
@@ -507,7 +516,7 @@ type OneCycle struct {
 func NewOneCycle(maxLR float64, total int, pctStart float64) *OneCycle {
 	// A schedule that cannot reach its peak or its end produces a NaN learning
 	// rate in the middle of a training step.
-	if total < 2 || pctStart <= 0 || pctStart >= 1 || math.IsNaN(maxLR) || math.IsInf(maxLR, 0) {
+	if total < 2 || pctStart <= 0 || pctStart >= 1 || maxLR <= 0 || math.IsNaN(maxLR) || math.IsInf(maxLR, 0) {
 		panic("autograd: invalid OneCycle configuration")
 	}
 	return &OneCycle{MaxLR: maxLR, Total: total, PctStart: pctStart, DivFactor: 25, FinalDivFactor: 1e4}

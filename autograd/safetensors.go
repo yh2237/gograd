@@ -197,22 +197,42 @@ func readSafetensors(path string) (map[string]safeTensorEntry, map[string]string
 	return entries, metadata, nil
 }
 
-func (m *Module) namedState() map[string]*Tensor {
+// namedState flattens the module tree into dotted names. Parameters and buffers
+// share one namespace, so a collision is reported instead of silently dropping
+// a tensor from the checkpoint.
+func (m *Module) namedState() (map[string]*Tensor, error) {
 	out := map[string]*Tensor{}
-	var walk func(string, *Module)
-	walk = func(prefix string, node *Module) {
+	var walk func(string, *Module) error
+	walk = func(prefix string, node *Module) error {
+		add := func(name string, value *Tensor) error {
+			key := prefix + name
+			if _, ok := out[key]; ok {
+				return fmt.Errorf("autograd: duplicate state name %s", key)
+			}
+			out[key] = value
+			return nil
+		}
 		for _, p := range node.Parameters {
-			out[prefix+p.Name] = p.Value
+			if err := add(p.Name, p.Value); err != nil {
+				return err
+			}
 		}
 		for _, p := range node.Buffers {
-			out[prefix+p.Name] = p.Value
+			if err := add(p.Name, p.Value); err != nil {
+				return err
+			}
 		}
 		for _, c := range node.Children {
-			walk(prefix+c.Name+".", c.Module)
+			if err := walk(prefix+c.Name+".", c.Module); err != nil {
+				return err
+			}
 		}
+		return nil
 	}
-	walk("", m)
-	return out
+	if err := walk("", m); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // SaveSafeTensors writes F32 tensors using the safetensors v1 file layout.
@@ -231,7 +251,10 @@ func (m *Module) SaveSafeTensorsMetadata(path string, metadata map[string]string
 }
 
 func (m *Module) stateEntries() (map[string]safeTensorEntry, error) {
-	state := m.namedState()
+	state, err := m.namedState()
+	if err != nil {
+		return nil, err
+	}
 	entries := make(map[string]safeTensorEntry, len(state))
 	for name, t := range state {
 		if t.DType != Float32 {
@@ -262,7 +285,10 @@ func (m *Module) LoadSafeTensors(path string) error {
 }
 
 func (m *Module) validateEntries(entries map[string]safeTensorEntry) error {
-	state := m.namedState()
+	state, err := m.namedState()
+	if err != nil {
+		return err
+	}
 	if len(entries) != len(state) {
 		return fmt.Errorf("autograd: safetensors entry count %d != %d", len(entries), len(state))
 	}
@@ -285,7 +311,11 @@ func (m *Module) validateEntries(entries map[string]safeTensorEntry) error {
 }
 
 func (m *Module) loadEntries(entries map[string]safeTensorEntry) error {
-	for name, t := range m.namedState() {
+	state, err := m.namedState()
+	if err != nil {
+		return err
+	}
+	for name, t := range state {
 		if err := t.CopyFrom(entries[name].Values); err != nil {
 			return err
 		}

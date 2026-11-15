@@ -184,7 +184,10 @@ func (m *Module) LoadSafeTensorsStream(path string) error {
 		return err
 	}
 	defer s.Close()
-	state := m.namedState()
+	state, err := m.namedState()
+	if err != nil {
+		return err
+	}
 	if len(state) != len(s.entries) {
 		return fmt.Errorf("autograd: safetensors entry count %d != %d", len(s.entries), len(state))
 	}
