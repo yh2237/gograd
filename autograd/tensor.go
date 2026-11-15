@@ -461,9 +461,25 @@ func bindexStrided(flat int, out, outStrides, src, srcStrides []int) int {
 	return j
 }
 
-type broadcastIndex struct{ d1, d2, s0, s1, s2, kind int }
+// broadcastIndex maps an output element to one operand. Ranks up to three use
+// the packed fields; higher ranks keep the stride vectors and walk only the
+// dims the operand actually varies along.
+type broadcastIndex struct {
+	d1, d2, s0, s1, s2, kind int
+	out, outStrides          []int
+	src, srcStrides          []int
+}
 
 func makeBroadcastIndex(out, src []int) broadcastIndex {
+	if len(out) > 3 {
+		q := broadcastIndex{kind: 5, out: out, outStrides: strides(out), src: src, srcStrides: strides(src)}
+		if slices.Equal(out, src) {
+			q.kind = 1
+		} else if numel(src) == 1 {
+			q.kind = 2
+		}
+		return q
+	}
 	o := [3]int{1, 1, 1}
 	v := [3]int{1, 1, 1}
 	for i, x := range out {
@@ -519,6 +535,16 @@ func (q broadcastIndex) at(i int) int {
 		return i % q.d2
 	case 4:
 		return i/(q.d1*q.d2)*q.d2 + i%q.d2
+	case 5:
+		j := 0
+		d := len(q.out) - len(q.src)
+		for k := range q.src {
+			if q.src[k] == 1 {
+				continue
+			}
+			j += ((i / q.outStrides[k+d]) % q.out[k+d]) * q.srcStrides[k]
+		}
+		return j
 	}
 	return (i/(q.d1*q.d2))*q.s0 + (i/q.d2%q.d1)*q.s1 + (i%q.d2)*q.s2
 }
@@ -541,100 +567,6 @@ func parallelForWork(n, elementsPerItem int, fn func(int, int)) {
 		go func() { defer wg.Done(); fn(start, end) }()
 	}
 	wg.Wait()
-}
-func binary(a, b *Tensor, f, da, db func(float32, float32) float32) *Tensor {
-	same(a, b)
-	s := bshape(a.Shape, b.Shape)
-	v := cpuAlloc(numel(s))
-	if len(s) <= 3 {
-		ai, bi := makeBroadcastIndex(s, a.Shape), makeBroadcastIndex(s, b.Shape)
-		parallelFor(len(v), func(start, end int) {
-			for i := start; i < end; i++ {
-				v[i] = f(a.Data[ai.at(i)], b.Data[bi.at(i)])
-			}
-		})
-	} else {
-		outStrides, aStrides, bStrides := strides(s), strides(a.Shape), strides(b.Shape)
-		// Equal shapes are the common rank-four case; their broadcast index is
-		// the identity, so skip the per-element division/modulo entirely.
-		aIdentity, bIdentity := slices.Equal(a.Shape, s), slices.Equal(b.Shape, s)
-		for i := range v {
-			ia, ib := i, i
-			if !aIdentity {
-				ia = bindexStrided(i, s, outStrides, a.Shape, aStrides)
-			}
-			if !bIdentity {
-				ib = bindexStrided(i, s, outStrides, b.Shape, bStrides)
-			}
-			v[i] = f(a.Data[ia], b.Data[ib])
-		}
-	}
-	return result(v, s, []*Tensor{a, b}, func(g []float32) {
-		ag := cpuAlloc(len(a.Data))
-		bg := cpuAlloc(len(b.Data))
-		if len(s) <= 3 {
-			ai, bi := makeBroadcastIndex(s, a.Shape), makeBroadcastIndex(s, b.Shape)
-			workers := min(runtime.GOMAXPROCS(0), len(g)/65536)
-			if workers < 2 {
-				workers = 1
-			}
-			localA := make([][]float32, workers)
-			localB := make([][]float32, workers)
-			var wg sync.WaitGroup
-			for w := 0; w < workers; w++ {
-				start, end := len(g)*w/workers, len(g)*(w+1)/workers
-				wg.Add(1)
-				go func(w, start, end int) {
-					defer wg.Done()
-					aa, bb := ag, bg
-					if workers > 1 && len(ag) != len(g) {
-						aa = make([]float32, len(ag))
-						localA[w] = aa
-					}
-					if workers > 1 && len(bg) != len(g) {
-						bb = make([]float32, len(bg))
-						localB[w] = bb
-					}
-					for i := start; i < end; i++ {
-						ia, ib := ai.at(i), bi.at(i)
-						x, y := a.Data[ia], b.Data[ib]
-						aa[ia] += g[i] * da(x, y)
-						bb[ib] += g[i] * db(x, y)
-					}
-				}(w, start, end)
-			}
-			wg.Wait()
-			for _, local := range localA {
-				for i, v := range local {
-					ag[i] += v
-				}
-			}
-			for _, local := range localB {
-				for i, v := range local {
-					bg[i] += v
-				}
-			}
-		} else {
-			outStrides, aStrides, bStrides := strides(s), strides(a.Shape), strides(b.Shape)
-			aIdentity, bIdentity := slices.Equal(a.Shape, s), slices.Equal(b.Shape, s)
-			for i, z := range g {
-				ia, ib := i, i
-				if !aIdentity {
-					ia = bindexStrided(i, s, outStrides, a.Shape, aStrides)
-				}
-				if !bIdentity {
-					ib = bindexStrided(i, s, outStrides, b.Shape, bStrides)
-				}
-				x, y := a.Data[ia], b.Data[ib]
-				ag[ia] += z * da(x, y)
-				bg[ib] += z * db(x, y)
-			}
-		}
-		a.addGrad(ag)
-		b.addGrad(bg)
-		cpuRelease(ag)
-		cpuRelease(bg)
-	})
 }
 func Add(a, b *Tensor) *Tensor {
 	return dispatchElementwise("add", a, b)

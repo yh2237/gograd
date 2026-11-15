@@ -136,38 +136,92 @@ func (s conv2dSpec) tileColumns() int {
 }
 
 // Lower a single batch/group, depth-major so output is already in NCHW order.
+// Each output row is walked in runs that stay inside one input row, so the
+// division and modulo happen once per row instead of once per element.
 func (s conv2dSpec) columns(dst, input []float32, batch, group, start, count int) {
 	ci := s.ci / s.options.Groups
+	strideY, strideX := s.options.Stride[0], s.options.Stride[1]
+	padY, padX := s.options.Padding[0], s.options.Padding[1]
+	dilY, dilX := s.options.Dilation[0], s.options.Dilation[1]
 	for d := 0; d < s.depth(); d++ {
 		channel, tap := d/(s.kh*s.kw), d%(s.kh*s.kw)
 		ky, kx := tap/s.kw, tap%s.kw
 		base := ((batch*s.ci + group*ci + channel) * s.h) * s.width
-		for j := 0; j < count; j++ {
+		row := dst[d*count : (d+1)*count]
+		for j := 0; j < count; {
 			p := start + j
-			y := (p/s.ow)*s.options.Stride[0] - s.options.Padding[0] + ky*s.options.Dilation[0]
-			x := (p%s.ow)*s.options.Stride[1] - s.options.Padding[1] + kx*s.options.Dilation[1]
-			v := float32(0)
-			if y >= 0 && y < s.h && x >= 0 && x < s.width {
-				v = input[base+y*s.width+x]
+			run := min(count-j, s.ow-p%s.ow)
+			y := (p/s.ow)*strideY - padY + ky*dilY
+			if y < 0 || y >= s.h {
+				clear(row[j : j+run])
+				j += run
+				continue
 			}
-			dst[d*count+j] = v
+			x0 := (p%s.ow)*strideX - padX + kx*dilX
+			source := input[base+y*s.width:]
+			if strideX == 1 {
+				lo, hi := max(0, -x0), min(run, s.width-x0)
+				if hi < lo {
+					hi = lo
+				}
+				if lo > 0 {
+					clear(row[j : j+lo])
+				}
+				if hi < run {
+					clear(row[j+hi : j+run])
+				}
+				if hi > lo {
+					copy(row[j+lo:j+hi], source[x0+lo:x0+hi])
+				}
+			} else {
+				for k := 0; k < run; k++ {
+					x := x0 + k*strideX
+					if x >= 0 && x < s.width {
+						row[j+k] = source[x]
+					} else {
+						row[j+k] = 0
+					}
+				}
+			}
+			j += run
 		}
 	}
 }
 
 func (s conv2dSpec) scatterColumns(dx, cols []float32, batch, group, start, count int) {
 	ci := s.ci / s.options.Groups
+	strideY, strideX := s.options.Stride[0], s.options.Stride[1]
+	padY, padX := s.options.Padding[0], s.options.Padding[1]
+	dilY, dilX := s.options.Dilation[0], s.options.Dilation[1]
 	for d := 0; d < s.depth(); d++ {
 		channel, tap := d/(s.kh*s.kw), d%(s.kh*s.kw)
 		ky, kx := tap/s.kw, tap%s.kw
 		base := ((batch*s.ci + group*ci + channel) * s.h) * s.width
-		for j := 0; j < count; j++ {
+		row := cols[d*count : (d+1)*count]
+		for j := 0; j < count; {
 			p := start + j
-			y := (p/s.ow)*s.options.Stride[0] - s.options.Padding[0] + ky*s.options.Dilation[0]
-			x := (p%s.ow)*s.options.Stride[1] - s.options.Padding[1] + kx*s.options.Dilation[1]
-			if y >= 0 && y < s.h && x >= 0 && x < s.width {
-				dx[base+y*s.width+x] += cols[d*count+j]
+			run := min(count-j, s.ow-p%s.ow)
+			y := (p/s.ow)*strideY - padY + ky*dilY
+			if y < 0 || y >= s.h {
+				j += run
+				continue
 			}
+			x0 := (p%s.ow)*strideX - padX + kx*dilX
+			target := dx[base+y*s.width:]
+			if strideX == 1 {
+				lo, hi := max(0, -x0), min(run, s.width-x0)
+				for k := lo; k < hi; k++ {
+					target[x0+k] += row[j+k]
+				}
+			} else {
+				for k := 0; k < run; k++ {
+					x := x0 + k*strideX
+					if x >= 0 && x < s.width {
+						target[x] += row[j+k]
+					}
+				}
+			}
+			j += run
 		}
 	}
 }

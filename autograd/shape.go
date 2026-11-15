@@ -140,30 +140,40 @@ func reduce(a *Tensor, mean bool, axes ...int) *Tensor {
 		}
 		return j
 	}
-	// The index map is only needed by the backward pass.
-	_, record := graphRecording([]*Tensor{a})
-	var mapping []int
-	if record {
-		mapping = make([]int, len(a.Data))
+	// The innermost input dim either survives or is reduced, so one output
+	// index covers a whole run of input elements in both cases. Mapping per run
+	// keeps the division out of the element loop.
+	run := 1
+	if len(a.Shape) > 0 {
+		run = a.Shape[len(a.Shape)-1]
 	}
+	innerKept := len(selected) > 0 && !selected[len(selected)-1]
+	blocks := len(a.Data) / max(run, 1)
 	workers := min(runtime.GOMAXPROCS(0), len(a.Data)/65536)
 	if workers >= 2 && len(v) <= 65536 {
 		partials := make([][]float32, workers)
 		var wg sync.WaitGroup
 		for w := 0; w < workers; w++ {
-			start, end := len(a.Data)*w/workers, len(a.Data)*(w+1)/workers
 			partials[w] = make([]float32, len(v))
 			wg.Add(1)
 			go func(w, start, end int) {
 				defer wg.Done()
-				for i := start; i < end; i++ {
-					j := mapAt(i)
-					if mapping != nil {
-						mapping[i] = j
+				p := partials[w]
+				for b := start; b < end; b++ {
+					base, j := b*run, mapAt(b*run)
+					if innerKept {
+						for k := 0; k < run; k++ {
+							p[j+k] += a.Data[base+k]
+						}
+						continue
 					}
-					partials[w][j] += a.Data[i]
+					var sum float32
+					for k := 0; k < run; k++ {
+						sum += a.Data[base+k]
+					}
+					p[j] += sum
 				}
-			}(w, start, end)
+			}(w, blocks*w/workers, blocks*(w+1)/workers)
 		}
 		wg.Wait()
 		for _, p := range partials {
@@ -172,12 +182,19 @@ func reduce(a *Tensor, mean bool, axes ...int) *Tensor {
 			}
 		}
 	} else {
-		for i, x := range a.Data {
-			j := mapAt(i)
-			if mapping != nil {
-				mapping[i] = j
+		for b := 0; b < blocks; b++ {
+			base, j := b*run, mapAt(b*run)
+			if innerKept {
+				for k := 0; k < run; k++ {
+					v[j+k] += a.Data[base+k]
+				}
+				continue
 			}
-			v[j] += x
+			var sum float32
+			for k := 0; k < run; k++ {
+				sum += a.Data[base+k]
+			}
+			v[j] += sum
 		}
 	}
 	if mean {
@@ -187,11 +204,24 @@ func reduce(a *Tensor, mean bool, axes ...int) *Tensor {
 	}
 	return result(v, s, []*Tensor{a}, func(g []float32) {
 		dx := make([]float32, len(a.Data))
-		parallelFor(len(mapping), func(start, end int) {
-			for i := start; i < end; i++ {
-				dx[i] = g[mapping[i]]
+		parallelForWork(blocks, run, func(start, end int) {
+			for b := start; b < end; b++ {
+				base, j := b*run, mapAt(b*run)
+				if innerKept {
+					for k := 0; k < run; k++ {
+						dx[base+k] = g[j+k]
+						if mean {
+							dx[base+k] /= count
+						}
+					}
+					continue
+				}
+				fill := g[j]
 				if mean {
-					dx[i] /= count
+					fill /= count
+				}
+				for k := 0; k < run; k++ {
+					dx[base+k] = fill
 				}
 			}
 		})

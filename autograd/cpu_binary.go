@@ -5,33 +5,54 @@ import (
 	"sync"
 )
 
-// cpuBinaryOp keeps the scalar rule in a switch and accumulates directly into
-// gradients when indices are one-to-one. Broadcast gradients use one partial
-// per worker, avoiding atomics and full-size temporary gradients.
+// binaryScalar is small enough to inline, which keeps the elementwise loops
+// free of indirect calls.
+func binaryScalar(op int, x, y float32) float32 {
+	switch op {
+	case 0:
+		return x + y
+	case 1:
+		return x - y
+	case 2:
+		return x * y
+	}
+	return x / y
+}
+
+func binaryGrad(op int, up, x, y float32) (float32, float32) {
+	switch op {
+	case 0:
+		return up, up
+	case 1:
+		return up, -up
+	case 2:
+		return up * y, up * x
+	}
+	return up / y, -up * x / (y * y)
+}
+
+// cpuBinaryOp accumulates directly into gradients when the indices are
+// one-to-one. Broadcast gradients use one partial per worker, avoiding atomics
+// and full-size temporary gradients.
 func cpuBinaryOp(a, b *Tensor, op int) *Tensor {
 	same(a, b)
 	s := bshape(a.Shape, b.Shape)
-	if len(s) > 3 {
-		spec := elementwiseRegistry[[]string{"add", "sub", "mul", "div"}[op]]
-		return binary(a, b, spec.CPUForward, spec.CPUGradA, spec.CPUGradB)
-	}
 	ai, bi := makeBroadcastIndex(s, a.Shape), makeBroadcastIndex(s, b.Shape)
+	identity := ai.kind == 1 && bi.kind == 1
 	out := cpuAlloc(numel(s))
-	parallelFor(len(out), func(start, end int) {
-		for i := start; i < end; i++ {
-			x, y := a.Data[ai.at(i)], b.Data[bi.at(i)]
-			switch op {
-			case 0:
-				out[i] = x + y
-			case 1:
-				out[i] = x - y
-			case 2:
-				out[i] = x * y
-			case 3:
-				out[i] = x / y
+	if identity {
+		parallelFor(len(out), func(start, end int) {
+			for i := start; i < end; i++ {
+				out[i] = binaryScalar(op, a.Data[i], b.Data[i])
 			}
-		}
-	})
+		})
+	} else {
+		parallelFor(len(out), func(start, end int) {
+			for i := start; i < end; i++ {
+				out[i] = binaryScalar(op, a.Data[ai.at(i)], b.Data[bi.at(i)])
+			}
+		})
+	}
 	return result(out, s, []*Tensor{a, b}, func(g []float32) {
 		if !a.RequiresGrad && !b.RequiresGrad {
 			return
@@ -43,69 +64,53 @@ func cpuBinaryOp(a, b *Tensor, op int) *Tensor {
 			b.Grad = make([]float32, b.Numel())
 		}
 		workers := min(runtime.GOMAXPROCS(0), len(g)/65536)
-		if workers < 1 {
+		if workers < 2 {
 			workers = 1
 		}
 		localsA, localsB := make([][]float32, workers), make([][]float32, workers)
-		var wg sync.WaitGroup
-		for w := 0; w < workers; w++ {
-			start, end := len(g)*w/workers, len(g)*(w+1)/workers
-			wg.Add(1)
-			go func(worker, start, end int) {
-				defer wg.Done()
-				var da, db []float32
-				if a.RequiresGrad {
-					da = a.Grad
-					if ai.kind != 1 && workers > 1 {
-						da = cpuAlloc(a.Numel())
-						localsA[worker] = da
-					}
+		run := func(worker, start, end int) {
+			var da, db []float32
+			if a.RequiresGrad {
+				da = a.Grad
+				if !identity && workers > 1 {
+					da = cpuAlloc(a.Numel())
+					localsA[worker] = da
 				}
-				if b.RequiresGrad {
-					db = b.Grad
-					if bi.kind != 1 && workers > 1 {
-						db = cpuAlloc(b.Numel())
-						localsB[worker] = db
-					}
+			}
+			if b.RequiresGrad {
+				db = b.Grad
+				if !identity && workers > 1 {
+					db = cpuAlloc(b.Numel())
+					localsB[worker] = db
 				}
-				for i := start; i < end; i++ {
-					ia, ib := ai.at(i), bi.at(i)
-					up := g[i]
-					switch op {
-					case 0:
-						if da != nil {
-							da[ia] += up
-						}
-						if db != nil {
-							db[ib] += up
-						}
-					case 1:
-						if da != nil {
-							da[ia] += up
-						}
-						if db != nil {
-							db[ib] -= up
-						}
-					case 2:
-						if da != nil {
-							da[ia] += up * b.Data[ib]
-						}
-						if db != nil {
-							db[ib] += up * a.Data[ia]
-						}
-					case 3:
-						if da != nil {
-							da[ia] += up / b.Data[ib]
-						}
-						if db != nil {
-							y := b.Data[ib]
-							db[ib] -= up * a.Data[ia] / (y * y)
-						}
-					}
+			}
+			for i := start; i < end; i++ {
+				ia, ib := i, i
+				if !identity {
+					ia, ib = ai.at(i), bi.at(i)
 				}
-			}(w, start, end)
+				ga, gb := binaryGrad(op, g[i], a.Data[ia], b.Data[ib])
+				if da != nil {
+					da[ia] += ga
+				}
+				if db != nil {
+					db[ib] += gb
+				}
+			}
 		}
-		wg.Wait()
+		if workers == 1 {
+			run(0, 0, len(g))
+		} else {
+			var wg sync.WaitGroup
+			for w := 0; w < workers; w++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					run(w, len(g)*w/workers, len(g)*(w+1)/workers)
+				}()
+			}
+			wg.Wait()
+		}
 		for _, local := range localsA {
 			if local != nil {
 				for i, v := range local {
