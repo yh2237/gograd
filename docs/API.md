@@ -17,7 +17,7 @@ CPU/CUDAで使う学習APIです。学習checkpointはsafetensorsの`gograd-trai
 | `autograd` | `ExecutionContext.SetCUDA`、`CUDA`、`WithCUDA` | device / streamの記録と一時適用 |
 | `autograd` | `NewEmbeddingLayer`、`NewConv1dLayer`、`NewLayerNormLayer`、`NewLinearLayer`、`DropoutLayer`、`GELULayer`、`Sequential` | グラフモジュール。Conv1dは入力`[batch,time,channels]`、重み`[out,in,kernel]` |
 | `autograd` | `Conv2d`、`Conv2dOptions`、`NewConv2dLayer`、`Conv2dLayer` | grouped / depthwiseを含むNCHW畳み込み |
-| `autograd` | `Conv1d`、`Conv1dGEMM`、`Conv1dGEMMStride` | time-majorの1D畳み込み。biasは必須 |
+| `autograd` | `Conv1d`、`Conv1dGEMM`、`Conv1dGEMMStride` | time-majorの1D畳み込み。biasはnilまたは`[out_channels]` |
 | `autograd` | `MaxPool2d`、`AvgPool2d`、`AdaptiveAvgPool2d`、各Options / Layer | NCHW pooling |
 | `autograd` | `BatchNorm`、`BatchNormOptions`、`NewBatchNormLayer`、`BatchNormLayerOptions` | 正規化とrunning state |
 | `autograd` | `Module.StateDict`、`LoadStateDict`、`SaveSafeTensors`、`SaveSafeTensorsMetadata`、`LoadSafeTensors` | 名前付きF32 state。metadataの値は文字列 |

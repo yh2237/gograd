@@ -182,8 +182,14 @@ func gpuConv1d(x, w, b *Tensor, dilation int) *Tensor {
 	timedGPU("conv_forward_sgemm", func() error {
 		return options.gemmSinglePrepared(rows, co, depth, false, true, cols.Pointer(), ptr(cols16), w.buf.Pointer(), wp16, out.Pointer(), 0)
 	})
-	timedGPU("conv_bias", func() error { return kernels.AddBiasColumns(out, b.buf, rows, co) })
-	r := resultGPU(out, []int{bs, t, co}, []*Tensor{x, w, b}, func(g *cuda.Buffer) {
+	if b != nil {
+		timedGPU("conv_bias", func() error { return kernels.AddBiasColumns(out, b.buf, rows, co) })
+	}
+	parents := []*Tensor{x, w}
+	if b != nil {
+		parents = append(parents, b)
+	}
+	r := resultGPU(out, []int{bs, t, co}, parents, func(g *cuda.Buffer) {
 		var g16 *cuda.Buffer
 		if options.BF16Autocast && (w.RequiresGrad || x.RequiresGrad) {
 			g16 = castBF16(g.Pointer(), g.Size()/4)
@@ -194,8 +200,10 @@ func gpuConv1d(x, w, b *Tensor, dilation int) *Tensor {
 				return options.gemmSinglePrepared(co, depth, rows, true, false, g.Pointer(), ptr(g16), cols.Pointer(), ptr(cols16), dw.Pointer(), 1)
 			})
 		}
-		if db := b.ensureGradGPU(); db != nil {
-			timedGPU("conv_db", func() error { return kernels.ColumnSum(g, db, rows, co) })
+		if b != nil {
+			if db := b.ensureGradGPU(); db != nil {
+				timedGPU("conv_db", func() error { return kernels.ColumnSum(g, db, rows, co) })
+			}
 		}
 		if dx := x.ensureGradGPU(); dx != nil {
 			dcols := mustAlloc(rows * depth)

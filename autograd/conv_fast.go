@@ -23,9 +23,12 @@ func Conv1dGEMMStride(x, w, b *Tensor, stride, padding, dilation int) *Tensor {
 
 func conv1dGEMM(x, w, b *Tensor, stride, padding, dilation int, legacy, useCUDA bool) *Tensor {
 	same(x, w, b)
-	x, w, b = x.Contiguous(), w.Contiguous(), b.Contiguous()
+	x, w = x.Contiguous(), w.Contiguous()
+	if b != nil {
+		b = b.Contiguous()
+	}
 	s := x.Shape
-	if len(s) != 3 || len(w.Shape) != 3 || w.Shape[1] != s[2] || b.Numel() != w.Shape[0] || w.Shape[2] < 1 || stride < 1 || padding < 0 || dilation < 1 || (legacy && w.Shape[2]%2 != 1) {
+	if len(s) != 3 || len(w.Shape) != 3 || w.Shape[1] != s[2] || (b != nil && b.Numel() != w.Shape[0]) || w.Shape[2] < 1 || stride < 1 || padding < 0 || dilation < 1 || (legacy && w.Shape[2]%2 != 1) {
 		panic("autograd: conv1d shape")
 	}
 	if !legacy {
@@ -51,17 +54,27 @@ func conv1dGEMM(x, w, b *Tensor, stride, padding, dilation int, legacy, useCUDA 
 	}
 	v := cpuAlloc(rows * co)
 	tensor.SGEMMOp(v, cols, w.Data, rows, co, depth, false, true)
-	for r := 0; r < rows; r++ {
-		for o := 0; o < co; o++ {
-			v[r*co+o] += b.Data[o]
-		}
-	}
-	r := result(v, []int{bs, t, co}, []*Tensor{x, w, b}, func(g []float32) {
-		db := cpuAlloc(co)
+	if b != nil {
 		for r := 0; r < rows; r++ {
 			for o := 0; o < co; o++ {
-				db[o] += g[r*co+o]
+				v[r*co+o] += b.Data[o]
 			}
+		}
+	}
+	parents := []*Tensor{x, w}
+	if b != nil {
+		parents = append(parents, b)
+	}
+	r := result(v, []int{bs, t, co}, parents, func(g []float32) {
+		if b != nil {
+			db := cpuAlloc(co)
+			for r := 0; r < rows; r++ {
+				for o := 0; o < co; o++ {
+					db[o] += g[r*co+o]
+				}
+			}
+			b.addGrad(db)
+			cpuRelease(db)
 		}
 		dwT := cpuAlloc(depth * co)
 		tensor.SGEMMOp(dwT, cols, g, depth, co, rows, true, false)
@@ -88,8 +101,6 @@ func conv1dGEMM(x, w, b *Tensor, stride, padding, dilation int, legacy, useCUDA 
 		}
 		x.addGrad(dx)
 		w.addGrad(dw)
-		b.addGrad(db)
-		cpuRelease(db)
 		cpuRelease(dwT)
 		cpuRelease(dw)
 		cpuRelease(dcols)

@@ -26,19 +26,22 @@ func GradientNormToHost() float32 {
 	return v[0]
 }
 
-// Conv1d uses [batch,time,channels] and [out,in,kernel] weights.
+// Conv1d uses [batch,time,channels] and [out,in,kernel] weights. Bias may be nil.
 func Conv1d(x, w, b *Tensor, dilation int) *Tensor {
 	if inferenceDevice(x.Device) {
 		return inferenceConv1d(x, w, b, 1, 0, dilation, true)
 	}
 	useCUDA := dispatchBackend("conv1d", x.Device)
-	x, w, b = x.Contiguous(), w.Contiguous(), b.Contiguous()
+	x, w = x.Contiguous(), w.Contiguous()
+	if b != nil {
+		b = b.Contiguous()
+	}
 	if useCUDA {
 		return Conv1dGEMM(x, w, b, dilation)
 	}
 	same(x, w, b)
 	s := x.Shape
-	if len(s) != 3 || len(w.Shape) != 3 || w.Shape[1] != s[2] || len(b.Data) != w.Shape[0] || w.Shape[2]%2 != 1 || dilation < 1 {
+	if len(s) != 3 || len(w.Shape) != 3 || w.Shape[1] != s[2] || (b != nil && len(b.Data) != w.Shape[0]) || w.Shape[2]%2 != 1 || dilation < 1 {
 		panic("autograd: conv1d shape")
 	}
 	bs, t, ci, co, k := s[0], s[1], s[2], w.Shape[0], w.Shape[2]
@@ -47,7 +50,10 @@ func Conv1d(x, w, b *Tensor, dilation int) *Tensor {
 	for n := 0; n < bs; n++ {
 		for at := 0; at < t; at++ {
 			for o := 0; o < co; o++ {
-				z := b.Data[o]
+				z := float32(0)
+				if b != nil {
+					z = b.Data[o]
+				}
 				for i := 0; i < ci; i++ {
 					for j := 0; j < k; j++ {
 						src := at + (j-k/2)*dilation
@@ -61,15 +67,24 @@ func Conv1d(x, w, b *Tensor, dilation int) *Tensor {
 		}
 	}
 	_ = pad
-	return result(v, []int{bs, t, co}, []*Tensor{x, w, b}, func(g []float32) {
+	parents := []*Tensor{x, w}
+	if b != nil {
+		parents = append(parents, b)
+	}
+	return result(v, []int{bs, t, co}, parents, func(g []float32) {
 		dx := make([]float32, len(x.Data))
 		dw := make([]float32, len(w.Data))
-		db := make([]float32, len(b.Data))
+		var db []float32
+		if b != nil {
+			db = make([]float32, len(b.Data))
+		}
 		for n := 0; n < bs; n++ {
 			for at := 0; at < t; at++ {
 				for o := 0; o < co; o++ {
 					z := g[(n*t+at)*co+o]
-					db[o] += z
+					if db != nil {
+						db[o] += z
+					}
 					for i := 0; i < ci; i++ {
 						for j := 0; j < k; j++ {
 							src := at + (j-k/2)*dilation
@@ -86,7 +101,9 @@ func Conv1d(x, w, b *Tensor, dilation int) *Tensor {
 		}
 		x.addGrad(dx)
 		w.addGrad(dw)
-		b.addGrad(db)
+		if db != nil {
+			b.addGrad(db)
+		}
 	})
 }
 
