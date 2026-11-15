@@ -169,3 +169,30 @@ func TestWriteWAVValidation(t *testing.T) {
 		t.Fatal("nil writer accepted")
 	}
 }
+
+// A zero-length data chunk is a valid, empty WAV rather than a missing chunk.
+func TestAuditWAVAcceptsEmptyDataChunk(t *testing.T) {
+	var buffer bytes.Buffer
+	buffer.WriteString("RIFF")
+	binary.Write(&buffer, binary.LittleEndian, uint32(0))
+	buffer.WriteString("WAVE")
+	var fmtChunk bytes.Buffer
+	binary.Write(&fmtChunk, binary.LittleEndian, uint16(waveFormatPCM))
+	binary.Write(&fmtChunk, binary.LittleEndian, uint16(1))
+	binary.Write(&fmtChunk, binary.LittleEndian, uint32(8000))
+	binary.Write(&fmtChunk, binary.LittleEndian, uint32(16000))
+	binary.Write(&fmtChunk, binary.LittleEndian, uint16(2))
+	binary.Write(&fmtChunk, binary.LittleEndian, uint16(16))
+	buffer.WriteString("fmt ")
+	binary.Write(&buffer, binary.LittleEndian, uint32(fmtChunk.Len()))
+	buffer.Write(fmtChunk.Bytes())
+	buffer.WriteString("data")
+	binary.Write(&buffer, binary.LittleEndian, uint32(0))
+	wav, err := ReadWAV(&buffer)
+	if err != nil {
+		t.Fatalf("empty data chunk rejected: %v", err)
+	}
+	if len(wav.Samples) != 0 || wav.SampleRate != 8000 {
+		t.Fatalf("empty WAV = %+v", wav)
+	}
+}

@@ -73,6 +73,7 @@ func ReadWAV(r io.Reader) (*WAV, error) {
 	var format, channels, bits int
 	var sampleRate int
 	var payload []byte
+	seenData := false
 	for {
 		var header [8]byte
 		if _, err := io.ReadFull(r, header[:]); err == io.EOF {
@@ -110,13 +111,13 @@ func ReadWAV(r io.Reader) (*WAV, error) {
 				format = int(binary.LittleEndian.Uint32(body[24:]))
 			}
 		case "data":
-			payload = body
+			payload, seenData = body, true
 		}
 	}
 	if channels <= 0 || sampleRate <= 0 {
 		return nil, fmt.Errorf("data: WAV is missing a valid fmt chunk")
 	}
-	if len(payload) == 0 {
+	if !seenData {
 		return nil, fmt.Errorf("data: WAV has no data chunk")
 	}
 	wav := &WAV{SampleRate: sampleRate, Channels: channels, Bits: bits, Float: format == waveFormatFloat}

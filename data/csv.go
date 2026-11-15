@@ -152,7 +152,7 @@ func (t *NumericTable) RegressionSamples(featureColumns []int, targetColumn int)
 			return nil, fmt.Errorf("data: ragged numeric table")
 		}
 	}
-	if targetColumn < 0 {
+	if targetColumn == -1 {
 		targetColumn = width - 1
 	}
 	if targetColumn < 0 || targetColumn >= width {

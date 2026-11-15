@@ -179,3 +179,16 @@ func TestAuditStandardizerApplyBatchRejectsOverflowingShape(t *testing.T) {
 		t.Fatal("ApplyBatch accepted an overflowing shape")
 	}
 }
+// Only -1 selects the last column; other negative values are out of range.
+func TestAuditRegressionSamplesRejectsOtherNegativeTarget(t *testing.T) {
+	table, err := ParseNumericCSV(strings.NewReader("a,b,c\n1,2,3\n"), ParseOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := table.RegressionSamples(nil, -2); err == nil {
+		t.Fatal("RegressionSamples accepted target column -2")
+	}
+	if _, err := table.RegressionSamples(nil, -1); err != nil {
+		t.Fatalf("RegressionSamples rejected target column -1: %v", err)
+	}
+}
