@@ -196,6 +196,13 @@ func (b *Backend) Conv1d(out, input, weight, bias *gpu.Buffer, o gpu.Conv1dOptio
 	if err != nil {
 		return err
 	}
+	// DirectML writes zeros instead of the convolution when a dilated kernel
+	// spans the padded input exactly and the input length equals the kernel,
+	// which leaves a single output position. Reject it rather than return
+	// silently wrong values.
+	if length == 1 && o.Dilation > 1 && o.InputLength == o.Kernel {
+		return fmt.Errorf("%w: DirectML Conv1d single-position dilated window", gpu.ErrUnsupported)
+	}
 	xSize, err := gpu.Elements(o.Batch, o.InputLength, o.InChannels)
 	if err != nil {
 		return err

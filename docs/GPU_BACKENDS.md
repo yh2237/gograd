@@ -38,6 +38,7 @@ Vulkanの`gpu.FusedBiasBackend`は1次元biasの`BiasGELU`と、同shapeのresid
 - `Available()`がfalseなら`Err()`で理由を確認できる。テンソル生成は`gpu.ErrUnavailable`を返し、`gpu.Get`は別デバイスへ切り替えない。転送やsubmitが失敗したバックエンドも以後は利用不可となる。`vulkan.DeviceInfo()` / `directml.DeviceInfo()`で選択したGPUとバージョンを取得できる。
 - 記録が有効な`RequiresGrad=true`の入力は出力を割り当てる前に拒否する。`ExecutionContext.NoGrad`内でforwardを行う。backward、optimizer、勾配クリップ、BatchNormの統計更新、学習時のDropoutはNoGrad中でも拒否し、`gpu.ErrInferenceOnly`を返すかpanicする。
 - LogSoftmaxとFlashAttentionは`gpu.ErrUnsupported`。`AttentionAlgorithm="flash"`の明示指定も拒否する。
+- DirectMLのConv1dは、dilationが1より大きく、出力位置が1つで、入力長がカーネル長と等しい場合に`gpu.ErrUnsupported`を返す。この組み合わせではDirectMLが畳み込みの結果ではなく0を書く。
 - `Backend.GELU`はtanh近似、`gpu.ExactGELUBackend`はerf式。`GELU(x, false)`をtanh式へ置き換えない。DirectMLのerf式とEncoderにはfeature level 5.1以上が必要。Vulkanのerfは誤差上限1.5e-7の多項式近似。
 - 共通APIのサイズはバイト数ではなくfloat32の要素数。形はバッファ全体と一致させ、出力は入力と別に割り当てる。`Download`は先頭の一部も読み戻せる。Conv1dのstride / dilationは正の値を明示する。
 - stride / offsetの単位も要素数。負のstrideは未対応。非連続入力は必要に応じてGPU上で実体化し、CPUへ戻さない。`CopyFrom`はScatterで別名のversionも更新し、Expandなど書込先が重複するviewは更新前に拒否する。

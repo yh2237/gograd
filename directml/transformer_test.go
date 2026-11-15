@@ -279,3 +279,28 @@ func TestDirectMLTransformerValidation(t *testing.T) {
 		t.Fatal("validation disabled healthy device")
 	}
 }
+
+// DirectML writes zeros for a single-position dilated window whose input length
+// equals the kernel, so the backend rejects that geometry instead.
+func TestDirectMLConv1dRejectsSinglePositionDilatedWindow(t *testing.T) {
+	b := testBackend(t)
+	o := gpu.Conv1dOptions{Batch: 1, InputLength: 4, InChannels: 1, OutChannels: 2, Kernel: 4, Stride: 1, Padding: 3, Dilation: 3}
+	x, err := b.Upload([]float32{1, 2, 3, 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer x.Close()
+	w, err := b.Upload([]float32{.1, .2, .3, .4, .5, .6, .7, .8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	y, err := b.Alloc(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer y.Close()
+	if err := b.Conv1d(y, x, w, nil, o); !errors.Is(err, gpu.ErrUnsupported) {
+		t.Fatalf("Conv1d error = %v, want ErrUnsupported", err)
+	}
+}
