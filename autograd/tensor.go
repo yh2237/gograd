@@ -404,8 +404,12 @@ func (t *Tensor) addGrad(g []float32) {
 	if !t.RequiresGrad {
 		return
 	}
+	// The first contribution is a plain copy, which is a memmove instead of a
+	// read-modify-write pass.
 	if t.Grad == nil {
 		t.Grad = make([]float32, t.Numel())
+		copy(t.Grad, g)
+		return
 	}
 	for i, v := range g {
 		t.Grad[i] += v
