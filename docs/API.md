@@ -429,8 +429,8 @@ CUDAグラフは未完了launchを同期してから保存し、stateを復元�
 
 ## 互換性の注意
 
-- autograd、CUDA graph、BF16、割当プール、opレジストリは実験的な位置づけです。dtypeはfloat32を中心とし、BF16は任意のシャドウを使います。
-- CUDAのdevice / stream / captureはOSスレッド単位で、プールはdevice / stream単位です。複数deviceを1つの実行コンテキストで扱うことは未対応です。独立分岐の複数stream実行にはRunBranchesを使います。
-- safetensorsは同じディレクトリの一時ファイル、sync、renameで保存します。読込みは不正形状・overflow・重複範囲・16 MiB超のヘッダを拒否します。通常のLoadSafeTensorsはファイル全体をメモリへ読み、大きいファイルにはOpenSafeTensorFile / LoadSafeTensorsStreamを使えます。deviceへの転送失敗は読込みを途中で止める場合があります。
+- autograd、CUDA graph、BF16、割当プール、opレジストリは実験的な位置づけです。
+- 複数deviceを1つの実行コンテキストで扱うことは未対応です。
+- safetensorsの読込みは、deviceへの転送に失敗すると途中で止まる場合があります。
 - 旧`nn`は独自のcheckpoint経路を保ちます。学習checkpointはAdamW / SGDとOneCycleを対象にします。
 - GoとPyTorchはサンプリング・初期化・dropoutの乱数ストリームが異なります。演算比較は重みとマスクを固定し、学習全体は測定した品質で比較します。
