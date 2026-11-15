@@ -361,7 +361,7 @@ func MatMul(a, b *Tensor) *Tensor {
 	}
 	useCUDA := dispatchBackend("matmul", a.Device)
 	same(a, b)
-	a, b = a.Contiguous(), b.Contiguous()
+	a = a.Contiguous()
 	if len(a.Shape) < 2 || len(b.Shape) < 2 {
 		panic("autograd: matmul rank")
 	}
@@ -372,18 +372,25 @@ func MatMul(a, b *Tensor) *Tensor {
 	n := b.Shape[len(b.Shape)-1]
 	batch := bshape(a.Shape[:len(a.Shape)-2], b.Shape[:len(b.Shape)-2])
 	s := append(append([]int(nil), batch...), m, n)
-	if useCUDA {
-		return gpuMatMul(a, b, s, m, n, k, batch)
-	}
 	count := numel(batch)
 	aBatch, bBatch := a.Shape[:len(a.Shape)-2], b.Shape[:len(b.Shape)-2]
 	flatLinear := count > 1 && numel(aBatch) == count && numel(bBatch) == 1
+	// A transposed view of a contiguous matrix is already the layout SGEMM's
+	// transB path reads, so the single-GEMM paths skip materializing it. The
+	// batched path indexes b by batch and still needs a contiguous operand.
+	transposedB := !useCUDA && (flatLinear || count == 1) && b.Offset == 0 && lastTwoTranspose(b.Shape, b.Strides, b.Offset)
+	if !transposedB {
+		b = b.Contiguous()
+	}
+	if useCUDA {
+		return gpuMatMul(a, b, s, m, n, k, batch)
+	}
 	// Divide the CPU budget between independent batches and each GEMM. In
 	// particular, an ordinary rank-two product must not be capped at one core.
 	gemmWorkers := max(1, runtime.GOMAXPROCS(0)/max(1, count))
 	v := cpuAlloc(numel(s))
 	if flatLinear || count == 1 {
-		tensor.SGEMM(v, a.Data, b.Data, count*m, n, k)
+		tensor.SGEMMOp(v, a.Data, b.Data, count*m, n, k, false, transposedB)
 	} else {
 		parallelBatches(count, func(z int) {
 			ai := bindex(z, batch, aBatch) * m * k
@@ -403,7 +410,8 @@ func MatMul(a, b *Tensor) *Tensor {
 		}
 		if flatLinear || count == 1 {
 			if a.RequiresGrad {
-				tensor.SGEMMOp(da, g, b.Data, count*m, k, n, false, true)
+				// A materialized b is [k,n]; the transposed view holds [n,k].
+				tensor.SGEMMOp(da, g, b.Data, count*m, k, n, false, !transposedB)
 				a.addGrad(da)
 			}
 			if b.RequiresGrad {
