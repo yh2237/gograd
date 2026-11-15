@@ -50,6 +50,13 @@ type DType string
 
 const Float32 DType = "float32"
 
+// GELU's two normalising factors are loop invariants; computing them per
+// element would add a square root to every call.
+const (
+	invSqrt2Pi  = 0.3989422804014327
+	sqrt2OverPi = 0.7978845608028654
+)
+
 func (t *Tensor) IsContiguous() bool {
 	if t.Offset != 0 {
 		return false
@@ -827,16 +834,16 @@ func GELU(a *Tensor, approx bool) *Tensor {
 	if !approx {
 		return unary(a, func(x float32) float32 { v := float64(x); return float32(.5 * v * (1 + math.Erf(v/math.Sqrt2))) }, func(x float32) float32 {
 			v := float64(x)
-			return float32(.5*(1+math.Erf(v/math.Sqrt2)) + v*math.Exp(-v*v/2)/math.Sqrt(2*math.Pi))
+			return float32(.5*(1+math.Erf(v/math.Sqrt2)) + v*math.Exp(-v*v/2)*invSqrt2Pi)
 		})
 	}
 	return unary(a, func(x float32) float32 {
 		v := float64(x)
-		return float32(.5 * v * (1 + math.Tanh(math.Sqrt(2/math.Pi)*(v+.044715*v*v*v))))
+		return float32(.5 * v * (1 + math.Tanh(sqrt2OverPi*(v+.044715*v*v*v))))
 	}, func(x float32) float32 {
 		v := float64(x)
-		u := math.Sqrt(2/math.Pi) * (v + .044715*v*v*v)
+		u := sqrt2OverPi * (v + .044715*v*v*v)
 		th := math.Tanh(u)
-		return float32(.5*(1+th) + .5*v*(1-th*th)*math.Sqrt(2/math.Pi)*(1+3*.044715*v*v))
+		return float32(.5*(1+th) + .5*v*(1-th*th)*sqrt2OverPi*(1+3*.044715*v*v))
 	})
 }
