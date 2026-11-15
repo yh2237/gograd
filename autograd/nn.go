@@ -525,7 +525,9 @@ func (c *OneCycle) LR() float64 {
 	initial := c.MaxLR / c.DivFactor
 	final := initial / c.FinalDivFactor
 	step := float64(c.StepCount)
-	warm := c.PctStart*float64(c.Total) - 1
+	// A short run can make the warmup span less than one step; clamping keeps
+	// the first update at the documented initial rate instead of near the peak.
+	warm := max(c.PctStart*float64(c.Total)-1, 0)
 	var start, end, p float64
 	if step <= warm {
 		start, end = initial, c.MaxLR

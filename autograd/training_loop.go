@@ -57,7 +57,8 @@ type TrainingLoop[B any] struct {
 	Optimizer Optimizer
 	// Schedule, when set, sets the learning rate after every update.
 	Schedule UpdateSchedule
-	// Updates is the number of updates this run applies.
+	// Updates is the total number of updates the run reaches, including the
+	// Applied count a resumed run restores.
 	Updates int
 	// Applied counts the updates already applied, which a resumed run takes
 	// from the restored schedule. Run increments it.
@@ -106,6 +107,8 @@ func (l *TrainingLoop[B]) Run(ctx context.Context) error {
 	if every < 1 {
 		every = 25
 	}
+	// A resumed run reports its own first update, not the absolute first.
+	start := l.Applied
 	var savepoint []byte
 	var rewind []byte
 	var stopped error
@@ -151,7 +154,7 @@ func (l *TrainingLoop[B]) Run(ctx context.Context) error {
 		if l.Schedule != nil {
 			l.Schedule.Step(l.Optimizer)
 		}
-		if l.Applied == 1 || l.Applied%every == 0 || l.Applied == l.Updates {
+		if l.Applied == start+1 || l.Applied%every == 0 || l.Applied == l.Updates {
 			if l.Report != nil {
 				l.Report(l.Applied, loss)
 			}

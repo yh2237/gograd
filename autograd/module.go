@@ -27,6 +27,9 @@ type Module struct {
 }
 
 func (m *Module) Train(training bool) {
+	if m == nil {
+		return
+	}
 	m.Training = training
 	if m.OnTrainingChange != nil {
 		m.OnTrainingChange(training)
@@ -57,16 +60,23 @@ func (m *Module) NamedParameters() []Parameter {
 	walk("", m)
 	return out
 }
+// StateDict returns a copy of every parameter and buffer. Parameters and
+// buffers share one namespace, so a duplicate name is a module definition error
+// rather than a silently dropped tensor.
 func (m *Module) StateDict() map[string][]float32 {
 	out := map[string][]float32{}
 	var walk func(string, *Module)
 	walk = func(prefix string, node *Module) {
 		for _, p := range append(append([]Parameter(nil), node.Parameters...), node.Buffers...) {
+			key := prefix + p.Name
+			if _, ok := out[key]; ok {
+				panic("autograd: duplicate state name " + key)
+			}
 			values, e := p.Value.ToHost()
 			if e != nil {
 				panic(e)
 			}
-			out[prefix+p.Name] = values
+			out[key] = values
 		}
 		for _, child := range node.Children {
 			walk(prefix+child.Name+".", child.Module)
