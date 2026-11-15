@@ -39,14 +39,29 @@ func cpuBinaryOp(a, b *Tensor, op int) *Tensor {
 	s := bshape(a.Shape, b.Shape)
 	ai, bi := makeBroadcastIndex(s, a.Shape), makeBroadcastIndex(s, b.Shape)
 	identity := ai.kind == 1 && bi.kind == 1
+	// A right operand that repeats along the last axis is the common bias case;
+	// a counter replaces the per-element modulo.
+	lastAxis := ai.kind == 1 && bi.kind == 3
 	out := cpuAlloc(numel(s))
-	if identity {
+	switch {
+	case identity:
 		parallelFor(len(out), func(start, end int) {
 			for i := start; i < end; i++ {
 				out[i] = binaryScalar(op, a.Data[i], b.Data[i])
 			}
 		})
-	} else {
+	case lastAxis:
+		m := bi.d2
+		parallelFor(len(out), func(start, end int) {
+			j := start % m
+			for i := start; i < end; i++ {
+				out[i] = binaryScalar(op, a.Data[i], b.Data[j])
+				if j++; j == m {
+					j = 0
+				}
+			}
+		})
+	default:
 		parallelFor(len(out), func(start, end int) {
 			for i := start; i < end; i++ {
 				out[i] = binaryScalar(op, a.Data[ai.at(i)], b.Data[bi.at(i)])
@@ -83,6 +98,23 @@ func cpuBinaryOp(a, b *Tensor, op int) *Tensor {
 					db = cpuAlloc(b.Numel())
 					localsB[worker] = db
 				}
+			}
+			if lastAxis {
+				m := bi.d2
+				j := start % m
+				for i := start; i < end; i++ {
+					ga, gb := binaryGrad(op, g[i], a.Data[i], b.Data[j])
+					if da != nil {
+						da[i] += ga
+					}
+					if db != nil {
+						db[j] += gb
+					}
+					if j++; j == m {
+						j = 0
+					}
+				}
+				return
 			}
 			for i := start; i < end; i++ {
 				ia, ib := i, i
