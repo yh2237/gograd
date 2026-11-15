@@ -88,8 +88,10 @@ func sgemmOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 		clear(c)
 		return
 	}
+	// A short row block keeps enough tiles to spread over the workers when m is
+	// small; tall matrices already have plenty.
 	mc := 32
-	if m <= 256 && k >= 1024 {
+	if m <= 512 {
 		mc = 16
 	}
 	const kc = 256

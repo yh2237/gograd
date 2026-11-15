@@ -199,3 +199,45 @@ func BenchmarkSGEMMTrainingShapes(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkSGEMMTransformerShapes covers the GEMMs of a batch-8, sequence-64,
+// model-256, FFN-1024 encoder layer.
+func BenchmarkSGEMMTransformerShapes(b *testing.B) {
+	shapes := []struct {
+		name    string
+		m, n, k int
+	}{
+		{"qkv_forward", 512, 768, 256},
+		{"qkv_grad_weight", 256, 768, 512},
+		{"out_proj_forward", 512, 256, 256},
+		{"ffn1_forward", 512, 1024, 256},
+		{"ffn2_forward", 512, 256, 1024},
+		{"attention_qk", 64, 64, 64},
+	}
+	for _, shape := range shapes {
+		transA := strings.HasSuffix(shape.name, "grad_weight")
+		transB := strings.HasSuffix(shape.name, "forward")
+		mode := "NN"
+		if transA {
+			mode = "TN"
+		} else if transB {
+			mode = "NT"
+		}
+		b.Run(fmt.Sprintf("%s/%s/M%d_N%d_K%d", shape.name, mode, shape.m, shape.n, shape.k), func(b *testing.B) {
+			a := make([]float32, shape.m*shape.k)
+			bb := make([]float32, shape.k*shape.n)
+			c := make([]float32, shape.m*shape.n)
+			for i := range a {
+				a[i] = float32(i%17-8) * .01
+			}
+			for i := range bb {
+				bb[i] = float32(i%13-6) * .02
+			}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				SGEMMOp(c, a, bb, shape.m, shape.n, shape.k, transA, transB)
+			}
+			b.ReportMetric(2*float64(shape.m)*float64(shape.n)*float64(shape.k)/b.Elapsed().Seconds()/1e9*float64(b.N), "GFLOP/s")
+		})
+	}
+}
