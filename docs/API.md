@@ -281,6 +281,16 @@ if complete {
 
 形状不一致、NaN/Inf、不正な件数、overflowは集計を変えずに拒否します。無視する分類行のスコアも有限値が必要です。
 
+## 信号処理
+
+`dsp`はPyTorchとtorchaudioの出力を再現するプリミティブを提供します。FFTはfloat64で累積し、書き出しで丸めます。
+
+- `NewFFT(n)`は2の冪の長さだけを受け付けます。`Transform(x, inverse)`は実部・虚部を交互に並べた`2*n`要素をその場で変換し、逆変換は`n`で割ります。`RealForward` / `RealInverse`は片側スペクトル`n/2+1`本を扱います。
+- `HannPeriodic(n)`は`torch.hann_window(n)`と同じ周期窓を返します。
+- `NewSTFT(filterLength, hopLength)`はhopが1以上フィルタ長以下であることを要求します。`Transform`は入力をフィルタ長の倍数までゼロ埋めし、`center`分の反射パディングを加えてから、周波数優先`[bins][frames]`の振幅と位相を返します。`FramesFor`は同じフレーム数を先に計算します。
+- `Inverse`は重なり加算した窓の二乗和で割り、`numSamples`に合わせて前後を切り落とします。窓に覆われない位置は0になります。空のスペクトルはpanicします。
+- `Resample(input, from, to)`は両レートの最大公約数で約分したポリフェーズHann窓sincフィルタを使います。レートが等しい場合はコピーを返し、0以下や空入力はnilを返します。
+
 ## 中断時の保存
 
 MNIST・数値回帰・音声の例は`TrainingLoop.Save`で最後の完了更新を保存します。更新前の中断でも初期checkpointから再開できます。中断時には評価と推論用重みの書出しは行いません。
