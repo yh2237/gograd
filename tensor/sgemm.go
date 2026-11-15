@@ -110,18 +110,38 @@ func sgemmOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 	} else {
 		bp = sgemmBuffer(groups * k * nr)
 		defer releaseSGEMMBuffer(bp)
-	}
-	for g := 0; g < groups && packed == nil; g++ {
-		j := g * nr
-		width := min(n-j, nr)
-		panel := bp[g*k*nr : (g+1)*k*nr]
-		for d := 0; d < k; d++ {
-			if transB {
-				for q := 0; q < width; q++ {
-					panel[d*nr+q] = b[(j+q)*k+d]
+		// The panel packing is independent per group and otherwise runs on one
+		// core while the rest of the machine waits.
+		pack := func(g int) {
+			j := g * nr
+			width := min(n-j, nr)
+			panel := bp[g*k*nr : (g+1)*k*nr]
+			for d := 0; d < k; d++ {
+				if transB {
+					for q := 0; q < width; q++ {
+						panel[d*nr+q] = b[(j+q)*k+d]
+					}
+				} else {
+					copy(panel[d*nr:d*nr+width], b[d*n+j:d*n+j+width])
 				}
-			} else {
-				copy(panel[d*nr:d*nr+width], b[d*n+j:d*n+j+width])
+			}
+		}
+		packWorkers := min(runtime.GOMAXPROCS(0), groups)
+		if packWorkers > 1 && groups*k*nr >= 65536 {
+			var wg sync.WaitGroup
+			for w := 0; w < packWorkers; w++ {
+				wg.Add(1)
+				go func(start, end int) {
+					defer wg.Done()
+					for g := start; g < end; g++ {
+						pack(g)
+					}
+				}(groups*w/packWorkers, groups*(w+1)/packWorkers)
+			}
+			wg.Wait()
+		} else {
+			for g := 0; g < groups; g++ {
+				pack(g)
 			}
 		}
 	}
