@@ -17,7 +17,7 @@ var registeredPublicOps = map[string]string{
 	"Add": "add", "Sub": "sub", "Mul": "mul", "Div": "div", "Scalar": "scalar",
 	"AddScalar": "add_scalar", "SubScalar": "sub_scalar", "MulScalar": "mul_scalar", "DivScalar": "div_scalar",
 	"Exp": "exp", "Log": "log", "Abs": "abs", "Tanh": "tanh", "Sin": "sin", "ReLU": "relu", "GELU": "gelu",
-	"Sqrt": "sqrt", "Sigmoid": "sigmoid",
+	"Sqrt": "sqrt", "Sigmoid": "sigmoid", "Clamp": "clamp", "PowScalar": "pow_scalar",
 	"Reshape": "reshape", "Permute": "permute", "Transpose": "transpose", "Slice": "slice", "Expand": "expand", "Contiguous": "contiguous",
 	"Sum": "sum", "Mean": "mean", "Concat": "concat", "MatMul": "matmul",
 	"Embedding": "embedding", "EmbeddingWithPadding": "embedding_padding", "EmbeddingFromIndexBuffer": "embedding_index_buffer",

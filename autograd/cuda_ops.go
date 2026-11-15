@@ -57,8 +57,35 @@ func gpuScalar(a *Tensor, value float32, op int) *Tensor {
 		launch("scalar_b", int(n), unsafe.Pointer(&gp), unsafe.Pointer(&da), unsafe.Pointer(&n), unsafe.Pointer(&value), unsafe.Pointer(&kind))
 	})
 }
-func aligned3(shape []int) [3]int32 {
-	if len(shape) > 3 {
+func gpuClamp(a *Tensor, lo, hi float32) *Tensor {
+	n := int32(a.Numel())
+	out := mustAlloc(int(n))
+	ap, yp := ptr(a.buf), ptr(out)
+	launch("clamp_f", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&lo), unsafe.Pointer(&hi))
+	return resultGPU(out, a.Shape, []*Tensor{a}, func(g *cuda.Buffer) {
+		da := ptr(a.ensureGradGPU())
+		if da == 0 {
+			return
+		}
+		gp := ptr(g)
+		launch("clamp_b", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&gp), unsafe.Pointer(&da), unsafe.Pointer(&n), unsafe.Pointer(&lo), unsafe.Pointer(&hi))
+	})
+}
+func gpuPowScalar(a *Tensor, p float32) *Tensor {
+	n := int32(a.Numel())
+	out := mustAlloc(int(n))
+	ap, yp := ptr(a.buf), ptr(out)
+	launch("pow_scalar_f", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&p))
+	return resultGPU(out, a.Shape, []*Tensor{a}, func(g *cuda.Buffer) {
+		da := ptr(a.ensureGradGPU())
+		if da == 0 {
+			return
+		}
+		gp := ptr(g)
+		launch("pow_scalar_b", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&gp), unsafe.Pointer(&da), unsafe.Pointer(&n), unsafe.Pointer(&p))
+	})
+}
+func aligned3(shape []int) [3]int32 {	if len(shape) > 3 {
 		panic("autograd: CUDA rank > 3")
 	}
 	out := [3]int32{1, 1, 1}

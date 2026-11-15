@@ -757,6 +757,35 @@ func Sigmoid(a *Tensor) *Tensor {
 func sigmoid32(x float32) float32 {
 	return float32(1 / (1 + math.Exp(-float64(x))))
 }
+
+// Clamp limits each element to [lo, hi]. The gradient passes through where the
+// input lies inside the interval, endpoints included.
+func Clamp(a *Tensor, lo, hi float32) *Tensor {
+	a = a.Contiguous()
+	if dispatchBackend("clamp", a.Device) {
+		return gpuClamp(a, lo, hi)
+	}
+	return unary(a, func(x float32) float32 { return min(max(x, lo), hi) }, func(x float32) float32 {
+		if x >= lo && x <= hi {
+			return 1
+		}
+		return 0
+	})
+}
+
+// PowScalar raises each element to a constant power.
+func PowScalar(a *Tensor, p float32) *Tensor {
+	a = a.Contiguous()
+	if dispatchBackend("pow_scalar", a.Device) {
+		return gpuPowScalar(a, p)
+	}
+	return unary(a, func(x float32) float32 { return float32(math.Pow(float64(x), float64(p))) }, func(x float32) float32 {
+		if p == 0 {
+			return 0
+		}
+		return p * float32(math.Pow(float64(x), float64(p-1)))
+	})
+}
 func ReLU(a *Tensor) *Tensor {
 	a = a.Contiguous()
 	if dispatchBackend("relu", a.Device) {

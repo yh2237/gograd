@@ -10,7 +10,7 @@ CPU/CUDAで使う学習APIです。学習checkpointはsafetensorsの`gograd-trai
 | `tensor` | `Device`、`CPU`、`CUDA` | 構築時のdevice選択 |
 | `autograd` | `NewCUDAContext`、`NewCUDAContextOn`、`CUDAContext.Device`、`Close` | OSスレッド固定、CUDA deviceの選択と復元 |
 | `autograd` | `New`、`Zeros`、`ToHost`、`Backward`、`ReleaseGraph`、`Close` | テンソル、勾配、寿命管理 |
-| `autograd` | `Add`、`Sub`、`Mul`、`Div`、`AddScalar`、`SubScalar`、`MulScalar`、`DivScalar`、`Exp`、`Log`、`Sqrt`、`Sigmoid`、`Tanh`、`Sin`、`Abs`、`ReLU`、`GELU` | 要素演算とbroadcast |
+| `autograd` | `Add`、`Sub`、`Mul`、`Div`、`AddScalar`、`SubScalar`、`MulScalar`、`DivScalar`、`PowScalar`、`Exp`、`Log`、`Sqrt`、`Sigmoid`、`Tanh`、`Sin`、`Abs`、`ReLU`、`GELU`、`Clamp` | 要素演算とbroadcast |
 | `autograd` | `RetainData`、`RetainGrad`、`BackwardWithOptions`、`BackwardOptions` | 値・勾配・履歴の保持 |
 | `autograd` | `NewExecutionContext`、`New`、`Zeros`、`Bind`、`BindModule`、`NoGrad`、`Recording`、`Tensor.ExecutionContext` | 記録スコープの分離 |
 | `autograd` | `ExecutionOptions`、`SetOptions`、`Options`、`Autocast` | BF16とアテンションの選択 |
