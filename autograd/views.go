@@ -18,6 +18,74 @@ func storageIndex(flat int, shape, stride []int, offset int) int {
 	return j
 }
 
+// gatherView copies a strided view into dst. The odometer advances the source
+// index one step at a time, so no division or modulo runs per element.
+func gatherView(dst, src []float32, shape, stride []int, offset int) {
+	n := len(shape)
+	if n == 0 {
+		if len(dst) > 0 {
+			dst[0] = src[offset]
+		}
+		return
+	}
+	coords := make([]int, n)
+	at := offset
+	for i := range dst {
+		dst[i] = src[at]
+		for k := n - 1; k >= 0; k-- {
+			coords[k]++
+			at += stride[k]
+			if coords[k] < shape[k] {
+				break
+			}
+			at -= coords[k] * stride[k]
+			coords[k] = 0
+		}
+	}
+}
+
+// scatterView accumulates src into a strided view of dst.
+func scatterView(dst, src []float32, shape, stride []int, offset int) {
+	n := len(shape)
+	if n == 0 {
+		if len(src) > 0 {
+			dst[offset] += src[0]
+		}
+		return
+	}
+	coords := make([]int, n)
+	at := offset
+	for i := range src {
+		dst[at] += src[i]
+		for k := n - 1; k >= 0; k-- {
+			coords[k]++
+			at += stride[k]
+			if coords[k] < shape[k] {
+				break
+			}
+			at -= coords[k] * stride[k]
+			coords[k] = 0
+		}
+	}
+}
+
+// contiguousBlock reports whether the view's elements are one contiguous run of
+// the parent storage starting at Offset. A row slice of a contiguous matrix is
+// the common case, and it needs no per-element index computation.
+func contiguousBlock(shape, stride []int) bool {
+	if len(shape) != len(stride) {
+		return false
+	}
+	expected := 1
+	for i := len(shape) - 1; i >= 0; i-- {
+		if stride[i] != expected {
+			return false
+		}
+		expected *= shape[i]
+	}
+	return true
+}
+
 // A common attention view swaps the last two axes of contiguous matrices.
 // Detect it once and copy tiles without per-element N-D division/modulo.
 func lastTwoTranspose(shape, stride []int, offset int) bool {
@@ -96,12 +164,13 @@ func makeView(a *Tensor, shape, stride []int, offset int) *Tensor {
 				return
 			}
 			dx := cpuAlloc(a.Numel())
-			if lastTwoTranspose(v.Shape, v.Strides, v.Offset) {
+			switch {
+			case contiguousBlock(v.Shape, v.Strides):
+				copy(dx[v.Offset:v.Offset+len(g)], g)
+			case lastTwoTranspose(v.Shape, v.Strides, v.Offset):
 				transposeViewCopy(dx, g, v.Shape, true)
-			} else {
-				for i, z := range g {
-					dx[storageIndex(i, v.Shape, v.Strides, v.Offset)] += z
-				}
+			default:
+				scatterView(dx, g, v.Shape, v.Strides, v.Offset)
 			}
 			a.addGrad(dx)
 			cpuRelease(dx)
@@ -137,12 +206,13 @@ func (t *Tensor) Contiguous() *Tensor {
 	n := t.Numel()
 	if !useCUDA {
 		v := cpuAlloc(n)
-		if lastTwoTranspose(t.Shape, t.Strides, t.Offset) {
+		switch {
+		case contiguousBlock(t.Shape, t.Strides):
+			copy(v, t.Data[t.Offset:t.Offset+n])
+		case lastTwoTranspose(t.Shape, t.Strides, t.Offset):
 			transposeViewCopy(v, t.Data, t.Shape, false)
-		} else {
-			for i := range v {
-				v[i] = t.Data[storageIndex(i, t.Shape, t.Strides, t.Offset)]
-			}
+		default:
+			gatherView(v, t.Data, t.Shape, t.Strides, t.Offset)
 		}
 		return result(v, append([]int(nil), t.Shape...), []*Tensor{t}, func(g []float32) { t.addGrad(g) })
 	}

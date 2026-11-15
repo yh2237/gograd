@@ -332,9 +332,7 @@ func (t *Tensor) Detach() *Tensor {
 		return v
 	}
 	values := make([]float32, t.Numel())
-	for i := range values {
-		values[i] = t.Data[storageIndex(i, t.Shape, t.Strides, t.Offset)]
-	}
+	gatherView(values, t.Data, t.Shape, t.Strides, t.Offset)
 	return &Tensor{Data: values, storage: cpuStorage(values, false), Shape: append([]int(nil), t.Shape...), Strides: strides(t.Shape), DType: t.DType, Device: t.Device, execution: t.execution}
 }
 func (t *Tensor) RetainGrad() { t.assertOpen(); t.retain = true }
