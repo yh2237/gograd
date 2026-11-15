@@ -131,13 +131,19 @@ func strides(s []int) []int {
 }
 
 // validateShape rejects dimensions that cannot describe storage. A negative
-// dimension can otherwise cancel another negative dimension in numel and pass
-// the element-count check.
+// dimension can otherwise cancel another negative dimension in numel, and a
+// product that overflows int can wrap to a plausible element count.
 func validateShape(shape []int) error {
+	limit := int(^uint(0) >> 1)
+	n := 1
 	for _, d := range shape {
 		if d < 0 {
 			return errors.New("autograd: negative dimension")
 		}
+		if d != 0 && n > limit/d {
+			return errors.New("autograd: oversized shape")
+		}
+		n *= d
 	}
 	return nil
 }
@@ -438,7 +444,13 @@ func bshape(a, b []int) []int {
 		if x != y && x != 1 && y != 1 {
 			panic("autograd: broadcast mismatch")
 		}
-		s[i] = max(x, y)
+		// A size-one dim adopts the other length, so a zero dim stays zero
+		// instead of becoming one.
+		if x == 1 {
+			s[i] = y
+		} else {
+			s[i] = x
+		}
 	}
 	return s
 }

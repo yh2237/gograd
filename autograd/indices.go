@@ -2,6 +2,7 @@ package autograd
 
 import (
 	"fmt"
+	"math"
 	"unsafe"
 
 	"github.com/yh2237/gograd/cuda"
@@ -22,8 +23,9 @@ func NewIndexBuffer(ids []int) (*IndexBuffer, error) {
 	}
 	values := make([]int32, len(ids))
 	for i, v := range ids {
-		if v < 0 {
-			return nil, fmt.Errorf("autograd: negative index")
+		// The device kernel reads int32, so a wider index would wrap silently.
+		if v < 0 || v > math.MaxInt32 {
+			return nil, fmt.Errorf("autograd: index out of range")
 		}
 		values[i] = int32(v)
 	}
@@ -48,6 +50,9 @@ func EmbeddingFromIndexBuffer(weight *Tensor, ids *IndexBuffer, shape []int, pad
 	dispatchBackend("embedding_index_buffer", weight.Device)
 	if weight.Device != tensor.CUDA || ids == nil || ids.buffer == nil || len(weight.Shape) != 2 || numel(shape) != ids.Count {
 		panic("autograd: CUDA embedding indices shape")
+	}
+	if paddingIdx < -1 || paddingIdx >= weight.Shape[0] {
+		panic("autograd: padding index")
 	}
 	r := gpuEmbeddingBuffer(weight.Contiguous(), ids.buffer, shape, paddingIdx, false)
 	r.savedLeases = append(r.savedLeases, ids.storage.acquire())

@@ -1,7 +1,9 @@
 package autograd
 
 import (
+	"math"
 	"math/rand"
+	"slices"
 	"strings"
 	"testing"
 
@@ -98,4 +100,61 @@ func TestAuditLayerConstructorsRejectInvalidDimensions(t *testing.T) {
 	}
 	norm.Weight.Close()
 	norm.Bias.Close()
+}
+
+// A size-one dim adopts the other length, so broadcasting against a zero dim
+// must keep the zero rather than widen it to one.
+func TestAuditBroadcastKeepsZeroDimension(t *testing.T) {
+	empty := Must([]float32{}, []int{0, 3}, false)
+	defer empty.Close()
+	one := Must([]float32{1, 2, 3}, []int{1, 3}, false)
+	defer one.Close()
+	sum := Add(empty, one)
+	defer sum.ReleaseGraph()
+	if !slices.Equal(sum.Shape, []int{0, 3}) {
+		t.Fatalf("Add([0,3],[1,3]) shape = %v, want [0 3]", sum.Shape)
+	}
+
+	zeros := Must([]float32{}, []int{0, 0}, false)
+	defer zeros.Close()
+	ones := Must([]float32{}, []int{1, 0}, false)
+	defer ones.Close()
+	product := Mul(zeros, ones)
+	defer product.ReleaseGraph()
+	if !slices.Equal(product.Shape, []int{0, 0}) {
+		t.Fatalf("Mul([0,0],[1,0]) shape = %v, want [0 0]", product.Shape)
+	}
+}
+
+// A batch dim of zero must survive the matmul broadcast instead of becoming one.
+func TestAuditMatMulKeepsZeroBatchDimension(t *testing.T) {
+	a := Must([]float32{}, []int{0, 0, 3}, false)
+	defer a.Close()
+	b := Must(make([]float32, 12), []int{1, 3, 4}, false)
+	defer b.Close()
+	out := MatMul(a, b)
+	defer out.ReleaseGraph()
+	if !slices.Equal(out.Shape, []int{0, 0, 4}) {
+		t.Fatalf("MatMul([0,0,3],[1,3,4]) shape = %v, want [0 0 4]", out.Shape)
+	}
+}
+
+// A shape whose element count overflows int must not pass the data-length check.
+func TestAuditNewRejectsOverflowingShape(t *testing.T) {
+	if _, err := New([]float32{}, []int{1 << 32, 1 << 32}, tensor.CPU, true); err == nil {
+		t.Fatal("New accepted a shape whose element count overflows int")
+	}
+	if _, err := Zeros([]int{1 << 32, 1 << 32}, tensor.CPU, false); err == nil {
+		t.Fatal("Zeros accepted a shape whose element count overflows int")
+	}
+}
+// The device kernel reads int32 indices, so a wider value must be rejected
+// instead of wrapping. The check runs before any allocation.
+func TestAuditIndexBufferRejectsWideIndex(t *testing.T) {
+	if _, err := NewIndexBuffer([]int{math.MaxInt32 + 1}); err == nil {
+		t.Fatal("NewIndexBuffer accepted an index wider than int32")
+	}
+	if _, err := NewIndexBuffer([]int{-1}); err == nil {
+		t.Fatal("NewIndexBuffer accepted a negative index")
+	}
 }

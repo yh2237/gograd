@@ -7,6 +7,25 @@ import (
 	randv2 "math/rand/v2"
 )
 
+// augmentationStream derives an independent PCG stream from the seed, the sample
+// index and a per-transform salt. Combining seed and index directly would make
+// both flips share one stream at index zero, where each combination collapses to
+// the same constant.
+func augmentationStream(seed uint64, index int, salt uint64) *randv2.Rand {
+	x := uint64(index) ^ salt
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return randv2.New(randv2.NewPCG(seed, x))
+}
+
+const (
+	horizontalSalt = 0x9e3779b97f4a7c15
+	verticalSalt   = 0xbf58476d1ce4e5b9
+)
+
 // FlipsHorizontallyFloat32 swaps columns in each channel plane. values is in
 // [channels,height,width] order. Invalid shapes leave values unchanged.
 func FlipsHorizontallyFloat32(values []float32, channels, height, width int) error {
@@ -77,7 +96,7 @@ func RandomVerticalFlipFloat32(values []float32, channels, height, width int, se
 	if index < 0 || probability < 0 || probability > 1 || math.IsNaN(probability) || math.IsInf(probability, 0) {
 		return fmt.Errorf("data: invalid flip index or probability")
 	}
-	rng := randv2.New(randv2.NewPCG(seed, uint64(index)*2+0x9e3779b97f4a7c15))
+	rng := augmentationStream(seed, index, verticalSalt)
 	if rng.Float64() < probability {
 		flipVertically(values, channels, height, width)
 	}
@@ -173,7 +192,7 @@ func RandomHorizontalFlipFloat32(values []float32, channels, height, width int, 
 	if index < 0 || probability < 0 || probability > 1 || math.IsNaN(probability) || math.IsInf(probability, 0) {
 		return fmt.Errorf("data: invalid flip index or probability")
 	}
-	rng := randv2.New(randv2.NewPCG(seed, uint64(index)^0x9e3779b97f4a7c15))
+	rng := augmentationStream(seed, index, horizontalSalt)
 	if rng.Float64() < probability {
 		flipHorizontally(values, channels, height, width)
 	}

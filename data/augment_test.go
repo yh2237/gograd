@@ -416,3 +416,26 @@ func TestMultiTransformChainRejectsInvalidInputs(t *testing.T) {
 		t.Fatal("invalid transform accepted")
 	}
 }
+
+// The two flips must not share a random stream at index zero, where a direct
+// combination of seed and index collapses to one constant.
+func TestAuditFlipStreamsAreIndependentAtIndexZero(t *testing.T) {
+	const trials = 64
+	original := []float32{1, 2, 3, 4}
+	agree := 0
+	for seed := uint64(0); seed < trials; seed++ {
+		h, v := slices.Clone(original), slices.Clone(original)
+		if err := RandomHorizontalFlipFloat32(h, 1, 2, 2, seed, 0, .5); err != nil {
+			t.Fatal(err)
+		}
+		if err := RandomVerticalFlipFloat32(v, 1, 2, 2, seed, 0, .5); err != nil {
+			t.Fatal(err)
+		}
+		if slices.Equal(h, original) == slices.Equal(v, original) {
+			agree++
+		}
+	}
+	if agree == trials {
+		t.Fatal("horizontal and vertical flips share one stream at index zero")
+	}
+}

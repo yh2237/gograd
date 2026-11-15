@@ -96,6 +96,9 @@ func (s *STFT) Inverse(magnitude, phase []float32, numSamples int) []float32 {
 		panic("dsp: spectrum size mismatch")
 	}
 	frames := len(magnitude) / bins
+	if frames < 1 {
+		panic("dsp: empty spectrum")
+	}
 	n, hop, width := len(s.window), s.hop, len(s.window)
 	istft := hop * (frames - 1)
 	accumulated, envelope := make([]float32, n+hop*(frames-1)), make([]float32, n+hop*(frames-1))
@@ -122,8 +125,10 @@ func (s *STFT) Inverse(magnitude, phase []float32, numSamples int) []float32 {
 		}
 	}
 	// The reference trims its own window multiple; when the input already
-	// divides the window, a whole window of zeros is removed.
-	trim := n - numSamples%n
+	// divides the window, a whole window of zeros is removed. The centring
+	// offset is already applied above, so only the padding multiple and the
+	// odd-length centring remainder are trimmed here.
+	trim := 2*s.center - numSamples%n
 	if trim >= len(out) {
 		return nil
 	}

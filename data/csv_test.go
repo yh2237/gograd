@@ -150,3 +150,32 @@ func TestStandardizerFitApplyState(t *testing.T) {
 		t.Fatal("inconsistent fit accepted")
 	}
 }
+
+// A malformed row must report its 1-based source line, not the count of records
+// that survived comment and blank-line skipping.
+func TestAuditCSVReportsSourceLine(t *testing.T) {
+	_, err := ParseNumericCSV(strings.NewReader("# c1\n# c2\na,b\n1,two\n"), ParseOptions{Comment: '#'})
+	if err == nil || !strings.Contains(err.Error(), "line 4") {
+		t.Fatalf("comment-skipped CSV error = %v, want line 4", err)
+	}
+	_, err = ParseNumericCSV(strings.NewReader("\n\n\na,b\n1,two\n"), ParseOptions{})
+	if err == nil || !strings.Contains(err.Error(), "line 5") {
+		t.Fatalf("blank-line CSV error = %v, want line 5", err)
+	}
+}
+
+// A header without data rows is not a usable table.
+func TestAuditCSVRejectsHeaderOnly(t *testing.T) {
+	if _, err := ParseNumericCSV(strings.NewReader("a,b\n"), ParseOptions{}); err == nil {
+		t.Fatal("header-only CSV was accepted")
+	}
+}
+
+// The batch length check must not overflow before it compares.
+func TestAuditStandardizerApplyBatchRejectsOverflowingShape(t *testing.T) {
+	s := Standardizer{Mean: []float32{0, 0, 0, 0}, Std: []float32{1, 1, 1, 1}}
+	batch := &RegressionBatch{Values: []float32{}, Shape: []int{1 << 62, 4}}
+	if err := s.ApplyBatch(batch); err == nil {
+		t.Fatal("ApplyBatch accepted an overflowing shape")
+	}
+}

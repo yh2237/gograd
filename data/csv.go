@@ -2,6 +2,7 @@ package data
 
 import (
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -48,16 +49,21 @@ func ParseNumericCSV(r io.Reader, options ParseOptions) (*NumericTable, error) {
 	reader.ReuseRecord = true
 	table := &NumericTable{}
 	width := 0
-	line := 0
 	for {
 		record, err := reader.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("data: CSV line %d: %w", line+1, err)
+			var parseErr *csv.ParseError
+			if errors.As(err, &parseErr) {
+				return nil, fmt.Errorf("data: CSV line %d: %w", parseErr.Line, err)
+			}
+			return nil, fmt.Errorf("data: CSV: %w", err)
 		}
-		line++
+		// The reader skips comment and blank lines, so the record count is not
+		// the source line. FieldPos reports where the record actually started.
+		line, _ := reader.FieldPos(0)
 		if len(record) == 1 && strings.TrimSpace(record[0]) == "" {
 			continue
 		}
@@ -87,7 +93,7 @@ func ParseNumericCSV(r io.Reader, options ParseOptions) (*NumericTable, error) {
 		}
 		table.Rows = append(table.Rows, row)
 	}
-	if len(table.Rows) == 0 && len(table.Names) == 0 {
+	if len(table.Rows) == 0 {
 		return nil, fmt.Errorf("data: CSV has no data rows")
 	}
 	if len(table.Names) == 0 {
@@ -263,8 +269,11 @@ func (s Standardizer) Apply(sample RegressionSample) RegressionSample {
 // ApplyBatch standardizes a collated batch in place, which is what training and
 // evaluation loops want before transferring the batch to a device.
 func (s Standardizer) ApplyBatch(batch *RegressionBatch) error {
-	if batch == nil || len(batch.Shape) != 2 || batch.Shape[1] != len(s.Mean) ||
-		batch.Shape[0] < 0 || len(batch.Values) != batch.Shape[0]*batch.Shape[1] {
+	if batch == nil || len(batch.Shape) != 2 || batch.Shape[1] != len(s.Mean) {
+		return fmt.Errorf("data: batch features do not match the standardizer")
+	}
+	size, err := shapeSize(batch.Shape)
+	if err != nil || size != len(batch.Values) {
 		return fmt.Errorf("data: batch features do not match the standardizer")
 	}
 	for row := 0; row < batch.Shape[0]; row++ {

@@ -247,3 +247,30 @@ func BenchmarkSTFTTransform(b *testing.B) {
 		s.Transform(signal)
 	}
 }
+
+// A filter length of one has no centring offset, so the inverse must return the
+// original length instead of trimming one sample too many.
+func TestAuditSTFTInverseSingleSampleWindow(t *testing.T) {
+	s, err := NewSTFT(1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	magnitude, phase, _ := s.Transform([]float32{1, 2, 3, 4, 5})
+	if out := s.Inverse(magnitude, phase, 5); len(out) != 5 {
+		t.Fatalf("Inverse length = %d, want 5", len(out))
+	}
+}
+
+// An empty spectrum has no frames to overlap-add.
+func TestAuditSTFTInverseRejectsEmptySpectrum(t *testing.T) {
+	s, err := NewSTFT(8, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("Inverse accepted an empty spectrum")
+		}
+	}()
+	s.Inverse(nil, nil, 0)
+}
