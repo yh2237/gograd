@@ -137,11 +137,17 @@ func (c *Conv1d) Backward(blas *cuda.Blas, grad *tensor.Tensor) (*tensor.Tensor,
 	if c.input == nil {
 		return nil, fmt.Errorf("nn: Conv1d backward before forward")
 	}
+	if grad == nil {
+		return nil, fmt.Errorf("nn: Conv1d backward requires a gradient")
+	}
 	s := c.input.Shape()
 	b, t := s[0], s[1]
 	rows, k := b*t, c.In*c.Kernel
 	if gs := grad.Shape(); len(gs) != 3 || gs[0] != b || gs[1] != t || gs[2] != c.Out {
 		return nil, fmt.Errorf("nn: Conv1d gradient shape mismatch")
+	}
+	if grad.Device() != c.input.Device() {
+		return nil, fmt.Errorf("nn: Conv1d gradient device mismatch")
 	}
 	if grad.Device() == tensor.CUDA {
 		return c.backwardCUDA(blas, grad, s, b, t, rows, k)
@@ -304,6 +310,12 @@ func activationBackward(a *activation, g *tensor.Tensor, f func(float32) float32
 	if a.input == nil {
 		return nil, fmt.Errorf("nn: activation backward before forward")
 	}
+	if g == nil {
+		return nil, fmt.Errorf("nn: activation backward requires a gradient")
+	}
+	if g.Device() != a.input.Device() || !sameShape(g.Shape(), a.input.Shape()) {
+		return nil, fmt.Errorf("nn: activation gradient shape or device mismatch")
+	}
 	v, err := values(a.input)
 	if err != nil {
 		return nil, err
@@ -330,6 +342,9 @@ func (a *ReLU) Forward(_ *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, error) {
 	})
 }
 func (a *ReLU) Backward(_ *cuda.Blas, g *tensor.Tensor) (*tensor.Tensor, error) {
+	if g == nil {
+		return nil, fmt.Errorf("nn: activation backward requires a gradient")
+	}
 	if g.Device() == tensor.CUDA {
 		return activationCUDA(&a.activation, a.input, g, 0, 0)
 	}
@@ -352,6 +367,9 @@ func (a *LeakyReLU) Forward(_ *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, err
 	})
 }
 func (a *LeakyReLU) Backward(_ *cuda.Blas, g *tensor.Tensor) (*tensor.Tensor, error) {
+	if g == nil {
+		return nil, fmt.Errorf("nn: activation backward requires a gradient")
+	}
 	if g.Device() == tensor.CUDA {
 		return activationCUDA(&a.activation, a.input, g, 1, a.Slope)
 	}
@@ -369,6 +387,9 @@ func (a *GELU) Forward(_ *cuda.Blas, x *tensor.Tensor) (*tensor.Tensor, error) {
 	return activationForward(&a.activation, x, gelu)
 }
 func (a *GELU) Backward(_ *cuda.Blas, g *tensor.Tensor) (*tensor.Tensor, error) {
+	if g == nil {
+		return nil, fmt.Errorf("nn: activation backward requires a gradient")
+	}
 	if g.Device() == tensor.CUDA {
 		return activationCUDA(&a.activation, a.input, g, 2, 0)
 	}
@@ -378,6 +399,9 @@ func (a *GELU) Backward(_ *cuda.Blas, g *tensor.Tensor) (*tensor.Tensor, error) 
 func activationCUDA(a *activation, x, grad *tensor.Tensor, kind int, slope float32) (*tensor.Tensor, error) {
 	if x == nil {
 		return nil, fmt.Errorf("nn: activation backward before forward")
+	}
+	if grad != nil && (grad.Device() != tensor.CUDA || !sameShape(grad.Shape(), x.Shape())) {
+		return nil, fmt.Errorf("nn: activation gradient shape or device mismatch")
 	}
 	y, err := tensor.NewOn(tensor.CUDA, x.Shape()...)
 	if err != nil {

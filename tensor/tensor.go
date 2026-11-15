@@ -52,18 +52,29 @@ func NewOn(device Device, shape ...int) (*Tensor, error) {
 	if device == Vulkan || device == DirectML {
 		return nil, fmt.Errorf("%w: %s tensor integration is not implemented yet", gpu.ErrUnavailable, device)
 	}
+	// A product that overflows int would wrap to a plausible element count and
+	// pass the later size checks.
+	limit := int(^uint(0) >> 1)
+	n := 1
 	for _, d := range shape {
 		if d < 0 {
 			return nil, fmt.Errorf("tensor: negative dimension")
 		}
+		if d != 0 && n > limit/d {
+			return nil, fmt.Errorf("tensor: oversized shape %v", shape)
+		}
+		n *= d
 	}
 	if device == CPU {
-		return &Tensor{data: make([]float32, Numel(shape)), device: CPU, shape: append([]int(nil), shape...), owned: true}, nil
+		return &Tensor{data: make([]float32, n), device: CPU, shape: append([]int(nil), shape...), owned: true}, nil
 	}
 	if device != CUDA {
 		return nil, fmt.Errorf("tensor: unknown device %q", device)
 	}
-	buf, err := cuda.Alloc(Numel(shape) * 4)
+	if n > limit/4 {
+		return nil, fmt.Errorf("tensor: oversized shape %v", shape)
+	}
+	buf, err := cuda.Alloc(n * 4)
 	if err != nil {
 		return nil, err
 	}
