@@ -291,6 +291,12 @@ if complete {
 - `Inverse`は重なり加算した窓の二乗和で割り、`numSamples`に合わせて前後を切り落とします。窓に覆われない位置は0になります。空のスペクトルはpanicします。
 - `Resample(input, from, to)`は両レートの最大公約数で約分したポリフェーズHann窓sincフィルタを使います。レートが等しい場合はコピーを返し、0以下や空入力はnilを返します。
 
+## PyTorchのcheckpointと乱数
+
+`torchpth.Read(filename)`は`torch.save`のzip形式を読み、名前ごとの`Tensor{Shape, Data}`を返します。入れ子のstate_dictはドットで連結し、単体のテンソルは空の名前で返します。Float / Half / BFloat16のstorageをfloat32へ変換し、それ以外のdtypeは拒否します。
+
+`torchrng`はPyTorch CPUの乱数列を再現します。`New(seed)`で作り、`Uniform` / `Normal`はfloat32、`Uniform64` / `Normal64`はfloat64の配列を埋めます。`State` / `SetState`で途中状態を保存・復元できます。Generatorは並行利用に対応しません。
+
 ## 中断時の保存
 
 MNIST・数値回帰・音声の例は`TrainingLoop.Save`で最後の完了更新を保存します。更新前の中断でも初期checkpointから再開できます。中断時には評価と推論用重みの書出しは行いません。
