@@ -267,6 +267,8 @@ if complete {
 
 端数groupでも`1/groups`のスケールを保ちます。途中で更新した場合はResetしてください。未完了の勾配はcheckpointに含まれないため、保存はgroup完了後に行います。
 
+`ClipGradNorm`はCPUではクリップ前のノルムを返し、CUDAでは読み戻しを避けるため`NaN`を返します。CUDAのノルムは`GradientNormToHost`で読み出せます。maxNormが0以下ならクリップしません。
+
 平均するのはmicro-batchごとの損失です。大きな1バッチと同じ勾配になるのは、有効件数と分母が等しい場合だけで、短いバッチや異なるマスクは呼出し側で重み付けします。
 
 ## 評価指標
