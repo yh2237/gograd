@@ -97,7 +97,7 @@ encoder before:  33.5330, 34.7472, 31.4275, 36.8871, 34.2618, 34.8019, 35.7983
 encoder after:   34.6284, 36.9622, 35.2579, 35.2272, 35.2707, 33.6217, 37.8502
 ```
 
-最大絶対誤差（GELU `4.77e-7`、LayerNorm `8.34e-7`、Encoder `8.11e-6`）とメモリ消費量に変化はなかった。Encoder全体で改善が見られなかったのは、Encoderが近似GELUではなくerf式GELUを使用しているためである（変更後のLayerNorm単体はCPUの0.1475 msより遅い）。
+最大絶対誤差（GELU `4.77e-7`、LayerNorm `8.34e-7`、Encoder `8.11e-6`）は変更前後で同じで、使用中バッファの増加はなかった。Encoder全体の改善は確認できなかった。Encoderはerf式GELUを使うため近似GELUの変更は適用されず、正規化のsubmitだけが減る。同じ測定でCPUも532.0→552.7 ms、未変更のVulkanも35.9→40.6 msと変動した。変更後のLayerNorm単体はCPUの0.1475 msより遅い。
 
 ## Vulkanのbias融合演算
 

@@ -53,7 +53,7 @@ CPU / CUDA向けの学習APIリファレンスです。学習checkpointはsafete
 
 要素演算の主なエッジケースは以下の通りです。
 - `Max` と `Min` は同値の場合に勾配を右辺へ流すため、二重計上されません。
-- `Clamp` は両端を含む区間で微分可能で、`Sqrt` の微分は0で無限大になります。
+- `Clamp` は境界を含めて区間内で勾配を通し、`Sqrt` の微分は0で無限大になります。
 - `Softplus` は `max(x,0)+log1p(exp(-|x|))` で計算し、有限入力に対して常に有限値を返します。`Log1p` と `Expm1` は0近傍の桁落ちを回避します。
 
 CUDAのデバイス・暗黙のstream・capture状態はOSスレッド単位で管理されます。処理の間は `NewCUDAContext` を保持してください。`NewCUDAContextOn` はデバイスを検証して選択し、`Close` で以前のデバイスへ復元します。
@@ -166,7 +166,7 @@ CPU、dropout有効時、融合できないレイアウトでは合成経路を�
 
 `CopyFrom` とeagerなoptimizer更新はストレージのversionを進め、`Backward` は勾配書き込み前に保存したオペランドと出力のversionを検証します。CPUの `Data` スライスへの直接書き込みや外部からのCUDA書き込み・再生は追跡されないため、グラフが生きている間は保存値を変更しないでください。
 
-`Data` と `Buffer()` は借用です。スライスの差し替え、Tensor所有バッファの直接Free、ハンドル終了後の借用メモリ利用は避けてください。TensorとIndexBufferは所有状態をポインタで保持するため、共有テンソルの変更・`Close`・`Backward` を並行して行わないでください。
+`Data` と `Buffer()` は借用です。スライスの差し替え、Tensor所有バッファの直接Free、ハンドル終了後の借用メモリ利用は避けてください。TensorとIndexBufferは値コピーせず、ポインタで扱ってください。共有テンソルの変更・`Close`・`Backward` を並行して行わないでください。
 
 ## Conv2dとCNNの学習
 
@@ -377,7 +377,7 @@ defer loader.Close()
 
 `Loader.Next` は取得・collate・キャンセル確認がすべて成功した後にのみカーソルを進めます。読み込みやcollateの失敗は再試行可能で、callbackのEOFは `UnexpectedEOF` へ変換されます。`BatchSize` は正とし、末尾の端数バッチは既定で小さいバッチとして返されます（`DropLast` 指定時は消費してEOFを返却）。
 
-`Stack` は同shapeのサンプルをコピーしてバッチ軸を付与します。`PadSequences` は末尾次元が一致する系列に対し、時間軸を最大長または指定 `Length` まで `PaddingOptions.Value` で埋めます（短い `Length` への切り詰めには `Truncate` が必要）。`Lengths` は元の長さ、`Mask` は `[batch,time]` のbool配列（有効位置のみtrue）で、空系列にも対応します。
+`Stack` は同shapeのサンプルをコピーしてバッチ軸を付与します。`PadSequences` は末尾次元が一致する系列に対し、時間軸を最大長または指定 `Length` まで `PaddingOptions.Value` で埋めます（短い `Length` への切り詰めには `Truncate` が必要）。`Lengths` は切り詰め後に残した長さ、`Mask` は `[batch,time]` のbool配列（有効位置のみtrue）で、空系列にも対応します。
 
 組み込みcollateは所有権を持つホストスライスを返します。独自collateでは借用サンプルを変更しないでください。ラベル・マスクのテンソル化やデバイス転送は呼び出し側で行います。Loaderと変更可能なSamplerは逐次使用し、独立workerには別インスタンスを用意してください。
 
