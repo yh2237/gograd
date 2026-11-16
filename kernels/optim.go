@@ -6,10 +6,6 @@ import (
 )
 
 const optimKernelSource = `
-extern "C" __global__ void sum_squares(const float* x, float* acc, int n) {
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i < n) atomicAdd(acc, x[i] * x[i]);
-}
 extern "C" __global__ void sqrt_scalar(float* x) {
 	x[0] = sqrtf(x[0]);
 }
@@ -28,7 +24,6 @@ extern "C" __global__ void adamw_update(float* p, const float* g, float* m, floa
 `
 
 type optimKernelSet struct {
-	sumSquares *cuda.Kernel
 	sqrtScalar *cuda.Kernel
 	adamw      *cuda.Kernel
 }
@@ -43,7 +38,6 @@ func optimKernels() (*optimKernelSet, error) {
 		}
 		set := &optimKernelSet{}
 		for name, target := range map[string]**cuda.Kernel{
-			"sum_squares":  &set.sumSquares,
 			"sqrt_scalar":  &set.sqrtScalar,
 			"adamw_update": &set.adamw,
 		} {
@@ -56,18 +50,6 @@ func optimKernels() (*optimKernelSet, error) {
 		}
 		return set, nil
 	})
-}
-
-// SumSquares accumulates the sum of x[i]^2 into acc[0].
-func SumSquares(x, acc *cuda.Buffer, count int) error {
-	set, err := optimKernels()
-	if err != nil {
-		return err
-	}
-	xAddr, accAddr := x.Pointer(), acc.Pointer()
-	n := int32(count)
-	args := []unsafe.Pointer{unsafe.Pointer(&xAddr), unsafe.Pointer(&accAddr), unsafe.Pointer(&n)}
-	return set.sumSquares.Launch(elementGrid(count), [3]int{256, 1, 1}, 0, nil, args)
 }
 
 // SqrtScalar replaces x[0] with its square root.

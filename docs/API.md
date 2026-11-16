@@ -468,5 +468,4 @@ CUDAグラフは未完了launchを同期してから保存し、stateを復元�
 - autograd、CUDA graph、BF16、割当プール、opレジストリは実験的な位置づけです。
 - 複数deviceを1つの実行コンテキストで扱うことは未対応です。
 - safetensorsの読込みは、deviceへの転送に失敗すると途中で止まる場合があります。
-- 旧`nn`は独自のcheckpoint経路を保ちます。学習checkpointはAdamW / SGDとOneCycleを対象にします。
 - GoとPyTorchはサンプリング・初期化・dropoutの乱数ストリームが異なります。演算比較は重みとマスクを固定し、学習全体は測定した品質で比較します。

@@ -16,7 +16,7 @@ Go 1.25.0以上を使います。
 | Vulkan | Linux/amd64 | FP32推論。ローダー・ABIを検証済み、実GPU計算は未検証 |
 | DirectML | Windows/amd64、DirectML / D3D12対応GPU | FP32推論。RTX 3060 Tiで検証 |
 
-Vulkan/DirectMLは`autograd`から使います。旧`tensor.Tensor` / `nn`はCPU/CUDA専用です。DirectMLのerf式GELUとEncoderにはfeature level 5.1以上が必要です。AMD / Intel GPUでの実機検証は未実施です。
+Vulkan/DirectMLは`autograd`から使います。DirectMLのerf式GELUとEncoderにはfeature level 5.1以上が必要です。AMD / Intel GPUでの実機検証は未実施です。
 
 LinuxのVulkan呼出しには純Goの`purego v0.11.2`を使い、実行時にlibc / libdl、`libvulkan.so.1`、対応ICDが必要です。cgoなしでも完全静的リンクにはなりません。[Linuxの条件と検証範囲](docs/GPU_LINUX.md)を参照してください。
 
@@ -77,7 +77,7 @@ GPUが利用できない場合、ライブラリは自動でCPUへ切り替え�
 | `autograd` | define-by-runの自動微分、層、Transformer、損失、AdamW / SGD、学習checkpoint |
 | `gpu`、`vulkan`、`directml` | FP32推論バックエンド、バッファとview |
 | `cuda`、`kernels` | CUDAバインディング、stream / event / graph、デバイスカーネル |
-| `tensor`、`nn` | 既存のCPU/CUDAテンソル・モジュール・明示的backward・JSON checkpoint |
+| `tensor` | CPU/CUDAのテンソルとSGEMM |
 | `data`、`metrics` | Dataset / Loader、CSV / IDX / WAV、augmentation、評価指標 |
 | `torchpth` | PyTorch zip形式のtensor / state_dict読込み |
 | `dsp`、`torchrng` | FFT / STFT / リサンプリング、PyTorch CPU乱数の再現 |

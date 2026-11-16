@@ -1,6 +1,6 @@
 # GPUバックエンド
 
-VulkanとDirectMLは`autograd`から使うFP32推論バックエンド。学習はCPU/CUDAを使う。旧`tensor.Tensor` / `nn`はCPU/CUDA専用。
+VulkanとDirectMLは`autograd`から使うFP32推論バックエンド。学習はCPU/CUDAを使う。
 
 | バックエンド | 対象環境 | 検証状況 |
 | --- | --- | --- |

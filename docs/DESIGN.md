@@ -58,7 +58,7 @@ AdamWはdecoupled decay、FP32モーメント、bias correctionを使います�
 
 汎用損失は既存の要素演算とreductionを合成します。重み付きmeanの分母はMSE/L1が重みの和、BCEが要素数です。GradAccumulatorは損失を1/groupsにスケールし、更新とクリップはgroup完了後に行います。
 
-safetensorsは8-byte little-endianのヘッダ長、JSON記述子、連続payloadからなります。読込みは名前・shape・範囲・重複・ヘッダ上限を検証し、保存は同一ディレクトリの一時ファイル、sync、renameで行います。OpenSafeTensorFileはindexを先に検証してテンソル単位で読み、LoadSafeTensorsStreamはコピー前に全名前とshapeを検証します。旧nnのJSON形式も維持します。
+safetensorsは8-byte little-endianのヘッダ長、JSON記述子、連続payloadからなります。読込みは名前・shape・範囲・重複・ヘッダ上限を検証し、保存は同一ディレクトリの一時ファイル、sync、renameで行います。OpenSafeTensorFileはindexを先に検証してテンソル単位で読み、LoadSafeTensorsStreamはコピー前に全名前とshapeを検証します。
 
 TrainingLoopは更新単位のZeroGrad、optimizer / scheduleのStep、報告、停止時保存を担当します。readerのEOFではepochを進め、reader / Stepのエラーでは保存しません。context終了時は未完了groupの勾配を捨て、Samplerをgroup先頭へ戻してSaveします。モデルとoptimizerは最後の完了更新を保ちます。forwardが変更するstateは呼出し側で戻す必要があります。
 

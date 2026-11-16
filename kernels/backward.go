@@ -7,18 +7,6 @@ import (
 )
 
 const backwardKernelSource = `
-extern "C" __global__ void tanh_backward(const float* a, const float* dout, float* din, int n) {
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i < n) din[i] += dout[i] * (1.0f - a[i] * a[i]);
-}
-extern "C" __global__ void add_into(float* dst, const float* src, int n) {
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i < n) dst[i] += src[i];
-}
-extern "C" __global__ void add_pair(float* dst, const float* a, const float* b, int n) {
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i < n) dst[i] = a[i] + b[i];
-}
 extern "C" __global__ void column_sum(const float* x, float* out, int rows, int cols, int chunks) {
 	// Each thread sums a contiguous row range for one column and adds it with
 	// an atomic, so wide reductions still fill the grid.
@@ -35,10 +23,7 @@ extern "C" __global__ void column_sum(const float* x, float* out, int rows, int 
 `
 
 type backwardKernelSet struct {
-	tanhBackward *cuda.Kernel
-	addInto      *cuda.Kernel
-	addPair      *cuda.Kernel
-	columnSum    *cuda.Kernel
+	columnSum *cuda.Kernel
 }
 
 var backwardCache cuda.DeviceCache[*backwardKernelSet]
@@ -49,21 +34,12 @@ func backwardKernels() (*backwardKernelSet, error) {
 		if err != nil {
 			return nil, err
 		}
-		set := &backwardKernelSet{}
-		for name, target := range map[string]**cuda.Kernel{
-			"tanh_backward": &set.tanhBackward,
-			"add_into":      &set.addInto,
-			"add_pair":      &set.addPair,
-			"column_sum":    &set.columnSum,
-		} {
-			kernel, err := program.Function(name)
-			if err != nil {
-				_ = program.Close()
-				return nil, err
-			}
-			*target = kernel
+		kernel, err := program.Function("column_sum")
+		if err != nil {
+			_ = program.Close()
+			return nil, err
 		}
-		return set, nil
+		return &backwardKernelSet{columnSum: kernel}, nil
 	})
 }
 
@@ -73,42 +49,6 @@ func int32Args(values ...int32) []unsafe.Pointer {
 		args[i] = unsafe.Pointer(&values[i])
 	}
 	return args
-}
-
-// TanhBackward accumulates dout*(1-a^2) into din.
-func TanhBackward(a, dout, din *cuda.Buffer, count int) error {
-	set, err := backwardKernels()
-	if err != nil {
-		return err
-	}
-	aAddr, doutAddr, dinAddr := a.Pointer(), dout.Pointer(), din.Pointer()
-	n := int32(count)
-	args := []unsafe.Pointer{unsafe.Pointer(&aAddr), unsafe.Pointer(&doutAddr), unsafe.Pointer(&dinAddr), unsafe.Pointer(&n)}
-	return set.tanhBackward.Launch(elementGrid(count), [3]int{256, 1, 1}, 0, nil, args)
-}
-
-// AddInto accumulates src into dst elementwise.
-func AddInto(dst, src *cuda.Buffer, count int) error {
-	set, err := backwardKernels()
-	if err != nil {
-		return err
-	}
-	dstAddr, srcAddr := dst.Pointer(), src.Pointer()
-	n := int32(count)
-	args := []unsafe.Pointer{unsafe.Pointer(&dstAddr), unsafe.Pointer(&srcAddr), unsafe.Pointer(&n)}
-	return set.addInto.Launch(elementGrid(count), [3]int{256, 1, 1}, 0, nil, args)
-}
-
-// AddPair writes dst = a + b elementwise.
-func AddPair(dst, a, b *cuda.Buffer, count int) error {
-	set, err := backwardKernels()
-	if err != nil {
-		return err
-	}
-	dstAddr, aAddr, bAddr := dst.Pointer(), a.Pointer(), b.Pointer()
-	n := int32(count)
-	args := []unsafe.Pointer{unsafe.Pointer(&dstAddr), unsafe.Pointer(&aAddr), unsafe.Pointer(&bAddr), unsafe.Pointer(&n)}
-	return set.addPair.Launch(elementGrid(count), [3]int{256, 1, 1}, 0, nil, args)
 }
 
 // ColumnSum accumulates out[c] += sum_r x[r,c] for a [rows,cols] matrix. The
