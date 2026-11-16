@@ -11,6 +11,7 @@ CPU/CUDAで使う学習APIです。学習checkpointはsafetensorsの`gograd-trai
 | `autograd` | `NewCUDAContext`、`NewCUDAContextOn`、`CUDAContext.Device`、`Close` | OSスレッド固定、CUDA deviceの選択と復元 |
 | `autograd` | `New`、`Zeros`、`ToHost`、`Backward`、`ReleaseGraph`、`Close` | テンソル、勾配、寿命管理 |
 | `autograd` | `Add`、`Sub`、`Mul`、`Div`、`Max`、`Min`、`AddScalar`、`SubScalar`、`MulScalar`、`DivScalar`、`PowScalar`、`Exp`、`Log`、`Sqrt`、`Sigmoid`、`Tanh`、`Sin`、`Cos`、`Softplus`、`Erf`、`Log1p`、`Expm1`、`Abs`、`ReLU`、`GELU`、`Clamp` | 要素演算とbroadcast |
+| `autograd` | `Reshape`、`Unsqueeze`、`Squeeze`、`Transpose`、`Permute`、`Slice`、`Expand`、`Contiguous` | viewと実体化 |
 | `autograd` | `RetainData`、`RetainGrad`、`BackwardWithOptions`、`BackwardOptions` | 値・勾配・履歴の保持 |
 | `autograd` | `NewExecutionContext`、`New`、`Zeros`、`Bind`、`BindModule`、`NoGrad`、`Recording`、`Tensor.ExecutionContext` | 記録スコープの分離 |
 | `autograd` | `ExecutionOptions`、`SetOptions`、`Options`、`Autocast` | BF16とアテンションの選択 |

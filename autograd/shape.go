@@ -1,13 +1,41 @@
 package autograd
 
 import (
-	"github.com/yh2237/gograd/gpu"
-	"github.com/yh2237/gograd/tensor"
+	"fmt"
 	"math"
 	"runtime"
 	"slices"
 	"sync"
+
+	"github.com/yh2237/gograd/gpu"
+	"github.com/yh2237/gograd/tensor"
 )
+
+// Unsqueeze inserts a size-1 axis at axis, which may equal the rank.
+func Unsqueeze(a *Tensor, axis int) *Tensor {
+	dispatchBackend("reshape", a.Device)
+	if axis < 0 || axis > len(a.Shape) {
+		panic(fmt.Errorf("autograd: unsqueeze axis %d out of range for rank %d", axis, len(a.Shape)))
+	}
+	shape := make([]int, 0, len(a.Shape)+1)
+	shape = append(shape, a.Shape[:axis]...)
+	shape = append(shape, 1)
+	shape = append(shape, a.Shape[axis:]...)
+	return Reshape(a, shape...)
+}
+
+// Squeeze removes every size-1 axis. A tensor whose axes are all 1 becomes a
+// scalar.
+func Squeeze(a *Tensor) *Tensor {
+	dispatchBackend("reshape", a.Device)
+	shape := make([]int, 0, len(a.Shape))
+	for _, d := range a.Shape {
+		if d != 1 {
+			shape = append(shape, d)
+		}
+	}
+	return Reshape(a, shape...)
+}
 
 func Reshape(a *Tensor, s ...int) *Tensor {
 	dispatchBackend("reshape", a.Device)
