@@ -29,11 +29,6 @@ extern "C" __global__ void tanh_array(const float* x, float* out, int n) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i < n) out[i] = tanhf(x[i]);
 }
-extern "C" __global__ void bias_columns_tanh(float* y, const float* bias, int rows, int cols) {
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i >= rows * cols) return;
-	y[i] = tanhf(y[i] + bias[i % cols]);
-}
 extern "C" __global__ void add_bias_columns(float* y, const float* bias, int rows, int cols) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= rows * cols) return;
@@ -52,7 +47,6 @@ extern "C" __global__ void transpose12(const float* x, float* out, int d0, int d
 
 type opsKernelSet struct {
 	addTanh    *cuda.Kernel
-	biasTanh   *cuda.Kernel
 	biasColumn *cuda.Kernel
 	transpose  *cuda.Kernel
 	tanh       *cuda.Kernel
@@ -70,7 +64,6 @@ func opsKernels() (*opsKernelSet, error) {
 		set := &opsKernelSet{}
 		for name, target := range map[string]**cuda.Kernel{
 			"add_tanh":          &set.addTanh,
-			"bias_columns_tanh": &set.biasTanh,
 			"add_bias_columns":  &set.biasColumn,
 			"transpose12":       &set.transpose,
 			"tanh_array":        &set.tanh,
@@ -143,18 +136,6 @@ func Tanh(x, out *cuda.Buffer, count int) error {
 	return set.tanh.Launch(elementGrid(count), [3]int{256, 1, 1}, 0, nil, args)
 }
 
-// BiasColumnsTanh adds a per-column bias and applies tanh to a [rows,cols]
-// row-major matrix.
-func BiasColumnsTanh(y, bias *cuda.Buffer, rows, cols int) error {
-	set, err := opsKernels()
-	if err != nil {
-		return err
-	}
-	r, c := int32(rows), int32(cols)
-	yAddr, biasAddr := y.Pointer(), bias.Pointer()
-	args := []unsafe.Pointer{unsafe.Pointer(&yAddr), unsafe.Pointer(&biasAddr), unsafe.Pointer(&r), unsafe.Pointer(&c)}
-	return set.biasTanh.Launch(elementGrid(rows*cols), [3]int{256, 1, 1}, 0, nil, args)
-}
 
 // AddBiasColumns adds a per-column bias to a [rows,cols] row-major matrix.
 func AddBiasColumns(y, bias *cuda.Buffer, rows, cols int) error {

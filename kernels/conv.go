@@ -29,17 +29,6 @@ extern "C" __global__ void im2col1d_batched(const float* x, float* col, int batc
 	if (src >= 0 && src < length) value = x[(b * length + src) * channels + c];
 	col[index] = value;
 }
-extern "C" __global__ void transpose_add_tanh(const float* conv, const float* state, const float* bias, float* out, int batch, int channels, int length) {
-	// conv is [channels, batch*length]; state, out are [batch,length,channels].
-	int index = blockIdx.x * blockDim.x + threadIdx.x;
-	if (index >= batch * length * channels) return;
-	int c = index % channels;
-	int bt = index / channels;
-	int t = bt % length;
-	int b = bt / length;
-	float value = state[(b * length + t) * channels + c] + conv[c * batch * length + b * length + t] + bias[c];
-	out[index] = tanhf(value);
-}
 extern "C" __global__ void to_hbt(const float* in, float* out, int batch, int channels, int length) {
 	// in is [batch,length,channels]; out is [channels, batch*length].
 	int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -110,7 +99,6 @@ extern "C" __global__ void col2im1d_stride(const float* col, float* dx, int batc
 
 type convKernelSet struct {
 	im2col           *cuda.Kernel
-	transposeAddTanh *cuda.Kernel
 	toHBT            *cuda.Kernel
 	rowSum           *cuda.Kernel
 	col2im           *cuda.Kernel
@@ -129,7 +117,6 @@ func convKernels() (*convKernelSet, error) {
 		set := &convKernelSet{}
 		for name, target := range map[string]**cuda.Kernel{
 			"im2col1d_batched":   &set.im2col,
-			"transpose_add_tanh": &set.transposeAddTanh,
 			"to_hbt":             &set.toHBT,
 			"row_sum":            &set.rowSum,
 			"col2im1d":           &set.col2im,
@@ -161,20 +148,6 @@ func Im2col(x, col *cuda.Buffer, batch, channels, length, kernel, dilation int) 
 		unsafe.Pointer(&b), unsafe.Pointer(&c), unsafe.Pointer(&t), unsafe.Pointer(&k), unsafe.Pointer(&d),
 	}
 	return set.im2col.Launch(elementGrid(batch*channels*kernel*length), [3]int{256, 1, 1}, 0, nil, args)
-}
-
-// TransposeAddTanh writes tanh(state + transpose(conv) + bias), where conv is
-// [channels,batch*length] and state and out are [batch,length,channels].
-func TransposeAddTanh(conv, state, bias, out *cuda.Buffer, batch, channels, length int) error {
-	set, err := convKernels()
-	if err != nil {
-		return err
-	}
-	convAddr, stateAddr, biasAddr, outAddr := conv.Pointer(), state.Pointer(), bias.Pointer(), out.Pointer()
-	b, c, l := int32(batch), int32(channels), int32(length)
-	args := []unsafe.Pointer{unsafe.Pointer(&convAddr), unsafe.Pointer(&stateAddr), unsafe.Pointer(&biasAddr), unsafe.Pointer(&outAddr),
-		unsafe.Pointer(&b), unsafe.Pointer(&c), unsafe.Pointer(&l)}
-	return set.transposeAddTanh.Launch(elementGrid(batch*channels*length), [3]int{256, 1, 1}, 0, nil, args)
 }
 
 // ToHBT permutes a time-major [batch,length,channels] tensor into
@@ -266,18 +239,6 @@ func Conv1dForwardTo(blas *cuda.Blas, x, weight, conv, columns *cuda.Buffer, bat
 		weight.Pointer(), columnCount, columns.Pointer(), columnCount, 0, conv.Pointer(), batch*length)
 }
 
-// ConvWeightGradGemm accumulates the convolution weight gradient from the
-// columns gathered by the forward pass: dw += dy*columns with dy
-// [outChannels, batch*length] and columns [batch*length, channels*kernel]. The
-// caller zeroes dw before the first accumulation.
-func ConvWeightGradGemm(blas *cuda.Blas, dy, columns, dw *cuda.Buffer, batch, channels, length, outChannels, kernel int) error {
-	if blas == nil {
-		return fmt.Errorf("cuda: ConvWeightGradGemm requires a cuBLAS handle")
-	}
-	columnCount := channels * kernel
-	return blas.SgemmRowMajor(outChannels, columnCount, batch*length, 1,
-		dy.Pointer(), batch*length, columns.Pointer(), columnCount, 1, dw.Pointer(), columnCount)
-}
 
 // ConvInputGrad accumulates the input gradient from dy [outChannels,
 // batch*length] into time-major dx [batch,length,channels].
