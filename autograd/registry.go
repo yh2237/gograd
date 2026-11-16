@@ -24,6 +24,7 @@ var operationRegistry = map[string]KernelPair{
 	"softplus": {"unary", "unary_f/b"},
 	"erf":      {"unary", "unary_f/b"},
 	"log1p":    {"unary", "unary_f/b"},
+	"expm1":    {"unary", "unary_f/b"},
 	"relu":     {"unary", "unary_f/b"}, "gelu": {"unary", "unary_f/b"},
 	"sqrt": {"unary", "unary_f/b"}, "sigmoid": {"unary", "unary_f/b"},
 	"clamp": {"unary", "clamp_f/b"}, "pow_scalar": {"unary", "pow_scalar_f/b"},

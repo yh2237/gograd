@@ -819,6 +819,18 @@ func Log1p(a *Tensor) *Tensor {
 	})
 }
 
+// Expm1 applies exp(x)-1 elementwise. It keeps precision for x near zero where
+// exp(x)-1 would cancel.
+func Expm1(a *Tensor) *Tensor {
+	a = a.Contiguous()
+	if dispatchBackend("expm1", a.Device) {
+		return gpuUnary(a, 14)
+	}
+	return unary(a, func(x float32) float32 { return float32(math.Expm1(float64(x))) }, func(x float32) float32 {
+		return float32(math.Exp(float64(x)))
+	})
+}
+
 // Clamp limits each element to [lo, hi]. The gradient passes through where the
 // input lies inside the interval, endpoints included.
 func Clamp(a *Tensor, lo, hi float32) *Tensor {
