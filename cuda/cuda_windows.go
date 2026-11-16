@@ -294,6 +294,12 @@ func initializeContext() error {
 	return runtimeError("cudaFree", code)
 }
 
+// InitializeContext creates the primary context on the current device when the
+// calling thread has none. cudaSetDevice normally does this, but a thread that
+// inherited a device index without a context needs the explicit cudaFree(0)
+// idiom before driver calls such as cuLaunchKernel can succeed.
+func InitializeContext() error { return initializeContext() }
+
 // Synchronize blocks until all preceding work on the current device finishes
 // and clears the sticky error state.
 func Synchronize() error {

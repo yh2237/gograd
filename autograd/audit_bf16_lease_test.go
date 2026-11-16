@@ -15,15 +15,12 @@ func TestAuditBF16ShadowLease(t *testing.T) {
 	if !cuda.Available() {
 		t.Skip("CUDA unavailable")
 	}
-	ctx, err := NewCUDAContext()
-	if err != nil {
-		t.Skip(err)
-	}
-	defer ctx.Close()
 	BF16Autocast = true
 	defer func() { BF16Autocast = false }()
 
+	// t.Run starts a new goroutine, so each subtest needs its own context.
 	t.Run("matmul", func(t *testing.T) {
+		pool2dContext(t, tensor.CUDA)
 		a, err := New(make([]float32, 2*2*4), []int{2, 2, 4}, tensor.CUDA, true)
 		if err != nil {
 			t.Fatal(err)
@@ -46,6 +43,7 @@ func TestAuditBF16ShadowLease(t *testing.T) {
 		}
 	})
 	t.Run("conv1d", func(t *testing.T) {
+		pool2dContext(t, tensor.CUDA)
 		x, err := New(make([]float32, 1*4*2), []int{1, 4, 2}, tensor.CUDA, true)
 		if err != nil {
 			t.Fatal(err)

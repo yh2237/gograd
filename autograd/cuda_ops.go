@@ -176,32 +176,6 @@ func gpuUnary(a *Tensor, op int) *Tensor {
 		launch("unary_b", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&gp), unsafe.Pointer(&da), unsafe.Pointer(&n), unsafe.Pointer(&kind))
 	})
 }
-func gpuPermute(a *Tensor, axes []int, s []int) *Tensor {
-	if len(s) > 3 {
-		panic("autograd: CUDA rank > 3")
-	}
-	n := int32(a.Numel())
-	out := mustAlloc(int(n))
-	var dims [3]int32
-	var st [3]int32
-	for i := range dims {
-		dims[i] = 1
-	}
-	for i := range s {
-		dims[3-len(s)+i] = int32(s[i])
-		st[3-len(s)+i] = int32(a.Strides[axes[i]])
-	}
-	ap, yp := ptr(a.buf), ptr(out)
-	launch("permute_f", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&dims[0]), unsafe.Pointer(&dims[1]), unsafe.Pointer(&dims[2]), unsafe.Pointer(&st[0]), unsafe.Pointer(&st[1]), unsafe.Pointer(&st[2]))
-	return resultGPU(out, s, []*Tensor{a}, func(g *cuda.Buffer) {
-		da := ptr(a.ensureGradGPU())
-		if da == 0 {
-			return
-		}
-		gp := ptr(g)
-		launch("permute_b", int(n), unsafe.Pointer(&gp), unsafe.Pointer(&da), unsafe.Pointer(&n), unsafe.Pointer(&dims[0]), unsafe.Pointer(&dims[1]), unsafe.Pointer(&dims[2]), unsafe.Pointer(&st[0]), unsafe.Pointer(&st[1]), unsafe.Pointer(&st[2]))
-	})
-}
 func gpuConcat(axis int, a, b *Tensor) *Tensor {
 	s := append([]int(nil), a.Shape...)
 	s[axis] += b.Shape[axis]
@@ -215,21 +189,6 @@ func gpuConcat(axis int, a, b *Tensor) *Tensor {
 		da, db := ptr(a.ensureGradGPU()), ptr(b.ensureGradGPU())
 		gp := ptr(g)
 		launch("concat_b", n, unsafe.Pointer(&gp), unsafe.Pointer(&da), unsafe.Pointer(&db), unsafe.Pointer(&o), unsafe.Pointer(&ac), unsafe.Pointer(&bc), unsafe.Pointer(&in))
-	})
-}
-func gpuSlice(a *Tensor, axis, start, end int, s []int) *Tensor {
-	n := numel(s)
-	out := mustAlloc(n)
-	ap, yp := ptr(a.buf), ptr(out)
-	nn, width, begin, full, inner := int32(n), int32(end-start), int32(start), int32(a.Shape[axis]), int32(numel(s[axis+1:]))
-	launch("slice_f", n, unsafe.Pointer(&ap), unsafe.Pointer(&yp), unsafe.Pointer(&nn), unsafe.Pointer(&width), unsafe.Pointer(&begin), unsafe.Pointer(&full), unsafe.Pointer(&inner))
-	return resultGPU(out, s, []*Tensor{a}, func(g *cuda.Buffer) {
-		da := ptr(a.ensureGradGPU())
-		if da == 0 {
-			return
-		}
-		gp := ptr(g)
-		launch("slice_b", n, unsafe.Pointer(&gp), unsafe.Pointer(&da), unsafe.Pointer(&nn), unsafe.Pointer(&width), unsafe.Pointer(&begin), unsafe.Pointer(&full), unsafe.Pointer(&inner))
 	})
 }
 func gpuEmbedding(w *Tensor, ids []int, shape []int, padding int) *Tensor {

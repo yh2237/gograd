@@ -121,20 +121,3 @@ func (o ExecutionOptions) gemmSingle(m, n, k int, ta, tb bool, a, b, c uintptr, 
 	defer bb.Free()
 	return blas().GemmRowMajorBF16(m, n, k, ta, tb, 1, ptr(ab), ptr(bb), beta, c)
 }
-
-func (o ExecutionOptions) gemmBatched(m, n, k int, ta, tb bool, a uintptr, as int64, b uintptr, bs int64, c uintptr, cs int64, count int, beta float32) error {
-	if !o.BF16Autocast {
-		return blas().SgemmRowMajorStridedBatched(m, n, k, ta, tb, 1, a, as, b, bs, beta, c, cs, count)
-	}
-	ac, bc := m*k, k*n
-	if as != 0 {
-		ac = int(as) * count
-	}
-	if bs != 0 {
-		bc = int(bs) * count
-	}
-	ab, bb := castBF16(a, ac), castBF16(b, bc)
-	defer ab.Free()
-	defer bb.Free()
-	return blas().GemmRowMajorStridedBF16(m, n, k, ta, tb, 1, ptr(ab), as, ptr(bb), bs, beta, c, cs, count)
-}

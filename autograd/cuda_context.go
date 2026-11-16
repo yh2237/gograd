@@ -46,6 +46,10 @@ func NewCUDAContextOn(device int) (*CUDAContext, error) {
 		runtime.UnlockOSThread()
 		return nil, err
 	}
+	if err := cuda.InitializeContext(); err != nil {
+		runtime.UnlockOSThread()
+		return nil, err
+	}
 	return &CUDAContext{device: device, previous: previous, restore: previous != device}, nil
 }
 

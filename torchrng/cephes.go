@@ -158,8 +158,7 @@ func xorSign(value, sign float32) float32 {
 	return math.Float32frombits(math.Float32bits(value) ^ math.Float32bits(sign))
 }
 
-// log1p32 is log1p(-x) evaluated in float32, for the serial fallback path.
-func log1p32(x float32) float32 { return float32(math.Log1p(float64(x))) }
+
 
 // normalFill16Vector is NormalFill16<float, true>: the AVX2 specialization.
 func normalFill16Vector(d []float32, mean, std float32) {

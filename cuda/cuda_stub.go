@@ -34,6 +34,8 @@ func SetDevice(device int) error { return ErrUnavailable }
 func CurrentDevice() (int, error) { return 0, ErrUnavailable }
 
 // Synchronize returns ErrUnavailable.
+func InitializeContext() error { return ErrUnavailable }
+
 func Synchronize() error { return ErrUnavailable }
 
 // LastError returns ErrUnavailable.
