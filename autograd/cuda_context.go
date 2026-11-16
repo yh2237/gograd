@@ -24,19 +24,24 @@ func NewCUDAContext() (*CUDAContext, error) { return NewCUDAContextOn(0) }
 
 // NewCUDAContextOn pins the calling goroutine to an OS thread and makes device
 // current on it. The device index is validated against the installed devices.
+// The thread is pinned before the first driver call so every call in this
+// function runs on the thread that will keep the context.
 func NewCUDAContextOn(device int) (*CUDAContext, error) {
+	runtime.LockOSThread()
 	count, err := cuda.DeviceCount()
 	if err != nil {
+		runtime.UnlockOSThread()
 		return nil, err
 	}
 	if device < 0 || device >= count {
+		runtime.UnlockOSThread()
 		return nil, fmt.Errorf("autograd: CUDA device %d is out of range for %d device(s)", device, count)
 	}
 	previous, err := cuda.CurrentDevice()
 	if err != nil {
+		runtime.UnlockOSThread()
 		return nil, err
 	}
-	runtime.LockOSThread()
 	if err := cuda.SetDevice(device); err != nil {
 		runtime.UnlockOSThread()
 		return nil, err
