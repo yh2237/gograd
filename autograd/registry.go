@@ -108,27 +108,19 @@ func inferenceMetadataOp(name string) bool {
 	return false
 }
 
-// ElementwiseKernel pairs the CPU scalar rule and CUDA kernel opcode. The
-// registry is the dispatch point for elementwise forward and backward rules.
+// ElementwiseKernel names the CUDA opcode of one elementwise operation. The CPU
+// rule lives in cpu_binary.go, keyed by the same opcode.
 type ElementwiseKernel struct {
-	CPUForward, CPUGradA, CPUGradB func(float32, float32) float32
-	CUDAOpcode                     int
+	CUDAOpcode int
 }
 
 var elementwiseRegistry = map[string]ElementwiseKernel{
-	"add": {func(x, y float32) float32 { return x + y }, func(x, y float32) float32 { return 1 }, func(x, y float32) float32 { return 1 }, 0},
-	"sub": {func(x, y float32) float32 { return x - y }, func(x, y float32) float32 { return 1 }, func(x, y float32) float32 { return -1 }, 1},
-	"mul": {func(x, y float32) float32 { return x * y }, func(x, y float32) float32 { return y }, func(x, y float32) float32 { return x }, 2},
-	"div": {func(x, y float32) float32 { return x / y }, func(x, y float32) float32 { return 1 / y }, func(x, y float32) float32 { return -x / (y * y) }, 3},
-	"max": {func(x, y float32) float32 { return max(x, y) }, func(x, y float32) float32 { return boolToFloat(x > y) }, func(x, y float32) float32 { return boolToFloat(x <= y) }, 4},
-	"min": {func(x, y float32) float32 { return min(x, y) }, func(x, y float32) float32 { return boolToFloat(x < y) }, func(x, y float32) float32 { return boolToFloat(x >= y) }, 5},
-}
-
-func boolToFloat(b bool) float32 {
-	if b {
-		return 1
-	}
-	return 0
+	"add": {0},
+	"sub": {1},
+	"mul": {2},
+	"div": {3},
+	"max": {4},
+	"min": {5},
 }
 
 func dispatchElementwise(name string, a, b *Tensor) *Tensor {
