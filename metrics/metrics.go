@@ -107,6 +107,73 @@ func (a *Accuracy) Value() float64 {
 }
 func (a *Accuracy) Reset() { *a = Accuracy{} }
 
+// TopKAccuracy accumulates top-k classification accuracy from row-major scores.
+// A label counts as correct when fewer than k classes score strictly higher, so
+// ties at the boundary are included.
+type TopKAccuracy struct {
+	k       int
+	correct int
+	count   int
+}
+
+// NewTopKAccuracy returns an accumulator for the given k. k must be positive.
+func NewTopKAccuracy(k int) (*TopKAccuracy, error) {
+	if k < 1 {
+		return nil, fmt.Errorf("metrics: k must be positive")
+	}
+	return &TopKAccuracy{k: k}, nil
+}
+
+// UpdateLogits accepts [len(labels), classes] scores. Scores need not be
+// normalized. ignoreIndex labels are excluded from both counts. All scores,
+// including ignored rows, must be finite. Errors leave the accumulator unchanged.
+func (a *TopKAccuracy) UpdateLogits(scores []float32, labels []int, classes, ignoreIndex int) error {
+	if classes < 1 || len(scores)%classes != 0 || len(scores)/classes != len(labels) {
+		return fmt.Errorf("metrics: scores/labels shape mismatch")
+	}
+	for _, score := range scores {
+		if !finite(float64(score)) {
+			return fmt.Errorf("metrics: non-finite classification score")
+		}
+	}
+	correct, count := a.correct, a.count
+	for i, label := range labels {
+		if label == ignoreIndex {
+			continue
+		}
+		if label < 0 || label >= classes {
+			return fmt.Errorf("metrics: label %d out of range", label)
+		}
+		var err error
+		if count, err = addCount(count, 1); err != nil {
+			return err
+		}
+		row := scores[i*classes : (i+1)*classes]
+		better := 0
+		for class := 0; class < classes; class++ {
+			if row[class] > row[label] {
+				better++
+			}
+		}
+		if better < a.k {
+			correct++
+		}
+	}
+	a.correct, a.count = correct, count
+	return nil
+}
+
+func (a *TopKAccuracy) K() int       { return a.k }
+func (a *TopKAccuracy) Count() int   { return a.count }
+func (a *TopKAccuracy) Correct() int { return a.correct }
+func (a *TopKAccuracy) Value() float64 {
+	if a.count == 0 {
+		return 0
+	}
+	return float64(a.correct) / float64(a.count)
+}
+func (a *TopKAccuracy) Reset() { *a = TopKAccuracy{k: a.k} }
+
 // Regression accumulates element-weighted MSE, RMSE and MAE. Each pair is
 // converted to float64 before subtraction and summation. For multi-output
 // models, Count is the number of elements, not the number of samples.

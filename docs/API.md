@@ -46,7 +46,7 @@ CPU/CUDAで使う学習APIです。学習checkpointはsafetensorsの`gograd-trai
 | `data` | `ParseNumericCSV`、`ParseOptions`、`NumericTable`、`RegressionSamples`、`RegressionSample`、`RegressionBatch`、`StackRegression` | 数値CSV / TSVと回帰バッチ |
 | `data` | `Standardizer`、`FitStandardizer`、`StandardizerState`、`Apply`、`ApplyBatch`、`State`、`LoadState` | 学習データの統計による標準化 |
 | `data` | `ReadWAV`、`ReadWAVFile`、`ReadWAVMono`、`WAV`、`Mono`、`WriteWAV`、`WAVEncoding` | 非圧縮RIFF音声の入出力 |
-| `metrics` | `Mean`、`Accuracy`、`Regression`、`ConfusionMatrix`、各型の`Count` / `Reset` | ホスト側の損失平均・正解率・回帰誤差・混同行列 |
+| `metrics` | `Mean`、`Accuracy`、`TopKAccuracy`、`Regression`、`ConfusionMatrix`、各型の`Count` / `Reset` | ホスト側の損失平均・正解率・回帰誤差・混同行列 |
 
 要素演算のうち、名前から分からない挙動を挙げます。`Max`と`Min`は同値のとき勾配を右辺へ送るので、二重計上は起きません。`Clamp`は両端を含む区間で微分が通ります。`Sqrt`の微分は0で無限になります。`Softplus`は`max(x,0)+log1p(exp(-|x|))`で計算するため、有限の入力に対しては常に有限の値を返します。`Log1p`と`Expm1`は0近傍の桁落ちを避ける実装です。
 
