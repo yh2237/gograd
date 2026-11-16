@@ -111,8 +111,9 @@ func (a *Accuracy) Reset() { *a = Accuracy{} }
 // converted to float64 before subtraction and summation. For multi-output
 // models, Count is the number of elements, not the number of samples.
 type Regression struct {
-	squared, absolute float64
-	count             int
+	squared, absolute           float64
+	sumTarget, sumTargetSquared float64
+	count                       int
 }
 
 // Update adds equally sized, finite prediction/target slices. Empty slices are a
@@ -126,6 +127,7 @@ func (r *Regression) Update(prediction, target []float32) error {
 		return err
 	}
 	squared, absolute := r.squared, r.absolute
+	sumTarget, sumTargetSquared := r.sumTarget, r.sumTargetSquared
 	for i, value := range prediction {
 		if !finite(float64(value)) || !finite(float64(target[i])) {
 			return fmt.Errorf("metrics: non-finite regression value")
@@ -133,11 +135,15 @@ func (r *Regression) Update(prediction, target []float32) error {
 		difference := float64(value) - float64(target[i])
 		squared += difference * difference
 		absolute += math.Abs(difference)
+		expected := float64(target[i])
+		sumTarget += expected
+		sumTargetSquared += expected * expected
 	}
-	if !finite(squared) || !finite(absolute) {
+	if !finite(squared) || !finite(absolute) || !finite(sumTarget) || !finite(sumTargetSquared) {
 		return fmt.Errorf("metrics: regression sum overflow")
 	}
 	r.squared, r.absolute, r.count = squared, absolute, count
+	r.sumTarget, r.sumTargetSquared = sumTarget, sumTargetSquared
 	return nil
 }
 
@@ -149,6 +155,20 @@ func (r *Regression) MSE() float64 {
 	return r.squared / float64(r.count)
 }
 func (r *Regression) RMSE() float64 { return math.Sqrt(r.MSE()) }
+
+// R2 is the coefficient of determination. It is 0 for an empty accumulator and
+// for targets without variance.
+func (r *Regression) R2() float64 {
+	if r.count == 0 {
+		return 0
+	}
+	n := float64(r.count)
+	total := r.sumTargetSquared - r.sumTarget*r.sumTarget/n
+	if total <= 0 {
+		return 0
+	}
+	return 1 - r.squared/total
+}
 func (r *Regression) MAE() float64 {
 	if r.count == 0 {
 		return 0
