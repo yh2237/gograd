@@ -3,6 +3,7 @@ package tensor
 import (
 	"fmt"
 	"math"
+	"math/rand"
 	"strings"
 	"testing"
 )
@@ -239,5 +240,52 @@ func BenchmarkSGEMMTransformerShapes(b *testing.B) {
 			}
 			b.ReportMetric(2*float64(shape.m)*float64(shape.n)*float64(shape.k)/b.Elapsed().Seconds()/1e9*float64(b.N), "GFLOP/s")
 		})
+	}
+}
+// A randomized comparison against the naive triple loop exercises the tiling,
+// packing and microkernel paths together, including both transpose flags.
+func TestSGEMMRandomized(t *testing.T) {
+	rng := rand.New(rand.NewSource(11))
+	for trial := 0; trial < 80; trial++ {
+		m, n, k := rng.Intn(70)+1, rng.Intn(70)+1, rng.Intn(300)+1
+		transA, transB := rng.Intn(2) == 0, rng.Intn(2) == 0
+		aSize, bSize := m*k, k*n
+		if transA {
+			aSize = k * m
+		}
+		if transB {
+			bSize = n * k
+		}
+		a, bb := make([]float32, aSize), make([]float32, bSize)
+		for i := range a {
+			a[i] = float32(rng.Intn(2001)-1000) / 1000
+		}
+		for i := range bb {
+			bb[i] = float32(rng.Intn(2001)-1000) / 1000
+		}
+		got := make([]float32, m*n)
+		SGEMMOp(got, a, bb, m, n, k, transA, transB)
+		for i := 0; i < m; i++ {
+			for j := 0; j < n; j++ {
+				var sum float64
+				for d := 0; d < k; d++ {
+					av, bv := a[i*k+d], bb[d*n+j]
+					if transA {
+						av = a[d*m+i]
+					}
+					if transB {
+						bv = bb[j*k+d]
+					}
+					sum += float64(av) * float64(bv)
+				}
+				want := float32(sum)
+				diff := got[i*n+j] - want
+				limit := float32(1e-4) * (1 + float32(math.Abs(float64(want))))
+				if diff < -limit || diff > limit {
+					t.Fatalf("trial %d m=%d n=%d k=%d transA=%v transB=%v entry %d: %g != %g",
+						trial, m, n, k, transA, transB, i*n+j, got[i*n+j], want)
+				}
+			}
+		}
 	}
 }
