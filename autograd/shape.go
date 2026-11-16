@@ -287,12 +287,12 @@ func reduce(a *Tensor, mean bool, axes ...int) *Tensor {
 }
 
 // Stack joins the inputs along a new axis inserted at axis. Every input must
-// have the same shape.
+// have the same shape. It composes Unsqueeze and Concat, which own the device
+// dispatch.
 func Stack(axis int, inputs ...*Tensor) *Tensor {
 	if len(inputs) == 0 {
 		panic("autograd: empty stack")
 	}
-	dispatchBackend("concat", inputs[0].Device)
 	rank := len(inputs[0].Shape)
 	if axis < 0 {
 		axis += rank + 1
