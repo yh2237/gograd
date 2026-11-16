@@ -796,6 +796,17 @@ func Softplus(a *Tensor) *Tensor {
 	}, sigmoid32)
 }
 
+// Erf applies the Gauss error function elementwise.
+func Erf(a *Tensor) *Tensor {
+	a = a.Contiguous()
+	if dispatchBackend("erf", a.Device) {
+		return gpuUnary(a, 12)
+	}
+	return unary(a, func(x float32) float32 { return float32(math.Erf(float64(x))) }, func(x float32) float32 {
+		return float32(2 / math.Sqrt(math.Pi) * math.Exp(-float64(x)*float64(x)))
+	})
+}
+
 // Clamp limits each element to [lo, hi]. The gradient passes through where the
 // input lies inside the interval, endpoints included.
 func Clamp(a *Tensor, lo, hi float32) *Tensor {

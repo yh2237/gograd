@@ -22,6 +22,7 @@ var operationRegistry = map[string]KernelPair{
 	"abs": {"unary", "unary_f/b"}, "tanh": {"unary", "unary_f/b"}, "sin": {"unary", "unary_f/b"},
 	"cos":      {"unary", "unary_f/b"},
 	"softplus": {"unary", "unary_f/b"},
+	"erf":      {"unary", "unary_f/b"},
 	"relu":     {"unary", "unary_f/b"}, "gelu": {"unary", "unary_f/b"},
 	"sqrt": {"unary", "unary_f/b"}, "sigmoid": {"unary", "unary_f/b"},
 	"clamp": {"unary", "clamp_f/b"}, "pow_scalar": {"unary", "pow_scalar_f/b"},
