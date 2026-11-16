@@ -48,6 +48,8 @@ CPU/CUDAで使う学習APIです。学習checkpointはsafetensorsの`gograd-trai
 | `data` | `ReadWAV`、`ReadWAVFile`、`ReadWAVMono`、`WAV`、`Mono`、`WriteWAV`、`WAVEncoding` | 非圧縮RIFF音声の入出力 |
 | `metrics` | `Mean`、`Accuracy`、`Regression`、各型の`Count` / `Reset` | ホスト側の損失平均・正解率・回帰誤差 |
 
+要素演算のうち、名前から分からない挙動を挙げます。`Max`と`Min`は同値のとき勾配を右辺へ送るので、二重計上は起きません。`Clamp`は両端を含む区間で微分が通ります。`Sqrt`の微分は0で無限になります。`Softplus`は`max(x,0)+log1p(exp(-|x|))`で計算するため、有限の入力に対しては常に有限の値を返します。`Log1p`と`Expm1`は0近傍の桁落ちを避ける実装です。
+
 CUDAのdevice・暗黙のstream・capture状態はOSスレッド単位です。処理の間は`NewCUDAContext`を保持します。`NewCUDAContextOn`はdeviceを検証して選択し、`Close`で以前のdeviceへ戻します。
 
 割当プールはdevice・stream・サイズクラスで分離します。`Buffer.Device()`は割当先、`Buffer.Size()`は論理バイト数を返します。コピー・memset・freeはバッファ自身のdeviceを選び、呼出し側のdeviceを復元します。カーネルとcuBLASは選択中のstreamに従い、`WithStream`はpanic時も以前の選択へ戻します。
