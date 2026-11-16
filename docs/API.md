@@ -20,7 +20,8 @@ CPU/CUDAで使う学習APIです。学習checkpointはsafetensorsの`gograd-trai
 | `autograd` | `Conv1d`、`Conv1dGEMM`、`Conv1dGEMMStride` | time-majorの1D畳み込み。biasはnilまたは`[out_channels]` |
 | `autograd` | `MaxPool2d`、`AvgPool2d`、`AdaptiveAvgPool2d`、各Options / Layer | NCHW pooling |
 | `autograd` | `BatchNorm`、`BatchNormOptions`、`NewBatchNormLayer`、`BatchNormLayerOptions` | 正規化とrunning state |
-| `autograd` | `NewRMSNormLayer`、`NewGroupNormLayer` | 最後の軸のRMS正規化、group単位の正規化 |
+| `autograd` | `NewRMSNormLayer`、`NewGroupNormLayer`、`RMSNormLast` | 最後の軸のRMS正規化、group単位の正規化 |
+| `autograd` | `RotaryHalf`、`GeGLU`、`SwiGLUProjection`、`KeyPaddingAttention` | 音声Transformer向けのRoPE、GLU、マスク付きattention |
 | `autograd` | `Module.StateDict`、`LoadStateDict`、`SaveSafeTensors`、`SaveSafeTensorsMetadata`、`LoadSafeTensors` | 名前付きF32 state。metadataの値は文字列 |
 | `autograd` | `Module.Train`、`SetTraining`、`OnTrainingChange` | 子モジュールへのtrain/eval伝播 |
 | `autograd` | `TrainingLoop[B]`、`BatchReader[B]`、`PositionSampler`、`UpdateSchedule`、`OneCycle.Updates` | 更新・報告・停止時保存 |
@@ -218,6 +219,16 @@ Moduleへ`weight` / `bias`と`running_mean` / `running_var` / スカラーの`nu
 `Train` / `Module.Train`が統計更新を制御し、NoGradは勾配記録だけを制御します。モードと構成はStateDictに保存しません。層は`TensorLayer` / `Trainer` / `ParameterizedLayer`を実装し、Closeはaffineとバッファを解放します。
 
 CPU/CUDAとも出力・勾配・保存統計はFP32、モーメントのreductionはfloat64累積です。CUDAのrunning更新とカウンタはデバイス上で行い、累積平均もcapture / 再生に対応します。
+
+## 音声Transformer向けの演算
+
+ModernBERT系の音声モデルで使う演算です。いずれもPyTorchの出力と突き合わせたテストがあります。
+
+- `RotaryHalf(x, theta)`は`[batch,heads,sequence,headDim]`に半回転RoPEを適用します。headDimは偶数、thetaは正が必要です。
+- `GeGLU(x)`は最終軸を2分割し、前半にGELUを適用して後半と掛けます。
+- `SwiGLUProjection(x, w1, w2, w3)`は`SiLU(x*w1^T) * (x*w3^T)`に`w2^T`を掛けます。重みはPyTorchの`[out,in]`配置です。
+- `KeyPaddingAttention(q, k, v, valid, radius)`は真偽値のキーマスクを加法的マスクに変換してattentionを計算します。radiusが負なら全attention、そうでなければクエリ中心の窓の外をマスクします。全キーがマスクされたクエリはpanicします。
+- `RMSNormLast(x, weight, eps)`は最終軸を二乗平均平方根で正規化し、チャネルごとの重みを掛けます。
 
 ## 汎用の損失
 
