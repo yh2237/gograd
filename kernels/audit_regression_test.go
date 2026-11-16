@@ -74,6 +74,11 @@ func TestAuditConvWeightGradTapAlignment(t *testing.T) {
 		defer deviceDW.Free()
 		defer deviceX.Free()
 		defer deviceDY.Free()
+		// ConvWeightGrad accumulates into dw, and the pool hands back reused
+		// memory, so the destination must start at zero.
+		if err := deviceDW.Memset(0, len(want)*4); err != nil {
+			t.Fatal(err)
+		}
 		if err := ConvWeightGrad(deviceX, deviceDY, deviceDW, batch, channels, length, outChannels, kernel, dilation); err != nil {
 			t.Fatal(err)
 		}
