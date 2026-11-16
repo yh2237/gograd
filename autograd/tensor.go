@@ -784,6 +784,18 @@ func sigmoid32(x float32) float32 {
 	return float32(1 / (1 + math.Exp(-float64(x))))
 }
 
+// Softplus applies log(1+exp(x)) elementwise. The forward pass is evaluated as
+// max(x,0)+log1p(exp(-|x|)) so that large magnitudes do not overflow.
+func Softplus(a *Tensor) *Tensor {
+	a = a.Contiguous()
+	if dispatchBackend("softplus", a.Device) {
+		return gpuUnary(a, 11)
+	}
+	return unary(a, func(x float32) float32 {
+		return max(x, 0) + float32(math.Log1p(math.Exp(-math.Abs(float64(x)))))
+	}, sigmoid32)
+}
+
 // Clamp limits each element to [lo, hi]. The gradient passes through where the
 // input lies inside the interval, endpoints included.
 func Clamp(a *Tensor, lo, hi float32) *Tensor {
