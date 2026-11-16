@@ -37,3 +37,75 @@ func TestAuditMatMulTransposedViewGradients(t *testing.T) {
 		}
 	})
 }
+
+// The batched path must also read a transposed view without materializing it.
+// The reference is a direct float64 triple loop over the same operands.
+func TestAuditMatMulBatchedTransposedView(t *testing.T) {
+	sinTestDevices(t, func(t *testing.T, device tensor.Device) {
+		const n, i, j, d = 2, 3, 5, 4
+		av := make([]float32, n*i*d)
+		for x := range av {
+			av[x] = float32(x%7-3) / 4
+		}
+		kv := make([]float32, n*j*d)
+		for x := range kv {
+			kv[x] = float32(x%5-2) / 4
+		}
+		a := conv2dTestTensor(t, av, []int{n, i, d}, device, true)
+		defer a.Close()
+		k := conv2dTestTensor(t, kv, []int{n, j, d}, device, true)
+		defer k.Close()
+		y := MatMul(a, Transpose(k, 1, 2))
+		got := conv2dHost(t, y, false)
+		want := make([]float32, n*i*j)
+		for b := 0; b < n; b++ {
+			for r := 0; r < i; r++ {
+				for c := 0; c < j; c++ {
+					var sum float64
+					for e := 0; e < d; e++ {
+						sum += float64(av[(b*i+r)*d+e]) * float64(kv[(b*j+c)*d+e])
+					}
+					want[(b*i+r)*j+c] = float32(sum)
+				}
+			}
+		}
+		for x := range want {
+			if diff := got[x] - want[x]; diff < -1e-6 || diff > 1e-6 {
+				t.Fatalf("output[%d] = %g, want %g", x, got[x], want[x])
+			}
+		}
+		loss := Sum(y, 0, 1, 2)
+		if err := loss.Backward(); err != nil {
+			t.Fatal(err)
+		}
+		da := conv2dHost(t, a, true)
+		dk := conv2dHost(t, k, true)
+		loss.ReleaseGraph()
+		for b := 0; b < n; b++ {
+			for r := 0; r < i; r++ {
+				for e := 0; e < d; e++ {
+					var sum float64
+					for c := 0; c < j; c++ {
+						sum += float64(kv[(b*j+c)*d+e])
+					}
+					if diff := float64(da[(b*i+r)*d+e]) - sum; diff < -1e-6 || diff > 1e-6 {
+						t.Fatalf("input gradient[%d,%d,%d] = %g, want %g", b, r, e, da[(b*i+r)*d+e], sum)
+					}
+				}
+			}
+		}
+		for b := 0; b < n; b++ {
+			for c := 0; c < j; c++ {
+				for e := 0; e < d; e++ {
+					var sum float64
+					for r := 0; r < i; r++ {
+						sum += float64(av[(b*i+r)*d+e])
+					}
+					if diff := float64(dk[(b*j+c)*d+e]) - sum; diff < -1e-6 || diff > 1e-6 {
+						t.Fatalf("weight gradient[%d,%d,%d] = %g, want %g", b, c, e, dk[(b*j+c)*d+e], sum)
+					}
+				}
+			}
+		}
+	})
+}

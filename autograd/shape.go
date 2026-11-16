@@ -376,9 +376,8 @@ func MatMul(a, b *Tensor) *Tensor {
 	aBatch, bBatch := a.Shape[:len(a.Shape)-2], b.Shape[:len(b.Shape)-2]
 	flatLinear := count > 1 && numel(aBatch) == count && numel(bBatch) == 1
 	// A transposed view of a contiguous matrix is already the layout SGEMM's
-	// transB path reads, so the single-GEMM paths skip materializing it. The
-	// batched path indexes b by batch and still needs a contiguous operand.
-	transposedB := !useCUDA && (flatLinear || count == 1) && b.Offset == 0 && lastTwoTranspose(b.Shape, b.Strides, b.Offset)
+	// transB path reads, and its batch stride stays k*n, so no copy is needed.
+	transposedB := !useCUDA && b.Offset == 0 && lastTwoTranspose(b.Shape, b.Strides, b.Offset)
 	if !transposedB {
 		b = b.Contiguous()
 	}
@@ -395,7 +394,7 @@ func MatMul(a, b *Tensor) *Tensor {
 		parallelBatches(count, func(z int) {
 			ai := bindex(z, batch, aBatch) * m * k
 			bi := bindex(z, batch, bBatch) * k * n
-			tensor.SGEMMOpWorkers(v[z*m*n:(z+1)*m*n], a.Data[ai:ai+m*k], b.Data[bi:bi+k*n], m, n, k, false, false, gemmWorkers)
+			tensor.SGEMMOpWorkers(v[z*m*n:(z+1)*m*n], a.Data[ai:ai+m*k], b.Data[bi:bi+k*n], m, n, k, false, transposedB, gemmWorkers)
 		})
 	}
 	return result(v, s, []*Tensor{a, b}, func(g []float32) {
@@ -426,7 +425,7 @@ func MatMul(a, b *Tensor) *Tensor {
 				bi := bindex(z, batch, bBatch) * k * n
 				gg := g[z*m*n : (z+1)*m*n]
 				if a.RequiresGrad {
-					tensor.SGEMMOpWorkers(da[ai:ai+m*k], gg, b.Data[bi:bi+k*n], m, k, n, false, true, gemmWorkers)
+					tensor.SGEMMOpWorkers(da[ai:ai+m*k], gg, b.Data[bi:bi+k*n], m, k, n, false, !transposedB, gemmWorkers)
 				}
 				if b.RequiresGrad {
 					tensor.SGEMMOpWorkers(db[bi:bi+k*n], a.Data[ai:ai+m*k], gg, k, n, m, true, false, gemmWorkers)
@@ -450,7 +449,7 @@ func MatMul(a, b *Tensor) *Tensor {
 			bi := bindex(z, batch, b.Shape[:len(b.Shape)-2]) * k * n
 			gg := g[z*m*n : (z+1)*m*n]
 			if a.RequiresGrad {
-				tensor.SGEMMOp(tmpA, gg, b.Data[bi:bi+k*n], m, k, n, false, true)
+				tensor.SGEMMOp(tmpA, gg, b.Data[bi:bi+k*n], m, k, n, false, !transposedB)
 			}
 			if b.RequiresGrad {
 				tensor.SGEMMOp(tmpB, a.Data[ai:ai+m*k], gg, k, n, m, true, false)
