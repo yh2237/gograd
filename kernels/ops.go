@@ -21,10 +21,6 @@ extern "C" __global__ void activation(const float* x, const float* grad, float* 
 	}
 	out[i] = backward ? grad[i] * y : y;
 }
-extern "C" __global__ void add_tanh(const float* a, const float* b, float* out, int n) {
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i < n) out[i] = tanhf(a[i] + b[i]);
-}
 extern "C" __global__ void tanh_array(const float* x, float* out, int n) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i < n) out[i] = tanhf(x[i]);
@@ -34,21 +30,10 @@ extern "C" __global__ void add_bias_columns(float* y, const float* bias, int row
 	if (i >= rows * cols) return;
 	y[i] += bias[i % cols];
 }
-extern "C" __global__ void transpose12(const float* x, float* out, int d0, int d1, int d2) {
-	int index = blockIdx.x * blockDim.x + threadIdx.x;
-	if (index >= d0 * d1 * d2) return;
-	int k = index % d1;
-	int rest = index / d1;
-	int j = rest % d2;
-	int b = rest / d2;
-	out[index] = x[b * d1 * d2 + k * d2 + j];
-}
 `
 
 type opsKernelSet struct {
-	addTanh    *cuda.Kernel
 	biasColumn *cuda.Kernel
-	transpose  *cuda.Kernel
 	tanh       *cuda.Kernel
 	activation *cuda.Kernel
 }
@@ -63,9 +48,7 @@ func opsKernels() (*opsKernelSet, error) {
 		}
 		set := &opsKernelSet{}
 		for name, target := range map[string]**cuda.Kernel{
-			"add_tanh":         &set.addTanh,
 			"add_bias_columns": &set.biasColumn,
-			"transpose12":      &set.transpose,
 			"tanh_array":       &set.tanh,
 			"activation":       &set.activation,
 		} {
@@ -112,18 +95,6 @@ func elementGrid(count int) [3]int {
 	return [3]int{(count + 255) / 256, 1, 1}
 }
 
-// AddTanh writes tanh(a+b) elementwise for equal-length buffers.
-func AddTanh(a, b, out *cuda.Buffer, count int) error {
-	set, err := opsKernels()
-	if err != nil {
-		return err
-	}
-	n := int32(count)
-	aAddr, bAddr, outAddr := a.Pointer(), b.Pointer(), out.Pointer()
-	args := []unsafe.Pointer{unsafe.Pointer(&aAddr), unsafe.Pointer(&bAddr), unsafe.Pointer(&outAddr), unsafe.Pointer(&n)}
-	return set.addTanh.Launch(elementGrid(count), [3]int{256, 1, 1}, 0, nil, args)
-}
-
 // Tanh writes tanh(x) elementwise.
 func Tanh(x, out *cuda.Buffer, count int) error {
 	set, err := opsKernels()
@@ -146,16 +117,4 @@ func AddBiasColumns(y, bias *cuda.Buffer, rows, cols int) error {
 	yAddr, biasAddr := y.Pointer(), bias.Pointer()
 	args := []unsafe.Pointer{unsafe.Pointer(&yAddr), unsafe.Pointer(&biasAddr), unsafe.Pointer(&r), unsafe.Pointer(&c)}
 	return set.biasColumn.Launch(elementGrid(rows*cols), [3]int{256, 1, 1}, 0, nil, args)
-}
-
-// Transpose12 swaps the last two dimensions of a contiguous [d0,d1,d2] tensor.
-func Transpose12(x, out *cuda.Buffer, d0, d1, d2 int) error {
-	set, err := opsKernels()
-	if err != nil {
-		return err
-	}
-	a, b, c := int32(d0), int32(d1), int32(d2)
-	xAddr, outAddr := x.Pointer(), out.Pointer()
-	args := []unsafe.Pointer{unsafe.Pointer(&xAddr), unsafe.Pointer(&outAddr), unsafe.Pointer(&a), unsafe.Pointer(&b), unsafe.Pointer(&c)}
-	return set.transpose.Launch(elementGrid(d0*d1*d2), [3]int{256, 1, 1}, 0, nil, args)
 }

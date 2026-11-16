@@ -32,42 +32,13 @@ extern "C" __global__ void column_sum(const float* x, float* out, int rows, int 
 	for (int r = begin; r < end; r++) sum += x[r * cols + c];
 	if (sum != 0.0f) atomicAdd(&out[c], sum);
 }
-extern "C" __global__ void conv_weight_grad_partial(const float* x, const float* dy, float* partial, int batch, int channels, int length, int outChannels, int kernel, int dilation) {
-	// Standalone fallback used when the forward columns are not available. One
-	// thread per (batch, out, in, kernel) writes its own partial sum.
-	int per = outChannels * channels * kernel;
-	int index = blockIdx.x * blockDim.x + threadIdx.x;
-	if (index >= batch * per) return;
-	int ock = index % per;
-	int b = index / per;
-	int k = ock % kernel;
-	int c = (ock / kernel) % channels;
-	int o = ock / (kernel * channels);
-	float sum = 0.0f;
-	for (int t = 0; t < length; t++) {
-		// The same centered tap offset the forward im2col uses.
-		int src = t - (kernel / 2) * dilation + k * dilation;
-		if (src < 0 || src >= length) continue;
-		sum += dy[(b * outChannels + o) * length + t] * x[(b * channels + c) * length + src];
-	}
-	partial[index] = sum;
-}
-extern "C" __global__ void sum_over_batch(const float* partial, float* out, int batch, int per) {
-	int index = blockIdx.x * blockDim.x + threadIdx.x;
-	if (index >= per) return;
-	float sum = 0.0f;
-	for (int b = 0; b < batch; b++) sum += partial[b * per + index];
-	out[index] += sum;
-}
 `
 
 type backwardKernelSet struct {
-	tanhBackward   *cuda.Kernel
-	addInto        *cuda.Kernel
-	addPair        *cuda.Kernel
-	columnSum      *cuda.Kernel
-	convWeightPart *cuda.Kernel
-	sumOverBatch   *cuda.Kernel
+	tanhBackward *cuda.Kernel
+	addInto      *cuda.Kernel
+	addPair      *cuda.Kernel
+	columnSum    *cuda.Kernel
 }
 
 var backwardCache cuda.DeviceCache[*backwardKernelSet]
@@ -80,12 +51,10 @@ func backwardKernels() (*backwardKernelSet, error) {
 		}
 		set := &backwardKernelSet{}
 		for name, target := range map[string]**cuda.Kernel{
-			"tanh_backward":            &set.tanhBackward,
-			"add_into":                 &set.addInto,
-			"add_pair":                 &set.addPair,
-			"column_sum":               &set.columnSum,
-			"conv_weight_grad_partial": &set.convWeightPart,
-			"sum_over_batch":           &set.sumOverBatch,
+			"tanh_backward": &set.tanhBackward,
+			"add_into":      &set.addInto,
+			"add_pair":      &set.addPair,
+			"column_sum":    &set.columnSum,
 		} {
 			kernel, err := program.Function(name)
 			if err != nil {
@@ -160,31 +129,4 @@ func ColumnSum(x, out *cuda.Buffer, rows, cols int) error {
 	args := int32Args(int32(rows), int32(cols), int32(chunks))
 	args = append([]unsafe.Pointer{unsafe.Pointer(&xAddr), unsafe.Pointer(&outAddr)}, args...)
 	return set.columnSum.Launch(elementGrid(cols*chunks), [3]int{256, 1, 1}, 0, nil, args)
-}
-
-// ConvWeightGrad accumulates the convolution weight gradient for channel-major
-// x [batch,channels,length] and dy [batch,outChannels,length]. A first pass
-// writes one partial sum per batch without atomics and a second reduces them.
-func ConvWeightGrad(x, dy, dw *cuda.Buffer, batch, channels, length, outChannels, kernel, dilation int) error {
-	set, err := backwardKernels()
-	if err != nil {
-		return err
-	}
-	per := outChannels * channels * kernel
-	partial, err := cuda.Alloc(batch * per * 4)
-	if err != nil {
-		return err
-	}
-	defer partial.Free()
-
-	xAddr, dyAddr, partialAddr := x.Pointer(), dy.Pointer(), partial.Pointer()
-	args := int32Args(int32(batch), int32(channels), int32(length), int32(outChannels), int32(kernel), int32(dilation))
-	args = append([]unsafe.Pointer{unsafe.Pointer(&xAddr), unsafe.Pointer(&dyAddr), unsafe.Pointer(&partialAddr)}, args...)
-	if err := set.convWeightPart.Launch(elementGrid(batch*per), [3]int{256, 1, 1}, 0, nil, args); err != nil {
-		return err
-	}
-	partialAddr2, dwAddr := partial.Pointer(), dw.Pointer()
-	sumArgs := int32Args(int32(batch), int32(per))
-	sumArgs = append([]unsafe.Pointer{unsafe.Pointer(&partialAddr2), unsafe.Pointer(&dwAddr)}, sumArgs...)
-	return set.sumOverBatch.Launch(elementGrid(per), [3]int{256, 1, 1}, 0, nil, sumArgs)
 }

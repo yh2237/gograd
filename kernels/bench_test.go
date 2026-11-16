@@ -38,96 +38,6 @@ func benchBuffer(b *testing.B, count int) *cuda.Buffer {
 	return buffer
 }
 
-func BenchmarkConv1dForward(b *testing.B) {
-	benchSetup(b)
-	x := benchBuffer(b, benchBatch*benchLength*benchChannels)
-	w := benchBuffer(b, benchOutChannels*benchChannels*benchKernel)
-	columns := benchBuffer(b, benchChannels*benchKernel*benchBatch*benchLength)
-	conv := benchBuffer(b, benchOutChannels*benchBatch*benchLength)
-	blas, err := cuda.NewBlas()
-	if err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() { blas.Destroy() })
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := Conv1dForwardTo(blas, x, w, conv, columns, benchBatch, benchChannels, benchLength, benchOutChannels, benchKernel, benchDilation); err != nil {
-			b.Fatal(err)
-		}
-	}
-	if err := cuda.Synchronize(); err != nil {
-		b.Fatal(err)
-	}
-}
-
-func BenchmarkConvWeightGrad(b *testing.B) {
-	benchSetup(b)
-	x := benchBuffer(b, benchBatch*benchChannels*benchLength)
-	dy := benchBuffer(b, benchBatch*benchOutChannels*benchLength)
-	dw := benchBuffer(b, benchOutChannels*benchChannels*benchKernel)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := ConvWeightGrad(x, dy, dw, benchBatch, benchChannels, benchLength, benchOutChannels, benchKernel, benchDilation); err != nil {
-			b.Fatal(err)
-		}
-	}
-	if err := cuda.Synchronize(); err != nil {
-		b.Fatal(err)
-	}
-}
-
-func BenchmarkConvInputGrad(b *testing.B) {
-	benchSetup(b)
-	dy := benchBuffer(b, benchOutChannels*benchBatch*benchLength)
-	w := benchBuffer(b, benchOutChannels*benchChannels*benchKernel)
-	dx := benchBuffer(b, benchBatch*benchLength*benchChannels)
-	blas, err := cuda.NewBlas()
-	if err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() { blas.Destroy() })
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := ConvInputGrad(blas, dy, w, dx, benchBatch, benchChannels, benchLength, benchOutChannels, benchKernel, benchDilation); err != nil {
-			b.Fatal(err)
-		}
-	}
-	if err := cuda.Synchronize(); err != nil {
-		b.Fatal(err)
-	}
-}
-
-func BenchmarkToHBT(b *testing.B) {
-	benchSetup(b)
-	in := benchBuffer(b, benchBatch*benchLength*benchChannels)
-	out := benchBuffer(b, benchChannels*benchBatch*benchLength)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := ToHBT(in, out, benchBatch, benchChannels, benchLength); err != nil {
-			b.Fatal(err)
-		}
-	}
-	if err := cuda.Synchronize(); err != nil {
-		b.Fatal(err)
-	}
-}
-
-func BenchmarkTranspose12(b *testing.B) {
-	benchSetup(b)
-	d0, d1, d2 := benchBatch, benchLength, benchChannels
-	input := benchBuffer(b, d0*d1*d2)
-	output := benchBuffer(b, d0*d1*d2)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := Transpose12(input, output, d0, d1, d2); err != nil {
-			b.Fatal(err)
-		}
-	}
-	if err := cuda.Synchronize(); err != nil {
-		b.Fatal(err)
-	}
-}
-
 func BenchmarkAddInto(b *testing.B) {
 	benchSetup(b)
 	count := benchBatch * benchLength * benchChannels
@@ -143,39 +53,6 @@ func BenchmarkAddInto(b *testing.B) {
 		b.Fatal(err)
 	}
 }
-
-func BenchmarkAddTanh(b *testing.B) {
-	benchSetup(b)
-	count := benchBatch * benchLength * benchChannels
-	a := benchBuffer(b, count)
-	bb := benchBuffer(b, count)
-	out := benchBuffer(b, count)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := AddTanh(a, bb, out, count); err != nil {
-			b.Fatal(err)
-		}
-	}
-	if err := cuda.Synchronize(); err != nil {
-		b.Fatal(err)
-	}
-}
-
-func BenchmarkRowSum(b *testing.B) {
-	benchSetup(b)
-	dy := benchBuffer(b, benchOutChannels*benchBatch*benchLength)
-	db := benchBuffer(b, benchOutChannels)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := RowSum(dy, db, benchOutChannels, benchBatch*benchLength); err != nil {
-			b.Fatal(err)
-		}
-	}
-	if err := cuda.Synchronize(); err != nil {
-		b.Fatal(err)
-	}
-}
-
 func BenchmarkTanhBackward(b *testing.B) {
 	benchSetup(b)
 	rows := benchBatch * benchLength

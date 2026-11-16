@@ -1,7 +1,6 @@
 package kernels
 
 import (
-	"math"
 	"runtime"
 	"testing"
 
@@ -17,80 +16,6 @@ func auditCUDAKernels(t *testing.T) {
 	t.Cleanup(runtime.UnlockOSThread)
 	if err := cuda.SetDevice(0); err != nil {
 		t.Fatal(err)
-	}
-}
-
-// referenceConvWeightGrad returns dw[o, c*kernel+k] for the centered tap
-// offset that the forward im2col uses. x is channel-major [batch,channels,length]
-// and dy is [batch,outChannels,length], the layout the fallback kernel reads.
-func referenceConvWeightGrad(x, dy []float32, batch, channels, length, outChannels, kernel, dilation int) []float32 {
-	dw := make([]float32, outChannels*channels*kernel)
-	for o := 0; o < outChannels; o++ {
-		for c := 0; c < channels; c++ {
-			for k := 0; k < kernel; k++ {
-				sum := float32(0)
-				for b := 0; b < batch; b++ {
-					for t := 0; t < length; t++ {
-						source := t - (kernel/2)*dilation + k*dilation
-						if source < 0 || source >= length {
-							continue
-						}
-						sum += dy[(b*outChannels+o)*length+t] * x[(b*channels+c)*length+source]
-					}
-				}
-				dw[(o*channels+c)*kernel+k] = sum
-			}
-		}
-	}
-	return dw
-}
-
-// TestAuditConvWeightGradTapAlignment checks that the standalone weight
-// gradient fallback uses the same centered tap offset as the forward im2col.
-// An uncentered offset silently mixes different input samples into the
-// gradient for every kernel whose size is not 2 or 3.
-func TestAuditConvWeightGradTapAlignment(t *testing.T) {
-	auditCUDAKernels(t)
-	const batch, channels, length, outChannels = 2, 3, 9, 4
-	for _, shape := range []struct{ kernel, dilation int }{
-		{3, 1}, {3, 2}, {4, 1}, {5, 2}, {1, 2}, {2, 1},
-	} {
-		kernel, dilation := shape.kernel, shape.dilation
-		x := make([]float32, batch*channels*length)
-		dy := make([]float32, batch*outChannels*length)
-		for i := range x {
-			x[i] = float32(math.Sin(float64(i) * 0.37))
-		}
-		for i := range dy {
-			dy[i] = float32(math.Cos(float64(i) * 0.21))
-		}
-		want := referenceConvWeightGrad(x, dy, batch, channels, length, outChannels, kernel, dilation)
-		deviceX := upload(t, x)
-		deviceDY := upload(t, dy)
-		deviceDW, err := cuda.Alloc(len(want) * 4)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer deviceDW.Free()
-		defer deviceX.Free()
-		defer deviceDY.Free()
-		// ConvWeightGrad accumulates into dw, and the pool hands back reused
-		// memory, so the destination must start at zero.
-		if err := deviceDW.Memset(0, len(want)*4); err != nil {
-			t.Fatal(err)
-		}
-		if err := ConvWeightGrad(deviceX, deviceDY, deviceDW, batch, channels, length, outChannels, kernel, dilation); err != nil {
-			t.Fatal(err)
-		}
-		if err := cuda.Synchronize(); err != nil {
-			t.Fatal(err)
-		}
-		got := download(t, deviceDW, len(want))
-		for i := range want {
-			if math.Abs(float64(got[i]-want[i])) > 1e-4*math.Max(1, math.Abs(float64(want[i]))) {
-				t.Fatalf("kernel=%d dilation=%d dw[%d]: got %v want %v", kernel, dilation, i, got[i], want[i])
-			}
-		}
 	}
 }
 
@@ -126,9 +51,6 @@ func TestAuditEmptyElementwiseLaunches(t *testing.T) {
 	}
 	if err := AddBiasColumns(out, empty, 0, 4); err != nil {
 		t.Fatalf("add bias columns with zero elements: %v", err)
-	}
-	if err := Transpose12(empty, out, 0, 2, 2); err != nil {
-		t.Fatalf("transpose with zero elements: %v", err)
 	}
 	if err := cuda.Synchronize(); err != nil {
 		t.Fatal(err)

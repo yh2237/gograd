@@ -1,7 +1,6 @@
 package kernels
 
 import (
-	"fmt"
 	"unsafe"
 
 	"github.com/yh2237/gograd/cuda"
@@ -28,27 +27,6 @@ extern "C" __global__ void im2col1d_batched(const float* x, float* col, int batc
 	float value = 0.0f;
 	if (src >= 0 && src < length) value = x[(b * length + src) * channels + c];
 	col[index] = value;
-}
-extern "C" __global__ void to_hbt(const float* in, float* out, int batch, int channels, int length) {
-	// in is [batch,length,channels]; out is [channels, batch*length].
-	int index = blockIdx.x * blockDim.x + threadIdx.x;
-	if (index >= channels * batch * length) return;
-	int t = index % length;
-	int tmp = index / length;
-	int b = tmp % batch;
-	int h = tmp / batch;
-	out[index] = in[(b * length + t) * channels + h];
-}
-extern "C" __global__ void row_sum(const float* x, float* out, int rows, int cols, int chunks) {
-	int index = blockIdx.x * blockDim.x + threadIdx.x;
-	if (index >= rows * chunks) return;
-	int chunk = index % chunks;
-	int r = index / chunks;
-	int begin = (cols * chunk) / chunks;
-	int end = (cols * (chunk + 1)) / chunks;
-	float sum = 0.0f;
-	for (int c = begin; c < end; c++) sum += x[r * cols + c];
-	if (sum != 0.0f) atomicAdd(&out[r], sum);
 }
 extern "C" __global__ void col2im1d(const float* col, float* dx, int batch, int channels, int length, int kernel, int dilation) {
 	// col is [batch*length, channels*kernel]; dx is [batch,length,channels].
@@ -99,8 +77,6 @@ extern "C" __global__ void col2im1d_stride(const float* col, float* dx, int batc
 
 type convKernelSet struct {
 	im2col       *cuda.Kernel
-	toHBT        *cuda.Kernel
-	rowSum       *cuda.Kernel
 	col2im       *cuda.Kernel
 	im2colStride *cuda.Kernel
 	col2imStride *cuda.Kernel
@@ -117,8 +93,6 @@ func convKernels() (*convKernelSet, error) {
 		set := &convKernelSet{}
 		for name, target := range map[string]**cuda.Kernel{
 			"im2col1d_batched": &set.im2col,
-			"to_hbt":           &set.toHBT,
-			"row_sum":          &set.rowSum,
 			"col2im1d":         &set.col2im,
 			"im2col1d_stride":  &set.im2colStride,
 			"col2im1d_stride":  &set.col2imStride,
@@ -148,39 +122,6 @@ func Im2col(x, col *cuda.Buffer, batch, channels, length, kernel, dilation int) 
 		unsafe.Pointer(&b), unsafe.Pointer(&c), unsafe.Pointer(&t), unsafe.Pointer(&k), unsafe.Pointer(&d),
 	}
 	return set.im2col.Launch(elementGrid(batch*channels*kernel*length), [3]int{256, 1, 1}, 0, nil, args)
-}
-
-// ToHBT permutes a time-major [batch,length,channels] tensor into
-// [channels, batch*length], the layout the convolution gradients expect.
-func ToHBT(in, out *cuda.Buffer, batch, channels, length int) error {
-	set, err := convKernels()
-	if err != nil {
-		return err
-	}
-	inAddr, outAddr := in.Pointer(), out.Pointer()
-	b, c, l := int32(batch), int32(channels), int32(length)
-	args := []unsafe.Pointer{unsafe.Pointer(&inAddr), unsafe.Pointer(&outAddr), unsafe.Pointer(&b), unsafe.Pointer(&c), unsafe.Pointer(&l)}
-	return set.toHBT.Launch(elementGrid(channels*batch*length), [3]int{256, 1, 1}, 0, nil, args)
-}
-
-// RowSum accumulates out[r] += sum_c x[r,c] for a [rows,cols] matrix. The
-// caller zeroes out before the first accumulation.
-func RowSum(x, out *cuda.Buffer, rows, cols int) error {
-	set, err := convKernels()
-	if err != nil {
-		return err
-	}
-	chunks := 1
-	if cols > 1 {
-		chunks = 256
-		if chunks > cols {
-			chunks = cols
-		}
-	}
-	xAddr, outAddr := x.Pointer(), out.Pointer()
-	args := int32Args(int32(rows), int32(cols), int32(chunks))
-	args = append([]unsafe.Pointer{unsafe.Pointer(&xAddr), unsafe.Pointer(&outAddr)}, args...)
-	return set.rowSum.Launch(elementGrid(rows*chunks), [3]int{256, 1, 1}, 0, nil, args)
 }
 
 // Col2im scatters a [channels*kernel, batch*length] patch gradient into the
@@ -219,41 +160,4 @@ func Col2imStride(col, dx *cuda.Buffer, batch, channels, length, kernel, outLeng
 	args := int32Args(int32(batch), int32(channels), int32(length), int32(kernel), int32(outLength), int32(stride), int32(padding), int32(dilation))
 	args = append([]unsafe.Pointer{unsafe.Pointer(&colAddr), unsafe.Pointer(&dxAddr)}, args...)
 	return set.col2imStride.Launch(elementGrid(batch*channels*length), [3]int{256, 1, 1}, 0, nil, args)
-}
-
-// Conv1dForwardTo gathers time-major x [batch,length,channels] into columns
-// [channels*kernel, batch*length] and computes conv [outChannels, batch*length]
-// = weight*columns with one GEMM. No bias or activation is applied here.
-func Conv1dForwardTo(blas *cuda.Blas, x, weight, conv, columns *cuda.Buffer, batch, channels, length, outChannels, kernel, dilation int) error {
-	if kernel < 1 || dilation < 1 {
-		return fmt.Errorf("cuda: invalid conv kernel=%d dilation=%d", kernel, dilation)
-	}
-	if blas == nil {
-		return fmt.Errorf("cuda: Conv1dForwardTo requires a cuBLAS handle")
-	}
-	if err := Im2col(x, columns, batch, channels, length, kernel, dilation); err != nil {
-		return err
-	}
-	columnCount := channels * kernel
-	return blas.SgemmRowMajorNT(outChannels, batch*length, columnCount, 1,
-		weight.Pointer(), columnCount, columns.Pointer(), columnCount, 0, conv.Pointer(), batch*length)
-}
-
-// ConvInputGrad accumulates the input gradient from dy [outChannels,
-// batch*length] into time-major dx [batch,length,channels].
-func ConvInputGrad(blas *cuda.Blas, dy, weight, dx *cuda.Buffer, batch, channels, length, outChannels, kernel, dilation int) error {
-	if blas == nil {
-		return fmt.Errorf("cuda: ConvInputGrad requires a cuBLAS handle")
-	}
-	columnCount := channels * kernel
-	columns, err := cuda.Alloc(columnCount * batch * length * 4)
-	if err != nil {
-		return err
-	}
-	defer columns.Free()
-	if err := blas.SgemmRowMajorTransposeA(batch*length, columnCount, outChannels, 1,
-		dy.Pointer(), batch*length, weight.Pointer(), columnCount, 0, columns.Pointer(), columnCount); err != nil {
-		return err
-	}
-	return Col2im(columns, dx, batch, channels, length, kernel, dilation)
 }
