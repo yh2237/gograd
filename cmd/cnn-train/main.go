@@ -71,7 +71,7 @@ func (m *classifier) forward(x *autograd.Tensor) *autograd.Tensor {
 	h = autograd.ReLU(m.norm2.Forward(m.second.Forward(h)))
 	// Adaptive pooling keeps the classifier independent of spatial dimensions.
 	h = autograd.AdaptiveAvgPool2d(h, [2]int{1, 1})
-	return m.head.Forward(autograd.Reshape(h, h.Shape[0], h.Shape[1]))
+	return m.head.Forward(autograd.FlattenLayer{}.Forward(h))
 }
 
 func (m *classifier) close() {
