@@ -285,6 +285,28 @@ func reduce(a *Tensor, mean bool, axes ...int) *Tensor {
 		a.addGrad(dx)
 	})
 }
+
+// Stack joins the inputs along a new axis inserted at axis. Every input must
+// have the same shape.
+func Stack(axis int, inputs ...*Tensor) *Tensor {
+	if len(inputs) == 0 {
+		panic("autograd: empty stack")
+	}
+	dispatchBackend("concat", inputs[0].Device)
+	rank := len(inputs[0].Shape)
+	if axis < 0 {
+		axis += rank + 1
+	}
+	if axis < 0 || axis > rank {
+		panic("autograd: invalid stack axis")
+	}
+	expanded := make([]*Tensor, len(inputs))
+	for i, t := range inputs {
+		expanded[i] = Unsqueeze(t, axis)
+	}
+	return Concat(axis, expanded...)
+}
+
 func Concat(axis int, inputs ...*Tensor) *Tensor {
 	if len(inputs) == 0 {
 		panic("autograd: empty concat")
