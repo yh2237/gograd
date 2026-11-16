@@ -55,7 +55,7 @@ func softmax(a *Tensor, axis int, logmode bool) *Tensor {
 			}
 		})
 	}
-	v := cpuAlloc(a.Numel())
+	v := cpuAllocUninit(a.Numel())
 	parallelForWork(outer*inner, dim, func(start, end int) {
 		for row := start; row < end; row++ {
 			base := (row/inner)*dim*inner + row%inner
