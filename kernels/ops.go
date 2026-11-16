@@ -63,11 +63,11 @@ func opsKernels() (*opsKernelSet, error) {
 		}
 		set := &opsKernelSet{}
 		for name, target := range map[string]**cuda.Kernel{
-			"add_tanh":          &set.addTanh,
-			"add_bias_columns":  &set.biasColumn,
-			"transpose12":       &set.transpose,
-			"tanh_array":        &set.tanh,
-			"activation":        &set.activation,
+			"add_tanh":         &set.addTanh,
+			"add_bias_columns": &set.biasColumn,
+			"transpose12":      &set.transpose,
+			"tanh_array":       &set.tanh,
+			"activation":       &set.activation,
 		} {
 			kernel, err := program.Function(name)
 			if err != nil {
@@ -135,7 +135,6 @@ func Tanh(x, out *cuda.Buffer, count int) error {
 	args := []unsafe.Pointer{unsafe.Pointer(&xAddr), unsafe.Pointer(&outAddr), unsafe.Pointer(&n)}
 	return set.tanh.Launch(elementGrid(count), [3]int{256, 1, 1}, 0, nil, args)
 }
-
 
 // AddBiasColumns adds a per-column bias to a [rows,cols] row-major matrix.
 func AddBiasColumns(y, bias *cuda.Buffer, rows, cols int) error {

@@ -158,8 +158,6 @@ func xorSign(value, sign float32) float32 {
 	return math.Float32frombits(math.Float32bits(value) ^ math.Float32bits(sign))
 }
 
-
-
 // normalFill16Vector is NormalFill16<float, true>: the AVX2 specialization.
 func normalFill16Vector(d []float32, mean, std float32) {
 	const twoPi = float32(2 * math.Pi) // _mm256_set1_ps(2.0f * c10::pi<double>)

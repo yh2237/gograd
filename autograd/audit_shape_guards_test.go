@@ -148,6 +148,7 @@ func TestAuditNewRejectsOverflowingShape(t *testing.T) {
 		t.Fatal("Zeros accepted a shape whose element count overflows int")
 	}
 }
+
 // The device kernel reads int32 indices, so a wider value must be rejected
 // instead of wrapping. The check runs before any allocation.
 func TestAuditIndexBufferRejectsWideIndex(t *testing.T) {

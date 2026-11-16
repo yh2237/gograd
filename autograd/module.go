@@ -60,6 +60,7 @@ func (m *Module) NamedParameters() []Parameter {
 	walk("", m)
 	return out
 }
+
 // StateDict returns a copy of every parameter and buffer. Parameters and
 // buffers share one namespace, so a duplicate name is a module definition error
 // rather than a silently dropped tensor.

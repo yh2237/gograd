@@ -98,12 +98,12 @@ extern "C" __global__ void col2im1d_stride(const float* col, float* dx, int batc
 `
 
 type convKernelSet struct {
-	im2col           *cuda.Kernel
-	toHBT            *cuda.Kernel
-	rowSum           *cuda.Kernel
-	col2im           *cuda.Kernel
-	im2colStride     *cuda.Kernel
-	col2imStride     *cuda.Kernel
+	im2col       *cuda.Kernel
+	toHBT        *cuda.Kernel
+	rowSum       *cuda.Kernel
+	col2im       *cuda.Kernel
+	im2colStride *cuda.Kernel
+	col2imStride *cuda.Kernel
 }
 
 var convCache cuda.DeviceCache[*convKernelSet]
@@ -116,12 +116,12 @@ func convKernels() (*convKernelSet, error) {
 		}
 		set := &convKernelSet{}
 		for name, target := range map[string]**cuda.Kernel{
-			"im2col1d_batched":   &set.im2col,
-			"to_hbt":             &set.toHBT,
-			"row_sum":            &set.rowSum,
-			"col2im1d":           &set.col2im,
-			"im2col1d_stride":    &set.im2colStride,
-			"col2im1d_stride":    &set.col2imStride,
+			"im2col1d_batched": &set.im2col,
+			"to_hbt":           &set.toHBT,
+			"row_sum":          &set.rowSum,
+			"col2im1d":         &set.col2im,
+			"im2col1d_stride":  &set.im2colStride,
+			"col2im1d_stride":  &set.col2imStride,
 		} {
 			kernel, err := program.Function(name)
 			if err != nil {
@@ -238,7 +238,6 @@ func Conv1dForwardTo(blas *cuda.Blas, x, weight, conv, columns *cuda.Buffer, bat
 	return blas.SgemmRowMajorNT(outChannels, batch*length, columnCount, 1,
 		weight.Pointer(), columnCount, columns.Pointer(), columnCount, 0, conv.Pointer(), batch*length)
 }
-
 
 // ConvInputGrad accumulates the input gradient from dy [outChannels,
 // batch*length] into time-major dx [batch,length,channels].

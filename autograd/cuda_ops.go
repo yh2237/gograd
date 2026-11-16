@@ -85,7 +85,8 @@ func gpuPowScalar(a *Tensor, p float32) *Tensor {
 		launch("pow_scalar_b", int(n), unsafe.Pointer(&ap), unsafe.Pointer(&gp), unsafe.Pointer(&da), unsafe.Pointer(&n), unsafe.Pointer(&p))
 	})
 }
-func aligned3(shape []int) [3]int32 {	if len(shape) > 3 {
+func aligned3(shape []int) [3]int32 {
+	if len(shape) > 3 {
 		panic("autograd: CUDA rank > 3")
 	}
 	out := [3]int32{1, 1, 1}

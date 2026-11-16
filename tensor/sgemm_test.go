@@ -242,6 +242,7 @@ func BenchmarkSGEMMTransformerShapes(b *testing.B) {
 		})
 	}
 }
+
 // A randomized comparison against the naive triple loop exercises the tiling,
 // packing and microkernel paths together, including both transpose flags.
 func TestSGEMMRandomized(t *testing.T) {
