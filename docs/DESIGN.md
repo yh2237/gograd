@@ -18,7 +18,7 @@ ExecutionContextは記録・BF16・アテンションの方針を分離します
 
 推論結果もReleaseGraph用の親を保ちますが、導関数は持ちません。CopyFromとeagerなoptimizer更新はストレージのversionを進め、Backwardが勾配変更前に検証します。Dataへの直接書込と外部CUDA書込・再生は追跡しません。
 
-CPU/CUDAの微分可能な公開演算はopレジストリでdispatchします。CPUはAVX2/FMAの8×8マイクロカーネル付きSGEMMを実行時に選び、`GOGRAD_SGEMM_8X8=0`なら4×8、それ以外の環境は純Go経路を使います。要素演算とreductionは複数コアへ分けます。
+CPU/CUDAの微分可能な公開演算はopレジストリでdispatchします。CPUはAVX2/FMAの4×16マイクロカーネル付きSGEMMを実行時に選び、`GOGRAD_SGEMM_4X16=0`なら4×8、それ以外の環境は純Go経路を使います。要素演算とreductionは複数コアへ分けます。
 
 CUDAの通常バッチGEMMはcuBLASのstrided-batched経路を使い、ブロードキャストする重みの勾配はバッチ軸を1 GEMMへ平坦化します。不規則なバッチはループで処理します。rank 6までのview・broadcast・reductionと、要素演算・正規化・損失・dropoutなどはNVRTCカーネルで実装します。
 
@@ -138,8 +138,6 @@ RTX 3060 Tiと12 CPUスレッドを使い、1セッションでgograd / PyTorch�
 | Transformer gograd | 2276.1 | 27.2 | 27.8 | 22.4 | 23.2 |
 
 CPU時間のPyTorch比はTransformer 1.76倍、Acoustic 1.55倍です。目標の2.5倍 / 1.5倍に対し、前者は範囲内、後者はわずかに超えました。graphはこのGEMMの多い処理ではほぼ短縮せず、BF16 eagerはgograd FP32より速いもののPyTorch BF16には届きません。TransformerのBF16 eagerはPyTorchの1.66倍です。
-
-CPU SGEMMの8×8 / 4×8の中央値はAcoustic 3783.4 / 4157.8 ms、Transformer 2085.0 / 2242.9 msでした。変更後のCPUプロファイルではSGEMMが約61% / 33%を占め、続いてindexingと要素勾配の処理でした。
 
 batch 1、heads 4、head幅64のattentionをCUDA eventで3回測った中央値と、使用中バッファのピーク増分です。
 

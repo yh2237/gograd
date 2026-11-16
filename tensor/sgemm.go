@@ -8,9 +8,20 @@ import (
 
 var sgemmPools sync.Map
 
-// The larger tile wins on both full-model median timings; set the environment
-// variable to 0 to retain the 4x8 fallback for diagnosis.
-var use8x8 = useAVX2FMA && os.Getenv("GOGRAD_SGEMM_8X8") != "0"
+// The 4x16 microkernel needs six loads per eight FMAs, one fewer per FMA than
+// 8x8. Set the environment variable to 0 to keep the 4x8 fallback.
+var use4x16 = useAVX2FMA && os.Getenv("GOGRAD_SGEMM_4X16") != "0"
+
+// sgemmTile reports the microkernel block size.
+func sgemmTile() (mr, nr int) {
+	if !useAVX2FMA {
+		return 4, 4
+	}
+	if use4x16 {
+		return 4, 16
+	}
+	return 4, 8
+}
 
 type PackedB struct {
 	data []float32
@@ -21,10 +32,7 @@ func PackB(b []float32, n, k int, transB bool) *PackedB {
 	if len(b) != n*k {
 		panic("tensor: SGEMM shape mismatch")
 	}
-	nr := 4
-	if useAVX2FMA {
-		nr = 8
-	}
+	_, nr := sgemmTile()
 	groups := (n + nr - 1) / nr
 	packed := &PackedB{data: make([]float32, groups*k*nr), n: n, k: k}
 	for group := 0; group < groups; group++ {
@@ -95,14 +103,7 @@ func sgemmOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 		mc = 16
 	}
 	const kc = 256
-	nr := 4
-	mr := 4
-	if useAVX2FMA {
-		nr = 8
-		if use8x8 {
-			mr = 8
-		}
-	}
+	mr, nr := sgemmTile()
 	groups := (n + nr - 1) / nr
 	var bp []float32
 	if packed != nil {
@@ -181,22 +182,20 @@ func sgemmOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 						height := min(mr, end-i)
 						aa := ap[(i-row)*kc:]
 						if height == mr && width == nr {
-							if useAVX2FMA {
-								if use8x8 {
-									kernel8x8AVX(&c[i*n+j], &aa[0], &bb[0], n, nk, depth != 0)
-								} else {
-									kernel4x8AVX(&c[i*n+j], &aa[0], &bb[0], n, nk, depth != 0)
-								}
+							if use4x16 {
+								kernel4x16AVX(&c[i*n+j], &aa[0], &bb[0], n, nk, depth != 0)
+							} else if useAVX2FMA {
+								kernel4x8AVX(&c[i*n+j], &aa[0], &bb[0], n, nk, depth != 0)
 							} else {
 								kernel4x4(c, aa, bb, i*n+j, n, nk, depth != 0)
 							}
-						} else if useAVX2FMA && use8x8 {
+						} else if use4x16 {
 							if depth != 0 {
 								for r := 0; r < height; r++ {
 									copy(edge[r*nr:r*nr+width], c[(i+r)*n+j:(i+r)*n+j+width])
 								}
 							}
-							kernel8x8AVX(&edge[0], &aa[0], &bb[0], nr, nk, depth != 0)
+							kernel4x16AVX(&edge[0], &aa[0], &bb[0], nr, nk, depth != 0)
 							for r := 0; r < height; r++ {
 								copy(c[(i+r)*n+j:(i+r)*n+j+width], edge[r*nr:r*nr+width])
 							}

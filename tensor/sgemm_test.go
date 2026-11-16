@@ -9,8 +9,8 @@ import (
 )
 
 func TestSGEMMWorkerScheduling(t *testing.T) {
-	avx, wide := useAVX2FMA, use8x8
-	defer func() { useAVX2FMA, use8x8 = avx, wide }()
+	avx, wide := useAVX2FMA, use4x16
+	defer func() { useAVX2FMA, use4x16 = avx, wide }()
 	backends := []struct {
 		name      string
 		avx, wide bool
@@ -23,11 +23,11 @@ func TestSGEMMWorkerScheduling(t *testing.T) {
 		}{name: "avx4x8", avx: true}, struct {
 			name      string
 			avx, wide bool
-		}{name: "avx8x8", avx: true, wide: true})
+		}{name: "avx4x16", avx: true, wide: true})
 	}
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
-			useAVX2FMA, use8x8 = backend.avx, backend.wide
+			useAVX2FMA, use4x16 = backend.avx, backend.wide
 			// One single-tile shape and one multi-tile shape cover the serial
 			// and the parallel path.
 			for _, shape := range [][3]int{{1, 1, 1}, {129, 17, 319}} {
