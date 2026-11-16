@@ -13,8 +13,8 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache: false
@@ -38,3 +38,15 @@ jobs:
             echo "$files"
             exit 1
           fi
+
+  # The race detector needs cgo and a C toolchain, which only the test build
+  # uses. The library itself stays cgo-free.
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - run: go test -race -timeout 30m ./...
