@@ -60,6 +60,7 @@ var operationRegistry = map[string]KernelPair{
 	"bias_residual":          {"Add", "bias_residual_f/b"},
 	"mse_loss":               {"Sub+Mul+Mean", "binary_f/b+reduce_nd_f/b"},
 	"l1_loss":                {"Sub+Abs+Mean", "binary_f/b+unary_f/b+reduce_nd_f/b"},
+	"smooth_l1_loss":         {"Sub+Abs+ReLU+Mul+Mean", "binary_f/b+unary_f/b+reduce_nd_f/b"},
 	"bce_logits_loss":        {"ReLU+Sub+Mul+Exp+Log+Add+Mean", "unary_f/b+binary_f/b+reduce_nd_f/b"},
 }
 

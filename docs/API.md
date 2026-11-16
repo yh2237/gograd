@@ -25,7 +25,7 @@ CPU/CUDAで使う学習APIです。学習checkpointはsafetensorsの`gograd-trai
 | `autograd` | `Module.Train`、`SetTraining`、`OnTrainingChange` | 子モジュールへのtrain/eval伝播 |
 | `autograd` | `TrainingLoop[B]`、`BatchReader[B]`、`PositionSampler`、`UpdateSchedule`、`OneCycle.Updates` | 更新・報告・停止時保存 |
 | `autograd` | `GradAccumulator`、`NewGradAccumulator`、`Backward`、`Pending`、`Reset`、`Groups` | micro-batchの勾配蓄積 |
-| `autograd` | `MSELoss`、`L1Loss`、`BCEWithLogitsLoss`、`LossOptions`、`Reduction` | mean / sumと要素ごとの重み付き損失 |
+| `autograd` | `MSELoss`、`L1Loss`、`SmoothL1Loss`、`BCEWithLogitsLoss`、`LossOptions`、`Reduction` | mean / sumと要素ごとの重み付き損失 |
 | `autograd` | `MaskedLoss(pred,target,false)`、`ClipGradNorm`、`NewAdamW`、`NewOneCycle` | NaNフレームをマスクしたL1、クリップ、AdamW、OneCycle |
 | `autograd` | `Optimizer`、`CheckpointOptimizer`、`OptimizerSnapshot`、`LearningRate`、`SetLearningRate` | 更新・学習率・checkpointの共通API |
 | `autograd` | `AdamW.State`、`LoadState`、`SaveSafeTensors`、`LoadSafeTensors`、`Close` | モーメント・設定・ステップの保存と復元 |
@@ -221,7 +221,7 @@ CPU/CUDAとも出力・勾配・保存統計はFP32、モーメントのreductio
 
 ## 汎用の損失
 
-`MSELoss`、`L1Loss`、`BCEWithLogitsLoss`は同shape・同deviceの予測とtargetからスカラーを返します。
+`MSELoss`、`L1Loss`、`SmoothL1Loss`、`BCEWithLogitsLoss`は同shape・同deviceの予測とtargetからスカラーを返します。SmoothL1Lossは`|d|<1`で`0.5*d^2`、それ以外で`|d|-0.5`です。
 
 | 設定 | 仕様 |
 | --- | --- |

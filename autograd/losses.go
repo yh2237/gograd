@@ -83,6 +83,20 @@ func L1Loss(prediction, target *Tensor, options LossOptions) *Tensor {
 	return reduceLoss(Abs(Sub(prediction, target)), options, true)
 }
 
+// SmoothL1Loss is the mean or sum of the Huber loss with a unit transition:
+// 0.5*d^2 below |d|=1 and |d|-0.5 above it. It is written as
+// 0.5*d^2 - 0.5*relu(|d|-1)^2 so the existing elementwise rules supply the
+// gradient.
+func SmoothL1Loss(prediction, target *Tensor, options LossOptions) *Tensor {
+	dispatchBackend("smooth_l1_loss", prediction.Device)
+	same(prediction, target)
+	difference := Sub(prediction, target)
+	excess := ReLU(SubScalar(Abs(difference), 1))
+	squared := Mul(difference, difference)
+	clipped := Mul(excess, excess)
+	return reduceLoss(Sub(MulScalar(squared, .5), MulScalar(clipped, .5)), options, true)
+}
+
 // BCEWithLogitsLoss is the mean or sum of the binary cross-entropy of logits,
 // using the max(x,0) - x*y + log(1+exp(-|x|)) form so large magnitudes stay
 // finite. Targets are probabilities in [0,1]. Use it instead of computing
