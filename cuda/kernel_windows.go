@@ -29,6 +29,7 @@ type kernelAPI struct {
 	moduleGetFunction *syscall.Proc
 	moduleUnload      *syscall.Proc
 	launchKernel      *syscall.Proc
+	ctxGetCurrent     *syscall.Proc
 
 	streamBeginCapture *syscall.Proc
 	streamEndCapture   *syscall.Proc
@@ -74,7 +75,7 @@ func loadKernelAPI() (*kernelAPI, error) {
 			return
 		}
 		driverProcs, err := findProcs(driver,
-			"cuModuleLoadData", "cuModuleGetFunction", "cuModuleUnload", "cuLaunchKernel",
+			"cuModuleLoadData", "cuModuleGetFunction", "cuModuleUnload", "cuLaunchKernel", "cuCtxGetCurrent",
 		)
 		if err != nil {
 			kernelErr = fmt.Errorf("%w: %v", ErrUnavailable, err)
@@ -98,7 +99,7 @@ func loadKernelAPI() (*kernelAPI, error) {
 			getPTXSize: nvrtcProcs[2], getPTX: nvrtcProcs[3],
 			getLogSize: nvrtcProcs[4], getLog: nvrtcProcs[5], destroyProgram: nvrtcProcs[6],
 			moduleLoadData: driverProcs[0], moduleGetFunction: driverProcs[1],
-			moduleUnload: driverProcs[2], launchKernel: driverProcs[3],
+			moduleUnload: driverProcs[2], launchKernel: driverProcs[3], ctxGetCurrent: driverProcs[4],
 			streamBeginCapture: graphProcs[0], streamEndCapture: graphProcs[1],
 			graphInstantiate: graphProcs[2], graphLaunch: graphProcs[3],
 			graphExecDestroy: graphProcs[4], graphDestroy: graphProcs[5],
@@ -296,6 +297,15 @@ func (k *Kernel) Launch(grid, block [3]int, sharedMemory int, stream *Stream, ar
 		uintptr(sharedMemory), streamHandle, arguments, 0,
 	)
 	runtime.KeepAlive(args)
+	if code != 0 {
+		// A missing current context is the usual cause of an invalid-context
+		// launch, and it is worth naming rather than reporting the raw code.
+		var current uintptr
+		a.ctxGetCurrent.Call(uintptr(unsafe.Pointer(&current)))
+		if current == 0 {
+			return fmt.Errorf("cuda: cuLaunchKernel failed (code %d): no current context on this thread", code)
+		}
+	}
 	return driverError("cuLaunchKernel", code)
 }
 
