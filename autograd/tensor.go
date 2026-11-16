@@ -747,6 +747,15 @@ func Sin(a *Tensor) *Tensor {
 	return unary(a, func(x float32) float32 { return float32(math.Sin(float64(x))) }, func(x float32) float32 { return float32(math.Cos(float64(x))) })
 }
 
+// Cos applies cosine elementwise.
+func Cos(a *Tensor) *Tensor {
+	a = a.Contiguous()
+	if dispatchBackend("cos", a.Device) {
+		return gpuUnary(a, 10)
+	}
+	return unary(a, func(x float32) float32 { return float32(math.Cos(float64(x))) }, func(x float32) float32 { return -float32(math.Sin(float64(x))) })
+}
+
 // Sqrt applies the square root elementwise. The derivative is infinite at zero,
 // matching the reference.
 func Sqrt(a *Tensor) *Tensor {
