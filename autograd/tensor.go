@@ -627,6 +627,9 @@ func Scalar(a *Tensor, v float32) *Tensor {
 	return b
 }
 func cpuScalar(a *Tensor, value float32, op int) *Tensor {
+	if op < 0 || op > 3 {
+		panic("autograd: unknown scalar op")
+	}
 	out := cpuAllocUninit(a.Numel())
 	parallelFor(len(out), func(start, end int) {
 		for i := start; i < end; i++ {

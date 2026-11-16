@@ -19,8 +19,10 @@ func binaryScalar(op int, x, y float32) float32 {
 		return x / y
 	case 4:
 		return max(x, y)
+	case 5:
+		return min(x, y)
 	}
-	return min(x, y)
+	panic("autograd: unknown binary op")
 }
 
 // binaryGrad splits the incoming gradient between the operands. For max and min
@@ -41,11 +43,13 @@ func binaryGrad(op int, up, x, y float32) (float32, float32) {
 			return up, 0
 		}
 		return 0, up
+	case 5:
+		if x < y {
+			return up, 0
+		}
+		return 0, up
 	}
-	if x < y {
-		return up, 0
-	}
-	return 0, up
+	panic("autograd: unknown binary op")
 }
 
 // cpuBinaryOp accumulates directly into gradients when the indices are
