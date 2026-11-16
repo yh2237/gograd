@@ -14,7 +14,7 @@ VulkanとDirectMLは`autograd`から使うFP32推論バックエンド。学習�
 
 | 演算・機能 | 対応範囲 |
 | --- | --- |
-| 基本演算 | Add、Mul、MulScalar、GPU間コピー |
+| 基本演算 | Add、Mul、MulScalar、GPU間コピー。Sub、Div、Max、Minは未対応で`ErrUnsupported`を返す |
 | MatMul | 転置4通り、rank 6までのバッチ軸のブロードキャスト |
 | view | Reshape、Permute、Transpose、Slice、Expand、Gather / Scatter |
 | Transformer向け演算 | tanh近似 / erf式GELU、任意軸Softmax、LayerNorm、GroupNorm、Concat |
