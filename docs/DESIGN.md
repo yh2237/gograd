@@ -139,6 +139,8 @@ RTX 3060 Tiと12 CPUスレッドを使い、1セッションでgograd / PyTorch�
 
 CPU時間のPyTorch比はTransformer 1.76倍、Acoustic 1.55倍です。目標の2.5倍 / 1.5倍に対し、前者は範囲内、後者はわずかに超えました。graphはこのGEMMの多い処理ではほぼ短縮せず、BF16 eagerはgograd FP32より速いもののPyTorch BF16には届きません。TransformerのBF16 eagerはPyTorchの1.66倍です。
 
+表のgograd CPU値は記録時点のもので、その後の最適化でTransformerは約990 msまで短縮しています。PyTorchとの比は同じセッションで測り直す必要があります。
+
 batch 1、heads 4、head幅64のattentionをCUDA eventで3回測った中央値と、使用中バッファのピーク増分です。
 
 | 系列長 | 実体化ステップ | tiledステップ | 実体化のピーク | tiledのピーク |
