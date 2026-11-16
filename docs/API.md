@@ -20,6 +20,7 @@ CPU/CUDAで使う学習APIです。学習checkpointはsafetensorsの`gograd-trai
 | `autograd` | `Conv1d`、`Conv1dGEMM`、`Conv1dGEMMStride` | time-majorの1D畳み込み。biasはnilまたは`[out_channels]` |
 | `autograd` | `MaxPool2d`、`AvgPool2d`、`AdaptiveAvgPool2d`、各Options / Layer | NCHW pooling |
 | `autograd` | `BatchNorm`、`BatchNormOptions`、`NewBatchNormLayer`、`BatchNormLayerOptions` | 正規化とrunning state |
+| `autograd` | `NewRMSNormLayer`、`NewGroupNormLayer` | 最後の軸のRMS正規化、group単位の正規化 |
 | `autograd` | `Module.StateDict`、`LoadStateDict`、`SaveSafeTensors`、`SaveSafeTensorsMetadata`、`LoadSafeTensors` | 名前付きF32 state。metadataの値は文字列 |
 | `autograd` | `Module.Train`、`SetTraining`、`OnTrainingChange` | 子モジュールへのtrain/eval伝播 |
 | `autograd` | `TrainingLoop[B]`、`BatchReader[B]`、`PositionSampler`、`UpdateSchedule`、`OneCycle.Updates` | 更新・報告・停止時保存 |

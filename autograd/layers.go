@@ -132,6 +132,60 @@ func (l *LayerNormLayer) StateModule() *Module      { return &l.Module }
 func (l *LayerNormLayer) Train(training bool)       { l.Module.Train(training) }
 func (l *LayerNormLayer) Forward(x *Tensor) *Tensor { return LayerNorm(x, l.Weight, l.Bias, l.Eps) }
 
+// RMSNormLayer normalizes the last axis by its root mean square and scales it.
+type RMSNormLayer struct {
+	Module Module
+	Weight *Tensor
+	Eps    float32
+}
+
+func NewRMSNormLayer(width int, eps float32, device tensor.Device) (*RMSNormLayer, error) {
+	if width < 1 || eps <= 0 {
+		return nil, fmt.Errorf("autograd: invalid RMSNorm width or epsilon")
+	}
+	w, e := layerParameter([]int{width}, device, func(int) float32 { return 1 })
+	if e != nil {
+		return nil, e
+	}
+	l := &RMSNormLayer{Weight: w, Eps: eps}
+	l.Module.Parameters = []Parameter{{"weight", w}}
+	return l, nil
+}
+func (l *RMSNormLayer) StateModule() *Module      { return &l.Module }
+func (l *RMSNormLayer) Train(training bool)       { l.Module.Train(training) }
+func (l *RMSNormLayer) Forward(x *Tensor) *Tensor { return RMSNormLast(x, l.Weight, l.Eps) }
+
+// GroupNormLayer normalizes each sample across time and channels per group.
+type GroupNormLayer struct {
+	Module       Module
+	Weight, Bias *Tensor
+	Groups       int
+	Eps          float32
+}
+
+func NewGroupNormLayer(channels, groups int, eps float32, device tensor.Device) (*GroupNormLayer, error) {
+	if channels < 1 || groups < 1 || channels%groups != 0 || eps <= 0 {
+		return nil, fmt.Errorf("autograd: invalid GroupNorm dimensions")
+	}
+	w, e := layerParameter([]int{channels}, device, func(int) float32 { return 1 })
+	if e != nil {
+		return nil, e
+	}
+	b, e := Zeros([]int{channels}, device, true)
+	if e != nil {
+		w.Close()
+		return nil, e
+	}
+	l := &GroupNormLayer{Weight: w, Bias: b, Groups: groups, Eps: eps}
+	l.Module.Parameters = []Parameter{{"weight", w}, {"bias", b}}
+	return l, nil
+}
+func (l *GroupNormLayer) StateModule() *Module { return &l.Module }
+func (l *GroupNormLayer) Train(training bool)  { l.Module.Train(training) }
+func (l *GroupNormLayer) Forward(x *Tensor) *Tensor {
+	return GroupNorm(x, l.Weight, l.Bias, l.Groups, l.Eps)
+}
+
 // LinearLayer applies a PyTorch-layout [out,in] affine projection on the last axis.
 type LinearLayer struct {
 	Module       Module
