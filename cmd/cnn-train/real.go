@@ -148,6 +148,9 @@ func trainReal(device tensor.Device, steps, trainLimit, validLimit int, imagesPa
 			if output == "" {
 				return nil
 			}
+			if err := ensureParent(output); err != nil {
+				return err
+			}
 			return m.module.SaveSafeTensors(output)
 		},
 	}
@@ -170,6 +173,9 @@ func trainReal(device tensor.Device, steps, trainLimit, validLimit int, imagesPa
 	}
 
 	if output != "" {
+		if err := ensureParent(output); err != nil {
+			return stats, err
+		}
 		if err := m.module.SaveSafeTensors(output); err != nil {
 			return stats, err
 		}

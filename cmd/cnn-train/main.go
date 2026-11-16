@@ -9,11 +9,22 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/yh2237/gograd/autograd"
 	"github.com/yh2237/gograd/tensor"
 )
+
+// ensureParent creates the directory that holds path so that saving does not
+// depend on the caller having prepared it.
+func ensureParent(path string) error {
+	dir := filepath.Dir(path)
+	if dir == "." || dir == "" {
+		return nil
+	}
+	return os.MkdirAll(dir, 0o755)
+}
 
 type classifier struct {
 	module        autograd.Module
@@ -183,6 +194,9 @@ func train(device tensor.Device, steps int, output string, log io.Writer) (train
 	}
 	stats.accuracy = float32(correct) / float32(len(labels))
 	if output != "" {
+		if err := ensureParent(output); err != nil {
+			return stats, err
+		}
 		if err := m.module.SaveSafeTensors(output); err != nil {
 			return stats, err
 		}

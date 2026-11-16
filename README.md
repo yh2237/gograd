@@ -66,7 +66,7 @@ go run ./cmd/vulkan-infer -linear
 go run ./cmd/directml-infer -encoder
 ```
 
-CNNの出力先ディレクトリは先に作成してください。MNISTはローカルのraw/gzip IDXも使えます。学習の再開、optimizer、prefetch、勾配蓄積の指定は[学習API](docs/API.md)にあります。
+MNISTはローカルのraw/gzip IDXも使えます。学習の再開、optimizer、prefetch、勾配蓄積の指定は[学習API](docs/API.md)にあります。
 
 GPUが利用できない場合、ライブラリは自動でCPUへ切り替えません。推論例の`-cpu-fallback`はテンソルとモデルの構築前にCPUを選ぶためのフラグです。
 
