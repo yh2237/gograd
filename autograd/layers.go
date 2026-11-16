@@ -232,6 +232,18 @@ type GELULayer struct{ Approximate bool }
 
 func (l GELULayer) Forward(x *Tensor) *Tensor { return GELU(x, l.Approximate) }
 
+// FlattenLayer collapses every axis after the first, which is the usual step
+// between a convolutional trunk and a linear head. Rank 1 and scalars pass
+// through unchanged.
+type FlattenLayer struct{}
+
+func (FlattenLayer) Forward(x *Tensor) *Tensor {
+	if len(x.Shape) <= 1 {
+		return x
+	}
+	return Flatten(x, 1, -1)
+}
+
 // Sequential applies tensor-to-tensor layers in order. Layers with additional
 // inputs (embedding indices or a dropout seed) are composed in a plain struct.
 type TensorLayer interface{ Forward(*Tensor) *Tensor }
