@@ -600,6 +600,16 @@ func Mul(a, b *Tensor) *Tensor {
 func Div(a, b *Tensor) *Tensor {
 	return dispatchElementwise("div", a, b)
 }
+
+// Max returns the elementwise maximum. Ties send the gradient to b.
+func Max(a, b *Tensor) *Tensor {
+	return dispatchElementwise("max", a, b)
+}
+
+// Min returns the elementwise minimum. Ties send the gradient to b.
+func Min(a, b *Tensor) *Tensor {
+	return dispatchElementwise("min", a, b)
+}
 func Scalar(a *Tensor, v float32) *Tensor {
 	dispatchBackend("scalar", a.Device)
 	b, err := New([]float32{v}, []int{}, a.Device, false)

@@ -15,10 +15,17 @@ func binaryScalar(op int, x, y float32) float32 {
 		return x - y
 	case 2:
 		return x * y
+	case 3:
+		return x / y
+	case 4:
+		return max(x, y)
 	}
-	return x / y
+	return min(x, y)
 }
 
+// binaryGrad splits the incoming gradient between the operands. For max and min
+// the comparison is strict on the left, so ties send the whole gradient right
+// and no element is counted twice.
 func binaryGrad(op int, up, x, y float32) (float32, float32) {
 	switch op {
 	case 0:
@@ -27,8 +34,18 @@ func binaryGrad(op int, up, x, y float32) (float32, float32) {
 		return up, -up
 	case 2:
 		return up * y, up * x
+	case 3:
+		return up / y, -up * x / (y * y)
+	case 4:
+		if x > y {
+			return up, 0
+		}
+		return 0, up
 	}
-	return up / y, -up * x / (y * y)
+	if x < y {
+		return up, 0
+	}
+	return 0, up
 }
 
 // cpuBinaryOp accumulates directly into gradients when the indices are

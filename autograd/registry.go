@@ -15,6 +15,7 @@ type KernelPair struct{ CPU, CUDA string }
 var operationRegistry = map[string]KernelPair{
 	"add": {"binary", "binary_f/b"}, "sub": {"binary", "binary_f/b"},
 	"mul": {"binary", "binary_f/b"}, "div": {"binary", "binary_f/b"},
+	"max": {"binary", "binary_f/b"}, "min": {"binary", "binary_f/b"},
 	"scalar":     {"New", "New"},
 	"add_scalar": {"cpuScalar", "scalar_f/b"}, "sub_scalar": {"cpuScalar", "scalar_f/b"},
 	"mul_scalar": {"cpuScalar", "scalar_f/b"}, "div_scalar": {"cpuScalar", "scalar_f/b"},
@@ -117,6 +118,15 @@ var elementwiseRegistry = map[string]ElementwiseKernel{
 	"sub": {func(x, y float32) float32 { return x - y }, func(x, y float32) float32 { return 1 }, func(x, y float32) float32 { return -1 }, 1},
 	"mul": {func(x, y float32) float32 { return x * y }, func(x, y float32) float32 { return y }, func(x, y float32) float32 { return x }, 2},
 	"div": {func(x, y float32) float32 { return x / y }, func(x, y float32) float32 { return 1 / y }, func(x, y float32) float32 { return -x / (y * y) }, 3},
+	"max": {func(x, y float32) float32 { return max(x, y) }, func(x, y float32) float32 { return boolToFloat(x > y) }, func(x, y float32) float32 { return boolToFloat(x <= y) }, 4},
+	"min": {func(x, y float32) float32 { return min(x, y) }, func(x, y float32) float32 { return boolToFloat(x < y) }, func(x, y float32) float32 { return boolToFloat(x >= y) }, 5},
+}
+
+func boolToFloat(b bool) float32 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func dispatchElementwise(name string, a, b *Tensor) *Tensor {
@@ -136,4 +146,4 @@ func dispatchElementwise(name string, a, b *Tensor) *Tensor {
 }
 
 // RegisteredElementwiseOps lists operations handled by this dispatch table.
-func RegisteredElementwiseOps() []string { return []string{"add", "sub", "mul", "div"} }
+func RegisteredElementwiseOps() []string { return []string{"add", "sub", "mul", "div", "max", "min"} }
