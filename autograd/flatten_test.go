@@ -40,6 +40,22 @@ func TestFlattenShape(t *testing.T) {
 	})
 }
 
+func TestFlattenScalar(t *testing.T) {
+	sinTestDevices(t, func(t *testing.T, device tensor.Device) {
+		x := conv2dTestTensor(t, []float32{7}, []int{}, device, false)
+		for _, tc := range []struct{ start, end int }{{0, 0}, {0, -1}} {
+			y := Flatten(x, tc.start, tc.end)
+			if !slices.Equal(y.Shape, []int{1}) {
+				t.Fatalf("Flatten(scalar, %d, %d) shape = %v, want [1]", tc.start, tc.end, y.Shape)
+			}
+			if got := conv2dHost(t, y, false); !slices.Equal(got, []float32{7}) {
+				t.Fatalf("Flatten(scalar, %d, %d) values = %v, want [7]", tc.start, tc.end, got)
+			}
+			y.ReleaseGraph()
+		}
+	})
+}
+
 func TestFlattenRejectsRange(t *testing.T) {
 	x := conv2dTestTensor(t, []float32{1, 2, 3, 4}, []int{2, 2}, tensor.CPU, false)
 	for _, tc := range []struct{ start, end int }{

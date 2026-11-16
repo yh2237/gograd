@@ -25,10 +25,17 @@ func Unsqueeze(a *Tensor, axis int) *Tensor {
 }
 
 // Flatten collapses the axes from start through end, both inclusive. Negative
-// indices count from the end, and start == end leaves the shape unchanged.
+// indices count from the end, and start == end leaves the shape unchanged. A
+// scalar becomes shape [1], matching PyTorch.
 func Flatten(a *Tensor, start, end int) *Tensor {
 	dispatchBackend("reshape", a.Device)
 	rank := len(a.Shape)
+	if rank == 0 {
+		if start != 0 || (end != 0 && end != -1) {
+			panic(fmt.Errorf("autograd: flatten range %d..%d out of range for rank 0", start, end))
+		}
+		return Reshape(a, 1)
+	}
 	if start < 0 {
 		start += rank
 	}
