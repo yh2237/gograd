@@ -92,6 +92,7 @@ GPUが利用できない場合、ライブラリは自動でCPUへ切り替え�
 
 ```sh
 go test ./...
+go test -short ./...
 go vet ./...
 go run ./cmd/gpu-infer-bench -warmup 2 -iters 7 -json
 go run ./cmd/transformer-bench -device cuda -warmup 1
@@ -99,6 +100,8 @@ go run ./cmd/transformer-bench -device cuda -warmup 2 -graph -bf16
 go run ./cmd/attention-bench -seq 4096 -algorithm materialized
 go run ./cmd/attention-bench -seq 4096 -algorithm flash
 ```
+
+`-short`は系列長4096のFlashAttention照合を省きます。この1件が全体の実行時間の大半を占めます。
 
 演算と勾配はPyTorchのfixtureや有限差分で照合します。PyTorchはfixtureの再生成・比較に使い、通常の利用には必要ありません。GPUを利用できない環境では実機テストをスキップします。Vulkan/DirectMLのスキップを禁止する環境変数は[GPUのテスト](docs/GPU_BACKENDS.md#テスト)を参照してください。
 

@@ -84,7 +84,12 @@ func TestFlashAttentionSequenceParityCUDA(t *testing.T) {
 		t.Skip("CUDA unavailable")
 	}
 	defer func() { AttentionAlgorithm = "auto" }()
-	for _, seq := range []int{256, 1024, 4096} {
+	sequences := []int{256, 1024, 4096}
+	if testing.Short() {
+		// The 4096 case dominates the runtime of the whole suite.
+		sequences = []int{256, 1024}
+	}
+	for _, seq := range sequences {
 		t.Run(fmt.Sprint(seq), func(t *testing.T) {
 			ctx, err := NewCUDAContext()
 			if err != nil {
