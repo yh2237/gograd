@@ -292,7 +292,9 @@ if complete {
 
 - `Mean.Add(value, weight)`は平均値を対象件数で重み付けする。マスク付き損失は有効件数を渡す。
 - `Accuracy.UpdateLogits(scores, labels, classes, ignoreIndex)`は`[len(labels),classes]`のrow-majorスコアを扱う。同点は小さいクラス番号、ignoreIndexは分子・分母から除く。Correctは正解件数、Countは有効件数。
-- `Regression.Update(prediction, target)`は同長のfloat32配列からMSE / RMSE / MAEを求める。差分と和はfloat64、Countと除数はサンプル数ではなく要素数。
+- `TopKAccuracy`は`NewTopKAccuracy(k)`で作り、`UpdateLogits`の引数は`Accuracy`と同じ。ラベルより高いスコアのクラスがk個未満なら正解なので、境界の同点は正解に含む。
+- `Regression.Update(prediction, target)`は同長のfloat32配列からMSE / RMSE / MAEを求める。差分と和はfloat64、Countと除数はサンプル数ではなく要素数。`R2`は決定係数で、分散のない目標値と空の集計では0。
+- `ConfusionMatrix.Update(predicted, actual, classes, ignoreIndex)`は行が正解、列が予測の件数表を作る。クラス数は最初の成功した更新で固定し、変更は拒否する。`Precision`、`Recall`、`F1`、`Support`はクラス単位、`MacroF1`は正解ラベルがあるクラスだけを平均する。
 
 形状不一致、NaN/Inf、不正な件数、overflowは集計を変えずに拒否します。無視する分類行のスコアも有限値が必要です。
 

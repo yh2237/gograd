@@ -232,8 +232,7 @@ type GELULayer struct{ Approximate bool }
 
 func (l GELULayer) Forward(x *Tensor) *Tensor { return GELU(x, l.Approximate) }
 
-// FlattenLayer collapses every axis after the first, which is the usual step
-// between a convolutional trunk and a linear head. Rank 1 and scalars pass
+// FlattenLayer collapses every axis after the first. Rank 1 and scalars pass
 // through unchanged.
 type FlattenLayer struct{}
 
