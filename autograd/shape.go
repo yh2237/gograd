@@ -24,6 +24,34 @@ func Unsqueeze(a *Tensor, axis int) *Tensor {
 	return Reshape(a, shape...)
 }
 
+// Flatten collapses the axes from start through end, both inclusive. Negative
+// indices count from the end, and start == end leaves the shape unchanged.
+func Flatten(a *Tensor, start, end int) *Tensor {
+	dispatchBackend("reshape", a.Device)
+	rank := len(a.Shape)
+	if start < 0 {
+		start += rank
+	}
+	if end < 0 {
+		end += rank
+	}
+	if start < 0 || start >= rank || end < start || end >= rank {
+		panic(fmt.Errorf("autograd: flatten range %d..%d out of range for rank %d", start, end, rank))
+	}
+	if start == end {
+		return Reshape(a, a.Shape...)
+	}
+	size := 1
+	for _, d := range a.Shape[start : end+1] {
+		size *= d
+	}
+	shape := make([]int, 0, rank-(end-start))
+	shape = append(shape, a.Shape[:start]...)
+	shape = append(shape, size)
+	shape = append(shape, a.Shape[end+1:]...)
+	return Reshape(a, shape...)
+}
+
 // Squeeze removes every size-1 axis. A tensor whose axes are all 1 becomes a
 // scalar.
 func Squeeze(a *Tensor) *Tensor {
