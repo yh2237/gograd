@@ -2,6 +2,8 @@ package autograd
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/yh2237/gograd/gpu"
 	"github.com/yh2237/gograd/tensor"
@@ -146,4 +148,4 @@ func dispatchElementwise(name string, a, b *Tensor) *Tensor {
 }
 
 // RegisteredElementwiseOps lists operations handled by this dispatch table.
-func RegisteredElementwiseOps() []string { return []string{"add", "sub", "mul", "div", "max", "min"} }
+func RegisteredElementwiseOps() []string { return slices.Sorted(maps.Keys(elementwiseRegistry)) }
