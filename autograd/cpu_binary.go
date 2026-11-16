@@ -59,7 +59,7 @@ func cpuBinaryOp(a, b *Tensor, op int) *Tensor {
 	// A right operand that repeats along the last axis is the common bias case;
 	// a counter replaces the per-element modulo.
 	lastAxis := ai.kind == 1 && bi.kind == 3
-	out := cpuAlloc(numel(s))
+	out := cpuAllocUninit(numel(s))
 	switch {
 	case identity:
 		parallelFor(len(out), func(start, end int) {

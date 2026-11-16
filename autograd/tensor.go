@@ -82,11 +82,17 @@ func (t *Tensor) IsContiguous() bool {
 var cpuPools sync.Map
 
 func cpuAlloc(n int) []float32 {
+	out := cpuAllocUninit(n)
+	clear(out)
+	return out
+}
+
+// cpuAllocUninit skips the clear for callers that overwrite every element
+// before reading it.
+func cpuAllocUninit(n int) []float32 {
 	p, _ := cpuPools.LoadOrStore(n, &sync.Pool{})
 	if v := p.(*sync.Pool).Get(); v != nil {
-		out := v.([]float32)[:n]
-		clear(out)
-		return out
+		return v.([]float32)[:n]
 	}
 	return make([]float32, n)
 }
@@ -621,7 +627,7 @@ func Scalar(a *Tensor, v float32) *Tensor {
 	return b
 }
 func cpuScalar(a *Tensor, value float32, op int) *Tensor {
-	out := cpuAlloc(a.Numel())
+	out := cpuAllocUninit(a.Numel())
 	parallelFor(len(out), func(start, end int) {
 		for i := start; i < end; i++ {
 			x := a.Data[i]
@@ -690,7 +696,7 @@ func DivScalar(a *Tensor, v float32) *Tensor {
 	return cpuScalar(a, v, 3)
 }
 func unary(a *Tensor, f, d func(float32) float32) *Tensor {
-	v := cpuAlloc(len(a.Data))
+	v := cpuAllocUninit(len(a.Data))
 	parallelFor(len(v), func(start, end int) {
 		for i := start; i < end; i++ {
 			v[i] = f(a.Data[i])
