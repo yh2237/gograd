@@ -141,6 +141,8 @@ CPU時間のPyTorch比はTransformer 1.76倍、Acoustic 1.55倍です。目標�
 
 表のgograd CPU値は記録時点のもので、その後の最適化でTransformerは約990 msまで短縮しています。PyTorchとの比は同じセッションで測り直す必要があります。
 
+同じTransformerのCPUステップを`-cpuprofile`で測った内訳は、SGEMM 31%、exp 10%、erf 8%、memmove 7%、要素演算の勾配6%、SGEMMのpacking 5%、memclr 5%です。関数単位ではGELUが19%、softmaxが8%を占めます。memmoveはSGEMMのpackingと、勾配の最初の寄与をコピーする`addGrad`から出ています。
+
 batch 1、heads 4、head幅64のattentionをCUDA eventで3回測った中央値と、使用中バッファのピーク増分です。
 
 | 系列長 | 実体化ステップ | tiledステップ | 実体化のピーク | tiledのピーク |
