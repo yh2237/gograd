@@ -807,6 +807,18 @@ func Erf(a *Tensor) *Tensor {
 	})
 }
 
+// Log1p applies log(1+x) elementwise. It keeps precision for x near zero where
+// log(1+x) would cancel.
+func Log1p(a *Tensor) *Tensor {
+	a = a.Contiguous()
+	if dispatchBackend("log1p", a.Device) {
+		return gpuUnary(a, 13)
+	}
+	return unary(a, func(x float32) float32 { return float32(math.Log1p(float64(x))) }, func(x float32) float32 {
+		return 1 / (1 + x)
+	})
+}
+
 // Clamp limits each element to [lo, hi]. The gradient passes through where the
 // input lies inside the interval, endpoints included.
 func Clamp(a *Tensor, lo, hi float32) *Tensor {
