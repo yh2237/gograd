@@ -2,133 +2,117 @@
 
 ## 対象範囲
 
-`autograd`はdefine-by-runのfloat32グラフです。TensorはShape、Strides、DType、Deviceと共有ストレージを持ちます。CPUはスライス、CUDAはデバイスバッファ、Vulkan/DirectMLの推論は`gpu.Buffer`を使います。学習はCPU/CUDAが対象です。
+`autograd` はdefine-by-runのfloat32自動微分エンジンです。Tensorは `Shape`、`Strides`、`DType`、`Device` と共有ストレージを持ち、CPUはGoスライス、CUDAはデバイスバッファ、Vulkan / DirectMLの推論は `gpu.Buffer` をバックエンドとします（学習はCPU / CUDAのみ対象）。
 
-Reshape、Transpose、Permute、Slice、Expandはviewを作ります。連続配置が必要な演算ではContiguousで実体化し、対応するGPU演算はstride / offsetを直接読みます。CUDAの値・勾配・optimizer stateはデバイス上に保ち、ToHostやstateの書出しで明示的に読み戻します。
+`Reshape`、`Transpose`、`Permute`、`Slice`、`Expand` はviewを生成します。連続メモリ配置が必要な演算では `Contiguous` で実体化し、対応するGPU演算はstride / offsetを直接参照します。CUDA上の値・勾配・optimizer stateはデバイス上に留まり、`ToHost` やstate書き出し時に明示的にホストへ転送します。
 
-ストレージはlease、グラフの辺は依存数で管理します。Close済みの先祖も計算に必要な間は内部で保持し、共有ノードは最後の依存が終わってから回収します。RetainData / RetainGradは履歴を保たず割当を保持できます。異なるdeviceと未対応dtypeの組合せは拒否します。
+ストレージはlease、グラフの辺は依存数で参照カウント管理します。`Close` 済みの先祖も計算に必要な間は内部で保持され、共有ノードは最後の依存が終了してから回収されます。`RetainData` / `RetainGrad` を使うと履歴を保持せずに割当だけを維持できます。
 
 ## グラフと演算
 
-記録中の演算は親とvector-Jacobian積を保存し、Backwardが逆順に伝播します。末端の勾配は加算し、中間の勾配はRetainGradしない限り破棄します。通常のBackwardは履歴を消費し、RetainGraph指定時は再利用できます。保存した統計・im2col・target・indexなどはその履歴が終わるまで保持します。
+記録中の演算は親ノードとvector-Jacobian積を保持し、`Backward` で逆順に伝播します。末端の勾配は累積加算され、中間勾配は `RetainGrad` 指定がない限り破棄されます。通常の `Backward` は履歴を消費し、`RetainGraph` 指定時のみ再利用可能です。正規化統計・im2col・target・indexなどの補助データも履歴終了まで保持されます。
 
-ExecutionContextは記録・BF16・アテンションの方針を分離します。モデルの全stateをforward前にBindModuleし、入力をそのコンテキストで作ります。viewとDetachも同じコンテキストを保ち、異なる明示的コンテキストの混在は拒否します。NoGradとAutocastはコンテキスト全体に作用し、入れ子とpanicから復帰します。
+`ExecutionContext` は記録・BF16・アテンション方針をスコープ分離します。モデルの全stateをforward前に `BindModule` し、入力を同じコンテキストで生成します。`NoGrad` と `Autocast` はコンテキスト全体に作用し、入れ子とpanicから復帰します。精度とアテンション方針はforward時に保存されるため、後の設定変更やretainした `Backward` でも一貫性が保たれます（複数演算からなるforward全体が1スナップショットになるわけではないため、設定変更はforwardの合間に行います）。
 
-精度とアテンションはforward時に保存し、後の設定変更やretainしたBackwardでも同じ方針を使います。既定はグローバル設定に依存しないFP32 / autoです。複数演算からなるforward全体は一括のスナップショットではないため、設定はforwardの合間に変えます。コンテキストは共有モデルの変更やストレージの寿命を同期しません。
+推論結果も `ReleaseGraph` 用の親リンクを持ちますが、導関数は保持しません。`CopyFrom` とeagerなoptimizer更新はストレージのversionを進め、`Backward` が勾配書き込み前に検証します（`Data` スライスへの直接書き込みや外部CUDA書き込み・再生は追跡対象外）。
 
-推論結果もReleaseGraph用の親を保ちますが、導関数は持ちません。CopyFromとeagerなoptimizer更新はストレージのversionを進め、Backwardが勾配変更前に検証します。Dataへの直接書込と外部CUDA書込・再生は追跡しません。
+CPU / CUDAの微分可能演算はopレジストリ経由でdispatchされます。
+- **CPU**：AVX2/FMAの4×16マイクロカーネル付きSGEMMを実行時に選択します（`GOGRAD_SGEMM_4X16=0` で4×8、非対応環境は純Go経路）。要素演算とreductionはマルチコアへ並列化します。
+- **CUDA**：通常のバッチGEMMはcuBLASのstrided-batched経路を使い、ブロードキャストする重みの勾配はバッチ軸を1 GEMMへ平坦化します（不規則バッチはループ処理）。rank 6までのview・broadcast・reductionおよび要素演算・正規化・損失・dropoutなどはNVRTCカーネルで実装しています。
 
-CPU/CUDAの微分可能な公開演算はopレジストリでdispatchします。CPUはAVX2/FMAの4×16マイクロカーネル付きSGEMMを実行時に選び、`GOGRAD_SGEMM_4X16=0`なら4×8、それ以外の環境は純Go経路を使います。要素演算とreductionは複数コアへ分けます。
+CUDAのデバイス・暗黙のstream・capture状態、およびcuBLASハンドル・クリップ用プランはOSスレッド単位で管理されます。`NewCUDAContext` でスレッドを固定し、`NewCUDAContextOn` は `Close` 時に以前のデバイスへ復元します。`SetCUDA` で設定したデバイス / streamは `WithCUDA` で一時適用されます。
 
-CUDAの通常バッチGEMMはcuBLASのstrided-batched経路を使い、ブロードキャストする重みの勾配はバッチ軸を1 GEMMへ平坦化します。不規則なバッチはループで処理します。rank 6までのview・broadcast・reductionと、要素演算・正規化・損失・dropoutなどはNVRTCカーネルで実装します。
+`RunBranches` は指定された分岐を別streamへenqueueし、呼び出し側streamへeventで合流させます（自動分岐は行いません）。`Capture` は明示的stream上で実行し、同一スレッドでの入れ子は拒否します。再生は記録時と同じデバイスを選択し、グラフ用割当は `Graph.Close` まで予約されます。
 
-CUDAのdevice・暗黙のstream・captureはOSスレッド単位です。cuBLASハンドルとクリップ用プランも同じ単位で持ちます。NewCUDAContextでスレッドを固定し、NewCUDAContextOnは以前のdeviceをClose時に復元します。SetCUDAで記録したdevice / streamをWithCUDAが一時適用します。
+CUDAメモリプールはデバイス・stream・サイズクラスで分離され、256 B、4 KiB、64 KiB、それ以上の領域は1 MiB刻みに丸められます。既定の上限は2 GiBで、超過時は古いキャッシュから退避します（`ReleasePool` でも使用中・グラフ予約中の割当は解放しません）。`Buffer` が所有デバイスを記録しているため、コピー・memset・freeはバッファ自身のデバイスを選択して実行します。
 
-RunBranchesは指定された分岐を別streamへenqueueし、呼出し側streamへeventで合流します。分岐は自動では作りません。Captureは明示的streamで行い、同じスレッドの入れ子を拒否します。再生は記録したdeviceを選び、グラフ用割当はGraph.Closeまで予約します。
+CUDA attentionはバッチGEMMと融合したmask / scale / softmaxを使用します。tiled経路はonline softmaxで二次サイズのscoreバッファを回避して `Backward` で再計算を行いますが、現状は実体化（materialized）経路より遅いため、`auto` ではscore scratchの見積もりが1 GiB以上の場合のみ選択されます。
 
-CUDAプールはdevice・stream・サイズクラスで分け、256 B、4 KiB、64 KiB、大きい領域は1 MiB刻みへ丸めます。既定の上限は2 GiBで、古いキャッシュから退避します。ReleasePoolは使用中・グラフ予約中の割当を解放しません。Bufferがdeviceを記録するため、コピー・memset・freeは所有するdeviceを選びます。
+BF16はGEMMオペランドと、viewや対応するpointwise演算を通過するシャドウに使用し、GEMMExの累積・master weight・勾配・optimizerモーメントはFP32で保持します。CPU、Conv2d、tiled attentionはFP32で動作します。CUDA Encoderはdropoutが0の場合にbias / GELU / residualを融合します。
 
-CUDA attentionはバッチGEMMと融合したmask / scale / softmaxを使います。tiled経路はonline softmaxで二次のscoreバッファを避け、Backwardで再計算します。加算maskに対応しますが、現在は実体化経路より遅いため、autoはscore scratchの見積もりが1 GiB以上の場合だけ選びます。
+Vulkan / DirectMLは `gpu.Backend` を介した推論専用経路です。対応演算はCPUへ戻さずGPU上で完結し、勾配記録や学習要求は拒否します。Vulkanは埋め込みSPIR-V、DirectMLはコンパイル済み演算子を使用し、バッファと演算子キャッシュに上限を設けています。詳細は [GPUバックエンド](GPU_BACKENDS.md) を参照してください。
 
-BF16はGEMMオペランドと、viewや対応するpointwise演算を通るシャドウに使います。GEMMExの累積、master weight、勾配、optimizerのモーメントはFP32です。CPU・Conv2d・tiled attentionはFP32のままです。CUDA Encoderはdropoutが0ならbias / GELU / residualを融合します。
-
-Vulkan/DirectMLは`gpu.Backend`を通す推論専用経路です。対応演算はCPUへ戻さず実行し、勾配記録や学習を要求された場合は拒否します。Vulkanは埋め込みSPIR-V、DirectMLはコンパイルした演算子を使い、バッファと演算子のキャッシュを制限します。詳細は[GPUバックエンド](GPU_BACKENDS.md)を参照してください。
-
-形状と演算の主な規則は次のとおりです。
+形状と演算の主な規則は以下の通りです。
 
 | 演算 | 規則 |
 | --- | --- |
-| broadcast / MatMul | 軸を右から揃え、同じ長さか片方1。MatMulの末尾2軸が行列、前の軸がバッチ |
-| reduction | 明示した軸を出力から除く。スカラーshapeは`[]` |
+| broadcast / MatMul | 軸を右から揃え、同長または片方が1。MatMulは末尾2軸が行列、それ以前がバッチ軸 |
+| reduction | 指定軸を出力から除外（スカラーshapeは `[]`） |
 | Concat / Slice | 0始まりの軸、半開区間 |
-| Embedding | 繰返すindexへ勾配をscatter加算。padding行は除外できる |
-| Conv1d | 入力`[batch,time,channels]`、重み`[out,in,kernel]`。奇数kernelのsame-padding、dilation、cross-correlation |
-| LayerNorm / GroupNorm | 最後の軸 / サンプル・groupごとのtimeとchannelsを正規化 |
-| MaskedLoss | 非NaNのtargetフレームを使い、有効フレーム×channelsで割る。0件なら損失0 |
-| Attention | scaleしたQKᵀ + 加算mask → softmax → Vとの積 |
-| Dropout | seedとelement indexのhashでmaskを再現。PyTorchの乱数とは異なる |
+| Embedding | 重複するindexへ勾配をscatter加算（padding行は除外可能） |
+| Conv1d | 入力 `[batch,time,channels]`、重み `[out,in,kernel]`。奇数kernelのsame-padding、dilation、cross-correlation |
+| LayerNorm / GroupNorm | 最終軸 / サンプル・groupごとのtimeとchannelsを正規化 |
+| MaskedLoss | 非NaNのtargetフレームのみ使用し、`有効フレーム × channels` で除算（0件時は損失0） |
+| Attention | scale済み `QKᵀ + 加算mask` → softmax → `V` との積 |
+| Dropout | seedとelement indexのhashでmaskを再現（PyTorchの乱数列とは異なる） |
 
-MultiheadAttentionはPyTorchのpacked投影レイアウト、TransformerEncoderLayerはbatch-firstのpre-norm構成です。
+`MultiheadAttention` はPyTorchのpacked投影レイアウト、`TransformerEncoderLayer` はbatch-firstのpre-norm構成を採用しています。
 
 ## モジュールと学習
 
-Moduleは名前付きパラメータ・バッファ・子を登録します。名前は安定したドット区切りで、同じ割当の別名は1回だけ保存します。学習パラメータはグラフの末端、running統計はoptimizer対象外のバッファです。Trainは子へ再帰伝播します。
+`Module` は名前付きパラメータ・バッファ・子モジュールをドット区切りの階層名で管理し、同一割当の別名は1回のみ保存します。学習パラメータはグラフ末端、running統計はoptimizer対象外のバッファとして登録され、`Train` は子モジュールへ再帰伝播します。
 
-AdamWはdecoupled decay、FP32モーメント、bias correctionを使います。グローバルノルムのクリップはStep前に行います。OneCycleはPyTorchの2段cosineで、initial=max/25、final=initial/10000、pct_startがwarmupの境界です。
-
-汎用損失は既存の要素演算とreductionを合成します。重み付きmeanの分母はMSE/L1が重みの和、BCEが要素数です。GradAccumulatorは損失を1/groupsにスケールし、更新とクリップはgroup完了後に行います。
-
-safetensorsは8-byte little-endianのヘッダ長、JSON記述子、連続payloadからなります。読込みは名前・shape・範囲・重複・ヘッダ上限を検証し、保存は同一ディレクトリの一時ファイル、sync、renameで行います。OpenSafeTensorFileはindexを先に検証してテンソル単位で読み、LoadSafeTensorsStreamはコピー前に全名前とshapeを検証します。
-
-TrainingLoopは更新単位のZeroGrad、optimizer / scheduleのStep、報告、停止時保存を担当します。readerのEOFではepochを進め、reader / Stepのエラーでは保存しません。context終了時は未完了groupの勾配を捨て、Samplerをgroup先頭へ戻してSaveします。モデルとoptimizerは最後の完了更新を保ちます。forwardが変更するstateは呼出し側で戻す必要があります。
+- **AdamW**：decoupled weight decay、FP32モーメント、bias correctionを使用します。グローバルノルムクリップは `Step` 前に実行します。
+- **OneCycle**：PyTorch準拠の2段cosineスケジュール（`initial = max/25`、`final = initial/10000`、`pct_start` がwarmup境界）。
+- **損失と勾配蓄積**：汎用損失は既存の要素演算とreductionの組み合わせで構成します。`GradAccumulator` は損失を `1/groups` にスケールし、クリップとパラメータ更新はgroup完了後に行います。
+- **safetensors**：8-byte little-endianのヘッダ長、JSON記述子、連続payloadで構成されます。読み込み時に名前・shape・範囲・重複・ヘッダ上限を検証し、保存は同一ディレクトリ内の一時ファイル書き込み・sync・renameでアトミックに行います。`OpenSafeTensorFile` はindex検証後にテンソル単位で遅延読み込みし、`LoadSafeTensorsStream` はコピー前に全名前とshapeを検証します。
+- **TrainingLoop**：更新単位の `ZeroGrad`、optimizer / scheduleの `Step`、進捗報告、停止時保存を担います。context終了時は未完了groupの勾配を破棄し、Samplerをgroup先頭へ戻して `Save` します。
 
 ## Conv2d
 
-CPU/CUDAともNCHWのcross-correlationで、重みは`[out,in/groups,kH,kW]`です。stride・padding・dilationはheight / width別に指定し、grouped / depthwise、出力multiplier、任意のbiasに対応します。
+CPU / CUDAともにNCHWのcross-correlation（重み `[out,in/groups,kH,kW]`）で、stride・padding・dilation（height / width個別指定）、grouped / depthwise、出力multiplier、任意biasに対応します。
 
-1バッチ・1groupずつdepth-majorのタイルへ展開してGEMMを行います。出力位置は最大512、im2colと出力で4 MiBを目標にし、完全な展開行列は保持しません。Backwardはim2colを再計算し、重み勾配を累積、入力勾配をcol2imでscatterします。CUDAはcuBLASとatomic加算を使います。推論のscratchは返却前に解放し、BF16シャドウとは独立したFP32経路です。
+1バッチ・1groupずつdepth-majorタイルへ展開してGEMMを実行します（出力位置最大512、im2colと出力の合計メモリ目標4 MiB）。完全な展開行列を保持しないため、Backward時はim2colを再計算して重み勾配を累積し、入力勾配はcol2imでscatter加算します（CUDAはcuBLASとatomic加算を使用）。推論scratchは返却前に解放され、BF16シャドウとは独立したFP32経路で動作します。
 
 ## NCHW pooling
 
-MaxPool2d、AvgPool2d、AdaptiveAvgPool2dは窓の幾何を共有し、実体化・出力確保前に検証します。maxの選択indexは記録中だけ保存し、retainした履歴でも保持します。average / adaptiveのBackwardは幾何と除数を使います。
+`MaxPool2d`、`AvgPool2d`、`AdaptiveAvgPool2d` は共通のウィンドウ幾何計算を持ち、実体化や出力メモリ確保の前にパラメータ検証を行います。maxの選択indexは勾配記録中（およびretainされた履歴）のみ保持します。
 
-CPUのBackwardはN*Cの面を分割し、面内の重複を直列加算して競合を避けます。CUDAは窓ごとに並列化し、Backwardはatomic scatter加算を使います。FP32でcapture / 再生に対応します。
-
-ceil modeは右端・下端のpaddingだけで始まる窓を除きます。averageは明示paddingとその外側を除数で区別し、adaptiveはfloor / ceilのbinが重なる場合も勾配を加算します。
+CPUのBackwardは `N*C` 面単位で並列化し、面内の重複加算を直列化して競合を回避します。CUDAはウィンドウ単位で並列化し、Backwardにはatomic scatter加算を使用します（FP32でcapture / 再生に対応）。
 
 ## BatchNormと可変state
 
-rank 2〜6のチャネル以外を正規化し、outer / channel / innerでchannels-first / lastを扱います。BatchNormLayerはaffine、running mean / variance、バッチカウンタをModuleへ登録します。NoGradはrunning stateの更新を止めません。
+rank 2〜6のテンソルを `outer / channel / inner` に分解してchannels-first / lastの両方を処理します。`BatchNormLayer` はaffineパラメータ、running mean / variance、バッチカウンタを `Module` に登録します（`NoGrad` 中もrunning stateの更新は停止しません）。
 
-学習の出力は偏りのある分散、running varianceは不偏分散を使います。モーメントはfloat64累積、各forwardの保存統計はFP32です。runningバッファはBackwardの依存ではないため、後の更新やCloseで以前のグラフは変わりません。入力とaffineはversion検証の対象です。
+学習時の出力には偏りのある分散、running varianceには不偏分散を使用し、モーメントはfloat64で累積して保存統計はFP32で保持します。runningバッファはBackwardの依存対象外であるため、後続の更新や `Close` が既存グラフに影響することはありません。
 
-CUDAはチャネルごとのreductionと要素ごとのforward / VJPを使います。カウンタ更新を別カーネルで先行させ、累積momentumとの競合を防ぎます。state更新はデバイス上で完了し、capture / 再生に対応します。num_batches_trackedもF32で、整数精度は`2^24`までです。
+CUDAではチャネルごとのreductionと要素ごとのforward / VJPカーネルを実行します。累積momentumとの競合を防ぐためカウンタ更新を別カーネルで先行させており、state更新までデバイス上で完結するためcapture / 再生に対応します（`num_batches_tracked` もFP32保持のため整数精度は `2^24` まで）。
 
 ## ホストのデータ処理
 
-dataはDataset、Sampler、collateをテンソル生成と分離します。同期Loaderはindexをpeekし、取得・collate・キャンセル確認の成功後にだけカーソルを確定します。失敗はデータを飛ばさず再試行でき、callbackのEOFはepochの終端と区別します。
+`data` パッケージはDataset、Sampler、collateをテンソル生成から分離しています。同期 `Loader` はindexをpeekし、取得・collate・キャンセル確認がすべて成功した後にカーソルを確定するため、失敗時はデータをスキップせず再試行できます（callbackのEOFはepoch終端と区別されます）。
 
-IndexSamplerはPCG、順列、位置、epochを保存し、復元前に構成とpayloadを検証します。Loader stateはバッチ構成を含みますが、データ内容・split・独自変換の同一性はアプリ側metadataで管理します。read-only Datasetは並行安全なら共有でき、変更可能なSampler / Loaderは逐次使用します。
+- `IndexSampler` はPCG状態・順列・位置・epochを保存し、復元時に構成とpayloadを検証します。read-onlyなDatasetは並行共有可能ですが、状態を持つSampler / Loaderは逐次使用を前提とします。
+- `TransformDataset` はindexとseedをcallbackへ渡し、コピー判断はcallback側に委ねます。組み込みの反転・ノイズ変換はサンプルごとのPCGを使うため、worker数・読み込み順・epochに依存せず再現性が保たれます（`Subset` でラップする順序により、元indexとsubset内位置のどちらを使うかを選択可能）。
+- 並列 `Loader` は上限付きでindexを先読みし、`Dataset.Get` のみをworkerへ分散して結果はSampler順へ整列します。collateおよびCUDAスレッド管理は `Next` の呼び出し元スレッドに残ります。キャンセル・エラー・`Close`・`NextEpoch` 時は古いreaderを停止・joinし、`State` は先読み分を破棄して配達済み位置のみを保存します（`Workers` / `Prefetch` はcheckpoint同一性に含まれないため変更して再開可能）。
 
-Stack / PadSequencesは所有するホスト値、長さ、bool maskを返し、アップロードは学習側で行います。IDXはuint8で保持し、sample取得時に変換します。fingerprintは復号した画像・ラベルの内容から計算します。
-
-TransformDatasetはindex / seedをcallbackへ渡し、コピーはcallbackに任せます。組込み反転とノイズはsampleごとのPCGを使い、worker数・読込順・epochに依存しません。Subsetで包む順序により、元indexかsubset内の位置かが決まります。
-
-並列Loaderは上限付きでindexを先読みし、sample取得だけをworkerへ渡します。結果はSampler順へ並べ、collateはNextの呼出し元で実行します。CUDAスレッド管理は学習側に残ります。
-
-キャンセル・エラー・Close・NextEpochでは古いreaderを止めてjoinします。Stateは先読みを捨て、配達済み位置だけを保存します。Workers / Prefetchはcheckpointの同一性に含めず、数を変えて再開できます。Getの副作用や乱数はアプリ側の責任です。
-
-数値CSVは矩形性と有限値を検証します。Standardizerはtraining splitだけでfloat64の統計を求め、定数特徴量のscaleを1にします。統計・分割・データfingerprintをcheckpointへ保存し、検証・再開時にfitし直しません。
-
-WAVの復号・符号化はdata、フレーム化・window・augmentationはアプリ側です。音声例のノイズは`(seed, window index)`から導くため、worker / prefetch / shuffle / 再開位置が変わっても同じ入力を再現します。
-
-学習例のCPU/CUDA実機確認は、いずれもseed 7、batch 64です。以下は動作と再開の確認であり、データセット全体の品質やoptimizer間の優劣を示すものではありません。
+以下は各サンプルの動作確認および中断・再開テストの結果です（すべてseed 7、batch 64、CPU / CUDA両環境で推論再読み込み誤差0を確認）。
 
 | 例 | データ・更新数 | 検証結果 |
 | --- | --- | --- |
 | MNIST / AdamW | 学習先頭2,000件、テスト先頭1,000件、100更新 | accuracy 86.4%、loss 0.455661 |
-| MNIST / SGD | 同じデータと更新数。momentum .9、Nesterov、OneCycleピーク .1 | accuracy 85.2%、loss 0.479619 |
-| MNIST / SGD、biasのdecayなし | 同上、`-no-decay-suffix bias` | accuracy 85.2%、loss 0.479656 |
-| 数値回帰 | 4特徴量、4,000行、うち800検証、200更新 | validation RMSE 12.164137 |
-| 音声denoiser | 生成した8秒・16 kHzのトーン、window 2,000、うち400検証、300更新 | 検証SNR 4.8665→15.0490 dB |
+| MNIST / SGD | 同上（momentum 0.9、Nesterov、OneCycleピーク 0.1） | accuracy 85.2%、loss 0.479619 |
+| MNIST / SGD（bias decayなし） | 同上（`-no-decay-suffix bias`） | accuracy 85.2%、loss 0.479656 |
+| 数値回帰 | 4特徴量、4,000行（うち検証800行）、200更新 | validation RMSE 12.164137 |
+| 音声denoiser | 生成8秒・16 kHzトーン、window 2,000（うち検証400）、300更新 | 検証SNR 4.8665 → 15.0490 dB |
 
-全例で推論の再読込みの差は0でした。MNISTはCPUを40更新で止めて100まで再開し、CUDAは連続実行しました。AdamWはreader 4 / prefetch 3、40更新後に2 / 2へ変更したCPU、4 / 4のCUDAでも同じ結果でした。SGDもCPUのworker設定を変えて再開しています。数値回帰は100、音声は150更新で止め、reader設定を変えて再開しても中断なしと同一の重みになりました。
+MNIST（40更新で中断→100更新まで再開）、数値回帰（100更新で中断）、音声（150更新で中断）のいずれにおいても、再開時にreader / prefetch設定を変更しても中断なし実行と完全に同一の重みが得られました。
 
 ## OptimizerとSGDのstate
 
-Optimizerはeagerな更新・リセット・学習率・寿命の共通APIです。CheckpointOptimizerはアルゴリズムのタグ付きstateを扱い、training-1のoptimizer_kindがなければ旧AdamWとみなします。live objectへのコピー前に種類と構成を検証します。
+`Optimizer` はeagerな更新・リセット・学習率制御・寿命管理の共通インターフェースです。`CheckpointOptimizer` はアルゴリズムタグ付きのstateを扱い、`gograd-training-1` で `optimizer_kind` が省略されている場合は旧AdamWとみなします。
 
-SGDはPyTorchのcoupled decay、momentum、dampening、Nesterov、ascentに合わせます。初回momentumはdampeningを適用せず、初期化はパラメータごとに遅延します。勾配なしは更新を飛ばし、0勾配は更新対象です。CUDAは更新後に初期化フラグを立て、stateの読書きの競合を避けます。
-
-CUDA graphではデバイス上のステップと初期化フラグを保持し、ZeroGradは安定した勾配バッファを0にします。保存とeager復帰ではステップを同期し、eager更新はストレージのversionを進めてBF16シャドウを無効にします。
-
-パラメータグループは名前付きの分割と学習率スケール・decayを持ちます。OneCycleは基準学習率だけを変えます。stateはindexではなく順序付きの名前を保存し、別グループへの読込みを拒否します。旧グループなしstateはスケールなしの単一グループだけが受け入れます。CUDA graphには記録時のスケールを固定します。
-
-AdamWのステップカウンタはoptimizer全体で1つです。PyTorchは勾配を受けたパラメータごとに進めるため、勾配なしの期間がある場合はbias correctionが異なり得ます。モーメント更新のスキップは同じですが、この差は残っています。
+- **SGD**：PyTorchのcoupled weight decay、momentum、dampening、Nesterov、ascentに準拠します。初回momentumはdampeningを適用せず、パラメータごとに遅延初期化します。勾配を持たないパラメータは更新をスキップし、0勾配は更新対象となります。CUDA上では更新後に初期化フラグを立ててstate読み書きの競合を防ぎます。
+- **CUDA graph連携**：デバイス上のステップ数と初期化フラグを保持し、`ZeroGrad` は既存の勾配バッファを0埋めします。保存およびeager復帰時にはステップ数を同期し、eager更新時はストレージversionを進めてBF16シャドウを無効化します。
+- **パラメータグループ**：名前付き分割・学習率スケール・decayを保持し、OneCycleは基準学習率のみを変更します。stateはindexではなく順序付きのパラメータ名を保存し、異なるグループ構成への復元を拒否します（CUDA graphには記録時のスケールが固定されます）。
+- **AdamWステップカウンタ**：optimizer全体で単一のステップカウンタを持ちます（勾配を受けたパラメータごとに進めるPyTorchとは、一部パラメータに勾配がない期間がある場合にbias correctionが異なり得ます）。
 
 ## 計測結果
 
-RTX 3060 Tiと12 CPUスレッドを使い、1セッションでgograd / PyTorchを対にして3回測った学習ステップ全体の中央値です。forward・backward・勾配クリップ・AdamWを含みます。単位はms。Transformerは4層、model 256、heads 4、FFN 1024、batch 16、系列長256。Acousticはhidden 384、batch 24、400 framesです。BF16はPyTorchのautocastとgogradのFP32値＋BF16シャドウを使い、適用範囲は異なります。CPU時間は測定中に変動しており、安定したスループット値ではありません。
+RTX 3060 Tiと12 CPUスレッドを用い、同一セッションでgogradとPyTorchを交互に3回計測した1学習ステップ（forward・backward・勾配クリップ・AdamW）の中央値（単位：ms）です。
+- **Transformer**：4層、model 256、heads 4、FFN 1024、batch 16、系列長256
+- **Acoustic**：hidden 384、batch 24、400 frames
+- **BF16**：PyTorchはautocast、gogradはFP32値＋BF16シャドウを使用
 
 | モデルと実行環境 | CPU FP32 | CUDA FP32 eager | CUDA FP32 graph | CUDA BF16 eager | CUDA BF16 graph |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -137,13 +121,13 @@ RTX 3060 Tiと12 CPUスレッドを使い、1セッションでgograd / PyTorch�
 | Transformer PyTorch | 1291.6 | 25.9 | 23.9 | 13.5 | 12.0 |
 | Transformer gograd | 2276.1 | 27.2 | 27.8 | 22.4 | 23.2 |
 
-CPU時間のPyTorch比はTransformer 1.76倍、Acoustic 1.55倍です。目標の2.5倍 / 1.5倍に対し、前者は範囲内、後者はわずかに超えました。graphはこのGEMMの多い処理ではほぼ短縮せず、BF16 eagerはgograd FP32より速いもののPyTorch BF16には届きません。TransformerのBF16 eagerはPyTorchの1.66倍です。
+CPU時間の対PyTorch比はTransformerで1.76倍、Acousticで1.55倍でした（目標比はそれぞれ2.5倍 / 1.5倍）。GEMM比重の高い本構成ではCUDA graphによる短縮効果は限定的で、BF16 eagerはFP32より高速化したもののPyTorch BF16には及びません（Transformer BF16 eagerでPyTorch比1.66倍）。
 
-表のgograd CPU値は記録時点のものです。同じTransformerを現在の環境で交互に5回測った中央値は、gograd 972.6 ms、PyTorch 474.3 ms（2.13.0+cu130、12スレッド）で、比は2.05倍でした。目標の2.5倍は満たしていますが、表の記録より比は悪化しています。gogradの絶対時間は約2.3倍短縮したものの、PyTorch側がそれ以上に速くなっています。
+※上表のCPU値は初期記録時のものです。現在の環境で同Transformerを交互に5回計測した中央値は、gograd 972.6 ms、PyTorch 474.3 ms（2.13.0+cu130、12スレッド）で比率は2.05倍でした。gograd自体の処理時間は約2.3倍高速化しましたが、PyTorch側の高速化幅がそれを上回っています。
 
-同じTransformerのCPUステップを`-cpuprofile`で測った内訳は、SGEMM 31%、exp 10%、erf 8%、memmove 7%、要素演算の勾配6%、SGEMMのpacking 5%、memclr 5%です。関数単位ではGELUが19%、softmaxが8%を占めます。memmoveはSGEMMのpackingと、勾配の最初の寄与をコピーする`addGrad`から出ています。
+同TransformerのCPUステップを `-cpuprofile` で計測した内訳は、SGEMM 31%、exp 10%、erf 8%、memmove 7%、要素演算勾配 6%、SGEMM packing 5%、memclr 5%（関数単位ではGELU 19%、softmax 8%）でした。`memmove` はSGEMMのpackingと、勾配の初回寄与をコピーする `addGrad` に由来します。
 
-batch 1、heads 4、head幅64のattentionをCUDA eventで3回測った中央値と、使用中バッファのピーク増分です。
+batch 1、heads 4、head幅64のattentionをCUDA eventで3回計測した中央値とピークメモリ増分は以下の通りです。
 
 | 系列長 | 実体化ステップ | tiledステップ | 実体化のピーク | tiledのピーク |
 | ---: | ---: | ---: | ---: | ---: |
@@ -151,11 +135,11 @@ batch 1、heads 4、head幅64のattentionをCUDA eventで3回測った中央値�
 | 1024 | 1.601 ms | 9.606 ms | 50.00 MiB | 4.03 MiB |
 | 4096 | 18.916 ms | 127.889 ms | 776.00 MiB | 16.12 MiB |
 
-tiledは3系列長で出力・勾配が実体化経路と一致しました。メモリは削減しますが、現在のBackwardは実体化経路より遅いままです。Vulkan / DirectMLの推論計測は[別文書](GPU_BACKEND_PERFORMANCE.md)にあります。
+tiled経路は全系列長で出力・勾配ともに実体化経路と一致しメモリ消費を大幅に抑えましたが、Backwardの再計算コストにより実行時間は実体化経路より遅くなっています。Vulkan / DirectMLの推論計測については [GPU性能測定](GPU_BACKEND_PERFORMANCE.md) を参照してください。
 
 ## 可変長系列のCUDAプール
 
-更新ごとにグラフを解放し、パディング後の長さが64通りある学習を再現しました。使用中は約11 MBのまま、サイズクラスと上限によりキャッシュが縮小しました。
+更新ごとにグラフを解放しつつ、パディング長が64通り変化する学習ワークロードでのメモリ推移です。サイズクラス化と上限設定によりキャッシュ肥大化を抑制しています（200ステップ継続時も同水準を維持、`cudaMalloc` 失敗時はキャッシュを解放して1回再試行）。
 
 | 64ステップ後 | 使用中bytes | キャッシュbytes | 予約bytes |
 | --- | ---: | ---: | ---: |
@@ -163,6 +147,4 @@ tiledは3系列長で出力・勾配が実体化経路と一致しました。�
 | サイズクラス＋上限 | 10,949,888 | 762,475,264 | 773,425,152 |
 | 上限256 MiBでの別実行 | 10,949,888 | 265,028,352 | 275,978,240 |
 
-200ステップでもキャッシュは同水準でした。cudaMalloc失敗時はキャッシュを解放して1回再試行します。ホスト転送のスライスはDLL呼出し中に保持します。
-
-固定shapeのAcoustic学習を最後の3対で比較した中央値は77.3→77.8 ms、差0.7%でした。それ以前の対はdevice負荷で両バイナリとも遅くなったため、この値を採用しました。
+固定shapeのAcoustic学習におけるプールのオーバーヘッドは、77.3 ms → 77.8 ms（+0.7%）でした。

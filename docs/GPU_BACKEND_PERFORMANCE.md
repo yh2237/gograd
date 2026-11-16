@@ -2,37 +2,34 @@
 
 ## 対象と測定方法
 
-`cmd/gpu-infer-bench`でCPU・Vulkan・DirectMLのFP32 / NoGrad推論を比較する。入力と重みはデバイスに常駐させ、同じ`autograd` APIと固定seedを使う。viewの実体化、割当、graph管理も含むAPI全体の時間で、カーネル単体ではない。
+`cmd/gpu-infer-bench` を用い、CPU・Vulkan・DirectMLのFP32 / NoGrad推論性能を比較する。入力と重みはデバイス上に常駐させ、viewの実体化・メモリ割当・グラフ管理を含む `autograd` API全体の実行時間を計測する（カーネル単体の時間ではない）。
 
 ```sh
 go run ./cmd/gpu-infer-bench -warmup 2 -iters 7 -json
 go run ./cmd/gpu-infer-bench -size 128 -hidden 512 -heads 4 -layers 1 -seq 74
 ```
 
-各サンプルはforward開始からGPU完了待ちとReleaseGraph終了まで。初期化・重み転送・初回実行・読み戻し・一致判定はmedianに含めない。backward、optimizer、BF16、CUDA graph captureも対象外。
+- 各サンプルはforward開始からGPU完了同期（`gpu.Synchronizer`）および `ReleaseGraph` 完了までの時間とする（初期化・重み転送・初回実行・ホスト読み戻し・一致検証はmedianに含めない）。
+- 初回出力をCPUと照合し、warmup後に `runtime.GC` を1回実行してから計測する。全反復終了後も `atol=1e-4`、`rtol=1e-4`、コサイン類似度0.999以上、およびメモリリークがないことを確認する。
+- 計時はWindowsでは `QueryPerformanceCounter`、その他ではGoのmonotonic clockを使用する。
+- JSON出力には全サンプル、median、nearest-rankのp95が含まれる。初期化時間等は別項目（`init_ms`、`setup_ms`、`first_forward_ms`）として記録する。
+- 利用不可なデバイスは理由を表示してスキップし、CPUへ自動フォールバックしない（`-skip-unavailable=false` でスキップ禁止、`-devices` で対象指定可能）。測定は他プロセスと競合しない環境で順次実行した。
 
-初回出力をCPUと照合し、warmup後にruntime.GCを1回実行してから測定する。計測後も`atol=1e-4`、`rtol=1e-4`、コサイン0.999以上を検証し、反復後の使用中バッファ数・バイト数の増加を確認する。完了待ちは`gpu.Synchronizer`、時計はWindowsがQueryPerformanceCounter、その他はGoのmonotonic clock。
+## 測定環境とワークロード
 
-JSONには全サンプル、median、nearest-rankのp95を出す。7サンプルのp95は最大値。`setup_ms`は初期値生成・構築・転送、`first_forward_ms`は初回forward完了まででgraph解放前。ドライバ初期化は別の`init_ms`。
-
-利用できないデバイスは理由を表示してスキップし、CPUに置き換えない。スキップ禁止は`-skip-unavailable=false`、対象指定は`-devices cpu,vulkan`。対応しない演算・feature levelはエラー。以下の測定はGPUテストや他のベンチマークと並行せず、1プロセス内で順次実行した。
-
-## 測定環境と形
-
-Windows/amd64、Go 1.27.0、CGO_ENABLED=0。CPUはIntel Core i5-12400、12 logical CPUs、GOMAXPROCS=12。GPUはRTX 3060 Ti、Vulkan API 1.4.341、DirectML feature level 6.4。
-
-共通の形はbatch=1、sequence=74、model=768、FFN=3072、heads=12、Encoder=12層、Conv1d入力channels=74。初回forwardの後にwarmup 2回、測定7回。
+- **環境**：Windows/amd64、Go 1.27.0（`CGO_ENABLED=0`）、Intel Core i5-12400（12論理コア、`GOMAXPROCS=12`）、NVIDIA GeForce RTX 3060 Ti、Vulkan API 1.4.341、DirectML Feature Level 6.4
+- **共通形状**：batch=1、sequence=74、model=768、FFN=3072、heads=12、Encoder=12層、Conv1d入力channels=74（初回forward後、warmup 2回・測定7回）
 
 | workload | 内容 |
 | --- | --- |
 | gemm | `[768,768] @ [768,768]` |
 | projection | `[74,768] @ [768,768]` |
 | ffn | `[1,74,768]` → Linear(3072) → bias + erf式GELU → Linear(768) + bias |
-| encoder | time-major Conv1d（kernel=3、stride=1、padding=1）→ 12層のpre-norm TransformerEncoderLayer |
+| encoder | time-major Conv1d（kernel=3, stride=1, padding=1）→ 12層のpre-norm TransformerEncoderLayer |
 
-## viewコピー削減後の測定
+## 最適化後のベンチマーク結果（viewコピー削減後）
 
-単位はms。倍率は同じworkloadのCPU中央値に対する値。
+単位はms。倍率は同一workloadのCPU中央値に対する高速化比を示す。
 
 | workload | CPU median / p95 | Vulkan median / p95 | Vulkan倍率 | DirectML median / p95 | DirectML倍率 |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -41,9 +38,9 @@ Windows/amd64、Go 1.27.0、CGO_ENABLED=0。CPUはIntel Core i5-12400、12 logic
 | ffn | 25.021 / 27.319 | 1.373 / 1.991 | 18.22x | 0.634 / 1.497 | 39.50x |
 | encoder | 553.505 / 612.442 | 36.174 / 37.709 | 15.30x | 33.830 / 42.922 | 16.36x |
 
-Encoderの最大絶対誤差はVulkan `5.72e-6`、DirectML `8.11e-6`、コサインはいずれも0.999以上。この条件では両バックエンドがCPU比2倍という目安を超えた。
+Encoderの最大絶対誤差はVulkan `5.72e-6`、DirectML `8.11e-6` で、コサイン類似度はいずれも0.999以上であった。
 
-Encoderの生サンプルは次のとおり。
+Encoderの生サンプル（ms）：
 
 ```text
 CPU:      547.8621, 612.4417, 586.6704, 553.5045, 535.0929, 565.9672, 545.8879
@@ -51,7 +48,7 @@ Vulkan:    37.7085,  37.4588,  36.1738,  35.2626,  34.3905,  36.2057,  35.3225
 DirectML:  33.0404,  32.9921,  32.2440,  34.4442,  33.8297,  42.9216,  41.3080
 ```
 
-同じ実行の構築・初回forward・読み戻し時間。上のmedianには含めない。
+同一実行におけるセットアップ・初回forward・読み戻し時間（medianには含まない）：
 
 | backend | パラメータ生成・構築・転送 | 初回forward | 初回出力の読み戻し |
 | --- | ---: | ---: | ---: |
@@ -59,13 +56,13 @@ DirectML:  33.0404,  32.9921,  32.2440,  34.4442,  33.8297,  42.9216,  41.3080
 | Vulkan | 478.523 ms | 84.947 ms | 0.489 ms |
 | DirectML | 501.270 ms | 138.646 ms | 0.291 ms |
 
-## DirectMLの変更前後
+## DirectMLのviewコピー削減前後
 
-旧経路はpacked QKVのK / Vのオフセット付き転置重みを、各768×768行列につき1要素ずつコピーしていた。12層では14,155,776個のcopy regionになる。
+旧実装ではpacked QKVのK / Vにおけるオフセット付き転置重みを、各768×768行列につき1要素ずつコピーしていたため、12層で計14,155,776個のcopy regionが発生していた。
 
-rank 4以下・16バイト境界のGEMMを直接バインドし、Add / Mulはゼロstrideでbroadcast、対応するGatherはIdentityで処理するよう変更した。offsetをcache keyから外し、同じ形のQ / K / Vで演算子を再利用する。非対応の配置はGPU上で実体化し、部分書込のScatterはbuffer copyを保つ。IdentityはScaleBiasを使わず、負のゼロとNaN payloadを保つ。
+これを改善するため、rank 4以下かつ16バイト境界に揃うGEMMの直接バインド、`Add` / `Mul` のゼロstrideブロードキャスト、および `Identity` 演算子を用いた非連続Gather（`ScaleBias` を使わず負のゼロやNaN payloadを保持）を実装した。また、offsetをcache keyから除外して同形状のQ / K / Vで演算子を再利用するようにした。
 
-別実行の`-workloads encoder -warmup 1 -iters 3`による中央値。
+別実行（`-workloads encoder -warmup 1 -iters 3`）による中央値比較：
 
 | backend | 変更前 | 変更後 |
 | --- | ---: | ---: |
@@ -73,19 +70,17 @@ rank 4以下・16バイト境界のGEMMを直接バインドし、Add / Mulは�
 | Vulkan | 39.667 ms | 35.939 ms |
 | DirectML | 7,070.639 ms | 32.930 ms |
 
-数秒規模のコピー記録は解消した。ただし3回測定のため、細かな差の評価には使わない。上の7回測定とは別の実行。
+数秒を要していたコピー処理のボトルネックは解消された（※3回測定の参考値）。
 
 ## DirectML複合演算内のバッチ化
 
-近似GELUの9 dispatch、LayerNorm / GroupNormの3 dispatchを、それぞれ1 command listへまとめた。warmup後のsubmit / フェンス待ちは9→1回、3→1回。計算式と演算間バリアは変えず、forward全体の非同期化は行っていない。
-
-cold時は全演算子を初期化してから実行用listを開く。同じ演算を繰り返す場合は独立したdescriptorスロットを使い、未実行のdescriptorを上書きしない。準備中の演算子はpinし、未キャッシュのものもフェンス完了まで保持する。近似GELUのwarm cacheは7演算子から9スロットとなり、通常のcache上限に数える。
+近似GELUの9 dispatch、およびLayerNorm / GroupNormの3 dispatchをそれぞれ1つのcommand listへ統合し、warmup後のsubmitとフェンス待ちを9→1回、3→1回へ削減した（演算間バリアは維持し、forward全体の非同期化は行っていない）。同一演算の反復時に未実行descriptorを上書きしないよう独立スロットを割り当て、実行完了まで演算子をpinする。
 
 ```sh
 go run ./cmd/gpu-infer-bench -workloads gelu,layernorm,encoder -warmup 2 -iters 7 -json
 ```
 
-前後を別プロセスで7回ずつ測定した。geluは`[1,74,3072]`のtanh近似、layernormは`[1,74,768]`の最終軸。
+別プロセスで7回ずつ測定した結果（`gelu` は `[1,74,3072]` のtanh近似、`layernorm` は `[1,74,768]` の最終軸）：
 
 | DirectML workload | 変更前 median / p95 | 変更後 median / p95 | 前後の中央値比 |
 | --- | ---: | ---: | ---: |
@@ -102,21 +97,17 @@ encoder before:  33.5330, 34.7472, 31.4275, 36.8871, 34.2618, 34.8019, 35.7983
 encoder after:   34.6284, 36.9622, 35.2579, 35.2272, 35.2707, 33.6217, 37.8502
 ```
 
-最大絶対誤差はGELU `4.77e-7`、LayerNorm `8.34e-7`、Encoder `8.11e-6`で前後とも同じ。コサイン0.999以上、使用中バッファの増加はなかった。
-
-Encoder全体の改善は確認できなかった。Encoderはerf式GELUを使うため近似GELUの変更は適用されず、正規化のsubmitだけが減る。同じ実行でCPUも532.0→552.7 ms、変更していないVulkanも35.9→40.6 msと変動した。変更後のLayerNorm単体はCPUの0.1475 msより遅い。
+最大絶対誤差（GELU `4.77e-7`、LayerNorm `8.34e-7`、Encoder `8.11e-6`）とメモリ消費量に変化はなかった。Encoder全体で改善が見られなかったのは、Encoderが近似GELUではなくerf式GELUを使用しているためである（変更後のLayerNorm単体はCPUの0.1475 msより遅い）。
 
 ## Vulkanのbias融合演算
 
-`gpu.FusedBiasBackend`でBiasGELU / BiasResidualを1 dispatchへ融合した。1次元biasと同shapeのresidualが対象。連続入力のdispatchとAlloc要求はそれぞれ3→1回となる。物理割当数はpool再利用による。
-
-GELUは従来と同じerf近似、残差加算は`(x + bias) + residual`の順序を保つ。非連続入力は必要なものだけGPUで連続化し、対象外のbroadcast、能力未実装、ErrUnsupportedは既存のGPU合成経路を使う。
+`gpu.FusedBiasBackend` により、1次元biasの `BiasGELU` と同shapeのresidualを加算する `BiasResidual` をそれぞれ1 dispatchへ融合し、連続入力時のdispatch数と `Alloc` 要求を3→1回に削減した。GELUはerf近似、残差加算は `(x + bias) + residual` の評価順を維持する。
 
 ```sh
 go run ./cmd/gpu-infer-bench -workloads bias_gelu,bias_residual,ffn,encoder -warmup 2 -iters 7 -json
 ```
 
-bias_geluは`[1,74,3072]`、bias_residualは`[1,74,768]`。前後を別プロセスで7回ずつ測定した。
+別プロセスで7回ずつ測定した結果（`bias_gelu` は `[1,74,3072]`、`bias_residual` は `[1,74,768]`）：
 
 | Vulkan workload | 変更前 median / p95 | 変更後 median / p95 | 前後の中央値比 |
 | --- | ---: | ---: | ---: |
@@ -136,14 +127,11 @@ encoder before:      40.2656, 43.8014, 41.6598, 37.9244, 38.6950, 39.4888, 39.87
 encoder after:       37.1714, 37.5938, 36.8934, 35.3774, 34.4226, 33.8998, 36.1015
 ```
 
-最大絶対誤差はBiasGELU `1.79e-7`、BiasResidual 0、FFN `2.68e-7`、Encoder `5.72e-6`で前後とも同じ。コサイン0.999以上、使用中バッファの増加はなかった。Encoderのgraph解放後のpool cacheは138,072,064→122,343,424 bytesに減った。
-
-BiasGELU単体は短縮したが、BiasResidualとFFNの中央値では改善を確認できなかった。Encoderは約9.5%短縮したものの、CPUも573.8→547.0 ms、変更していないDirectMLも33.8→43.3 msと変動した。
+最大絶対誤差（BiasGELU `1.79e-7`、BiasResidual `0`、FFN `2.68e-7`、Encoder `5.72e-6`）は変わらず、Encoderのgraph解放後のpool cacheは 138,072,064 → 122,343,424 bytes に減少した。別プロセス実行による環境変動も含まれるため、単純な前後差は参考値とする。
 
 ## 残る制約
 
-測定は常駐データのsteady stateで、初期化・重み転送込みの速度や、他のGPU・shapeでの速度は保証しない。前後の差を最適化だけの因果効果とは断定しない。
-
-現在は各submitでフェンスを待ち、forward全体の記録のまとめは未実装。カーネル融合にも改善余地がある。メモリ値は入力と重みが常駐した状態のgograd管理分であり、ピークやプロセス全体のVRAM量ではない。
-
-Linuxの実GPU計算・性能とAMD / Intel GPUは未検証。[Linux版の検証範囲](GPU_LINUX.md#検証した範囲)を参照。
+- 本測定は常駐データのsteady stateに対するものであり、初期化・データ転送込みの速度や他のGPU・形状での性能は保証しない。
+- 現在は各submitでフェンスを待機しており、forward全体のコマンド一括記録やさらなるカーネル融合に改善の余地がある。
+- メモリ使用量はgograd管理分のバッファのみを対象としており、プロセス全体のVRAM消費量ではない。
+- Linuxの実GPU計算およびAMD / Intel GPUは未検証である（詳細は [Linux版の検証範囲](GPU_LINUX.md#検証した範囲) を参照）。
