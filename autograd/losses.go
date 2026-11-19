@@ -83,18 +83,80 @@ func L1Loss(prediction, target *Tensor, options LossOptions) *Tensor {
 	return reduceLoss(Abs(Sub(prediction, target)), options, true)
 }
 
-// SmoothL1Loss is the mean or sum of the Huber loss with a unit transition:
-// 0.5*d^2 below |d|=1 and |d|-0.5 above it. It is written as
-// 0.5*d^2 - 0.5*relu(|d|-1)^2 so the existing elementwise rules supply the
-// gradient.
 func SmoothL1Loss(prediction, target *Tensor, options LossOptions) *Tensor {
-	dispatchBackend("smooth_l1_loss", prediction.Device)
+	useCUDA := dispatchBackend("smooth_l1_loss", prediction.Device)
 	same(prediction, target)
-	difference := Sub(prediction, target)
-	excess := ReLU(SubScalar(Abs(difference), 1))
-	squared := Mul(difference, difference)
-	clipped := Mul(excess, excess)
-	return reduceLoss(Sub(MulScalar(squared, .5), MulScalar(clipped, .5)), options, true)
+	shape := bshape(prediction.Shape, target.Shape)
+	if useCUDA {
+		if !slices.Equal(prediction.Shape, shape) {
+			prediction = Expand(prediction, shape...)
+		}
+		if !slices.Equal(target.Shape, shape) {
+			target = Expand(target, shape...)
+		}
+		return reduceLoss(gpuSmoothL1(prediction.Contiguous(), target.Contiguous()), options, true)
+	}
+	prediction, target = prediction.Contiguous(), target.Contiguous()
+	equal := slices.Equal(prediction.Shape, shape) && slices.Equal(target.Shape, shape)
+	indices := func(i int) (int, int) {
+		if equal {
+			return i, i
+		}
+		return bindex(i, shape, prediction.Shape), bindex(i, shape, target.Shape)
+	}
+	v := cpuAllocUninit(numel(shape))
+	parallelFor(len(v), func(start, end int) {
+		for i := start; i < end; i++ {
+			xi, ti := indices(i)
+			d := prediction.Data[xi] - target.Data[ti]
+			ad := float32(math.Abs(float64(d)))
+			if ad < 1 {
+				v[i] = .5 * d * d
+			} else {
+				v[i] = ad - .5
+			}
+		}
+	})
+	elementwise := result(v, shape, []*Tensor{prediction, target}, func(g []float32) {
+		var dx, dt []float32
+		if prediction.RequiresGrad {
+			dx = cpuAlloc(prediction.Numel())
+			defer cpuRelease(dx)
+		}
+		if target.RequiresGrad {
+			dt = cpuAlloc(target.Numel())
+			defer cpuRelease(dt)
+		}
+		back := func(start, end int) {
+			for i := start; i < end; i++ {
+				xi, ti := indices(i)
+				d := prediction.Data[xi] - target.Data[ti]
+				s := d
+				if !(float32(math.Abs(float64(d))) < 1) {
+					if d > 0 {
+						s = 1
+					} else if d < 0 {
+						s = -1
+					}
+				}
+				u := g[i] * s
+				if dx != nil {
+					dx[xi] += u
+				}
+				if dt != nil {
+					dt[ti] -= u
+				}
+			}
+		}
+		if equal {
+			parallelFor(len(g), back)
+		} else {
+			back(0, len(g))
+		}
+		prediction.addGrad(dx)
+		target.addGrad(dt)
+	})
+	return reduceLoss(elementwise, options, true)
 }
 
 // BCEWithLogitsLoss is the mean or sum of the binary cross-entropy of logits,

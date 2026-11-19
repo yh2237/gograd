@@ -1,12 +1,26 @@
 package tensor
 
 import (
+	"math/bits"
 	"os"
 	"runtime"
 	"sync"
 )
 
-var sgemmPools sync.Map
+const maxSGEMMPoolSize = 1 << 26
+
+var sgemmPools [81]sync.Pool
+
+func sgemmPoolBucket(n int) (int, int) {
+	if n <= 64 {
+		return 0, 64
+	}
+	shift := bits.Len(uint(n - 1))
+	base := 1 << (shift - 1)
+	step := 1 << (shift - 3)
+	sub := (n - 1 - base) / step
+	return 1 + (shift-7)*4 + sub, base + (sub+1)*step
+}
 
 // The 4x16 microkernel needs six loads per eight FMAs, one fewer per FMA than
 // 8x8. Set the environment variable to 0 to keep the 4x8 fallback.
@@ -57,15 +71,28 @@ func SGEMMPacked(c, a []float32, b *PackedB, m, maxWorkers int) {
 }
 
 func sgemmBuffer(n int) []float32 {
-	p, _ := sgemmPools.LoadOrStore(n, &sync.Pool{})
-	if v := p.(*sync.Pool).Get(); v != nil {
+	if n <= 0 {
+		return make([]float32, 0)
+	}
+	if n > maxSGEMMPoolSize {
+		return make([]float32, n)
+	}
+	idx, size := sgemmPoolBucket(n)
+	if v := sgemmPools[idx].Get(); v != nil {
 		return v.([]float32)[:n]
 	}
-	return make([]float32, n)
+	return make([]float32, n, size)
 }
 func releaseSGEMMBuffer(v []float32) {
-	p, _ := sgemmPools.LoadOrStore(len(v), &sync.Pool{})
-	p.(*sync.Pool).Put(v)
+	c := cap(v)
+	if c == 0 || c > maxSGEMMPoolSize {
+		return
+	}
+	idx, size := sgemmPoolBucket(c)
+	if c != size {
+		return
+	}
+	sgemmPools[idx].Put(v[:size])
 }
 
 // SGEMM computes C = A*B for contiguous row-major matrices.

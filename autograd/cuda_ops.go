@@ -287,7 +287,11 @@ func gpuReduceND(a *Tensor, s []int, selected []bool, mean bool) *Tensor {
 	n := int32(a.Numel())
 	scale := float32(1)
 	if mean {
-		scale /= float32(a.Numel() / numel(s))
+		if numel(s) > 0 {
+			if divisor := a.Numel() / numel(s); divisor > 0 {
+				scale = 1 / float32(divisor)
+			}
+		}
 	}
 	out := mustAlloc(numel(s))
 	if err := out.Memset(0, out.Size()); err != nil {

@@ -18,6 +18,40 @@ func storageIndex(flat int, shape, stride []int, offset int) int {
 	return j
 }
 
+func viewOverlaps(shape, stride []int) bool {
+	if numel(shape) == 0 {
+		return false
+	}
+	type axis struct{ stride, size int }
+	axes := make([]axis, 0, len(shape))
+	for i, dim := range shape {
+		if dim <= 1 {
+			continue
+		}
+		if stride[i] < 0 {
+			return true
+		}
+		axes = append(axes, axis{stride[i], dim})
+	}
+	for i := 1; i < len(axes); i++ {
+		cur := axes[i]
+		j := i
+		for j > 0 && axes[j-1].stride > cur.stride {
+			axes[j] = axes[j-1]
+			j--
+		}
+		axes[j] = cur
+	}
+	span := 1
+	for _, a := range axes {
+		if a.stride < span {
+			return true
+		}
+		span += (a.size - 1) * a.stride
+	}
+	return false
+}
+
 // gatherView copies a strided view into dst. The odometer advances the source
 // index one step at a time, so no division or modulo runs per element.
 func gatherView(dst, src []float32, shape, stride []int, offset int) {

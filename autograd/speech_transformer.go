@@ -20,9 +20,17 @@ func RotaryHalf(x *Tensor, theta float64) *Tensor {
 			si[pos*half+d] = float32(math.Sin(angle))
 		}
 	}
-	c, _ := New(co, []int{1, 1, seq, half}, x.Device, false)
-	s, _ := New(si, []int{1, 1, seq, half}, x.Device, false)
+	c, err := New(co, []int{1, 1, seq, half}, x.Device, false)
+	if err != nil {
+		panic(err)
+	}
+	s, err := New(si, []int{1, 1, seq, half}, x.Device, false)
+	if err != nil {
+		c.Close()
+		panic(err)
+	}
 	c.ephemeral, s.ephemeral = true, true
+	c.execution, s.execution = x.execution, x.execution
 	first, second := Slice(x, 3, 0, half), Slice(x, 3, half, 2*half)
 	return Concat(3, Sub(Mul(first, c), Mul(second, s)), Add(Mul(second, c), Mul(first, s)))
 }
@@ -47,7 +55,7 @@ func SwiGLUProjection(x, w1, w2, w3 *Tensor) *Tensor {
 	}
 	a := MatMul(x, Transpose(w1, 0, 1))
 	b := MatMul(x, Transpose(w3, 0, 1))
-	silu := Div(a, AddScalar(Exp(MulScalar(a, -1)), 1))
+	silu := Mul(a, Sigmoid(a))
 	return MatMul(Mul(silu, b), Transpose(w2, 0, 1))
 }
 
@@ -76,7 +84,11 @@ func KeyPaddingAttention(q, k, v *Tensor, valid []bool, radius int) *Tensor {
 			}
 		}
 	}
-	m, _ := New(mask, []int{batch, 1, queries, keys}, q.Device, false)
+	m, err := New(mask, []int{batch, 1, queries, keys}, q.Device, false)
+	if err != nil {
+		panic(err)
+	}
 	m.ephemeral = true
+	m.execution = q.execution
 	return ScaledDotProductAttention(q, k, v, m)
 }

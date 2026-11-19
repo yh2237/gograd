@@ -290,3 +290,20 @@ func TestSGEMMRandomized(t *testing.T) {
 		}
 	}
 }
+
+func TestSGEMMPoolBuckets(t *testing.T) {
+	for _, n := range []int{0, 1, 64, 65, 80, 128, 129, 4096, maxSGEMMPoolSize} {
+		buf := sgemmBuffer(n)
+		if len(buf) != n {
+			t.Fatalf("sgemmBuffer(%d): len=%d", n, len(buf))
+		}
+		if n > 0 {
+			idx, size := sgemmPoolBucket(n)
+			if idx < 0 || idx >= len(sgemmPools) || size < n || cap(buf) != size {
+				t.Fatalf("bucket(%d) = (%d, %d), cap=%d", n, idx, size, cap(buf))
+			}
+		}
+		releaseSGEMMBuffer(buf)
+	}
+	releaseSGEMMBuffer(make([]float32, 37))
+}

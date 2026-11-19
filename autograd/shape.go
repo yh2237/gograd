@@ -460,9 +460,7 @@ func MatMul(a, b *Tensor) *Tensor {
 	count := numel(batch)
 	aBatch, bBatch := a.Shape[:len(a.Shape)-2], b.Shape[:len(b.Shape)-2]
 	flatLinear := count > 1 && numel(aBatch) == count && numel(bBatch) == 1
-	// A transposed view of a contiguous matrix is already the layout SGEMM's
-	// transB path reads, and its batch stride stays k*n, so no copy is needed.
-	transposedB := !useCUDA && b.Offset == 0 && lastTwoTranspose(b.Shape, b.Strides, b.Offset)
+	transposedB := !useCUDA && b.Offset == 0 && len(b.Data) == b.Numel() && lastTwoTranspose(b.Shape, b.Strides, b.Offset)
 	if !transposedB {
 		b = b.Contiguous()
 	}

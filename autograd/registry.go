@@ -55,7 +55,7 @@ var operationRegistry = map[string]KernelPair{
 	"rms_norm_last":          {"Mean+Log+Exp+Mul", "reduce_nd+unary+binary"},
 	"rotary_half":            {"Slice+Mul+Concat", "view+binary+concat"},
 	"geglu":                  {"Slice+GELU+Mul", "view+unary+binary"},
-	"swiglu_projection":      {"MatMul+Exp+Mul", "cuBLAS+unary+binary"},
+	"swiglu_projection":      {"MatMul+Sigmoid+Mul", "cuBLAS+unary+binary"},
 	"key_padding_attention":  {"ScaledDotProductAttention", "attention"},
 	"softmax":                {"softmax", "softmax_f/b"},
 	"log_softmax":            {"softmax", "softmax_f/b"},
@@ -66,7 +66,7 @@ var operationRegistry = map[string]KernelPair{
 	"bias_residual":          {"Add", "bias_residual_f/b"},
 	"mse_loss":               {"Sub+Mul+Mean", "binary_f/b+reduce_nd_f/b"},
 	"l1_loss":                {"Sub+Abs+Mean", "binary_f/b+unary_f/b+reduce_nd_f/b"},
-	"smooth_l1_loss":         {"Sub+Abs+ReLU+Mul+Mean", "binary_f/b+unary_f/b+reduce_nd_f/b"},
+	"smooth_l1_loss":         {"smooth_l1", "smooth_l1_f/b"},
 	"bce_logits_loss":        {"ReLU+Sub+Mul+Exp+Log+Add+Mean", "unary_f/b+binary_f/b+reduce_nd_f/b"},
 }
 

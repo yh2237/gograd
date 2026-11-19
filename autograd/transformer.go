@@ -19,6 +19,9 @@ type MultiheadAttention struct {
 }
 
 func newParameter(shape []int, device tensor.Device, seed int64, scale float32) (*Tensor, error) {
+	if err := validateShape(shape); err != nil {
+		return nil, err
+	}
 	data := make([]float32, numel(shape))
 	rng := rand.New(rand.NewSource(seed))
 	for i := range data {
@@ -26,11 +29,21 @@ func newParameter(shape []int, device tensor.Device, seed int64, scale float32) 
 	}
 	return New(data, shape, device, true)
 }
+func closeParameters(params []Parameter) {
+	for _, p := range params {
+		if p.Value != nil {
+			p.Value.Close()
+		}
+	}
+}
+
 func NewMultiheadAttention(model, heads int, device tensor.Device) (*MultiheadAttention, error) {
 	if model < 1 || heads < 1 || model%heads != 0 {
 		return nil, fmt.Errorf("autograd: invalid attention dimensions")
 	}
 	m := &MultiheadAttention{Model: model, Heads: heads, Training: true}
+	m.Module.Training = true
+	m.Module.OnTrainingChange = func(training bool) { m.Training = training }
 	for i, p := range []struct {
 		name  string
 		shape []int
@@ -43,6 +56,7 @@ func NewMultiheadAttention(model, heads int, device tensor.Device) (*MultiheadAt
 	} {
 		v, e := newParameter(p.shape, device, int64(i+1), p.scale)
 		if e != nil {
+			closeParameters(m.Parameters)
 			return nil, e
 		}
 		m.Parameters = append(m.Parameters, Parameter{p.name, v})
@@ -93,12 +107,21 @@ type TransformerEncoderLayer struct {
 }
 
 func NewTransformerEncoderLayer(model, heads, feedForward int, device tensor.Device) (*TransformerEncoderLayer, error) {
+	if feedForward < 1 {
+		return nil, fmt.Errorf("autograd: invalid encoder feedForward dimension")
+	}
 	att, e := NewMultiheadAttention(model, heads, device)
 	if e != nil {
 		return nil, e
 	}
 	m := &TransformerEncoderLayer{Attention: att, Model: model, FeedForward: feedForward, Training: true}
+	m.Module.Training = true
+	m.Module.OnTrainingChange = func(training bool) { m.Training = training }
 	m.Children = []NamedModule{{"self_attn", &att.Module}}
+	cleanup := func() {
+		closeParameters(m.Parameters)
+		closeParameters(att.Parameters)
+	}
 	for i, p := range []struct {
 		name  string
 		shape []int
@@ -111,6 +134,7 @@ func NewTransformerEncoderLayer(model, heads, feedForward int, device tensor.Dev
 	} {
 		v, e := newParameter(p.shape, device, int64(100+i), p.scale)
 		if e != nil {
+			cleanup()
 			return nil, e
 		}
 		if p.name == "norm1.weight" || p.name == "norm2.weight" {
@@ -119,6 +143,8 @@ func NewTransformerEncoderLayer(model, heads, feedForward int, device tensor.Dev
 				ones[j] = 1
 			}
 			if e := v.CopyFrom(ones); e != nil {
+				v.Close()
+				cleanup()
 				return nil, e
 			}
 		}

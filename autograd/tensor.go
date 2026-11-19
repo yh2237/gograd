@@ -6,6 +6,7 @@ import (
 	"github.com/yh2237/gograd/cuda"
 	"github.com/yh2237/gograd/tensor"
 	"math"
+	"math/bits"
 	"runtime"
 	"slices"
 	"sync"
@@ -79,7 +80,20 @@ func (t *Tensor) IsContiguous() bool {
 	return true
 }
 
-var cpuPools sync.Map
+const maxCPUPoolSize = 1 << 26
+
+var cpuPools [81]sync.Pool
+
+func cpuPoolBucket(n int) (int, int) {
+	if n <= 64 {
+		return 0, 64
+	}
+	shift := bits.Len(uint(n - 1))
+	base := 1 << (shift - 1)
+	step := 1 << (shift - 3)
+	sub := (n - 1 - base) / step
+	return 1 + (shift-7)*4 + sub, base + (sub+1)*step
+}
 
 func cpuAlloc(n int) []float32 {
 	out := cpuAllocUninit(n)
@@ -87,21 +101,30 @@ func cpuAlloc(n int) []float32 {
 	return out
 }
 
-// cpuAllocUninit skips the clear for callers that overwrite every element
-// before reading it.
 func cpuAllocUninit(n int) []float32 {
-	p, _ := cpuPools.LoadOrStore(n, &sync.Pool{})
-	if v := p.(*sync.Pool).Get(); v != nil {
+	if n <= 0 {
+		return make([]float32, 0)
+	}
+	if n > maxCPUPoolSize {
+		return make([]float32, n)
+	}
+	idx, size := cpuPoolBucket(n)
+	if v := cpuPools[idx].Get(); v != nil {
 		return v.([]float32)[:n]
 	}
-	return make([]float32, n)
+	return make([]float32, n, size)
 }
+
 func cpuRelease(v []float32) {
-	if v == nil {
+	c := cap(v)
+	if c == 0 || c > maxCPUPoolSize {
 		return
 	}
-	p, _ := cpuPools.LoadOrStore(len(v), &sync.Pool{})
-	p.(*sync.Pool).Put(v)
+	idx, size := cpuPoolBucket(c)
+	if c != size {
+		return
+	}
+	cpuPools[idx].Put(v[:size])
 }
 
 // ReleaseGraph requests reclamation of this graph's intermediates. A node still
@@ -197,6 +220,17 @@ func floatBytes(data []float32) []byte {
 	}
 	return unsafe.Slice((*byte)(unsafe.Pointer(&data[0])), len(data)*4)
 }
+
+func slicesOverlap(a, b []float32) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	a0 := uintptr(unsafe.Pointer(&a[0]))
+	a1 := uintptr(unsafe.Pointer(&a[len(a)-1]))
+	b0 := uintptr(unsafe.Pointer(&b[0]))
+	b1 := uintptr(unsafe.Pointer(&b[len(b)-1]))
+	return a0 <= b1 && b0 <= a1
+}
 func (t *Tensor) Numel() int { return numel(t.Shape) }
 func (t *Tensor) ToHost() ([]float32, error) {
 	if err := t.checkOpen(); err != nil {
@@ -260,7 +294,14 @@ func (t *Tensor) CopyFrom(data []float32) error {
 	}
 	if t.Device == tensor.CPU {
 		if !t.IsContiguous() {
-			for i, v := range data {
+			if viewOverlaps(t.Shape, t.Strides) {
+				return errors.New("autograd: CopyFrom requires a non-overlapping view")
+			}
+			src := data
+			if slicesOverlap(t.Data, data) {
+				src = append([]float32(nil), data...)
+			}
+			for i, v := range src {
 				t.Data[storageIndex(i, t.Shape, t.Strides, t.Offset)] = v
 			}
 			t.storage.version.Add(1)
