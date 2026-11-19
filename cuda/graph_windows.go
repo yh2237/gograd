@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
@@ -32,10 +33,13 @@ type launchState struct {
 	stream    uintptr
 	streamRef *Stream
 	capturing bool
+	captureID uint64
 	// touched marks pool pointers used while this thread captures a graph. It
 	// stays per thread so two concurrent captures cannot clobber each other.
 	touched map[uintptr]int
 }
+
+var nextCaptureID atomic.Uint64
 
 var launchStates sync.Map // uintptr -> *launchState
 
@@ -69,6 +73,8 @@ func currentStreamHandle() uintptr {
 // Driver calls that capture forbids, such as setting the device, must be avoided
 // while it is true.
 func InCapture() bool { return launchStateForThread().capturing }
+
+func CaptureID() uint64 { return launchStateForThread().captureID }
 
 // SetCurrentStream routes kernel launches that do not name a stream to s on the
 // calling OS thread. Pass nil to use the default stream.
@@ -138,12 +144,14 @@ func Capture(stream *Stream, fn func() error) (*Graph, error) {
 	previous, previousRef := state.stream, state.streamRef
 	state.stream, state.streamRef = stream.handle, stream
 	state.capturing = true
+	state.captureID = nextCaptureID.Add(1)
 	poolMu.Lock()
 	state.touched = map[uintptr]int{}
 	poolMu.Unlock()
 	defer func() {
 		state.stream, state.streamRef = previous, previousRef
 		state.capturing = false
+		state.captureID = 0
 		poolMu.Lock()
 		state.touched = nil
 		poolMu.Unlock()

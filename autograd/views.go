@@ -182,7 +182,7 @@ func makeView(a *Tensor, shape, stride []int, offset int) *Tensor {
 	if !req {
 		return v
 	}
-	identity := offset == 0
+	identity := offset == 0 && numel(shape) == a.Numel()
 	want := strides(shape)
 	for i := range want {
 		if stride[i] != want[i] {
@@ -213,12 +213,10 @@ func makeView(a *Tensor, shape, stride []int, offset int) *Tensor {
 		}
 	} else {
 		v.backwardGPU = func(g *cuda.Buffer) {
-			if dst := a.ensureGradGPU(); dst != nil {
-				if identity {
-					addDevice(dst, g, v.Numel())
-				} else {
-					gpuViewScatter(g, dst, v.Shape, v.Strides, v.Offset)
-				}
+			if identity {
+				a.copyOrAddGradGPU(g, v.Numel())
+			} else if dst := a.ensureGradGPU(); dst != nil {
+				gpuViewScatter(g, dst, v.Shape, v.Strides, v.Offset)
 			}
 		}
 	}
@@ -255,9 +253,7 @@ func (t *Tensor) Contiguous() *Tensor {
 	out := mustAlloc(n)
 	gpuViewGather(t.buf, out, t.Shape, t.Strides, t.Offset)
 	res := resultGPU(out, append([]int(nil), t.Shape...), []*Tensor{t}, func(g *cuda.Buffer) {
-		if dst := t.ensureGradGPU(); dst != nil {
-			addDevice(dst, g, n)
-		}
+		t.copyOrAddGradGPU(g, n)
 	})
 	if executionOptions(t).BF16Autocast && t.currentBF16() != nil {
 		shadow := allocBF16(n)

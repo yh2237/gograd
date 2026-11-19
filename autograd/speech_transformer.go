@@ -53,10 +53,10 @@ func SwiGLUProjection(x, w1, w2, w3 *Tensor) *Tensor {
 	if len(x.Shape) < 2 || len(w1.Shape) != 2 || len(w2.Shape) != 2 || len(w3.Shape) != 2 || w1.Shape[0] != w3.Shape[0] || w1.Shape[1] != x.Shape[len(x.Shape)-1] || w3.Shape[1] != w1.Shape[1] || w2.Shape[1] != w1.Shape[0] || w2.Shape[0] != w1.Shape[1] {
 		panic("autograd: invalid SwiGLU shape")
 	}
-	a := MatMul(x, Transpose(w1, 0, 1))
-	b := MatMul(x, Transpose(w3, 0, 1))
+	a := matMulTransB(x, w1)
+	b := matMulTransB(x, w3)
 	silu := Mul(a, Sigmoid(a))
-	return MatMul(Mul(silu, b), Transpose(w2, 0, 1))
+	return matMulTransB(Mul(silu, b), w2)
 }
 
 // KeyPaddingAttention converts a boolean key mask to an additive attention

@@ -214,7 +214,7 @@ func NewLinearLayer(in, out int, device tensor.Device, rng *rand.Rand) (*LinearL
 func (l *LinearLayer) StateModule() *Module { return &l.Module }
 func (l *LinearLayer) Train(training bool)  { l.Module.Train(training) }
 func (l *LinearLayer) Forward(x *Tensor) *Tensor {
-	return Add(MatMul(x, Transpose(l.Weight, 0, 1)), l.Bias)
+	return Add(matMulTransB(x, l.Weight), l.Bias)
 }
 
 type DropoutLayer struct {

@@ -94,6 +94,11 @@ func gpuBatchNorm(x, w, b, mean, variance, count *Tensor, o BatchNormOptions, s 
 		variance.invalidateBF16()
 	}
 	launchBatchNorm("bn_f", (x.Numel()+255)/256, 256, unsafe.Pointer(&xp), unsafe.Pointer(&wp), unsafe.Pointer(&bp), unsafe.Pointer(&sp), unsafe.Pointer(&yp), unsafe.Pointer(&n), unsafe.Pointer(&channels), unsafe.Pointer(&inner))
+	_, recording := graphRecording(parents)
+	if !recording {
+		stats.Free()
+		return resultGPU(out, x.Shape, parents, nil)
+	}
 	saved := &Tensor{buf: stats, storage: deviceStorage(stats), Shape: []int{2, s.channels}, Strides: []int{s.channels, 1}, DType: Float32, Device: tensor.CUDA, execution: context, ephemeral: true}
 	return resultGPUWithSaved(out, x.Shape, parents, []*Tensor{saved}, func(g *cuda.Buffer) {
 		sums := mustAlloc(2 * s.channels)

@@ -74,6 +74,85 @@ func (m *MultiheadAttention) param(name string) *Tensor {
 func (m *MultiheadAttention) Forward(q, k, v, mask *Tensor) *Tensor {
 	return m.ForwardSeed(q, k, v, mask, 0)
 }
+func cpuSplitHeads(x *Tensor, b, t, heads, dim, parts, which int) *Tensor {
+	x = x.Contiguous()
+	out := cpuAllocUninit(b * heads * t * dim)
+	model := heads * dim
+	stride := parts * model
+	offset := which * model
+	parallelForWork(b*heads*t, dim, func(start, end int) {
+		for idx := start; idx < end; idx++ {
+			ti := idx % t
+			tmp := idx / t
+			h := tmp % heads
+			bi := tmp / heads
+			src := (bi*t+ti)*stride + offset + h*dim
+			copy(out[idx*dim:(idx+1)*dim], x.Data[src:src+dim])
+		}
+	})
+	return result(out, []int{b, heads, t, dim}, []*Tensor{x}, func(g []float32) {
+		if !x.RequiresGrad {
+			return
+		}
+		if x.Grad == nil {
+			x.Grad = make([]float32, x.Numel())
+		}
+		grad := x.Grad
+		parallelForWork(b*heads*t, dim, func(start, end int) {
+			for idx := start; idx < end; idx++ {
+				ti := idx % t
+				tmp := idx / t
+				h := tmp % heads
+				bi := tmp / heads
+				dst := (bi*t+ti)*stride + offset + h*dim
+				src := idx * dim
+				for d := 0; d < dim; d++ {
+					grad[dst+d] += g[src+d]
+				}
+			}
+		})
+	})
+}
+
+func cpuMergeHeads(x *Tensor, b, t, heads, dim int) *Tensor {
+	x = x.Contiguous()
+	out := cpuAllocUninit(b * t * heads * dim)
+	model := heads * dim
+	parallelForWork(b*t*heads, dim, func(start, end int) {
+		for idx := start; idx < end; idx++ {
+			h := idx % heads
+			tmp := idx / heads
+			ti := tmp % t
+			bi := tmp / t
+			src := ((bi*heads+h)*t + ti) * dim
+			dst := (bi*t+ti)*model + h*dim
+			copy(out[dst:dst+dim], x.Data[src:src+dim])
+		}
+	})
+	return result(out, []int{b, t, model}, []*Tensor{x}, func(g []float32) {
+		if !x.RequiresGrad {
+			return
+		}
+		if x.Grad == nil {
+			x.Grad = make([]float32, x.Numel())
+		}
+		grad := x.Grad
+		parallelForWork(b*t*heads, dim, func(start, end int) {
+			for idx := start; idx < end; idx++ {
+				h := idx % heads
+				tmp := idx / heads
+				ti := tmp % t
+				bi := tmp / t
+				dst := ((bi*heads+h)*t + ti) * dim
+				src := (bi*t+ti)*model + h*dim
+				for d := 0; d < dim; d++ {
+					grad[dst+d] += g[src+d]
+				}
+			}
+		})
+	})
+}
+
 func (m *MultiheadAttention) ForwardSeed(q, k, v, mask *Tensor, seed uint32) *Tensor {
 	if inferenceDevice(q.Device) && m.Training {
 		panic(gpu.ErrInferenceOnly)
@@ -82,19 +161,60 @@ func (m *MultiheadAttention) ForwardSeed(q, k, v, mask *Tensor, seed uint32) *Te
 		panic("autograd: attention shape")
 	}
 	b, t, source := q.Shape[0], q.Shape[1], k.Shape[1]
+	headDim := m.Model / m.Heads
 	weight, bias := m.param("in_proj_weight"), m.param("in_proj_bias")
-	project := func(x *Tensor, start int) *Tensor {
-		w := Slice(weight, 0, start, start+m.Model)
-		z := MatMul(x, Transpose(w, 0, 1))
-		return Add(z, Slice(bias, 0, start, start+m.Model))
+	var qh, kh, vh *Tensor
+	if q == k && k == v {
+		qkv := Add(matMulTransB(q, weight), bias)
+		switch q.Device {
+		case tensor.CUDA:
+			qh = gpuSplitHeads(qkv, b, t, m.Heads, headDim, 3, 0)
+			kh = gpuSplitHeads(qkv, b, t, m.Heads, headDim, 3, 1)
+			vh = gpuSplitHeads(qkv, b, t, m.Heads, headDim, 3, 2)
+		case tensor.CPU:
+			qh = cpuSplitHeads(qkv, b, t, m.Heads, headDim, 3, 0)
+			kh = cpuSplitHeads(qkv, b, t, m.Heads, headDim, 3, 1)
+			vh = cpuSplitHeads(qkv, b, t, m.Heads, headDim, 3, 2)
+		default:
+			offStep := m.Model
+			if b == 0 || t == 0 {
+				offStep = 0
+			}
+			viewShape := []int{b, m.Heads, t, headDim}
+			viewStrides := []int{t * 3 * m.Model, headDim, 3 * m.Model, 1}
+			qh = makeView(qkv, viewShape, viewStrides, 0)
+			kh = makeView(qkv, viewShape, viewStrides, offStep)
+			vh = makeView(qkv, viewShape, viewStrides, 2*offStep)
+		}
+	} else {
+		project := func(x *Tensor, start, seq int) *Tensor {
+			w := Slice(weight, 0, start, start+m.Model)
+			z := Add(matMulTransB(x, w), Slice(bias, 0, start, start+m.Model))
+			switch x.Device {
+			case tensor.CUDA:
+				return gpuSplitHeads(z, b, seq, m.Heads, headDim, 1, 0)
+			case tensor.CPU:
+				return cpuSplitHeads(z, b, seq, m.Heads, headDim, 1, 0)
+			default:
+				return Permute(Reshape(z, b, seq, m.Heads, headDim), 0, 2, 1, 3)
+			}
+		}
+		qh, kh, vh = project(q, 0, t), project(k, m.Model, source), project(v, 2*m.Model, source)
 	}
-	qh, kh, vh := project(q, 0), project(k, m.Model), project(v, 2*m.Model)
-	toHeads := func(x *Tensor, seq int) *Tensor {
-		return Permute(Reshape(x, b, seq, m.Heads, m.Model/m.Heads), 0, 2, 1, 3)
+	att := attentionWithDropout(qh, kh, vh, mask, m.Dropout, seed, m.Training)
+	if len(att.Shape) != 4 || att.Shape[0] != b || att.Shape[1] != m.Heads || att.Shape[2] != t || att.Shape[3] != headDim {
+		panic("autograd: reshape size")
 	}
-	att := attentionWithDropout(toHeads(qh, t), toHeads(kh, source), toHeads(vh, source), mask, m.Dropout, seed, m.Training)
-	merged := Reshape(Permute(att, 0, 2, 1, 3), b, t, m.Model)
-	return Add(MatMul(merged, Transpose(m.param("out_proj.weight"), 0, 1)), m.param("out_proj.bias"))
+	var merged *Tensor
+	switch q.Device {
+	case tensor.CUDA:
+		merged = gpuMergeHeads(att, b, t, m.Heads, headDim)
+	case tensor.CPU:
+		merged = cpuMergeHeads(att, b, t, m.Heads, headDim)
+	default:
+		merged = Reshape(Permute(att, 0, 2, 1, 3), b, t, m.Model)
+	}
+	return Add(matMulTransB(merged, m.param("out_proj.weight")), m.param("out_proj.bias"))
 }
 
 // TransformerEncoderLayer is the pre-norm, batch-first encoder variant.
@@ -168,9 +288,9 @@ func (m *TransformerEncoderLayer) Forward(x, mask *Tensor, stepSeed uint32) *Ten
 	h = m.Attention.ForwardSeed(h, h, h, mask, stepSeed+3)
 	x = Add(x, Dropout(h, m.Dropout, stepSeed, m.Training))
 	h = LayerNorm(x, m.param("norm2.weight"), m.param("norm2.bias"), 1e-5)
-	h = BiasGELU(MatMul(h, Transpose(m.param("linear1.weight"), 0, 1)), m.param("linear1.bias"))
+	h = BiasGELU(matMulTransB(h, m.param("linear1.weight")), m.param("linear1.bias"))
 	h = Dropout(h, m.Dropout, stepSeed+1, m.Training)
-	h = MatMul(h, Transpose(m.param("linear2.weight"), 0, 1))
+	h = matMulTransB(h, m.param("linear2.weight"))
 	if !m.Training || m.Dropout == 0 {
 		return BiasResidual(h, m.param("linear2.bias"), x)
 	}

@@ -139,12 +139,22 @@ func gpuConv1dStride(x, w, b *Tensor, bs, length, ci, co, k, outLength, rows, de
 			})
 		}
 	})
-	r.aux = []*cuda.Buffer{cols}
-	if cols16 != nil {
-		r.aux = append(r.aux, cols16)
-	}
-	if wLease != nil {
-		r.savedLeases = append(r.savedLeases, wLease)
+	if r.RequiresGrad {
+		r.aux = []*cuda.Buffer{cols}
+		if cols16 != nil {
+			r.aux = append(r.aux, cols16)
+		}
+		if wLease != nil {
+			r.savedLeases = append(r.savedLeases, wLease)
+		}
+	} else {
+		cols.Free()
+		if cols16 != nil {
+			cols16.Free()
+		}
+		if wLease != nil {
+			wLease.release()
+		}
 	}
 	return r
 }

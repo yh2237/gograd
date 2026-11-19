@@ -37,31 +37,58 @@ func gpuAttention(q, k, v, mask *Tensor, options ExecutionOptions) *Tensor {
 	}
 	scores, probs, out := mustAlloc(count*m*n), mustAlloc(count*m*n), mustAlloc(count*m*e)
 	qa, ka, va, sa, pa, oa := ptr(q.buf), ptr(k.buf), ptr(v.buf), ptr(scores), ptr(probs), ptr(out)
+	nonEmptyScores := count > 0 && m > 0 && n > 0
 	var q16, k16, v16 uintptr
 	var qLease, kLease, vLease *tensorStorage
-	if options.BF16Autocast {
+	if options.BF16Autocast && nonEmptyScores {
 		q16, qLease = q.ensureBF16Lease()
 		k16, kLease = k.ensureBF16Lease()
-		v16, vLease = v.ensureBF16Lease()
+		if e > 0 {
+			v16, vLease = v.ensureBF16Lease()
+		}
 	}
-	timedGPU("attn_qk", func() error {
-		return options.gemmBatchedPrepared(m, n, d, false, true, qa, q16, int64(m*d), ka, k16, int64(n*d), sa, int64(m*n), count, 0)
-	})
-	rows, dim, scale := int32(count*m), int32(n), float32(1/math.Sqrt(float64(d)))
-	launch("attn_softmax_f", int(rows)*32, unsafe.Pointer(&sa), unsafe.Pointer(&maskPtr), unsafe.Pointer(&pa), unsafe.Pointer(&rows), unsafe.Pointer(&dim), unsafe.Pointer(&scale), unsafe.Pointer(&shape), unsafe.Pointer(&ms))
-	scores.Free()
 	var probs16 *cuda.Buffer
-	if options.BF16Autocast {
-		probs16 = castBF16(pa, count*m*n)
+	rows, dim, scale := int32(count*m), int32(n), float32(1/math.Sqrt(float64(d)))
+	if nonEmptyScores {
+		if d == 0 {
+			if err := scores.Memset(0, scores.Size()); err != nil {
+				panic(err)
+			}
+		} else {
+			timedGPU("attn_qk", func() error {
+				return options.gemmBatchedPrepared(m, n, d, false, true, qa, q16, int64(m*d), ka, k16, int64(n*d), sa, int64(m*n), count, 0)
+			})
+		}
+		if options.BF16Autocast {
+			probs16 = allocBF16(count * m * n)
+		}
+		p16 := ptr(probs16)
+		launch("attn_softmax_f", int(rows)*32, unsafe.Pointer(&sa), unsafe.Pointer(&maskPtr), unsafe.Pointer(&pa), unsafe.Pointer(&p16), unsafe.Pointer(&rows), unsafe.Pointer(&dim), unsafe.Pointer(&scale), unsafe.Pointer(&shape), unsafe.Pointer(&ms))
+		if e > 0 {
+			timedGPU("attn_pv", func() error {
+				return options.gemmBatchedPrepared(m, e, n, false, false, pa, p16, int64(m*n), va, v16, int64(n*e), oa, int64(m*e), count, 0)
+			})
+		}
+	} else if count > 0 && m > 0 && e > 0 {
+		if err := out.Memset(0, out.Size()); err != nil {
+			panic(err)
+		}
 	}
-	timedGPU("attn_pv", func() error {
-		return options.gemmBatchedPrepared(m, e, n, false, false, pa, ptr(probs16), int64(m*n), va, v16, int64(n*e), oa, int64(m*e), count, 0)
-	})
+	scores.Free()
 	parents := []*Tensor{q, k, v}
 	if mask != nil {
 		parents = append(parents, mask)
 	}
 	r := resultGPU(out, outShape, parents, func(g *cuda.Buffer) {
+		if !nonEmptyScores || e == 0 {
+			q.ensureGradGPU()
+			k.ensureGradGPU()
+			v.ensureGradGPU()
+			if mask != nil {
+				mask.ensureGradGPU()
+			}
+			return
+		}
 		gp := ptr(g)
 		var g16 *cuda.Buffer
 		if options.BF16Autocast {
@@ -88,32 +115,45 @@ func gpuAttention(q, k, v, mask *Tensor, options ExecutionOptions) *Tensor {
 		if mask != nil {
 			dmask = ptr(mask.ensureGradGPU())
 		}
-		launch("attn_softmax_b", int(rows)*32, unsafe.Pointer(&pa), unsafe.Pointer(&dpp), unsafe.Pointer(&dsp), unsafe.Pointer(&dmask), unsafe.Pointer(&rows), unsafe.Pointer(&dim), unsafe.Pointer(&scale), unsafe.Pointer(&shape), unsafe.Pointer(&ms))
 		var ds16 *cuda.Buffer
 		if options.BF16Autocast {
-			ds16 = castBF16(dsp, count*m*n)
+			ds16 = allocBF16(count * m * n)
 			defer ds16.Free()
 		}
-		if dq := q.ensureGradGPU(); dq != nil {
+		ds16p := ptr(ds16)
+		launch("attn_softmax_b", int(rows)*32, unsafe.Pointer(&pa), unsafe.Pointer(&dpp), unsafe.Pointer(&dsp), unsafe.Pointer(&ds16p), unsafe.Pointer(&dmask), unsafe.Pointer(&rows), unsafe.Pointer(&dim), unsafe.Pointer(&scale), unsafe.Pointer(&shape), unsafe.Pointer(&ms))
+		if dq := q.ensureGradGPU(); dq != nil && d > 0 {
 			qp := ptr(dq)
 			timedGPU("attn_dq", func() error {
-				return options.gemmBatchedPrepared(m, d, n, false, false, dsp, ptr(ds16), int64(m*n), ka, k16, int64(n*d), qp, int64(m*d), count, 1)
+				return options.gemmBatchedPrepared(m, d, n, false, false, dsp, ds16p, int64(m*n), ka, k16, int64(n*d), qp, int64(m*d), count, 1)
 			})
 		}
-		if dk := k.ensureGradGPU(); dk != nil {
+		if dk := k.ensureGradGPU(); dk != nil && d > 0 {
 			kp := ptr(dk)
 			timedGPU("attn_dk", func() error {
-				return options.gemmBatchedPrepared(n, d, m, true, false, dsp, ptr(ds16), int64(m*n), qa, q16, int64(m*d), kp, int64(n*d), count, 1)
+				return options.gemmBatchedPrepared(n, d, m, true, false, dsp, ds16p, int64(m*n), qa, q16, int64(m*d), kp, int64(n*d), count, 1)
 			})
 		}
 	})
-	r.aux = []*cuda.Buffer{probs}
-	if probs16 != nil {
-		r.aux = append(r.aux, probs16)
-	}
-	for _, lease := range []*tensorStorage{qLease, kLease, vLease} {
-		if lease != nil {
-			r.savedLeases = append(r.savedLeases, lease)
+	if r.RequiresGrad {
+		r.aux = []*cuda.Buffer{probs}
+		if probs16 != nil {
+			r.aux = append(r.aux, probs16)
+		}
+		for _, lease := range []*tensorStorage{qLease, kLease, vLease} {
+			if lease != nil {
+				r.savedLeases = append(r.savedLeases, lease)
+			}
+		}
+	} else {
+		probs.Free()
+		if probs16 != nil {
+			probs16.Free()
+		}
+		for _, lease := range []*tensorStorage{qLease, kLease, vLease} {
+			if lease != nil {
+				lease.release()
+			}
 		}
 	}
 	return r

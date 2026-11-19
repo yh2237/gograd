@@ -36,6 +36,7 @@ func (t *Tensor) dropBF16() {
 	if t.bf16Storage != nil {
 		t.bf16Storage.release()
 		t.bf16Storage = nil
+		t.bf16CaptureID = 0
 	}
 }
 
@@ -54,6 +55,7 @@ func (t *Tensor) setBF16(buffer *cuda.Buffer) {
 	if buffer != nil {
 		t.bf16Storage = deviceStorage(buffer)
 		t.bf16Version = t.storage.version.Load()
+		t.bf16CaptureID = cuda.CaptureID()
 	}
 }
 
@@ -61,6 +63,7 @@ func (t *Tensor) shareBF16(parent *Tensor) {
 	if parent.currentBF16() != nil {
 		t.bf16Storage = parent.bf16Storage.acquire()
 		t.bf16Version = parent.bf16Version
+		t.bf16CaptureID = parent.bf16CaptureID
 	}
 }
 
@@ -76,6 +79,13 @@ func (t *Tensor) ensureBF16() *cuda.Buffer {
 // to it: invalidating the shadow between the forward and the backward must not
 // free the memory the backward still reads.
 func (t *Tensor) ensureBF16Lease() (uintptr, *tensorStorage) {
+	if captureID := cuda.CaptureID(); captureID != 0 {
+		if t.intermediate && t.bf16CaptureID == captureID && t.currentBF16() != nil {
+			return ptr(t.bf16Storage.buffer), t.bf16Storage.acquire()
+		}
+		buf := castBF16(ptr(t.buf), t.Numel())
+		return ptr(buf), deviceStorage(buf)
+	}
 	buffer := t.ensureBF16()
 	if t.bf16Storage == nil {
 		return 0, nil

@@ -108,82 +108,486 @@ extern "C" __global__ void reduce_scalar_f(const float* x,float* y,int n,float s
 }
 __device__ float warp_sum(float x){for(int delta=16;delta>0;delta>>=1)x+=__shfl_down_sync(0xffffffff,x,delta);return __shfl_sync(0xffffffff,x,0);}
 __device__ float warp_max(float x){for(int delta=16;delta>0;delta>>=1){float o=__shfl_down_sync(0xffffffff,x,delta);x=(isnan(x)||isnan(o))?__int_as_float(0x7fc00000):fmaxf(x,o);}return __shfl_sync(0xffffffff,x,0);}
-extern "C" __global__ void softmax_f(const float* x,float* y,int rows,int dim,int inner,int logmode){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int o=row/inner,j=row%inner,base=o*dim*inner+j;float mx=-__int_as_float(0x7f800000);for(int k=lane;k<dim;k+=32){float v=x[base+k*inner];mx=isnan(v)?v:fmaxf(mx,v);}mx=warp_max(mx);float sum=0;for(int k=lane;k<dim;k+=32)sum+=expf(x[base+k*inner]-mx);sum=warp_sum(sum);float ls=logf(sum);for(int k=lane;k<dim;k+=32){int idx=base+k*inner;y[idx]=logmode?x[idx]-mx-ls:expf(x[idx]-mx)/sum;}}
-extern "C" __global__ void softmax_b(const float* y,const float* g,float* dx,int rows,int dim,int inner,int logmode){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int o=row/inner,j=row%inner,base=o*dim*inner+j;float dot=0;for(int k=lane;k<dim;k+=32){int idx=base+k*inner;dot+=g[idx]*(logmode?1.0f:y[idx]);}dot=warp_sum(dot);for(int k=lane;k<dim;k+=32){int idx=base+k*inner;dx[idx]+=logmode?g[idx]-expf(y[idx])*dot:y[idx]*(g[idx]-dot);}}
-extern "C" __global__ void attn_softmax_f(const float* scores,const float* mask,float* probs,int rows,int dim,float scale,Axes6 shape,Axes6 ms){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int base=row*dim;float mx=-__int_as_float(0x7f800000);for(int k=lane;k<dim;k+=32){int i=base+k;float z=scores[i]*scale+(mask?mask[view_index(i,shape,ms,0)]:0.0f);mx=isnan(z)?z:fmaxf(mx,z);}mx=warp_max(mx);float sum=0;for(int k=lane;k<dim;k+=32){int i=base+k;float z=scores[i]*scale+(mask?mask[view_index(i,shape,ms,0)]:0.0f);sum+=expf(z-mx);}sum=warp_sum(sum);for(int k=lane;k<dim;k+=32){int i=base+k;float z=scores[i]*scale+(mask?mask[view_index(i,shape,ms,0)]:0.0f);probs[i]=expf(z-mx)/sum;}}
-extern "C" __global__ void attn_softmax_b(const float* probs,const float* dp,float* ds,float* dmask,int rows,int dim,float scale,Axes6 shape,Axes6 ms){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int base=row*dim;float dot=0;for(int k=lane;k<dim;k+=32){int i=base+k;dot+=probs[i]*dp[i];}dot=warp_sum(dot);for(int k=lane;k<dim;k+=32){int i=base+k;float z=probs[i]*(dp[i]-dot);ds[i]=z*scale;if(dmask)atomicAdd(&dmask[view_index(i,shape,ms,0)],z);}}
-// One warp owns one query row. Its online normalizer and output accumulator
-// stay in registers; only two scalars per query are saved for backward.
-extern "C" __global__ void flash_attention_f(const float* q,const float* k,const float* v,const float* mask,float* out,float* stats,int rows,int nq,int nk,int d,int e,float scale,Axes6 shape,Axes6 ms){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int batch=row/nq,qi=row%nq;const float* qr=q+row*d;float mx=-3.402823466e38f,den=0.0f;for(int key=0;key<nk;key++){const float* kr=k+(batch*nk+key)*d;float dot=0.0f;for(int j=lane;j<d;j+=32)dot+=qr[j]*kr[j];float score=warp_sum(dot)*scale;if(mask)score+=mask[view_index(row*nk+key,shape,ms,0)];float next=fmaxf(mx,score),old=expf(mx-next),p=expf(score-next);den=den*old+p;mx=next;for(int c=lane;c<e;c+=32){float previous=key==0?0.0f:out[row*e+c];out[row*e+c]=previous*old+p*v[(batch*nk+key)*e+c];}}for(int c=lane;c<e;c+=32)out[row*e+c]/=den;if(lane==0){stats[row*2]=mx;stats[row*2+1]=den;}}
-extern "C" __global__ void flash_attention_b(const float* q,const float* k,const float* v,const float* mask,const float* out,const float* stats,const float* g,float* dq,float* dk,float* dv,float* dmask,int rows,int nq,int nk,int d,int e,float scale,Axes6 shape,Axes6 ms){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int batch=row/nq;const float* qr=q+row*d;const float* gr=g+row*e;float delta=0.0f;for(int c=lane;c<e;c+=32)delta+=gr[c]*out[row*e+c];delta=warp_sum(delta);float mx=stats[row*2],den=stats[row*2+1];for(int key=0;key<nk;key++){const float* kr=k+(batch*nk+key)*d;const float* vr=v+(batch*nk+key)*e;float dot=0.0f;for(int j=lane;j<d;j+=32)dot+=qr[j]*kr[j];float score=warp_sum(dot)*scale;if(mask)score+=mask[view_index(row*nk+key,shape,ms,0)];float p=expf(score-mx)/den;float dp=0.0f;for(int c=lane;c<e;c+=32)dp+=gr[c]*vr[c];float ds=p*(warp_sum(dp)-delta);for(int c=lane;c<e;c+=32)if(dv)atomicAdd(&dv[(batch*nk+key)*e+c],p*gr[c]);for(int j=lane;j<d;j+=32){if(dq)atomicAdd(&dq[row*d+j],ds*scale*kr[j]);if(dk)atomicAdd(&dk[(batch*nk+key)*d+j],ds*scale*qr[j]);}if(dmask && lane==0)atomicAdd(&dmask[view_index(row*nk+key,shape,ms,0)],ds);}}
-// Sixteen keys and values are cooperatively loaded once per eight query warps.
-// Each warp keeps its online softmax and output (or dQ) in registers.
-extern "C" __global__ void flash_attention_tiled_f(const float* q,const float* k,const float* v,const float* mask,float* out,float* stats,int nq,int nk,int d,int e,int qblocks,float scale,Axes6 shape,Axes6 ms){
-  __shared__ float sk[16*128],sv[16*128];
-  int batch=blockIdx.x/qblocks,warp=threadIdx.x>>5,lane=threadIdx.x&31;
-  int query=(blockIdx.x%qblocks)*8+warp,row=batch*nq+query;
-  bool valid=query<nq;float acc[4]={0,0,0,0},mx=-3.402823466e38f,den=0.0f;
-  for(int base=0;base<nk;base+=16){
-    int tile=min(16,nk-base);
-    for(int z=threadIdx.x;z<tile*d;z+=256)sk[z]=k[(batch*nk+base)*d+z];
-    for(int z=threadIdx.x;z<tile*e;z+=256)sv[z]=v[(batch*nk+base)*e+z];
-    __syncthreads();
-    if(valid)for(int t=0;t<tile;t++){
-      float dot=0.0f;for(int j=lane;j<d;j+=32)dot+=q[row*d+j]*sk[t*d+j];
-      float score=warp_sum(dot)*scale;
-      if(mask)score+=mask[view_index(row*nk+base+t,shape,ms,0)];
-      float next=fmaxf(mx,score),old=expf(mx-next),p=expf(score-next);
-      den=den*old+p;mx=next;
-      for(int c=lane,slot=0;c<e;c+=32,slot++)acc[slot]=acc[slot]*old+p*sv[t*e+c];
-    }
-    __syncthreads();
-  }
-  if(valid){for(int c=lane,slot=0;c<e;c+=32,slot++)out[row*e+c]=acc[slot]/den;
-    if(lane==0){stats[row*2]=mx;stats[row*2+1]=den;}}
+extern "C" __global__ void reduce_last_f(const float* x,float* y,int rows,int dim,float scale){
+ int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;
+ if(row>=rows)return;
+ int base=row*dim;float sum=0.0f;
+ for(int j=lane;j<dim;j+=32)sum+=x[base+j]*scale;
+ sum=warp_sum(sum);
+ if(lane==0)y[row]=sum;
 }
-extern "C" __global__ void flash_attention_tiled_b(const float* q,const float* k,const float* v,const float* mask,const float* out,const float* stats,const float* g,float* dq,float* dk,float* dv,float* dmask,int nq,int nk,int d,int e,int qblocks,float scale,Axes6 shape,Axes6 ms){
-  __shared__ float sk[16*128],sv[16*128];
-  int batch=blockIdx.x/qblocks,warp=threadIdx.x>>5,lane=threadIdx.x&31;
-  int query=(blockIdx.x%qblocks)*8+warp,row=batch*nq+query;
-  bool valid=query<nq;float dqacc[4]={0,0,0,0},delta=0.0f,mx=0.0f,den=1.0f;
-  if(valid){for(int c=lane;c<e;c+=32)delta+=g[row*e+c]*out[row*e+c];delta=warp_sum(delta);mx=stats[row*2];den=stats[row*2+1];}
-  for(int base=0;base<nk;base+=16){
-    int tile=min(16,nk-base);
-    for(int z=threadIdx.x;z<tile*d;z+=256)sk[z]=k[(batch*nk+base)*d+z];
-    for(int z=threadIdx.x;z<tile*e;z+=256)sv[z]=v[(batch*nk+base)*e+z];
+extern "C" __global__ void split_heads_f(const float* x,float* y,int n,int t,int heads,int dim,int parts,int which){
+ int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;
+ int d=i%dim,tmp=i/dim,ti=tmp%t;tmp/=t;int h=tmp%heads,b=tmp/heads;
+ y[i]=x[((b*t+ti)*parts+which)*heads*dim+h*dim+d];
+}
+extern "C" __global__ void split_heads_bf16_f(const float* x,float* y,unsigned short* y16,int n,int t,int heads,int dim,int parts,int which){
+ int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;
+ int d=i%dim,tmp=i/dim,ti=tmp%t;tmp/=t;int h=tmp%heads,b=tmp/heads;
+ float v=x[((b*t+ti)*parts+which)*heads*dim+h*dim+d];
+ y[i]=v;y16[i]=round_bf16(v);
+}
+extern "C" __global__ void split_heads_b(const float* g,float* dx,int n,int t,int heads,int dim,int parts,int which,int add){
+ int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;
+ int d=i%dim,tmp=i/dim,ti=tmp%t;tmp/=t;int h=tmp%heads,b=tmp/heads;
+ int dst=((b*t+ti)*parts+which)*heads*dim+h*dim+d;
+ if(add)dx[dst]+=g[i];else dx[dst]=g[i];
+}
+extern "C" __global__ void merge_heads_f(const float* x,float* y,int n,int t,int heads,int dim){
+ int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;
+ int d=i%dim,tmp=i/dim,h=tmp%heads;tmp/=heads;int ti=tmp%t,b=tmp/t;
+ y[i]=x[((b*heads+h)*t+ti)*dim+d];
+}
+extern "C" __global__ void merge_heads_bf16_f(const float* x,float* y,unsigned short* y16,int n,int t,int heads,int dim){
+ int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;
+ int d=i%dim,tmp=i/dim,h=tmp%heads;tmp/=heads;int ti=tmp%t,b=tmp/t;
+ float v=x[((b*heads+h)*t+ti)*dim+d];
+ y[i]=v;y16[i]=round_bf16(v);
+}
+extern "C" __global__ void merge_heads_b(const float* g,float* dx,int n,int t,int heads,int dim,int add){
+ int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;
+ int d=i%dim,tmp=i/dim,h=tmp%heads;tmp/=heads;int ti=tmp%t,b=tmp/t;
+ int dst=((b*heads+h)*t+ti)*dim+d;
+ if(add)dx[dst]+=g[i];else dx[dst]=g[i];
+}
+extern "C" __global__ void softmax_f(const float* x,float* y,int rows,int dim,int inner,int logmode){int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;if(row>=rows)return;int o=row/inner,j=row%inner,base=o*dim*inner+j;float mx=-__int_as_float(0x7f800000);for(int k=lane;k<dim;k+=32){float v=x[base+k*inner];mx=isnan(v)?v:fmaxf(mx,v);}mx=warp_max(mx);float sum=0;for(int k=lane;k<dim;k+=32)sum+=expf(x[base+k*inner]-mx);sum=warp_sum(sum);float ls=logf(sum);for(int k=lane;k<dim;k+=32){int idx=base+k*inner;y[idx]=logmode?x[idx]-mx-ls:expf(x[idx]-mx)/sum;}}
+extern "C" __global__ void softmax_b(const float* y,const float* g,float* dx,int rows,int dim,int inner,int logmode){int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;if(row>=rows)return;int o=row/inner,j=row%inner,base=o*dim*inner+j;float dot=0;for(int k=lane;k<dim;k+=32){int idx=base+k*inner;dot+=g[idx]*(logmode?1.0f:y[idx]);}dot=warp_sum(dot);for(int k=lane;k<dim;k+=32){int idx=base+k*inner;dx[idx]+=logmode?g[idx]-expf(y[idx])*dot:y[idx]*(g[idx]-dot);}}
+extern "C" __global__ void attn_softmax_f(const float* scores,const float* mask,float* probs,unsigned short* probs16,int rows,int dim,float scale,Axes6 shape,Axes6 ms){int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;if(row>=rows)return;int base=row*dim;float mx=-__int_as_float(0x7f800000);for(int k=lane;k<dim;k+=32){int i=base+k;float z=scores[i]*scale+(mask?mask[view_index(i,shape,ms,0)]:0.0f);mx=isnan(z)?z:fmaxf(mx,z);}mx=warp_max(mx);float sum=0;for(int k=lane;k<dim;k+=32){int i=base+k;float z=scores[i]*scale+(mask?mask[view_index(i,shape,ms,0)]:0.0f);sum+=expf(z-mx);}sum=warp_sum(sum);for(int k=lane;k<dim;k+=32){int i=base+k;float z=scores[i]*scale+(mask?mask[view_index(i,shape,ms,0)]:0.0f);float p=expf(z-mx)/sum;probs[i]=p;if(probs16)probs16[i]=round_bf16(p);}}
+extern "C" __global__ void attn_softmax_b(const float* probs,const float* dp,float* ds,unsigned short* ds16,float* dmask,int rows,int dim,float scale,Axes6 shape,Axes6 ms){int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;if(row>=rows)return;int base=row*dim;float dot=0;for(int k=lane;k<dim;k+=32){int i=base+k;dot+=probs[i]*dp[i];}dot=warp_sum(dot);for(int k=lane;k<dim;k+=32){int i=base+k;float z=probs[i]*(dp[i]-dot);float dsv=z*scale;ds[i]=dsv;if(ds16)ds16[i]=round_bf16(dsv);if(dmask)atomicAdd(&dmask[view_index(i,shape,ms,0)],z);}}
+template<int BR,int BC,int ECOLS>
+__device__ __forceinline__ void flash_fwd_impl(const float* q,const float* k,const float* v,const float* mask,float* out,float* stats,int nq,int nk,int d,int e,int qblocks,float scale,Axes6 shape,Axes6 ms){
+  extern __shared__ float smem[];
+  constexpr int RM=BR/8,CM=BC/16,SS=BC+1;
+  int dp=d|1,kp=(d>e?d:e)|1;
+  float* sq=smem;
+  float* skv=sq+BR*dp;
+  float* ss=skv+BC*kp;
+  float* sm=ss+BR*SS;
+  float* sl=sm+BR;
+  float* sold=sl+BR;
+  int batch=blockIdx.x/qblocks,qbase=(blockIdx.x%qblocks)*BR;
+  int qtile=min(BR,nq-qbase);
+  int tx=threadIdx.x&15,ty=threadIdx.x>>4;
+  int r0=ty*RM,c0=tx*CM;
+  for(int r=ty;r<BR;r+=8)for(int j=tx;j<d;j+=16)sq[r*dp+j]=r<qtile?q[(batch*nq+qbase+r)*d+j]:0.0f;
+  float ninf=-__int_as_float(0x7f800000);
+  if(threadIdx.x<BR){sm[threadIdx.x]=ninf;sl[threadIdx.x]=0.0f;sold[threadIdx.x]=1.0f;}
+  __syncthreads();
+  float acc[RM][ECOLS];
+  #pragma unroll
+  for(int ri=0;ri<RM;ri++){
+    #pragma unroll
+    for(int col=0;col<ECOLS;col++)acc[ri][col]=0.0f;}
+  for(int base=0;base<nk;base+=BC){
+    int ktile=min(BC,nk-base);
+    for(int r=ty;r<BC;r+=8)for(int j=tx;j<d;j+=16)skv[r*kp+j]=r<ktile?k[(batch*nk+base+r)*d+j]:0.0f;
     __syncthreads();
-    if(valid)for(int t=0;t<tile;t++){
-      int key=base+t;float dot=0.0f;
-      for(int j=lane;j<d;j+=32)dot+=q[row*d+j]*sk[t*d+j];
-      float score=warp_sum(dot)*scale;
-      if(mask)score+=mask[view_index(row*nk+key,shape,ms,0)];
-      float p=expf(score-mx)/den,dp=0.0f;
-      for(int c=lane;c<e;c+=32)dp+=g[row*e+c]*sv[t*e+c];
-      float ds=p*(warp_sum(dp)-delta);
-      for(int c=lane;c<e;c+=32)if(dv)atomicAdd(&dv[(batch*nk+key)*e+c],p*g[row*e+c]);
-      for(int j=lane,slot=0;j<d;j+=32,slot++){
-        dqacc[slot]+=ds*scale*sk[t*d+j];
-        if(dk)atomicAdd(&dk[(batch*nk+key)*d+j],ds*scale*q[row*d+j]);
+    float s[RM][CM];
+    #pragma unroll
+    for(int ri=0;ri<RM;ri++){
+      #pragma unroll
+      for(int ci=0;ci<CM;ci++)s[ri][ci]=0.0f;}
+    for(int j=0;j<d;j++){
+      float qv[RM],kv[CM];
+      #pragma unroll
+      for(int ri=0;ri<RM;ri++)qv[ri]=sq[(r0+ri)*dp+j];
+      #pragma unroll
+      for(int ci=0;ci<CM;ci++)kv[ci]=skv[(c0+ci)*kp+j];
+      #pragma unroll
+      for(int ri=0;ri<RM;ri++){
+      #pragma unroll
+        for(int ci=0;ci<CM;ci++)s[ri][ci]=fmaf(qv[ri],kv[ci],s[ri][ci]);}
+    }
+    #pragma unroll
+    for(int ri=0;ri<RM;ri++){
+      int rr=r0+ri;
+      #pragma unroll
+      for(int ci=0;ci<CM;ci++){
+        int cc=c0+ci;
+        float val=s[ri][ci]*scale;
+        if(mask&&rr<qtile&&cc<ktile)val+=mask[view_index((batch*nq+qbase+rr)*nk+base+cc,shape,ms,0)];
+        ss[rr*SS+cc]=(cc<ktile)?val:ninf;
       }
-      if(dmask && lane==0)atomicAdd(&dmask[view_index(row*nk+key,shape,ms,0)],ds);
+    }
+    __syncthreads();
+    int sr=threadIdx.x>>2,slane=threadIdx.x&3;
+    float tm=ninf;
+    for(int c=slane;c<BC;c+=4){float v0=ss[sr*SS+c];tm=(isnan(tm)||isnan(v0))?__int_as_float(0x7fc00000):fmaxf(tm,v0);}
+    for(int delta=2;delta>0;delta>>=1){float o=__shfl_xor_sync(0xffffffff,tm,delta);tm=(isnan(tm)||isnan(o))?__int_as_float(0x7fc00000):fmaxf(tm,o);}
+    float mx=sm[sr];
+    float next=(isnan(mx)||isnan(tm))?__int_as_float(0x7fc00000):fmaxf(mx,tm);
+    float old=(next==mx)?1.0f:expf(mx-next);
+    float sum=0.0f;
+    for(int c=slane;c<BC;c+=4){
+      float p=(c<ktile&&next!=ninf)?expf(ss[sr*SS+c]-next):0.0f;
+      ss[sr*SS+c]=p;
+      sum+=p;
+    }
+    for(int delta=2;delta>0;delta>>=1)sum+=__shfl_xor_sync(0xffffffff,sum,delta);
+    if(slane==0){sold[sr]=old;sm[sr]=next;sl[sr]=sl[sr]*old+sum;}
+    for(int r=ty;r<ktile;r+=8)for(int c=tx;c<e;c+=16)skv[r*kp+c]=v[(batch*nk+base+r)*e+c];
+    __syncthreads();
+    #pragma unroll
+    for(int ri=0;ri<RM;ri++){
+      float sc=sold[r0+ri];
+      #pragma unroll
+      for(int col=0;col<ECOLS;col++)acc[ri][col]*=sc;
+    }
+    for(int t=0;t<ktile;t++){
+      float pv[RM],vv[ECOLS];
+      #pragma unroll
+      for(int ri=0;ri<RM;ri++)pv[ri]=ss[(r0+ri)*SS+t];
+      #pragma unroll
+      for(int col=0;col<ECOLS;col++){int c=tx+col*16;vv[col]=(c<e)?skv[t*kp+c]:0.0f;}
+      #pragma unroll
+      for(int ri=0;ri<RM;ri++){
+      #pragma unroll
+        for(int col=0;col<ECOLS;col++)acc[ri][col]=fmaf(pv[ri],vv[col],acc[ri][col]);}
     }
     __syncthreads();
   }
-  if(valid && dq)for(int j=lane,slot=0;j<d;j+=32,slot++)dq[row*d+j]+=dqacc[slot];
+  #pragma unroll
+  for(int ri=0;ri<RM;ri++){
+    int rr=r0+ri;
+    if(rr<qtile){
+      float inv=1.0f/sl[rr];
+      #pragma unroll
+      for(int col=0;col<ECOLS;col++){
+        int c=tx+col*16;
+        if(c<e)out[(batch*nq+qbase+rr)*e+c]=acc[ri][col]*inv;
+      }
+    }
+  }
+  if(threadIdx.x<qtile){int row=batch*nq+qbase+threadIdx.x;stats[row*2]=sm[threadIdx.x];stats[row*2+1]=sl[threadIdx.x];}
 }
-extern "C" __global__ void layernorm_f(const float* x,const float* w,const float* b,float* y,float* stats,int rows,int dim,float eps){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int base=row*dim;float sum=0;for(int j=lane;j<dim;j+=32)sum+=x[base+j];float mean=warp_sum(sum)/(float)dim;float ss=0;for(int j=lane;j<dim;j+=32){float z=x[base+j]-mean;ss+=z*z;}float inv=rsqrtf(warp_sum(ss)/(float)dim+eps);if(lane==0){stats[row*2]=mean;stats[row*2+1]=inv;}for(int j=lane;j<dim;j+=32)y[base+j]=(x[base+j]-mean)*inv*w[j]+b[j];}
-extern "C" __global__ void layernorm_bf16_f(const float* x,const float* w,const float* b,float* y,unsigned short* y16,float* stats,int rows,int dim,float eps){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int base=row*dim;float sum=0;for(int j=lane;j<dim;j+=32)sum+=x[base+j];float mean=warp_sum(sum)/(float)dim;float ss=0;for(int j=lane;j<dim;j+=32){float z=x[base+j]-mean;ss+=z*z;}float inv=rsqrtf(warp_sum(ss)/(float)dim+eps);if(lane==0){stats[row*2]=mean;stats[row*2+1]=inv;}for(int j=lane;j<dim;j+=32){float z=(x[base+j]-mean)*inv*w[j]+b[j];y[base+j]=z;y16[base+j]=round_bf16(z);}}
-extern "C" __global__ void layernorm_b(const float* x,const float* w,const float* g,const float* stats,float* dx,float* dw,float* db,int rows,int dim){int tid=blockIdx.x*blockDim.x+threadIdx.x,row=tid>>5,lane=tid&31;if(row>=rows)return;int base=row*dim;float mean=stats[row*2],inv=stats[row*2+1];float sg=0,sgn=0;for(int j=lane;j<dim;j+=32){int i=base+j;float norm=(x[i]-mean)*inv,z=g[i]*w[j];sg+=z;sgn+=z*norm;}sg=warp_sum(sg)/(float)dim;sgn=warp_sum(sgn)/(float)dim;for(int j=lane;j<dim;j+=32){int i=base+j;float norm=(x[i]-mean)*inv;if(dx)dx[i]+=inv*(g[i]*w[j]-sg-norm*sgn);if(dw)atomicAdd(&dw[j],g[i]*norm);if(db)atomicAdd(&db[j],g[i]);}}
+extern "C" __global__ void flash_attention_tiled_f(const float* q,const float* k,const float* v,const float* mask,float* out,float* stats,int nq,int nk,int d,int e,int qblocks,float scale,Axes6 shape,Axes6 ms){flash_fwd_impl<32,64,4>(q,k,v,mask,out,stats,nq,nk,d,e,qblocks,scale,shape,ms);}
+extern "C" __global__ void flash_attention_tiled_f128(const float* q,const float* k,const float* v,const float* mask,float* out,float* stats,int nq,int nk,int d,int e,int qblocks,float scale,Axes6 shape,Axes6 ms){flash_fwd_impl<32,32,8>(q,k,v,mask,out,stats,nq,nk,d,e,qblocks,scale,shape,ms);}
+extern "C" __global__ void flash_attention_delta(const float* out,const float* g,float* delta,int rows,int e){
+  int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;
+  if(row>=rows)return;
+  float sum=0.0f;
+  for(int c=lane;c<e;c+=32)sum=fmaf(g[row*e+c],out[row*e+c],sum);
+  sum=warp_sum(sum);
+  if(lane==0)delta[row]=sum;
+}
+template<int BR,int BC,int DCOLS>
+__device__ __forceinline__ void flash_bwd_q_impl(const float* q,const float* k,const float* v,const float* mask,const float* stats,const float* deltaBuf,const float* g,float* dq,float* dmask,int nq,int nk,int d,int e,int qblocks,float scale,Axes6 shape,Axes6 ms){
+  extern __shared__ float smem[];
+  constexpr int RM=BR/8,CM=BC/16,SS=BC+1;
+  int dp=d|1,ep=e|1,kp=(d>e?d:e)|1;
+  float* sq=smem;
+  float* sgo=sq+BR*dp;
+  float* skv=sgo+BR*ep;
+  float* sdp=skv+BC*kp;
+  float* sm=sdp+BR*SS;
+  float* sinv=sm+BR;
+  float* sdelta=sinv+BR;
+  int batch=blockIdx.x/qblocks,qbase=(blockIdx.x%qblocks)*BR;
+  int qtile=min(BR,nq-qbase);
+  int tx=threadIdx.x&15,ty=threadIdx.x>>4;
+  int r0=ty*RM,c0=tx*CM;
+  for(int r=ty;r<BR;r+=8){
+    for(int j=tx;j<d;j+=16)sq[r*dp+j]=r<qtile?q[(batch*nq+qbase+r)*d+j]:0.0f;
+    for(int c=tx;c<e;c+=16)sgo[r*ep+c]=r<qtile?g[(batch*nq+qbase+r)*e+c]:0.0f;
+  }
+  if(threadIdx.x<BR){
+    if(threadIdx.x<qtile){
+      int row=batch*nq+qbase+threadIdx.x;
+      sm[threadIdx.x]=stats[row*2];
+      sinv[threadIdx.x]=1.0f/stats[row*2+1];
+      sdelta[threadIdx.x]=deltaBuf[row];
+    }else{
+      sm[threadIdx.x]=0.0f;sinv[threadIdx.x]=0.0f;sdelta[threadIdx.x]=0.0f;
+    }
+  }
+  __syncthreads();
+  float dqa[RM][DCOLS];
+  #pragma unroll
+  for(int ri=0;ri<RM;ri++){
+    #pragma unroll
+    for(int col=0;col<DCOLS;col++)dqa[ri][col]=0.0f;}
+  for(int base=0;base<nk;base+=BC){
+    int ktile=min(BC,nk-base);
+    for(int r=ty;r<BC;r+=8)for(int c=tx;c<e;c+=16)skv[r*kp+c]=r<ktile?v[(batch*nk+base+r)*e+c]:0.0f;
+    __syncthreads();
+    float dpv[RM][CM];
+    #pragma unroll
+    for(int ri=0;ri<RM;ri++){
+      #pragma unroll
+      for(int ci=0;ci<CM;ci++)dpv[ri][ci]=0.0f;}
+    for(int c=0;c<e;c++){
+      float gv[RM],vv[CM];
+      #pragma unroll
+      for(int ri=0;ri<RM;ri++)gv[ri]=sgo[(r0+ri)*ep+c];
+      #pragma unroll
+      for(int ci=0;ci<CM;ci++)vv[ci]=skv[(c0+ci)*kp+c];
+      #pragma unroll
+      for(int ri=0;ri<RM;ri++){
+      #pragma unroll
+        for(int ci=0;ci<CM;ci++)dpv[ri][ci]=fmaf(gv[ri],vv[ci],dpv[ri][ci]);}
+    }
+    #pragma unroll
+    for(int ri=0;ri<RM;ri++){
+      #pragma unroll
+      for(int ci=0;ci<CM;ci++)sdp[(r0+ri)*SS+c0+ci]=dpv[ri][ci];}
+    __syncthreads();
+    for(int r=ty;r<BC;r+=8)for(int j=tx;j<d;j+=16)skv[r*kp+j]=r<ktile?k[(batch*nk+base+r)*d+j]:0.0f;
+    __syncthreads();
+    float sv[RM][CM];
+    #pragma unroll
+    for(int ri=0;ri<RM;ri++){
+      #pragma unroll
+      for(int ci=0;ci<CM;ci++)sv[ri][ci]=0.0f;}
+    for(int j=0;j<d;j++){
+      float qv[RM],kv[CM];
+      #pragma unroll
+      for(int ri=0;ri<RM;ri++)qv[ri]=sq[(r0+ri)*dp+j];
+      #pragma unroll
+      for(int ci=0;ci<CM;ci++)kv[ci]=skv[(c0+ci)*kp+j];
+      #pragma unroll
+      for(int ri=0;ri<RM;ri++){
+      #pragma unroll
+        for(int ci=0;ci<CM;ci++)sv[ri][ci]=fmaf(qv[ri],kv[ci],sv[ri][ci]);}
+    }
+    #pragma unroll
+    for(int ri=0;ri<RM;ri++){
+      int rr=r0+ri;
+      float m=sm[rr],inv=sinv[rr],dl=sdelta[rr];
+      #pragma unroll
+      for(int ci=0;ci<CM;ci++){
+        int cc=c0+ci;
+        float ds=0.0f;
+        if(rr<qtile&&cc<ktile){
+          float val=sv[ri][ci]*scale;
+          if(mask)val+=mask[view_index((batch*nq+qbase+rr)*nk+base+cc,shape,ms,0)];
+          ds=expf(val-m)*inv*(sdp[rr*SS+cc]-dl);
+          if(dmask)atomicAdd(&dmask[view_index((batch*nq+qbase+rr)*nk+base+cc,shape,ms,0)],ds);
+        }
+        sdp[rr*SS+cc]=ds*scale;
+      }
+    }
+    __syncthreads();
+    if(dq){
+      for(int t=0;t<ktile;t++){
+        float av[RM],kv[DCOLS];
+        #pragma unroll
+        for(int ri=0;ri<RM;ri++)av[ri]=sdp[(r0+ri)*SS+t];
+        #pragma unroll
+        for(int col=0;col<DCOLS;col++){int j=tx+col*16;kv[col]=(j<d)?skv[t*kp+j]:0.0f;}
+        #pragma unroll
+        for(int ri=0;ri<RM;ri++){
+      #pragma unroll
+          for(int col=0;col<DCOLS;col++)dqa[ri][col]=fmaf(av[ri],kv[col],dqa[ri][col]);}
+      }
+    }
+    __syncthreads();
+  }
+  if(dq){
+    #pragma unroll
+    for(int ri=0;ri<RM;ri++){
+      int rr=r0+ri;
+      if(rr<qtile){
+        #pragma unroll
+        for(int col=0;col<DCOLS;col++){
+          int j=tx+col*16;
+          if(j<d)dq[(batch*nq+qbase+rr)*d+j]+=dqa[ri][col];
+        }
+      }
+    }
+  }
+}
+extern "C" __global__ void flash_attention_tiled_b(const float* q,const float* k,const float* v,const float* mask,const float* stats,const float* deltaBuf,const float* g,float* dq,float* dmask,int nq,int nk,int d,int e,int qblocks,float scale,Axes6 shape,Axes6 ms){flash_bwd_q_impl<32,64,4>(q,k,v,mask,stats,deltaBuf,g,dq,dmask,nq,nk,d,e,qblocks,scale,shape,ms);}
+extern "C" __global__ void flash_attention_tiled_b128(const float* q,const float* k,const float* v,const float* mask,const float* stats,const float* deltaBuf,const float* g,float* dq,float* dmask,int nq,int nk,int d,int e,int qblocks,float scale,Axes6 shape,Axes6 ms){flash_bwd_q_impl<16,32,8>(q,k,v,mask,stats,deltaBuf,g,dq,dmask,nq,nk,d,e,qblocks,scale,shape,ms);}
+template<int BK,int BQ,int DCOLS,int ECOLS>
+__device__ __forceinline__ void flash_bwd_kv_impl(const float* q,const float* k,const float* v,const float* mask,const float* stats,const float* deltaBuf,const float* g,float* dk,float* dv,int nq,int nk,int d,int e,int kvblocks,float scale,Axes6 shape,Axes6 ms){
+  extern __shared__ float smem[];
+  constexpr int RM=BK/8,CM=BQ/16,SS=BQ+1;
+  int dp=d|1,ep=e|1;
+  float* sk=smem;
+  float* sv=sk+BK*dp;
+  float* sq=sv+BK*ep;
+  float* sgo=sq+BQ*dp;
+  float* sp=sgo+BQ*ep;
+  float* sds=sp+BK*SS;
+  float* sm=sds+BK*SS;
+  float* sinv=sm+BQ;
+  float* sdelta=sinv+BQ;
+  int batch=blockIdx.x/kvblocks,kbase=(blockIdx.x%kvblocks)*BK;
+  int ktile=min(BK,nk-kbase);
+  int tx=threadIdx.x&15,ty=threadIdx.x>>4;
+  int r0=ty*RM,c0=tx*CM;
+  for(int r=ty;r<BK;r+=8){
+    for(int j=tx;j<d;j+=16)sk[r*dp+j]=r<ktile?k[(batch*nk+kbase+r)*d+j]:0.0f;
+    for(int c=tx;c<e;c+=16)sv[r*ep+c]=r<ktile?v[(batch*nk+kbase+r)*e+c]:0.0f;
+  }
+  __syncthreads();
+  float dka[RM][DCOLS],dva[RM][ECOLS];
+  #pragma unroll
+  for(int ri=0;ri<RM;ri++){
+    #pragma unroll
+    for(int col=0;col<DCOLS;col++)dka[ri][col]=0.0f;
+    #pragma unroll
+    for(int col=0;col<ECOLS;col++)dva[ri][col]=0.0f;
+  }
+  for(int base=0;base<nq;base+=BQ){
+    int qtile=min(BQ,nq-base);
+    for(int r=ty;r<BQ;r+=8){
+      for(int j=tx;j<d;j+=16)sq[r*dp+j]=r<qtile?q[(batch*nq+base+r)*d+j]:0.0f;
+      for(int c=tx;c<e;c+=16)sgo[r*ep+c]=r<qtile?g[(batch*nq+base+r)*e+c]:0.0f;
+    }
+    if(threadIdx.x<BQ){
+      if(threadIdx.x<qtile){
+        int qrow=batch*nq+base+threadIdx.x;
+        sm[threadIdx.x]=stats[qrow*2];
+        sinv[threadIdx.x]=1.0f/stats[qrow*2+1];
+        sdelta[threadIdx.x]=deltaBuf[qrow];
+      }else{
+        sm[threadIdx.x]=0.0f;sinv[threadIdx.x]=0.0f;sdelta[threadIdx.x]=0.0f;
+      }
+    }
+    __syncthreads();
+    float s[RM][CM],dpv[RM][CM];
+    #pragma unroll
+    for(int ri=0;ri<RM;ri++){
+      #pragma unroll
+      for(int ci=0;ci<CM;ci++){s[ri][ci]=0.0f;dpv[ri][ci]=0.0f;}}
+    for(int j=0;j<d;j++){
+      float kv[RM],qv[CM];
+      #pragma unroll
+      for(int ri=0;ri<RM;ri++)kv[ri]=sk[(r0+ri)*dp+j];
+      #pragma unroll
+      for(int ci=0;ci<CM;ci++)qv[ci]=sq[(c0+ci)*dp+j];
+      #pragma unroll
+      for(int ri=0;ri<RM;ri++){
+      #pragma unroll
+        for(int ci=0;ci<CM;ci++)s[ri][ci]=fmaf(kv[ri],qv[ci],s[ri][ci]);}
+    }
+    for(int c=0;c<e;c++){
+      float vv[RM],gv[CM];
+      #pragma unroll
+      for(int ri=0;ri<RM;ri++)vv[ri]=sv[(r0+ri)*ep+c];
+      #pragma unroll
+      for(int ci=0;ci<CM;ci++)gv[ci]=sgo[(c0+ci)*ep+c];
+      #pragma unroll
+      for(int ri=0;ri<RM;ri++){
+      #pragma unroll
+        for(int ci=0;ci<CM;ci++)dpv[ri][ci]=fmaf(vv[ri],gv[ci],dpv[ri][ci]);}
+    }
+    #pragma unroll
+    for(int ri=0;ri<RM;ri++){
+      int rr=r0+ri;
+      #pragma unroll
+      for(int ci=0;ci<CM;ci++){
+        int cc=c0+ci;
+        float p=0.0f,ds=0.0f;
+        if(rr<ktile&&cc<qtile){
+          float val=s[ri][ci]*scale;
+          if(mask)val+=mask[view_index((batch*nq+base+cc)*nk+kbase+rr,shape,ms,0)];
+          p=expf(val-sm[cc])*sinv[cc];
+          ds=p*(dpv[ri][ci]-sdelta[cc])*scale;
+        }
+        sp[rr*SS+cc]=p;
+        sds[rr*SS+cc]=ds;
+      }
+    }
+    __syncthreads();
+    if(dv){
+      for(int t=0;t<qtile;t++){
+        float pv[RM],gv[ECOLS];
+        #pragma unroll
+        for(int ri=0;ri<RM;ri++)pv[ri]=sp[(r0+ri)*SS+t];
+        #pragma unroll
+        for(int col=0;col<ECOLS;col++){int c=tx+col*16;gv[col]=(c<e)?sgo[t*ep+c]:0.0f;}
+        #pragma unroll
+        for(int ri=0;ri<RM;ri++){
+      #pragma unroll
+          for(int col=0;col<ECOLS;col++)dva[ri][col]=fmaf(pv[ri],gv[col],dva[ri][col]);}
+      }
+    }
+    if(dk){
+      for(int t=0;t<qtile;t++){
+        float av[RM],qv[DCOLS];
+        #pragma unroll
+        for(int ri=0;ri<RM;ri++)av[ri]=sds[(r0+ri)*SS+t];
+        #pragma unroll
+        for(int col=0;col<DCOLS;col++){int j=tx+col*16;qv[col]=(j<d)?sq[t*dp+j]:0.0f;}
+        #pragma unroll
+        for(int ri=0;ri<RM;ri++){
+      #pragma unroll
+          for(int col=0;col<DCOLS;col++)dka[ri][col]=fmaf(av[ri],qv[col],dka[ri][col]);}
+      }
+    }
+    __syncthreads();
+  }
+  if(dk){
+    #pragma unroll
+    for(int ri=0;ri<RM;ri++){
+      int rr=r0+ri;
+      if(rr<ktile){
+        #pragma unroll
+        for(int col=0;col<DCOLS;col++){
+          int j=tx+col*16;
+          if(j<d)dk[(batch*nk+kbase+rr)*d+j]+=dka[ri][col];
+        }
+      }
+    }
+  }
+  if(dv){
+    #pragma unroll
+    for(int ri=0;ri<RM;ri++){
+      int rr=r0+ri;
+      if(rr<ktile){
+        #pragma unroll
+        for(int col=0;col<ECOLS;col++){
+          int c=tx+col*16;
+          if(c<e)dv[(batch*nk+kbase+rr)*e+c]+=dva[ri][col];
+        }
+      }
+    }
+  }
+}
+extern "C" __global__ void flash_attention_tiled_b_kv(const float* q,const float* k,const float* v,const float* mask,const float* stats,const float* deltaBuf,const float* g,float* dk,float* dv,int nq,int nk,int d,int e,int kvblocks,float scale,Axes6 shape,Axes6 ms){flash_bwd_kv_impl<32,32,4,4>(q,k,v,mask,stats,deltaBuf,g,dk,dv,nq,nk,d,e,kvblocks,scale,shape,ms);}
+extern "C" __global__ void flash_attention_tiled_b_kv128(const float* q,const float* k,const float* v,const float* mask,const float* stats,const float* deltaBuf,const float* g,float* dk,float* dv,int nq,int nk,int d,int e,int kvblocks,float scale,Axes6 shape,Axes6 ms){flash_bwd_kv_impl<16,16,8,8>(q,k,v,mask,stats,deltaBuf,g,dk,dv,nq,nk,d,e,kvblocks,scale,shape,ms);}
+extern "C" __global__ void layernorm_f(const float* x,const float* w,const float* b,float* y,float* stats,int rows,int dim,float eps){int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;if(row>=rows)return;int base=row*dim;float sum=0;for(int j=lane;j<dim;j+=32)sum+=x[base+j];float mean=warp_sum(sum)/(float)dim;float ss=0;for(int j=lane;j<dim;j+=32){float z=x[base+j]-mean;ss+=z*z;}float inv=rsqrtf(warp_sum(ss)/(float)dim+eps);if(lane==0){stats[row*2]=mean;stats[row*2+1]=inv;}for(int j=lane;j<dim;j+=32)y[base+j]=(x[base+j]-mean)*inv*w[j]+b[j];}
+extern "C" __global__ void layernorm_bf16_f(const float* x,const float* w,const float* b,float* y,unsigned short* y16,float* stats,int rows,int dim,float eps){int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;if(row>=rows)return;int base=row*dim;float sum=0;for(int j=lane;j<dim;j+=32)sum+=x[base+j];float mean=warp_sum(sum)/(float)dim;float ss=0;for(int j=lane;j<dim;j+=32){float z=x[base+j]-mean;ss+=z*z;}float inv=rsqrtf(warp_sum(ss)/(float)dim+eps);if(lane==0){stats[row*2]=mean;stats[row*2+1]=inv;}for(int j=lane;j<dim;j+=32){float z=(x[base+j]-mean)*inv*w[j]+b[j];y[base+j]=z;y16[base+j]=round_bf16(z);}}
+extern "C" __global__ void layernorm_b(const float* x,const float* w,const float* g,const float* stats,float* dx,float* dw,float* db,int rows,int dim){int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;if(row>=rows)return;int base=row*dim;float mean=stats[row*2],inv=stats[row*2+1];float sg=0,sgn=0;for(int j=lane;j<dim;j+=32){int i=base+j;float norm=(x[i]-mean)*inv,z=g[i]*w[j];sg+=z;sgn+=z*norm;}sg=warp_sum(sg)/(float)dim;sgn=warp_sum(sgn)/(float)dim;for(int j=lane;j<dim;j+=32){int i=base+j;float norm=(x[i]-mean)*inv;if(dx)dx[i]+=inv*(g[i]*w[j]-sg-norm*sgn);if(dw)atomicAdd(&dw[j],g[i]*norm);if(db)atomicAdd(&db[j],g[i]);}}
 __device__ unsigned int dropout_hash(unsigned int i,unsigned int seed){unsigned int x=i^seed;x^=x>>16;x*=0x7feb352du;x^=x>>15;x*=0x846ca68bu;x^=x>>16;return x;}
 extern "C" __global__ void dropout_f(const float* x,float* y,int n,float p,unsigned int seed,unsigned int cutoff){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)y[i]=dropout_hash(i,seed)<cutoff?0.0f:x[i]/(1.0f-p);}
 extern "C" __global__ void dropout_b(const float* g,float* dx,int n,float p,unsigned int seed,unsigned int cutoff){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)dx[i]+=dropout_hash(i,seed)<cutoff?0.0f:g[i]/(1.0f-p);}
-extern "C" __global__ void ce_f(const float* x,const int* target,float* acc,int rows,int classes,int ignore){int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=rows||target[row]==ignore)return;int base=row*classes;float mx=-3.402823466e38f;for(int j=0;j<classes;j++)mx=fmaxf(mx,x[base+j]);float sum=0;for(int j=0;j<classes;j++)sum+=expf(x[base+j]-mx);atomicAdd(&acc[0],(mx-x[base+target[row]])+logf(sum));atomicAdd(&acc[1],1.0f);}
+extern "C" __global__ void ce_f(const float* x,const int* target,float* acc,int rows,int classes,int ignore){
+  int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;
+  if(row>=rows)return;
+  int tg=target[row];
+  if(tg==ignore)return;
+  int base=row*classes;
+  float mx=-__int_as_float(0x7f800000);
+  for(int j=lane;j<classes;j+=32){float v=x[base+j];mx=isnan(v)?v:fmaxf(mx,v);}
+  mx=warp_max(mx);
+  float sum=0.0f;
+  for(int j=lane;j<classes;j+=32)sum+=expf(x[base+j]-mx);
+  sum=warp_sum(sum);
+  if(lane==0){atomicAdd(&acc[0],(mx-x[base+tg])+logf(sum));atomicAdd(&acc[1],1.0f);}
+}
 extern "C" __global__ void bce_logits_f(const float* x,const float* target,float* out,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=x[i];out[i]=fmaxf(z,0.0f)-z*target[i]+log1pf(expf(-fabsf(z)));}}
 extern "C" __global__ void bce_logits_b(const float* x,const float* target,const float* g,float* dx,float* dt,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=x[i],e=expf(-fabsf(z)),sig=z>=0.0f?1.0f/(1.0f+e):e/(1.0f+e);if(dx)dx[i]+=g[i]*(sig-target[i]);if(dt)dt[i]-=g[i]*z;}}
 extern "C" __global__ void smooth_l1_f(const float* x,const float* target,float* out,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float d=x[i]-target[i],a=fabsf(d);out[i]=a<1.0f?0.5f*d*d:a-0.5f;}}
 extern "C" __global__ void smooth_l1_b(const float* x,const float* target,const float* g,float* dx,float* dt,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float d=x[i]-target[i],a=fabsf(d),s=a<1.0f?d:(d>0.0f?1.0f:(d<0.0f?-1.0f:d)),u=g[i]*s;if(dx)dx[i]+=u;if(dt)dt[i]-=u;}}
 extern "C" __global__ void ce_finish(const float* acc,float* y){y[0]=acc[0]/acc[1];}
-extern "C" __global__ void ce_b(const float* x,const int* target,const float* acc,const float* g,float* dx,int rows,int classes,int ignore){int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=rows||target[row]==ignore||acc[1]==0)return;int base=row*classes;float mx=-3.402823466e38f;for(int j=0;j<classes;j++)mx=fmaxf(mx,x[base+j]);float sum=0;for(int j=0;j<classes;j++)sum+=expf(x[base+j]-mx);float up=g[0]/acc[1];for(int j=0;j<classes;j++)dx[base+j]+=up*(expf(x[base+j]-mx)/sum-(j==target[row]?1.0f:0.0f));}
+extern "C" __global__ void ce_b(const float* x,const int* target,const float* acc,const float* g,float* dx,int rows,int classes,int ignore){
+  int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;
+  if(row>=rows)return;
+  int tg=target[row];
+  if(tg==ignore||acc[1]==0)return;
+  int base=row*classes;
+  float mx=-__int_as_float(0x7f800000);
+  for(int j=lane;j<classes;j+=32){float v=x[base+j];mx=isnan(v)?v:fmaxf(mx,v);}
+  mx=warp_max(mx);
+  float sum=0.0f;
+  for(int j=lane;j<classes;j+=32)sum+=expf(x[base+j]-mx);
+  sum=warp_sum(sum);
+  float up=g[0]/acc[1],inv=1.0f/sum;
+  for(int j=lane;j<classes;j+=32)dx[base+j]+=up*(expf(x[base+j]-mx)*inv-(j==tg?1.0f:0.0f));
+}
 extern "C" __global__ void graph_adam_inc(int* step){if(threadIdx.x==0&&blockIdx.x==0)step[0]++;}
 // wd is already the effective learning rate times the group's weight decay.
 extern "C" __global__ void graph_adamw(float* p,const float* g,float* m,float* v,const int* step,int n,float b1,float b2,float lr,float wd,float eps){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;float grad=g[i];float mm=b1*m[i]+(1.0f-b1)*grad;float vv=b2*v[i]+(1.0f-b2)*grad*grad;m[i]=mm;v[i]=vv;float bc1=1.0f-powf(b1,(float)step[0]),bc2=1.0f-powf(b2,(float)step[0]);p[i]=p[i]*(1.0f-wd)-lr*(mm/bc1)/(sqrtf(vv/bc2)+eps);}
@@ -194,6 +598,27 @@ extern "C" __global__ void clamp_f(const float* a,float* out,int n,float lo,floa
 extern "C" __global__ void clamp_b(const float* a,const float* g,float* da,int n,float lo,float hi){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n&&a[i]>=lo&&a[i]<=hi)da[i]+=g[i];}
 extern "C" __global__ void pow_scalar_f(const float* a,float* out,int n,float p){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=powf(a[i],p);}
 extern "C" __global__ void pow_scalar_b(const float* a,const float* g,float* da,int n,float p){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)da[i]+=g[i]*(p==0.0f?0.0f:p*powf(a[i],p-1.0f));}
+extern "C" __global__ void binary_same_f(const float* a,const float* b,float* out,int n,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float x=a[i],y=b[i];out[i]=op==0?x+y:op==1?x-y:op==2?x*y:op==3?x/y:op==4?fmaxf(x,y):fminf(x,y);}}
+extern "C" __global__ void binary_same_bf16_f(const float* a,const float* b,float* out,unsigned short* out16,int n,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float x=a[i],y=b[i];float z=op==0?x+y:op==1?x-y:op==2?x*y:op==3?x/y:op==4?fmaxf(x,y):fminf(x,y);out[i]=z;out16[i]=round_bf16(z);}}
+extern "C" __global__ void binary_same_b(const float* a,const float* b,const float* g,float* da,float* db,int n,int op,int addA,int addB){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;float x=a[i],y=b[i],z=g[i];if(da){float ga=z*(op==2?y:op==3?1.0f/y:op==4?(x>y?1.0f:0.0f):op==5?(x<y?1.0f:0.0f):1.0f);if(addA)da[i]+=ga;else da[i]=ga;}if(db){float gb=z*(op==0?1.0f:op==1?-1.0f:op==2?x:op==4?(x>y?0.0f:1.0f):op==5?(x<y?0.0f:1.0f):-x/(y*y));if(addB)db[i]+=gb;else db[i]=gb;}}
+extern "C" __global__ void bias_add_f(const float* a,const float* b,float* out,int n,int cols){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=a[i]+b[i%cols];}
+extern "C" __global__ void bias_add_bf16_f(const float* a,const float* b,float* out,unsigned short* out16,int n,int cols){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=a[i]+b[i%cols];out[i]=z;out16[i]=round_bf16(z);}}
+extern "C" __global__ void bias_add_b(const float* g,float* db,int rows,int cols){
+  __shared__ float s[8][32];
+  int col=blockIdx.x*32+threadIdx.x;
+  float sum=0.0f;
+  if(col<cols){for(int r=blockIdx.y*8+threadIdx.y;r<rows;r+=gridDim.y*8)sum+=g[r*cols+col];}
+  s[threadIdx.y][threadIdx.x]=sum;
+  __syncthreads();
+  if(threadIdx.y<4)s[threadIdx.y][threadIdx.x]+=s[threadIdx.y+4][threadIdx.x];
+  __syncthreads();
+  if(threadIdx.y<2)s[threadIdx.y][threadIdx.x]+=s[threadIdx.y+2][threadIdx.x];
+  __syncthreads();
+  if(threadIdx.y==0&&col<cols){
+    float total=s[0][threadIdx.x]+s[1][threadIdx.x];
+    if(gridDim.y==1)db[col]+=total;else atomicAdd(&db[col],total);
+  }
+}
 __device__ int index3(int i,int d1,int d2,int s0,int s1,int s2){int z=i%d2;int y=(i/d2)%d1;int x=i/(d1*d2);return (s0==1?0:x*s1*s2)+(s1==1?0:y*s2)+(s2==1?0:z);}
 extern "C" __global__ void binary_f(const float* a,const float* b,float* out,int n,int d1,int d2,int a0,int a1,int a2,int b0,int b1,int b2,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;float x=a[index3(i,d1,d2,a0,a1,a2)],y=b[index3(i,d1,d2,b0,b1,b2)];out[i]=op==0?x+y:op==1?x-y:op==2?x*y:op==3?x/y:op==4?fmaxf(x,y):fminf(x,y);}
 extern "C" __global__ void binary_bf16_f(const float* a,const float* b,float* out,unsigned short* out16,int n,int d1,int d2,int a0,int a1,int a2,int b0,int b1,int b2,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;float x=a[index3(i,d1,d2,a0,a1,a2)],y=b[index3(i,d1,d2,b0,b1,b2)];float z=op==0?x+y:op==1?x-y:op==2?x*y:op==3?x/y:op==4?fmaxf(x,y):fminf(x,y);out[i]=z;out16[i]=round_bf16(z);}
@@ -245,7 +670,7 @@ extern "C" __global__ void scale_all_grads(const unsigned long long* ptrs,const 
 var graphCache cuda.KernelCache
 
 func graphKernel(name string) *cuda.Kernel {
-	functions, err := graphCache.Get(graphSource, "reduce_scalar_f", "copy_values", "f32_to_bf16", "set_one", "write_clip_entry", "view_gather", "view_gather_bf16", "view_scatter", "binary_nd_f", "binary_nd_bf16_f", "binary_nd_b", "reduce_nd_f", "reduce_nd_b", "softmax_f", "softmax_b", "attn_softmax_f", "attn_softmax_b", "flash_attention_tiled_f", "flash_attention_tiled_b", "layernorm_f", "layernorm_b", "layernorm_bf16_f", "bias_gelu_f", "bias_gelu_bf16_f", "bias_gelu_b", "bias_residual_f", "bias_residual_bf16_f", "bias_residual_b", "dropout_f", "dropout_b", "ce_f", "ce_finish", "ce_b", "bce_logits_f", "bce_logits_b", "smooth_l1_f", "smooth_l1_b", "graph_adam_inc", "graph_adamw", "add_values", "scalar_f", "scalar_b", "clamp_f", "clamp_b", "pow_scalar_f", "pow_scalar_b", "binary_f", "binary_b", "binary_bf16_f", "unary_f", "unary_b", "permute_f", "permute_b", "concat_f", "concat_b", "slice_f", "slice_b", "embedding_f", "embedding_b", "reduce_f", "reduce_b", "group_stats", "group_f", "group_backstats", "group_b", "masked_f", "masked_finish", "masked_b", "scale_grad", "global_norm_parts", "scale_all_grads")
+	functions, err := graphCache.Get(graphSource, "reduce_scalar_f", "reduce_last_f", "copy_values", "f32_to_bf16", "set_one", "write_clip_entry", "view_gather", "view_gather_bf16", "view_scatter", "binary_nd_f", "binary_nd_bf16_f", "binary_nd_b", "reduce_nd_f", "reduce_nd_b", "split_heads_f", "split_heads_bf16_f", "split_heads_b", "merge_heads_f", "merge_heads_bf16_f", "merge_heads_b", "softmax_f", "softmax_b", "attn_softmax_f", "attn_softmax_b", "flash_attention_tiled_f", "flash_attention_tiled_f128", "flash_attention_delta", "flash_attention_tiled_b", "flash_attention_tiled_b128", "flash_attention_tiled_b_kv", "flash_attention_tiled_b_kv128", "layernorm_f", "layernorm_b", "layernorm_bf16_f", "bias_gelu_f", "bias_gelu_bf16_f", "bias_gelu_b", "bias_residual_f", "bias_residual_bf16_f", "bias_residual_b", "dropout_f", "dropout_b", "ce_f", "ce_finish", "ce_b", "bce_logits_f", "bce_logits_b", "smooth_l1_f", "smooth_l1_b", "graph_adam_inc", "graph_adamw", "add_values", "scalar_f", "scalar_b", "clamp_f", "clamp_b", "pow_scalar_f", "pow_scalar_b", "binary_same_f", "binary_same_bf16_f", "binary_same_b", "bias_add_f", "bias_add_bf16_f", "bias_add_b", "binary_f", "binary_b", "binary_bf16_f", "unary_f", "unary_b", "permute_f", "permute_b", "concat_f", "concat_b", "slice_f", "slice_b", "embedding_f", "embedding_b", "reduce_f", "reduce_b", "group_stats", "group_f", "group_backstats", "group_b", "masked_f", "masked_finish", "masked_b", "scale_grad", "global_norm_parts", "scale_all_grads")
 	if err != nil {
 		panic(err)
 	}

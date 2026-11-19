@@ -28,7 +28,11 @@ func gpuLayerNorm(x, w, b *Tensor, eps float32) *Tensor {
 		dx, dw, db := ptr(x.ensureGradGPU()), ptr(w.ensureGradGPU()), ptr(b.ensureGradGPU())
 		launch("layernorm_b", rows*32, unsafe.Pointer(&xp), unsafe.Pointer(&wp), unsafe.Pointer(&gp), unsafe.Pointer(&sp), unsafe.Pointer(&dx), unsafe.Pointer(&dw), unsafe.Pointer(&db), unsafe.Pointer(&r), unsafe.Pointer(&d))
 	})
-	res.aux = []*cuda.Buffer{stats}
+	if res.RequiresGrad {
+		res.aux = []*cuda.Buffer{stats}
+	} else {
+		stats.Free()
+	}
 	res.setBF16(shadow)
 	return res
 }

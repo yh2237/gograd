@@ -24,6 +24,7 @@ type Tensor struct {
 	storage          *tensorStorage
 	bf16Storage      *tensorStorage
 	bf16Version      uint64
+	bf16CaptureID    uint64
 	gradBuf          *cuda.Buffer
 	aux              []*cuda.Buffer
 	auxCPU           [][]float32
@@ -453,6 +454,33 @@ func (t *Tensor) ensureGradGPU() *cuda.Buffer {
 		t.gradBuf = b
 	}
 	return t.gradBuf
+}
+
+func (t *Tensor) allocGradGPU() (*cuda.Buffer, float32) {
+	if !t.RequiresGrad {
+		return nil, 0
+	}
+	if t.gradBuf == nil {
+		b, e := cuda.Alloc(t.Numel() * 4)
+		if e != nil {
+			panic(e)
+		}
+		t.gradBuf = b
+		return b, 0
+	}
+	return t.gradBuf, 1
+}
+
+func (t *Tensor) copyOrAddGradGPU(src *cuda.Buffer, n int) {
+	dst, beta := t.allocGradGPU()
+	if dst == nil {
+		return
+	}
+	if beta == 0 {
+		_ = copyDevice(dst, src, n)
+	} else {
+		addDevice(dst, src, n)
+	}
 }
 func (t *Tensor) addGrad(g []float32) {
 	if !t.RequiresGrad {

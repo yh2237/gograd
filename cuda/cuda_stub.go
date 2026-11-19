@@ -85,6 +85,8 @@ func ThreadID() uintptr { return 0 }
 // InCapture always reports false on this platform.
 func InCapture() bool { return false }
 
+func CaptureID() uint64 { return 0 }
+
 // Graph is a captured sequence of GPU work.
 type Graph struct{ exec uintptr }
 

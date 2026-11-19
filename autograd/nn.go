@@ -125,11 +125,12 @@ func GroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
 	bs, t, c := s[0], s[1], s[2]
 	cg := c / groups
 	size := float32(t * cg)
-	v := cpuAlloc(len(x.Data))
-	norm := cpuAlloc(len(x.Data))
-	inv := cpuAlloc(bs * groups)
-	for n := 0; n < bs; n++ {
-		for gr := 0; gr < groups; gr++ {
+	v := cpuAllocUninit(len(x.Data))
+	norm := cpuAllocUninit(len(x.Data))
+	inv := cpuAllocUninit(bs * groups)
+	parallelForWork(bs*groups, t*cg, func(start, end int) {
+		for item := start; item < end; item++ {
+			n, gr := item/groups, item%groups
 			var mean, variance float32
 			for at := 0; at < t; at++ {
 				for ch := gr * cg; ch < (gr+1)*cg; ch++ {
@@ -145,7 +146,7 @@ func GroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
 			}
 			variance /= size
 			iv := float32(1 / math.Sqrt(float64(variance+eps)))
-			inv[n*groups+gr] = iv
+			inv[item] = iv
 			for at := 0; at < t; at++ {
 				for ch := gr * cg; ch < (gr+1)*cg; ch++ {
 					idx := (n*t+at)*c + ch
@@ -154,13 +155,16 @@ func GroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
 				}
 			}
 		}
-	}
+	})
 	r := result(v, s, []*Tensor{x, w, b}, func(g []float32) {
-		dx := cpuAlloc(len(g))
+		dx := cpuAllocUninit(len(g))
 		dw := cpuAlloc(c)
 		db := cpuAlloc(c)
-		for n := 0; n < bs; n++ {
-			for gr := 0; gr < groups; gr++ {
+		var mu sync.Mutex
+		parallelForWork(bs*groups, t*cg, func(start, end int) {
+			localW, localB := make([]float32, c), make([]float32, c)
+			for item := start; item < end; item++ {
+				n, gr := item/groups, item%groups
 				var sg, sgn float32
 				for at := 0; at < t; at++ {
 					for ch := gr * cg; ch < (gr+1)*cg; ch++ {
@@ -168,18 +172,25 @@ func GroupNorm(x, w, b *Tensor, groups int, eps float32) *Tensor {
 						z := g[idx] * w.Data[ch]
 						sg += z
 						sgn += z * norm[idx]
-						dw[ch] += g[idx] * norm[idx]
-						db[ch] += g[idx]
+						localW[ch] += g[idx] * norm[idx]
+						localB[ch] += g[idx]
 					}
 				}
+				iv := inv[item]
 				for at := 0; at < t; at++ {
 					for ch := gr * cg; ch < (gr+1)*cg; ch++ {
 						idx := (n*t+at)*c + ch
-						dx[idx] = inv[n*groups+gr] * (size*g[idx]*w.Data[ch] - sg - norm[idx]*sgn) / size
+						dx[idx] = iv * (size*g[idx]*w.Data[ch] - sg - norm[idx]*sgn) / size
 					}
 				}
 			}
-		}
+			mu.Lock()
+			for ch := 0; ch < c; ch++ {
+				dw[ch] += localW[ch]
+				db[ch] += localB[ch]
+			}
+			mu.Unlock()
+		})
 		x.addGrad(dx)
 		w.addGrad(dw)
 		b.addGrad(db)
@@ -215,8 +226,8 @@ func LayerNorm(x, w, b *Tensor, eps float32) *Tensor {
 		return gpuLayerNorm(x, w, b, eps)
 	}
 	rows := x.Numel() / c
-	out, means, invs := cpuAlloc(x.Numel()), cpuAlloc(rows), cpuAlloc(rows)
-	parallelFor(rows, func(start, end int) {
+	out, means, invs := cpuAllocUninit(x.Numel()), cpuAllocUninit(rows), cpuAllocUninit(rows)
+	parallelForWork(rows, c, func(start, end int) {
 		for row := start; row < end; row++ {
 			base := row * c
 			var mean, varsum float32
@@ -236,9 +247,9 @@ func LayerNorm(x, w, b *Tensor, eps float32) *Tensor {
 		}
 	})
 	r := result(out, x.Shape, []*Tensor{x, w, b}, func(g []float32) {
-		dx, dw, db := cpuAlloc(x.Numel()), cpuAlloc(c), cpuAlloc(c)
+		dx, dw, db := cpuAllocUninit(x.Numel()), cpuAlloc(c), cpuAlloc(c)
 		var mu sync.Mutex
-		parallelFor(rows, func(start, end int) {
+		parallelForWork(rows, c, func(start, end int) {
 			localW, localB := make([]float32, c), make([]float32, c)
 			for row := start; row < end; row++ {
 				base := row * c

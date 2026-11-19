@@ -279,15 +279,20 @@ func CrossEntropy(logits *Tensor, targets []int, ignoreIndex int) *Tensor {
 		out := mustAlloc(1)
 		xp, ip, ap, yp := ptr(logits.buf), ptr(idBuf), ptr(acc), ptr(out)
 		r, c, ig := int32(rows), int32(classes), int32(ignoreIndex)
-		launch("ce_f", rows, unsafe.Pointer(&xp), unsafe.Pointer(&ip), unsafe.Pointer(&ap), unsafe.Pointer(&r), unsafe.Pointer(&c), unsafe.Pointer(&ig))
+		launch("ce_f", rows*32, unsafe.Pointer(&xp), unsafe.Pointer(&ip), unsafe.Pointer(&ap), unsafe.Pointer(&r), unsafe.Pointer(&c), unsafe.Pointer(&ig))
 		launch("ce_finish", 1, unsafe.Pointer(&ap), unsafe.Pointer(&yp))
 		res := resultGPU(out, []int{}, []*Tensor{logits}, func(g *cuda.Buffer) {
 			if dx := logits.ensureGradGPU(); dx != nil {
 				gp, dp := ptr(g), ptr(dx)
-				launch("ce_b", rows, unsafe.Pointer(&xp), unsafe.Pointer(&ip), unsafe.Pointer(&ap), unsafe.Pointer(&gp), unsafe.Pointer(&dp), unsafe.Pointer(&r), unsafe.Pointer(&c), unsafe.Pointer(&ig))
+				launch("ce_b", rows*32, unsafe.Pointer(&xp), unsafe.Pointer(&ip), unsafe.Pointer(&ap), unsafe.Pointer(&gp), unsafe.Pointer(&dp), unsafe.Pointer(&r), unsafe.Pointer(&c), unsafe.Pointer(&ig))
 			}
 		})
-		res.aux = []*cuda.Buffer{idBuf, acc}
+		if res.RequiresGrad {
+			res.aux = []*cuda.Buffer{idBuf, acc}
+		} else {
+			idBuf.Free()
+			acc.Free()
+		}
 		return res
 	}
 	// The caller may reuse its host target buffer before backward.

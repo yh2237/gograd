@@ -460,12 +460,13 @@ func MatMul(a, b *Tensor) *Tensor {
 	count := numel(batch)
 	aBatch, bBatch := a.Shape[:len(a.Shape)-2], b.Shape[:len(b.Shape)-2]
 	flatLinear := count > 1 && numel(aBatch) == count && numel(bBatch) == 1
-	transposedB := !useCUDA && b.Offset == 0 && len(b.Data) == b.Numel() && lastTwoTranspose(b.Shape, b.Strides, b.Offset)
+	transposedB := b.Offset == 0 && lastTwoTranspose(b.Shape, b.Strides, b.Offset) &&
+		((!useCUDA && len(b.Data) == b.Numel()) || (useCUDA && b.buf != nil && b.buf.Size() == b.Numel()*4))
 	if !transposedB {
 		b = b.Contiguous()
 	}
 	if useCUDA {
-		return gpuMatMul(a, b, s, m, n, k, batch)
+		return gpuMatMul(a, b, s, m, n, k, batch, transposedB)
 	}
 	// Divide the CPU budget between independent batches and each GEMM. In
 	// particular, an ordinary rank-two product must not be capped at one core.
@@ -546,6 +547,44 @@ func MatMul(a, b *Tensor) *Tensor {
 		}
 		a.addGrad(da)
 		b.addGrad(db)
+	})
+}
+
+func matMulTransB(a, w *Tensor) *Tensor {
+	if inferenceDevice(a.Device) {
+		return MatMul(a, Transpose(w, 0, 1))
+	}
+	useCUDA := dispatchBackend("matmul", a.Device)
+	same(a, w)
+	a, w = a.Contiguous(), w.Contiguous()
+	if len(a.Shape) < 2 || len(w.Shape) != 2 {
+		panic("autograd: matmul rank")
+	}
+	k := a.Shape[len(a.Shape)-1]
+	if w.Shape[1] != k {
+		panic("autograd: matmul inner dimension")
+	}
+	n := w.Shape[0]
+	s := append(append([]int(nil), a.Shape[:len(a.Shape)-1]...), n)
+	rows := numel(a.Shape[:len(a.Shape)-1])
+	if useCUDA {
+		return gpuMatMulTransB(a, w, s, rows, n, k)
+	}
+	v := cpuAllocUninit(rows * n)
+	tensor.SGEMMOp(v, a.Data, w.Data, rows, n, k, false, true)
+	return result(v, s, []*Tensor{a, w}, func(g []float32) {
+		if a.RequiresGrad {
+			da := cpuAllocUninit(rows * k)
+			tensor.SGEMMOp(da, g, w.Data, rows, k, n, false, false)
+			a.addGrad(da)
+			cpuRelease(da)
+		}
+		if w.RequiresGrad {
+			dw := cpuAllocUninit(n * k)
+			tensor.SGEMMOp(dw, g, a.Data, n, k, rows, true, false)
+			w.addGrad(dw)
+			cpuRelease(dw)
+		}
 	})
 }
 func Embedding(weight *Tensor, ids []int, shape []int) *Tensor {
