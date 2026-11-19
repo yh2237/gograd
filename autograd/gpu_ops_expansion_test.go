@@ -75,339 +75,361 @@ func makeData(n int, scale, shift float32) []float32 {
 	return out
 }
 
-func TestDirectMLOpsExpansion(t *testing.T) {
-	if !directml.Available() {
-		t.Skipf("DirectML unavailable: %v", directml.Err())
+func availableInferenceDevices(t *testing.T) []tensor.Device {
+	t.Helper()
+	var devices []tensor.Device
+	if directml.Available() {
+		devices = append(devices, tensor.DirectML)
 	}
-	before := directml.MemoryStats().LiveBytes
+	if vulkan.Available() {
+		devices = append(devices, tensor.Vulkan)
+	}
+	if len(devices) == 0 {
+		t.Skip("no DirectML or Vulkan device available")
+	}
+	return devices
+}
 
+func inferenceLiveBytes(dev tensor.Device) uint64 {
+	if dev == tensor.DirectML {
+		return directml.MemoryStats().LiveBytes
+	}
+	return vulkan.MemoryStats().LiveBytes
+}
+
+func TestInferenceOpsExpansion(t *testing.T) {
 	aVals := makeData(24, 0.15, 0.05)
 	bVals := makeData(24, 0.12, 1.8)
 	posVals := makeData(24, 0.08, 2.2)
 	biasVals := []float32{0.5, -1.25, 2.0, -0.75}
 
-	for _, tc := range []struct {
-		name string
-		fn   func(a, b *Tensor) *Tensor
-	}{
-		{"Sub", Sub},
-		{"Div", Div},
-		{"Max", Max},
-		{"Min", Min},
-	} {
-		runCPUAndDevice(t, tensor.DirectML, tc.name+"/same", 1e-5, 1e-5, func(c *ExecutionContext, dev tensor.Device) (*Tensor, func()) {
-			a, err := c.New(aVals, []int{2, 3, 4}, dev, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			b, err := c.New(bVals, []int{2, 3, 4}, dev, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			return tc.fn(a, b), func() { a.Close(); b.Close() }
-		})
-		runCPUAndDevice(t, tensor.DirectML, tc.name+"/broadcast_view", 1e-5, 1e-5, func(c *ExecutionContext, dev tensor.Device) (*Tensor, func()) {
-			a, err := c.New(aVals, []int{2, 4, 3}, dev, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			b, err := c.New(biasVals, []int{1, 1, 4}, dev, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			return tc.fn(Transpose(a, 1, 2), b), func() { a.Close(); b.Close() }
-		})
-	}
+	for _, dev := range availableInferenceDevices(t) {
+		t.Run(string(dev), func(t *testing.T) {
+			before := inferenceLiveBytes(dev)
 
-	for _, tc := range []struct {
-		name string
-		vals []float32
-		fn   func(*Tensor) *Tensor
-	}{
-		{"AddScalar", aVals, func(x *Tensor) *Tensor { return AddScalar(x, 1.75) }},
-		{"SubScalar", aVals, func(x *Tensor) *Tensor { return SubScalar(x, 0.625) }},
-		{"DivScalar", aVals, func(x *Tensor) *Tensor { return DivScalar(x, 3.5) }},
-		{"PowScalar", posVals, func(x *Tensor) *Tensor { return PowScalar(x, 1.5) }},
-		{"Exp", aVals, Exp},
-		{"Log", posVals, Log},
-		{"Abs", aVals, Abs},
-		{"Tanh", aVals, Tanh},
-		{"ReLU", aVals, ReLU},
-		{"Sin", aVals, Sin},
-		{"Cos", aVals, Cos},
-		{"Sqrt", posVals, Sqrt},
-		{"Sigmoid", aVals, Sigmoid},
-		{"Softplus", aVals, Softplus},
-		{"Erf", aVals, Erf},
-		{"Clamp", aVals, func(x *Tensor) *Tensor { return Clamp(x, -0.5, 0.75) }},
-	} {
-		runCPUAndDevice(t, tensor.DirectML, tc.name, 1e-4, 1e-4, func(c *ExecutionContext, dev tensor.Device) (*Tensor, func()) {
-			x, err := c.New(tc.vals, []int{4, 6}, dev, false)
-			if err != nil {
-				t.Fatal(err)
+			for _, tc := range []struct {
+				name string
+				fn   func(a, b *Tensor) *Tensor
+			}{
+				{"Sub", Sub},
+				{"Div", Div},
+				{"Max", Max},
+				{"Min", Min},
+			} {
+				runCPUAndDevice(t, dev, tc.name+"/same", 1e-5, 1e-5, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
+					a, err := c.New(aVals, []int{2, 3, 4}, d, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					b, err := c.New(bVals, []int{2, 3, 4}, d, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return tc.fn(a, b), func() { a.Close(); b.Close() }
+				})
+				runCPUAndDevice(t, dev, tc.name+"/broadcast_view", 1e-5, 1e-5, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
+					a, err := c.New(aVals, []int{2, 4, 3}, d, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					b, err := c.New(biasVals, []int{1, 1, 4}, d, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return tc.fn(Transpose(a, 1, 2), b), func() { a.Close(); b.Close() }
+				})
 			}
-			return tc.fn(Transpose(x, 0, 1)), func() { x.Close() }
+
+			for _, tc := range []struct {
+				name string
+				vals []float32
+				fn   func(*Tensor) *Tensor
+			}{
+				{"AddScalar", aVals, func(x *Tensor) *Tensor { return AddScalar(x, 1.75) }},
+				{"SubScalar", aVals, func(x *Tensor) *Tensor { return SubScalar(x, 0.625) }},
+				{"DivScalar", aVals, func(x *Tensor) *Tensor { return DivScalar(x, 3.5) }},
+				{"PowScalar", posVals, func(x *Tensor) *Tensor { return PowScalar(x, 1.5) }},
+				{"Exp", aVals, Exp},
+				{"Log", posVals, Log},
+				{"Abs", aVals, Abs},
+				{"Tanh", aVals, Tanh},
+				{"ReLU", aVals, ReLU},
+				{"Sin", aVals, Sin},
+				{"Cos", aVals, Cos},
+				{"Sqrt", posVals, Sqrt},
+				{"Sigmoid", aVals, Sigmoid},
+				{"Softplus", aVals, Softplus},
+				{"Erf", aVals, Erf},
+				{"Clamp", aVals, func(x *Tensor) *Tensor { return Clamp(x, -0.5, 0.75) }},
+			} {
+				runCPUAndDevice(t, dev, tc.name, 1e-4, 1e-4, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
+					x, err := c.New(tc.vals, []int{4, 6}, d, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return tc.fn(Transpose(x, 0, 1)), func() { x.Close() }
+				})
+			}
+
+			for _, axis := range []int{0, 1, -1} {
+				runCPUAndDevice(t, dev, "LogSoftmax", 1e-4, 1e-4, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
+					x, err := c.New(aVals, []int{2, 3, 4}, d, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return LogSoftmax(x, axis), func() { x.Close() }
+				})
+			}
+			{
+				c := NewExecutionContext()
+				emptyAxis, err := c.Zeros([]int{2, 0}, dev, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertGPUErrorPanic(t, gpu.ErrInvalidArgument, func() { c.NoGrad(func() { LogSoftmax(emptyAxis, -1) }) })
+				emptyAxis.Close()
+
+				emptyOuter, err := c.Zeros([]int{0, 2}, dev, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var out *Tensor
+				c.NoGrad(func() { out = LogSoftmax(emptyOuter, -1) })
+				out.ReleaseGraph()
+				emptyOuter.Close()
+			}
+
+			for _, tc := range []struct {
+				name  string
+				shape []int
+				axes  []int
+				mean  bool
+			}{
+				{"Sum/last", []int{2, 3, 4}, []int{-1}, false},
+				{"Mean/mid", []int{2, 3, 4}, []int{1}, true},
+				{"Sum/multi", []int{2, 3, 4, 5}, []int{0, 2}, false},
+				{"Mean/all", []int{2, 3, 4}, []int{0, 1, 2}, true},
+				{"Sum/rank6_alt", []int{2, 3, 2, 2, 2, 3}, []int{1, 3, 5}, false},
+				{"Mean/rank6_alt", []int{2, 3, 2, 2, 2, 3}, []int{0, 2, 4}, true},
+				{"Sum/no_axis", []int{2, 3}, nil, false},
+				{"Mean/size1_axis", []int{2, 1, 3}, []int{1}, true},
+				{"Sum/empty_axis", []int{0, 3}, []int{0}, false},
+				{"Mean/empty_axis", []int{0, 3}, []int{0}, true},
+				{"Sum/empty_out", []int{0, 3}, []int{1}, false},
+			} {
+				vals := makeData(numel(tc.shape), 0.1, 0.2)
+				runCPUAndDevice(t, dev, tc.name, 1e-4, 1e-4, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
+					x, err := c.New(vals, tc.shape, d, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if tc.mean {
+						return Mean(x, tc.axes...), func() { x.Close() }
+					}
+					return Sum(x, tc.axes...), func() { x.Close() }
+				})
+			}
+
+			if after := inferenceLiveBytes(dev); after != before {
+				t.Fatalf("%s elementwise/reduce leaked: %d -> %d", dev, before, after)
+			}
 		})
-	}
-
-	for _, axis := range []int{0, 1, -1} {
-		runCPUAndDevice(t, tensor.DirectML, "LogSoftmax", 1e-4, 1e-4, func(c *ExecutionContext, dev tensor.Device) (*Tensor, func()) {
-			x, err := c.New(aVals, []int{2, 3, 4}, dev, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			return LogSoftmax(x, axis), func() { x.Close() }
-		})
-	}
-	{
-		c := NewExecutionContext()
-		emptyAxis, err := c.Zeros([]int{2, 0}, tensor.DirectML, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		assertGPUErrorPanic(t, gpu.ErrInvalidArgument, func() { c.NoGrad(func() { LogSoftmax(emptyAxis, -1) }) })
-		emptyAxis.Close()
-
-		emptyOuter, err := c.Zeros([]int{0, 2}, tensor.DirectML, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var out *Tensor
-		c.NoGrad(func() { out = LogSoftmax(emptyOuter, -1) })
-		out.ReleaseGraph()
-		emptyOuter.Close()
-	}
-
-	for _, tc := range []struct {
-		name  string
-		shape []int
-		axes  []int
-		mean  bool
-	}{
-		{"Sum/last", []int{2, 3, 4}, []int{-1}, false},
-		{"Mean/mid", []int{2, 3, 4}, []int{1}, true},
-		{"Sum/multi", []int{2, 3, 4, 5}, []int{0, 2}, false},
-		{"Mean/all", []int{2, 3, 4}, []int{0, 1, 2}, true},
-		{"Sum/rank6_alt", []int{2, 3, 2, 2, 2, 3}, []int{1, 3, 5}, false},
-		{"Mean/rank6_alt", []int{2, 3, 2, 2, 2, 3}, []int{0, 2, 4}, true},
-		{"Sum/no_axis", []int{2, 3}, nil, false},
-		{"Mean/size1_axis", []int{2, 1, 3}, []int{1}, true},
-		{"Sum/empty_axis", []int{0, 3}, []int{0}, false},
-		{"Mean/empty_axis", []int{0, 3}, []int{0}, true},
-		{"Sum/empty_out", []int{0, 3}, []int{1}, false},
-	} {
-		n := numel(tc.shape)
-		vals := makeData(n, 0.1, 0.2)
-		runCPUAndDevice(t, tensor.DirectML, tc.name, 1e-4, 1e-4, func(c *ExecutionContext, dev tensor.Device) (*Tensor, func()) {
-			x, err := c.New(vals, tc.shape, dev, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if tc.mean {
-				return Mean(x, tc.axes...), func() { x.Close() }
-			}
-			return Sum(x, tc.axes...), func() { x.Close() }
-		})
-	}
-
-	if after := directml.MemoryStats().LiveBytes; after != before {
-		t.Fatalf("DirectML elementwise/reduce leaked: %d -> %d", before, after)
 	}
 }
 
-func TestDirectMLVisionAndBatchNorm(t *testing.T) {
-	if !directml.Available() {
-		t.Skipf("DirectML unavailable: %v", directml.Err())
-	}
-	before := directml.MemoryStats().LiveBytes
-
+func TestInferenceVisionAndBatchNorm(t *testing.T) {
 	xVals := makeData(2*4*7*8, 0.1, -0.05)
 	wVals := makeData(6*2*3*3, 0.1, 0.02)
 	bVals := makeData(6, 0.2, 0.1)
-
-	runCPUAndDevice(t, tensor.DirectML, "Conv2d/groups_dilated_bias", 1e-4, 1e-4, func(c *ExecutionContext, dev tensor.Device) (*Tensor, func()) {
-		x, err := c.New(xVals, []int{2, 4, 7, 8}, dev, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		w, err := c.New(wVals, []int{6, 2, 3, 3}, dev, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		b, err := c.New(bVals, []int{6}, dev, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return Conv2d(x, w, b, Conv2dOptions{Stride: [2]int{1, 2}, Padding: [2]int{1, 1}, Dilation: [2]int{2, 1}, Groups: 2}), func() {
-			x.Close()
-			w.Close()
-			b.Close()
-		}
-	})
-
-	runCPUAndDevice(t, tensor.DirectML, "MaxPool2d/ceil", 1e-5, 1e-5, func(c *ExecutionContext, dev tensor.Device) (*Tensor, func()) {
-		x, err := c.New(xVals, []int{2, 4, 7, 8}, dev, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return MaxPool2d(x, MaxPool2dOptions{KernelSize: [2]int{3, 2}, Stride: [2]int{2, 2}, Padding: [2]int{1, 0}, CeilMode: true}), func() { x.Close() }
-	})
-
-	runCPUAndDevice(t, tensor.DirectML, "MaxPool2d/dilated", 1e-5, 1e-5, func(c *ExecutionContext, dev tensor.Device) (*Tensor, func()) {
-		x, err := c.New(xVals, []int{2, 4, 7, 8}, dev, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return MaxPool2d(x, MaxPool2dOptions{KernelSize: [2]int{2, 2}, Stride: [2]int{1, 2}, Padding: [2]int{0, 0}, Dilation: [2]int{2, 2}}), func() { x.Close() }
-	})
-
-	runCPUAndDevice(t, tensor.DirectML, "AvgPool2d/include_pad", 1e-5, 1e-5, func(c *ExecutionContext, dev tensor.Device) (*Tensor, func()) {
-		x, err := c.New(xVals, []int{2, 4, 7, 8}, dev, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return AvgPool2d(x, AvgPool2dOptions{KernelSize: [2]int{3, 3}, Stride: [2]int{2, 2}, Padding: [2]int{1, 1}}), func() { x.Close() }
-	})
-
-	runCPUAndDevice(t, tensor.DirectML, "AvgPool2d/ceil_exclude_pad", 1e-5, 1e-5, func(c *ExecutionContext, dev tensor.Device) (*Tensor, func()) {
-		x, err := c.New(xVals, []int{2, 4, 7, 8}, dev, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return AvgPool2d(x, AvgPool2dOptions{KernelSize: [2]int{3, 3}, Stride: [2]int{2, 2}, Padding: [2]int{1, 0}, CeilMode: true, ExcludePad: true}), func() { x.Close() }
-	})
-
-	runCPUAndDevice(t, tensor.DirectML, "AdaptiveAvgPool2d/global", 1e-5, 1e-5, func(c *ExecutionContext, dev tensor.Device) (*Tensor, func()) {
-		x, err := c.New(xVals, []int{2, 4, 7, 8}, dev, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return AdaptiveAvgPool2d(x, [2]int{1, 1}), func() { x.Close() }
-	})
-
 	bnMean := []float32{0.2, -0.5, 0.1, 0.7}
 	bnVar := []float32{0.8, 1.5, 0.4, 2.2}
 	bnWeight := []float32{1.2, 0.7, -0.9, 1.5}
 	bnBias := []float32{0.1, -0.3, 0.4, -0.2}
-	for _, tc := range []struct {
-		name         string
-		shape        []int
-		channelsLast bool
-		hasW, hasB   bool
-	}{
-		{"NCHW_affine", []int{2, 4, 3, 5}, false, true, true},
-		{"NCHW_no_affine", []int{2, 4, 3, 5}, false, false, false},
-		{"ChannelsLast_weight_only", []int{2, 5, 3, 4}, true, true, false},
-		{"Rank2_bias_only", []int{6, 4}, false, false, true},
-	} {
-		vals := makeData(numel(tc.shape), 0.2, 0.1)
-		runCPUAndDevice(t, tensor.DirectML, "BatchNorm/"+tc.name, 1e-4, 1e-4, func(c *ExecutionContext, dev tensor.Device) (*Tensor, func()) {
-			x, err := c.New(vals, tc.shape, dev, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			m, err := c.New(bnMean, []int{4}, dev, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			v, err := c.New(bnVar, []int{4}, dev, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var w, b *Tensor
-			if tc.hasW {
-				w, err = c.New(bnWeight, []int{4}, dev, false)
+
+	for _, dev := range availableInferenceDevices(t) {
+		t.Run(string(dev), func(t *testing.T) {
+			before := inferenceLiveBytes(dev)
+
+			runCPUAndDevice(t, dev, "Conv2d/groups_dilated_bias", 1e-4, 1e-4, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
+				x, err := c.New(xVals, []int{2, 4, 7, 8}, d, false)
 				if err != nil {
 					t.Fatal(err)
 				}
-			}
-			if tc.hasB {
-				b, err = c.New(bnBias, []int{4}, dev, false)
+				w, err := c.New(wVals, []int{6, 2, 3, 3}, d, false)
 				if err != nil {
 					t.Fatal(err)
 				}
-			}
-			return BatchNorm(x, w, b, m, v, BatchNormOptions{ChannelsLast: tc.channelsLast, Eps: 1e-5}), func() {
-				x.Close()
-				m.Close()
-				v.Close()
-				if w != nil {
+				b, err := c.New(bVals, []int{6}, d, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return Conv2d(x, w, b, Conv2dOptions{Stride: [2]int{1, 2}, Padding: [2]int{1, 1}, Dilation: [2]int{2, 1}, Groups: 2}), func() {
+					x.Close()
 					w.Close()
-				}
-				if b != nil {
 					b.Close()
 				}
+			})
+
+			runCPUAndDevice(t, dev, "MaxPool2d/ceil", 1e-5, 1e-5, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
+				x, err := c.New(xVals, []int{2, 4, 7, 8}, d, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return MaxPool2d(x, MaxPool2dOptions{KernelSize: [2]int{3, 2}, Stride: [2]int{2, 2}, Padding: [2]int{1, 0}, CeilMode: true}), func() { x.Close() }
+			})
+
+			runCPUAndDevice(t, dev, "MaxPool2d/dilated", 1e-5, 1e-5, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
+				x, err := c.New(xVals, []int{2, 4, 7, 8}, d, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return MaxPool2d(x, MaxPool2dOptions{KernelSize: [2]int{2, 2}, Stride: [2]int{1, 2}, Padding: [2]int{0, 0}, Dilation: [2]int{2, 2}}), func() { x.Close() }
+			})
+
+			runCPUAndDevice(t, dev, "AvgPool2d/include_pad", 1e-5, 1e-5, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
+				x, err := c.New(xVals, []int{2, 4, 7, 8}, d, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return AvgPool2d(x, AvgPool2dOptions{KernelSize: [2]int{3, 3}, Stride: [2]int{2, 2}, Padding: [2]int{1, 1}}), func() { x.Close() }
+			})
+
+			runCPUAndDevice(t, dev, "AvgPool2d/ceil_exclude_pad", 1e-5, 1e-5, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
+				x, err := c.New(xVals, []int{2, 4, 7, 8}, d, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return AvgPool2d(x, AvgPool2dOptions{KernelSize: [2]int{3, 3}, Stride: [2]int{2, 2}, Padding: [2]int{1, 0}, CeilMode: true, ExcludePad: true}), func() { x.Close() }
+			})
+
+			runCPUAndDevice(t, dev, "AdaptiveAvgPool2d/global", 1e-5, 1e-5, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
+				x, err := c.New(xVals, []int{2, 4, 7, 8}, d, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return AdaptiveAvgPool2d(x, [2]int{1, 1}), func() { x.Close() }
+			})
+
+			for _, tc := range []struct {
+				name         string
+				shape        []int
+				channelsLast bool
+				hasW, hasB   bool
+			}{
+				{"NCHW_affine", []int{2, 4, 3, 5}, false, true, true},
+				{"NCHW_no_affine", []int{2, 4, 3, 5}, false, false, false},
+				{"ChannelsLast_weight_only", []int{2, 5, 3, 4}, true, true, false},
+				{"Rank2_bias_only", []int{6, 4}, false, false, true},
+			} {
+				vals := makeData(numel(tc.shape), 0.2, 0.1)
+				runCPUAndDevice(t, dev, "BatchNorm/"+tc.name, 1e-4, 1e-4, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
+					x, err := c.New(vals, tc.shape, d, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					m, err := c.New(bnMean, []int{4}, d, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					v, err := c.New(bnVar, []int{4}, d, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var w, b *Tensor
+					if tc.hasW {
+						w, err = c.New(bnWeight, []int{4}, d, false)
+						if err != nil {
+							t.Fatal(err)
+						}
+					}
+					if tc.hasB {
+						b, err = c.New(bnBias, []int{4}, d, false)
+						if err != nil {
+							t.Fatal(err)
+						}
+					}
+					return BatchNorm(x, w, b, m, v, BatchNormOptions{ChannelsLast: tc.channelsLast, Eps: 1e-5}), func() {
+						x.Close()
+						m.Close()
+						v.Close()
+						if w != nil {
+							w.Close()
+						}
+						if b != nil {
+							b.Close()
+						}
+					}
+				})
 			}
-		})
-	}
 
-	c := NewExecutionContext()
-	x, err := c.New(xVals, []int{2, 4, 7, 8}, tensor.DirectML, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer x.Close()
-	assertGPUErrorPanic(t, gpu.ErrUnsupported, func() {
-		c.NoGrad(func() { AvgPool2d(x, AvgPool2dOptions{KernelSize: [2]int{2, 2}, DivisorOverride: 3}) })
-	})
-	assertGPUErrorPanic(t, gpu.ErrUnsupported, func() {
-		c.NoGrad(func() {
-			AvgPool2d(x, AvgPool2dOptions{KernelSize: [2]int{3, 3}, Stride: [2]int{2, 2}, Padding: [2]int{0, 0}, CeilMode: true})
-		})
-	})
-	assertGPUErrorPanic(t, gpu.ErrUnsupported, func() {
-		c.NoGrad(func() { AdaptiveAvgPool2d(x, [2]int{3, 3}) })
-	})
-
-	runCPUAndDevice(t, tensor.DirectML, "MiniCNN_Stack", 1e-4, 1e-4, func(c *ExecutionContext, dev tensor.Device) (*Tensor, func()) {
-		rng := rand.New(rand.NewSource(42))
-		conv1, err := NewConv2dLayer(3, 8, [2]int{3, 3}, Conv2dOptions{Padding: [2]int{1, 1}}, true, dev, rng)
-		if err != nil {
-			t.Fatal(err)
-		}
-		bn1, err := NewBatchNormLayer(8, BatchNormLayerOptions{}, dev)
-		if err != nil {
-			t.Fatal(err)
-		}
-		bn1.Train(false)
-		conv2, err := NewConv2dLayer(8, 12, [2]int{3, 3}, Conv2dOptions{Padding: [2]int{1, 1}}, false, dev, rng)
-		if err != nil {
-			t.Fatal(err)
-		}
-		head, err := NewLinearLayer(12, 5, dev, rng)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, m := range []*Module{conv1.StateModule(), bn1.StateModule(), conv2.StateModule(), head.StateModule()} {
-			if err := c.BindModule(m); err != nil {
+			c := NewExecutionContext()
+			x, err := c.New(xVals, []int{2, 4, 7, 8}, dev, false)
+			if err != nil {
 				t.Fatal(err)
 			}
-		}
-		inVals := makeData(2*3*8*8, 0.1, 0.05)
-		in, err := c.New(inVals, []int{2, 3, 8, 8}, dev, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		h := ReLU(bn1.Forward(conv1.Forward(in)))
-		h = MaxPool2dLayer{Options: MaxPool2dOptions{KernelSize: [2]int{2, 2}}}.Forward(h)
-		h = ReLU(conv2.Forward(h))
-		h = AdaptiveAvgPool2dLayer{OutputSize: [2]int{1, 1}}.Forward(h)
-		h = Flatten(h, 1, -1)
-		out := LogSoftmax(head.Forward(h), -1)
-		return out, func() {
-			in.Close()
-			conv1.Weight.Close()
-			conv1.Bias.Close()
-			bn1.Close()
-			conv2.Weight.Close()
-			head.Weight.Close()
-			head.Bias.Close()
-		}
-	})
+			assertGPUErrorPanic(t, gpu.ErrUnsupported, func() {
+				c.NoGrad(func() { AvgPool2d(x, AvgPool2dOptions{KernelSize: [2]int{2, 2}, DivisorOverride: 3}) })
+			})
+			assertGPUErrorPanic(t, gpu.ErrUnsupported, func() {
+				c.NoGrad(func() {
+					AvgPool2d(x, AvgPool2dOptions{KernelSize: [2]int{3, 3}, Stride: [2]int{2, 2}, Padding: [2]int{0, 0}, CeilMode: true})
+				})
+			})
+			assertGPUErrorPanic(t, gpu.ErrUnsupported, func() {
+				c.NoGrad(func() { AdaptiveAvgPool2d(x, [2]int{3, 3}) })
+			})
+			x.Close()
 
-	x.Close()
-	if after := directml.MemoryStats().LiveBytes; after != before {
-		t.Fatalf("DirectML vision/BN leaked: %d -> %d", before, after)
+			runCPUAndDevice(t, dev, "MiniCNN_Stack", 1e-4, 1e-4, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
+				rng := rand.New(rand.NewSource(42))
+				conv1, err := NewConv2dLayer(3, 8, [2]int{3, 3}, Conv2dOptions{Padding: [2]int{1, 1}}, true, d, rng)
+				if err != nil {
+					t.Fatal(err)
+				}
+				bn1, err := NewBatchNormLayer(8, BatchNormLayerOptions{}, d)
+				if err != nil {
+					t.Fatal(err)
+				}
+				bn1.Train(false)
+				conv2, err := NewConv2dLayer(8, 12, [2]int{3, 3}, Conv2dOptions{Padding: [2]int{1, 1}}, false, d, rng)
+				if err != nil {
+					t.Fatal(err)
+				}
+				head, err := NewLinearLayer(12, 5, d, rng)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, m := range []*Module{conv1.StateModule(), bn1.StateModule(), conv2.StateModule(), head.StateModule()} {
+					if err := c.BindModule(m); err != nil {
+						t.Fatal(err)
+					}
+				}
+				inVals := makeData(2*3*8*8, 0.1, 0.05)
+				in, err := c.New(inVals, []int{2, 3, 8, 8}, d, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				h := ReLU(bn1.Forward(conv1.Forward(in)))
+				h = MaxPool2dLayer{Options: MaxPool2dOptions{KernelSize: [2]int{2, 2}}}.Forward(h)
+				h = ReLU(conv2.Forward(h))
+				h = AdaptiveAvgPool2dLayer{OutputSize: [2]int{1, 1}}.Forward(h)
+				h = Flatten(h, 1, -1)
+				out := LogSoftmax(head.Forward(h), -1)
+				return out, func() {
+					in.Close()
+					conv1.Weight.Close()
+					conv1.Bias.Close()
+					bn1.Close()
+					conv2.Weight.Close()
+					head.Weight.Close()
+					head.Bias.Close()
+				}
+			})
+
+			if after := inferenceLiveBytes(dev); after != before {
+				t.Fatalf("%s vision/BN leaked: %d -> %d", dev, before, after)
+			}
+		})
 	}
 }
 
@@ -418,56 +440,49 @@ func TestInferenceModernTransformerBlocks(t *testing.T) {
 	kVals := makeData(2*2*5*8, 0.1, -0.03)
 	vVals := makeData(2*2*5*8, 0.1, 0.04)
 	valid := []bool{true, true, true, true, false, true, true, true, false, false}
+	rmsX := makeData(2*5*8, 0.15, 0.1)
+	rmsW := makeData(8, 0.1, 1.0)
+	swiX := makeData(2*4*8, 0.1, 0.05)
+	w1Vals := makeData(16*8, 0.05, 0.01)
+	w2Vals := makeData(8*16, 0.05, -0.01)
+	w3Vals := makeData(16*8, 0.05, 0.02)
 
-	for _, dev := range []tensor.Device{tensor.DirectML, tensor.Vulkan} {
-		if dev == tensor.DirectML && !directml.Available() {
-			continue
-		}
-		if dev == tensor.Vulkan && !vulkan.Available() {
-			continue
-		}
-		var before uint64
-		if dev == tensor.DirectML {
-			before = directml.MemoryStats().LiveBytes
-		} else {
-			before = vulkan.MemoryStats().LiveBytes
-		}
+	for _, dev := range availableInferenceDevices(t) {
+		t.Run(string(dev), func(t *testing.T) {
+			before := inferenceLiveBytes(dev)
 
-		runCPUAndDevice(t, dev, "RotaryHalf", 1e-4, 1e-4, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
-			x, err := c.New(ropeVals, []int{2, 3, 6, 8}, d, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			return RotaryHalf(x, 10000), func() { x.Close() }
-		})
+			runCPUAndDevice(t, dev, "RotaryHalf", 1e-4, 1e-4, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
+				x, err := c.New(ropeVals, []int{2, 3, 6, 8}, d, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return RotaryHalf(x, 10000), func() { x.Close() }
+			})
 
-		runCPUAndDevice(t, dev, "GeGLU", 1e-4, 1e-4, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
-			x, err := c.New(gegluVals, []int{2, 5, 16}, d, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			return GeGLU(x), func() { x.Close() }
-		})
+			runCPUAndDevice(t, dev, "GeGLU", 1e-4, 1e-4, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
+				x, err := c.New(gegluVals, []int{2, 5, 16}, d, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return GeGLU(x), func() { x.Close() }
+			})
 
-		runCPUAndDevice(t, dev, "KeyPaddingAttention/windowed", 1e-4, 1e-4, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
-			q, err := c.New(qVals, []int{2, 2, 5, 8}, d, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			k, err := c.New(kVals, []int{2, 2, 5, 8}, d, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			v, err := c.New(vVals, []int{2, 2, 5, 8}, d, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			return KeyPaddingAttention(q, k, v, valid, 2), func() { q.Close(); k.Close(); v.Close() }
-		})
+			runCPUAndDevice(t, dev, "KeyPaddingAttention/windowed", 1e-4, 1e-4, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
+				q, err := c.New(qVals, []int{2, 2, 5, 8}, d, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				k, err := c.New(kVals, []int{2, 2, 5, 8}, d, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				v, err := c.New(vVals, []int{2, 2, 5, 8}, d, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return KeyPaddingAttention(q, k, v, valid, 2), func() { q.Close(); k.Close(); v.Close() }
+			})
 
-		if dev == tensor.DirectML {
-			rmsX := makeData(2*5*8, 0.15, 0.1)
-			rmsW := makeData(8, 0.1, 1.0)
 			runCPUAndDevice(t, dev, "RMSNormLast", 1e-4, 1e-4, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
 				x, err := c.New(rmsX, []int{2, 5, 8}, d, false)
 				if err != nil {
@@ -480,10 +495,6 @@ func TestInferenceModernTransformerBlocks(t *testing.T) {
 				return RMSNormLast(x, w, 1e-5), func() { x.Close(); w.Close() }
 			})
 
-			swiX := makeData(2*4*8, 0.1, 0.05)
-			w1Vals := makeData(16*8, 0.05, 0.01)
-			w2Vals := makeData(8*16, 0.05, -0.01)
-			w3Vals := makeData(16*8, 0.05, 0.02)
 			runCPUAndDevice(t, dev, "SwiGLUProjection", 1e-4, 1e-4, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
 				x, err := c.New(swiX, []int{2, 4, 8}, d, false)
 				if err != nil {
@@ -503,64 +514,23 @@ func TestInferenceModernTransformerBlocks(t *testing.T) {
 				}
 				return SwiGLUProjection(x, w1, w2, w3), func() { x.Close(); w1.Close(); w2.Close(); w3.Close() }
 			})
-		} else {
+
 			c := NewExecutionContext()
-			x, err := c.New(makeData(16, 0.1, 0.2), []int{2, 8}, tensor.Vulkan, false)
+			x, err := c.New(makeData(16, 0.1, 0.2), []int{2, 8}, dev, false)
 			if err != nil {
 				t.Fatal(err)
 			}
-			w, err := c.New(makeData(8, 0.1, 1.0), []int{8}, tensor.Vulkan, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			assertGPUErrorPanic(t, gpu.ErrUnsupported, func() { c.NoGrad(func() { RMSNormLast(x, w, 1e-5) }) })
-			assertGPUErrorPanic(t, gpu.ErrUnsupported, func() { c.NoGrad(func() { ReLU(x) }) })
-			assertGPUErrorPanic(t, gpu.ErrUnsupported, func() { c.NoGrad(func() { Div(x, x) }) })
-			w1, err := c.New(makeData(16*8, 0.05, 0.01), []int{16, 8}, tensor.Vulkan, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			w2, err := c.New(makeData(8*16, 0.05, -0.01), []int{8, 16}, tensor.Vulkan, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			w3, err := c.New(makeData(16*8, 0.05, 0.02), []int{16, 8}, tensor.Vulkan, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			assertGPUErrorPanic(t, gpu.ErrUnsupported, func() { c.NoGrad(func() { SwiGLUProjection(x, w1, w2, w3) }) })
-			badW, err := c.New(makeData(4*4, 0.1, 0), []int{4, 4}, tensor.Vulkan, false)
+			badW, err := c.New(makeData(16, 0.1, 0), []int{4, 4}, dev, false)
 			if err != nil {
 				t.Fatal(err)
 			}
 			assertGPUErrorPanic(t, gpu.ErrInvalidArgument, func() { c.NoGrad(func() { matMulTransB(x, badW) }) })
-			w1.Close()
-			w2.Close()
-			w3.Close()
-			badW.Close()
-			runCPUAndDevice(t, tensor.Vulkan, "Sub_and_Scalar_Vulkan", 1e-5, 1e-5, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
-				a, err := c.New(makeData(12, 0.2, 0.1), []int{3, 4}, d, false)
-				if err != nil {
-					t.Fatal(err)
-				}
-				b, err := c.New(makeData(4, 0.15, -0.3), []int{1, 4}, d, false)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return DivScalar(SubScalar(AddScalar(Sub(a, b), 2.5), 0.5), 2.0), func() { a.Close(); b.Close() }
-			})
 			x.Close()
-			w.Close()
-		}
+			badW.Close()
 
-		var after uint64
-		if dev == tensor.DirectML {
-			after = directml.MemoryStats().LiveBytes
-		} else {
-			after = vulkan.MemoryStats().LiveBytes
-		}
-		if after != before {
-			t.Fatalf("%s leaked: %d -> %d", dev, before, after)
-		}
+			if after := inferenceLiveBytes(dev); after != before {
+				t.Fatalf("%s leaked: %d -> %d", dev, before, after)
+			}
+		})
 	}
 }

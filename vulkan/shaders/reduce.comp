@@ -19,7 +19,7 @@ float sumReduce(float value) {
         barrier();
     }
     float total = scratch[0];
-    barrier(); // All lanes finish reading before the next reduction.
+    barrier();
     return total;
 }
 float maxReduce(float value) {
@@ -43,14 +43,19 @@ void main() {
     uint row = gl_WorkGroupID.x + gl_WorkGroupID.y*gl_NumWorkGroups.x;
     if (row >= p.rows) return;
     uint lane = gl_LocalInvocationID.x;
-    if (p.kind == 0u) {
+    if (p.kind == 0u || p.kind == 3u) {
         float mx = uintBitsToFloat(0xff800000u);
         for (uint j = lane; j < p.cols; j += 128u) mx = max(mx, x[row*p.cols+j]);
         mx = maxReduce(mx);
         float sum = 0.0;
         for (uint j = lane; j < p.cols; j += 128u) sum += exp(x[row*p.cols+j]-mx);
         sum = sumReduce(sum);
-        for (uint j = lane; j < p.cols; j += 128u) y[row*p.cols+j] = exp(x[row*p.cols+j]-mx)/sum;
+        if (p.kind == 3u) {
+            float lse = log(sum);
+            for (uint j = lane; j < p.cols; j += 128u) y[row*p.cols+j] = x[row*p.cols+j] - mx - lse;
+        } else {
+            for (uint j = lane; j < p.cols; j += 128u) y[row*p.cols+j] = exp(x[row*p.cols+j]-mx)/sum;
+        }
     } else {
         float sum = 0.0;
         for (uint j = lane; j < p.cols; j += 128u) sum += x[indexOf(row,j)];

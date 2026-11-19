@@ -99,6 +99,18 @@ func (d *vkDriver) initPipeline() error {
 	if d.convPipeline, err = d.createCompute(d.convShader, nil); err != nil {
 		return err
 	}
+	if d.ndReduceShader, err = d.createShader(ndreduceSPV); err != nil {
+		return err
+	}
+	if d.ndReducePipeline, err = d.createCompute(d.ndReduceShader, nil); err != nil {
+		return err
+	}
+	if d.visionShader, err = d.createShader(visionSPV); err != nil {
+		return err
+	}
+	if d.visionPipeline, err = d.createCompute(d.visionShader, nil); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -291,7 +303,7 @@ func (d *vkDriver) zero(out *block, size uint64) error {
 	return nil
 }
 
-func (d *vkDriver) pointwise(out, a, b *block, n, kind uint32, scalar float32) error {
+func (d *vkDriver) pointwise(out, a, b *block, n, kind uint32, scalar, scalar2 float32) error {
 	x, y, err := dispatchGrid(n, d.properties.MaxWorkGroupCount)
 	if err != nil {
 		return err
@@ -302,7 +314,7 @@ func (d *vkDriver) pointwise(out, a, b *block, n, kind uint32, scalar float32) e
 	}
 	d.bindBuffersSet(sets[0], out, a, b, n, n, n)
 	d.beforeCompute(out, a, b)
-	push := vkPointwisePush{N: n, Kind: kind, Scalar: scalar}
+	push := vkPointwisePush{N: n, Kind: kind, Scalar: scalar, Scalar2: scalar2}
 	d.bindComputeSet(sets[0], d.pipeline, unsafe.Pointer(&push), unsafe.Sizeof(push))
 	d.call("vkCmdDispatch", d.command, uintptr(x), uintptr(y), 1)
 	d.barrier(out, accessShaderWrite, accessShaderRead|accessShaderWrite|accessTransferRead, stageCompute, stageCompute|stageTransfer)
@@ -481,6 +493,101 @@ func (d *vkDriver) conv1d(b convBatch) error {
 		p := b.conv
 		p.N, p.Kind = b.outCount, 1
 		d.bindComputeSet(sets[2], d.convPipeline, unsafe.Pointer(&p), unsafe.Sizeof(p))
+		d.call("vkCmdDispatch", d.command, uintptr(bx), uintptr(by), 1)
+	}
+	d.barrier(b.out, accessShaderWrite, accessShaderRead|accessShaderWrite|accessTransferRead, stageCompute, stageCompute|stageTransfer)
+	d.batchOps++
+	return nil
+}
+
+func (d *vkDriver) ndReduce(out, a *block, outCount, aCount uint32, p ndReduceParams) error {
+	x, y, err := groupGrid(uint64(p.OutN), d.properties.MaxWorkGroupCount)
+	if err != nil {
+		return err
+	}
+	sets, err := d.ensureBatch(1)
+	if err != nil {
+		return err
+	}
+	d.bindBuffersSet(sets[0], out, a, a, outCount, aCount, aCount)
+	d.beforeCompute(out, a)
+	d.bindComputeSet(sets[0], d.ndReducePipeline, unsafe.Pointer(&p), unsafe.Sizeof(p))
+	d.call("vkCmdDispatch", d.command, uintptr(x), uintptr(y), 1)
+	d.barrier(out, accessShaderWrite, accessShaderRead|accessShaderWrite|accessTransferRead, stageCompute, stageCompute|stageTransfer)
+	d.batchOps++
+	return nil
+}
+
+func (d *vkDriver) vision(out, a, b, c *block, outCount, aCount, bCount, cCount uint32, p visionParams) error {
+	x, y, err := dispatchGrid(p.N, d.properties.MaxWorkGroupCount)
+	if err != nil {
+		return err
+	}
+	sets, err := d.ensureBatch(1)
+	if err != nil {
+		return err
+	}
+	d.bindBuffersSet(sets[0], out, a, b, outCount, aCount, bCount)
+	info := vkDescriptorBufferInfo{Buffer: c.buffer, Range: uint64(cCount) * 4}
+	write := vkDescriptorWrite{vkHeader: header(35), Set: sets[0], Binding: 3, Count: 1, Type: 7, BufferInfo: &info}
+	d.call("vkUpdateDescriptorSets", d.device, 1, uintptr(unsafe.Pointer(&write)), 0, 0)
+	d.beforeCompute(out, a, b, c)
+	d.bindComputeSet(sets[0], d.visionPipeline, unsafe.Pointer(&p), unsafe.Sizeof(p))
+	d.call("vkCmdDispatch", d.command, uintptr(x), uintptr(y), 1)
+	d.barrier(out, accessShaderWrite, accessShaderRead|accessShaderWrite|accessTransferRead, stageCompute, stageCompute|stageTransfer)
+	d.batchOps++
+	return nil
+}
+
+func (d *vkDriver) conv2d(b conv2dBatch) error {
+	x, y, err := dispatchGrid(b.colCount, d.properties.MaxWorkGroupCount)
+	if err != nil {
+		return err
+	}
+	gx, gy, err := groupGrid(uint64(b.gemm.Batch)*uint64(b.gemm.TilesPerMatrix), d.properties.MaxWorkGroupCount)
+	if err != nil {
+		return err
+	}
+	slots := 2
+	var bx, by uint32
+	if b.hasBias {
+		slots = 3
+		bx, by, err = dispatchGrid(b.outCount, d.properties.MaxWorkGroupCount)
+		if err != nil {
+			return err
+		}
+	}
+	sets, err := d.ensureBatch(slots)
+	if err != nil {
+		return err
+	}
+	d.bindBuffersSet(sets[0], b.col, b.input, b.input, b.colCount, b.inputCount, b.inputCount)
+	d.bindBuffersSet(sets[1], b.out, b.weight, b.col, b.outCount, b.weightCount, b.colCount)
+	if b.hasBias {
+		d.bindBuffersSet(sets[2], b.out, b.out, b.bias, b.outCount, b.outCount, b.biasCount)
+		info := vkDescriptorBufferInfo{Buffer: b.bias.buffer, Range: uint64(b.biasCount) * 4}
+		write := vkDescriptorWrite{vkHeader: header(35), Set: sets[2], Binding: 3, Count: 1, Type: 7, BufferInfo: &info}
+		d.call("vkUpdateDescriptorSets", d.device, 1, uintptr(unsafe.Pointer(&write)), 0, 0)
+	}
+	d.beforeCompute(b.col, b.input)
+	d.bindComputeSet(sets[0], d.visionPipeline, unsafe.Pointer(&b.im2col), unsafe.Sizeof(b.im2col))
+	d.call("vkCmdDispatch", d.command, uintptr(x), uintptr(y), 1)
+	d.barrier(b.col, accessShaderWrite, accessShaderRead, stageCompute, stageCompute)
+
+	if d.batchOps == 0 {
+		d.before(b.weight, accessShaderRead, stageCompute)
+		d.before(b.out, accessShaderWrite, stageCompute)
+	} else {
+		d.barrier(b.out, accessShaderRead|accessShaderWrite|accessTransferRead|accessTransferWrite, accessShaderWrite, stageCompute|stageTransfer, stageCompute)
+	}
+	d.bindComputeSet(sets[1], d.gemmPipelines[b.variant], unsafe.Pointer(&b.gemm), unsafe.Sizeof(b.gemm))
+	d.call("vkCmdDispatch", d.command, uintptr(gx), uintptr(gy), 1)
+	if b.hasBias {
+		d.barrier(b.out, accessShaderWrite, accessShaderRead|accessShaderWrite, stageCompute, stageCompute)
+		if d.batchOps == 0 {
+			d.before(b.bias, accessShaderRead, stageCompute)
+		}
+		d.bindComputeSet(sets[2], d.visionPipeline, unsafe.Pointer(&b.biasOp), unsafe.Sizeof(b.biasOp))
 		d.call("vkCmdDispatch", d.command, uintptr(bx), uintptr(by), 1)
 	}
 	d.barrier(b.out, accessShaderWrite, accessShaderRead|accessShaderWrite|accessTransferRead, stageCompute, stageCompute|stageTransfer)

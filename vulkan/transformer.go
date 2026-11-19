@@ -97,7 +97,7 @@ func (b *Backend) reduction(out, a, weight, bias *gpu.Buffer, n, affineCount int
 		return err
 	}
 	w, v := x, x
-	if p.Kind != 0 {
+	if p.Kind == 1 || p.Kind == 2 {
 		w, err = b.native(weight, affineCount)
 		if err != nil {
 			return err

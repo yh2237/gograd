@@ -1,0 +1,52 @@
+#version 450
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0, std430) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Unused1 { float u1[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Y { float y[]; };
+layout(set = 0, binding = 3, std430) readonly buffer Unused3 { float u3[]; };
+layout(push_constant) uniform Params {
+    uint outN;
+    uint reduceN;
+    uint outRank;
+    uint redRank;
+    uint op;
+    uint outShape[6];
+    uint outInStrides[6];
+    uint redShape[6];
+    uint redInStrides[6];
+} p;
+shared float scratch[128];
+
+void main() {
+    uint outIdx = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (outIdx >= p.outN) return;
+    uint lane = gl_LocalInvocationID.x;
+    uint rest = outIdx;
+    uint base = 0u;
+    for (uint k = 0u; k < p.outRank; k++) {
+        uint dim = p.outRank - 1u - k;
+        uint coord = rest % p.outShape[dim];
+        rest /= p.outShape[dim];
+        base += coord * p.outInStrides[dim];
+    }
+    float acc = 0.0;
+    float scale = p.op == 1u ? (1.0 / float(p.reduceN)) : 1.0;
+    for (uint r = lane; r < p.reduceN; r += 128u) {
+        uint rr = r;
+        uint off = base;
+        for (uint k = 0u; k < p.redRank; k++) {
+            uint dim = p.redRank - 1u - k;
+            uint coord = rr % p.redShape[dim];
+            rr /= p.redShape[dim];
+            off += coord * p.redInStrides[dim];
+        }
+        acc += p.op == 1u ? (x[off] * scale) : x[off];
+    }
+    scratch[lane] = acc;
+    barrier();
+    for (uint step = 64u; step > 0u; step >>= 1u) {
+        if (lane < step) scratch[lane] += scratch[lane + step];
+        barrier();
+    }
+    if (lane == 0u) y[outIdx] = scratch[0];
+}

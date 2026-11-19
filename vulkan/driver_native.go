@@ -13,21 +13,22 @@ import (
 )
 
 type vkDriver struct {
-	library                                                *vkLibrary
-	getProc                                                uintptr
-	procs                                                  map[string]uintptr
-	instance, physical, device, queue, command             uintptr
-	commandPool, fence                                     uint64
-	descriptorLayout, descriptorPool, descriptorSet        uint64
-	descriptorSets                                         []uint64
-	pipelineLayout, shader, pipeline                       uint64
-	viewShader, viewPipeline                               uint64
-	binaryShader, binaryPipeline                           uint64
-	gemmShader                                             uint64
-	gemmPipelines                                          [4]uint64
-	reduceShader, reducePipeline, convShader, convPipeline uint64
-	properties                                             Info
-	memory                                                 vkMemoryProperties
+	library                                                        *vkLibrary
+	getProc                                                        uintptr
+	procs                                                          map[string]uintptr
+	instance, physical, device, queue, command                     uintptr
+	commandPool, fence                                             uint64
+	descriptorLayout, descriptorPool, descriptorSet                uint64
+	descriptorSets                                                 []uint64
+	pipelineLayout, shader, pipeline                               uint64
+	viewShader, viewPipeline                                       uint64
+	binaryShader, binaryPipeline                                   uint64
+	gemmShader                                                     uint64
+	gemmPipelines                                                  [4]uint64
+	reduceShader, reducePipeline, convShader, convPipeline         uint64
+	ndReduceShader, ndReducePipeline, visionShader, visionPipeline uint64
+	properties                                                     Info
+	memory                                                         vkMemoryProperties
 	// pending means completion has not been established, even after an emergency
 	// wait. Never reset commands, update descriptors, free memory or unload while set.
 	pending    bool
@@ -246,7 +247,9 @@ func (d *vkDriver) close() error {
 			{"vkDestroyPipeline", d.pipeline}, {"vkDestroyPipeline", d.viewPipeline},
 			{"vkDestroyPipeline", d.binaryPipeline},
 			{"vkDestroyPipeline", d.reducePipeline}, {"vkDestroyPipeline", d.convPipeline},
+			{"vkDestroyPipeline", d.ndReducePipeline}, {"vkDestroyPipeline", d.visionPipeline},
 			{"vkDestroyShaderModule", d.reduceShader}, {"vkDestroyShaderModule", d.convShader},
+			{"vkDestroyShaderModule", d.ndReduceShader}, {"vkDestroyShaderModule", d.visionShader},
 			{"vkDestroyShaderModule", d.shader}, {"vkDestroyShaderModule", d.viewShader},
 			{"vkDestroyShaderModule", d.binaryShader}, {"vkDestroyShaderModule", d.gemmShader},
 			{"vkDestroyPipelineLayout", d.pipelineLayout},

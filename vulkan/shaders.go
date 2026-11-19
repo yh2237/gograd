@@ -10,6 +10,8 @@ import _ "embed"
 //go:generate glslang -V --target-env vulkan1.1 -o shaders/gemm.spv shaders/gemm.comp
 //go:generate glslang -V --target-env vulkan1.1 -o shaders/reduce.spv shaders/reduce.comp
 //go:generate glslang -V --target-env vulkan1.1 -o shaders/conv.spv shaders/conv.comp
+//go:generate glslang -V --target-env vulkan1.1 -o shaders/ndreduce.spv shaders/ndreduce.comp
+//go:generate glslang -V --target-env vulkan1.1 -o shaders/vision.spv shaders/vision.comp
 
 //go:embed shaders/pointwise.spv
 var pointwiseSPV []byte
@@ -28,3 +30,9 @@ var reduceSPV []byte
 
 //go:embed shaders/conv.spv
 var convSPV []byte
+
+//go:embed shaders/ndreduce.spv
+var ndreduceSPV []byte
+
+//go:embed shaders/vision.spv
+var visionSPV []byte

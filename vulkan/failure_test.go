@@ -25,8 +25,26 @@ func (*failingDriver) write(*block, []float32)                {}
 func (*failingDriver) read(*block, []float32)                 {}
 func (d *failingDriver) copy(out, src *block, n uint64) error { return d.failure }
 func (d *failingDriver) zero(*block, uint64) error            { return d.failure }
-func (d *failingDriver) pointwise(out, a, b *block, n, kind uint32, scalar float32) error {
+func (d *failingDriver) pointwise(out, a, b *block, n, kind uint32, scalar, scalar2 float32) error {
 	return d.failure
+}
+func (d *failingDriver) ndReduce(out, a *block, outCount, aCount uint32, p ndReduceParams) error {
+	return d.computeFailure()
+}
+func (d *failingDriver) vision(out, a, b, c *block, outCount, aCount, bCount, cCount uint32, p visionParams) error {
+	return d.computeFailure()
+}
+func (d *failingDriver) conv2d(p conv2dBatch) error {
+	stages := 2
+	if p.hasBias {
+		stages++
+	}
+	for i := 0; i < stages; i++ {
+		if err := d.computeFailure(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (d *failingDriver) fusedBias(out, a, bias, residual *block, n, channels, kind uint32) error {
 	return d.computeFailure()

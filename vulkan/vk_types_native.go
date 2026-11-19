@@ -196,6 +196,7 @@ type vkPointwisePush struct {
 	N, Kind  uint32
 	Scalar   float32
 	Channels uint32
+	Scalar2  float32
 }
 
 type vkSpecializationMapEntry struct {
@@ -243,11 +244,13 @@ func checkABI() error {
 		{"shader", unsafe.Sizeof(vkShaderCreateInfo{}), 40},
 		{"shader stage", unsafe.Sizeof(vkShaderStage{}), 48},
 		{"compute pipeline", unsafe.Sizeof(vkComputePipelineCreateInfo{}), 96},
-		{"push constants", unsafe.Sizeof(vkPointwisePush{}), 16},
+		{"push constants", unsafe.Sizeof(vkPointwisePush{}), 20},
 		{"pointwise channels offset", unsafe.Offsetof(vkPointwisePush{}.Channels), 12},
 		{"view push constants", unsafe.Sizeof(viewParams{}), 64},
 		{"gemm push constants", unsafe.Sizeof(gemmParams{}), 100},
 		{"reduction push constants", unsafe.Sizeof(reduceParams{}), 28},
+		{"ndreduce push constants", unsafe.Sizeof(ndReduceParams{}), 116},
+		{"vision push constants", unsafe.Sizeof(visionParams{}), 68},
 		{"conv push constants", unsafe.Sizeof(convParams{}), 40},
 		{"specialization entry", unsafe.Sizeof(vkSpecializationMapEntry{}), 16},
 		{"specialization info", unsafe.Sizeof(vkSpecializationInfo{}), 32},

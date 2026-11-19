@@ -47,13 +47,16 @@ type driver interface {
 	read(*block, []float32)
 	copy(out, src *block, size uint64) error
 	zero(out *block, size uint64) error
-	pointwise(out, a, b *block, n, kind uint32, scalar float32) error
+	pointwise(out, a, b *block, n, kind uint32, scalar, scalar2 float32) error
 	fusedBias(out, a, bias, residual *block, n, channels, kind uint32) error
 	viewCopy(out, src *block, outCount, srcCount uint32, params viewParams) error
 	binaryViews(out, a, b *block, outCount, aCount, bCount uint32, params binaryParams) error
 	gemm(out, a, b *block, outCount, aCount, bCount uint32, params gemmParams, variant int) error
 	reduce(out, a, weight, bias *block, count, affineCount uint32, params reduceParams) error
+	ndReduce(out, a *block, outCount, aCount uint32, params ndReduceParams) error
+	vision(out, a, b, c *block, outCount, aCount, bCount, cCount uint32, params visionParams) error
 	conv1d(convBatch) error
+	conv2d(conv2dBatch) error
 	hasBatch() bool
 	flush() error
 	discard()
@@ -503,6 +506,9 @@ func (b *Backend) Copy(out, src *gpu.Buffer, n int) error {
 	return b.fail(b.driver.copy(y, x, uint64(n)*4))
 }
 func (b *Backend) elementwise(out, a, right *gpu.Buffer, n int, kind uint32, scalar float32) error {
+	return b.elementwise2(out, a, right, n, kind, scalar, 0)
+}
+func (b *Backend) elementwise2(out, a, right *gpu.Buffer, n int, kind uint32, scalar, scalar2 float32) error {
 	if err := b.lock(); err != nil {
 		return err
 	}
@@ -528,7 +534,7 @@ func (b *Backend) elementwise(out, a, right *gpu.Buffer, n int, kind uint32, sca
 	if _, _, err := dispatchGrid(uint32(n), b.driver.info().MaxWorkGroupCount); err != nil {
 		return err
 	}
-	return b.fail(b.driver.pointwise(z, x, y, uint32(n), kind, scalar))
+	return b.fail(b.driver.pointwise(z, x, y, uint32(n), kind, scalar, scalar2))
 }
 func (b *Backend) Add(out, a, right *gpu.Buffer, n int) error {
 	return b.elementwise(out, a, right, n, 0, 0)

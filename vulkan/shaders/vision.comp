@@ -1,0 +1,114 @@
+#version 450
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0, std430) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1, std430) readonly buffer B { float b[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Y { float y[]; };
+layout(set = 0, binding = 3, std430) readonly buffer C { float c[]; };
+layout(push_constant) uniform Params {
+    uint kind;
+    uint n;
+    uint d0, d1, d2, d3;
+    uint d4, d5, d6, d7;
+    uint d8, d9, d10, d11;
+    uint d12, d13;
+    float f0;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 128u;
+    if (i >= p.n) return;
+    if (p.kind == 0u) {
+        uint inChannels = p.d0, height = p.d1, width = p.d2, groups = p.d3;
+        uint kh = p.d4, kw = p.d5, oh = p.d6, ow = p.d7;
+        uint strideH = p.d8, strideW = p.d9, padH = p.d10, padW = p.d11, dilH = p.d12, dilW = p.d13;
+        uint spatial = oh * ow;
+        uint pos = i % spatial;
+        uint ox = pos % ow;
+        uint oy = pos / ow;
+        uint rem = i / spatial;
+        uint kx = rem % kw;
+        rem /= kw;
+        uint ky = rem % kh;
+        rem /= kh;
+        uint ciPerG = inChannels / groups;
+        uint icInG = rem % ciPerG;
+        rem /= ciPerG;
+        uint g = rem % groups;
+        uint batchIdx = rem / groups;
+        uint ch = g * ciPerG + icInG;
+        uint sy = oy * strideH + ky * dilH;
+        uint sx = ox * strideW + kx * dilW;
+        if (sy >= padH && sy - padH < height && sx >= padW && sx - padW < width) {
+            y[i] = a[((batchIdx * inChannels + ch) * height + (sy - padH)) * width + (sx - padW)];
+        } else {
+            y[i] = 0.0;
+        }
+    } else if (p.kind == 1u) {
+        uint height = p.d1, width = p.d2;
+        uint kh = p.d4, kw = p.d5, oh = p.d6, ow = p.d7;
+        uint strideH = p.d8, strideW = p.d9, padH = p.d10, padW = p.d11, dilH = p.d12, dilW = p.d13;
+        uint spatial = oh * ow;
+        uint pos = i % spatial;
+        uint ox = pos % ow;
+        uint oy = pos / ow;
+        uint base = (i / spatial) * height * width;
+        float best = uintBitsToFloat(0xff800000u);
+        bool has = false;
+        for (uint ky = 0u; ky < kh; ky++) {
+            uint sy = oy * strideH + ky * dilH;
+            if (sy < padH || sy - padH >= height) continue;
+            uint iy = sy - padH;
+            for (uint kx = 0u; kx < kw; kx++) {
+                uint sx = ox * strideW + kx * dilW;
+                if (sx < padW || sx - padW >= width) continue;
+                float v = a[base + iy * width + (sx - padW)];
+                if (!has || v > best || isnan(v)) {
+                    best = v;
+                    has = true;
+                }
+            }
+        }
+        y[i] = best;
+    } else if (p.kind == 2u) {
+        uint height = p.d1, width = p.d2, includePad = p.d3;
+        uint kh = p.d4, kw = p.d5, oh = p.d6, ow = p.d7;
+        uint strideH = p.d8, strideW = p.d9, padH = p.d10, padW = p.d11;
+        uint spatial = oh * ow;
+        uint pos = i % spatial;
+        uint ox = pos % ow;
+        uint oy = pos / ow;
+        uint base = (i / spatial) * height * width;
+        float sum = 0.0;
+        uint count = 0u;
+        for (uint ky = 0u; ky < kh; ky++) {
+            uint sy = oy * strideH + ky;
+            if (sy < padH || sy - padH >= height) continue;
+            uint iy = sy - padH;
+            for (uint kx = 0u; kx < kw; kx++) {
+                uint sx = ox * strideW + kx;
+                if (sx < padW || sx - padW >= width) continue;
+                sum += a[base + iy * width + (sx - padW)];
+                count++;
+            }
+        }
+        float denom = float(count);
+        if (includePad != 0u) {
+            uint hs = oy * strideH;
+            uint he = min(hs + kh, height + 2u * padH);
+            uint ws = ox * strideW;
+            uint we = min(ws + kw, width + 2u * padW);
+            denom = float(he > hs ? he - hs : 0u) * float(we > ws ? we - ws : 0u);
+        }
+        y[i] = sum / denom;
+    } else if (p.kind == 3u) {
+        uint ch = (i / p.d1) % p.d0;
+        float denom = c[ch] + p.f0;
+        y[i] = (isnan(denom) || denom < 0.0) ? uintBitsToFloat(0x7fc00000u) : (a[i] - b[ch]) / sqrt(denom);
+    } else if (p.kind == 4u) {
+        uint ch = (i / p.d1) % p.d0;
+        float v = a[i];
+        if (p.d2 != 0u) v *= b[ch];
+        if (p.d3 != 0u) v += c[ch];
+        y[i] = v;
+    }
+}
