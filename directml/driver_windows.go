@@ -13,21 +13,29 @@ import (
 )
 
 const (
-	stateUAV           = 0x8
-	stateCopyDest      = 0x400
-	stateCopySource    = 0x800
-	stateGenericRead   = 0xac3
-	maxCachedOperators = 64
-	operatorCacheBytes = 256 << 20
+	stateUAV             = 0x8
+	stateCopyDest        = 0x400
+	stateCopySource      = 0x800
+	stateGenericRead     = 0xac3
+	maxCachedOperators   = 64
+	operatorCacheBytes   = 256 << 20
+	batchHeapDescriptors = 4096
+	maxQueuedOps         = 512
 )
 
 type nativeDriver struct {
 	dlls                                                    []*syscall.DLL
 	device, dml, queue, allocator, command, fence, recorder *object
+	batchHeap, batchTable                                   *object
+	batchHeapSize                                           uint32
+	batchCPU, batchGPU, descSize                            uint64
 	serial                                                  uint64
 	properties                                              Info
 	operators                                               map[opKey]*compiled
 	order                                                   []opKey
+	queued                                                  []queuedStep
+	queuedRegions                                           int
+	onFlush                                                 func()
 }
 
 func openDriver() (_ driver, err error) {
@@ -147,15 +155,41 @@ func openDriver() (_ driver, err error) {
 	if err := hresult("CreateCommandRecorder", call(d.dml, 11, uintptr(unsafe.Pointer(iidRecorder)), uintptr(unsafe.Pointer(&d.recorder)))); err != nil {
 		return nil, err
 	}
+	d.descSize = uint64(uint32(call(d.device, 15, 0)))
+	if err := d.ensureBatchHeap(batchHeapDescriptors); err != nil {
+		return nil, err
+	}
+	if err := hresult("CreateBindingTable", call(d.dml, 12, 0, uintptr(unsafe.Pointer(iidBindingTable)), uintptr(unsafe.Pointer(&d.batchTable)))); err != nil {
+		return nil, err
+	}
 	return d, nil
+}
+
+func (d *nativeDriver) ensureBatchHeap(count uint32) error {
+	if count <= d.batchHeapSize && d.batchHeap != nil {
+		return nil
+	}
+	heapDesc := descriptorHeapDesc{Count: count, Flags: 1}
+	var heap *object
+	if err := hresult("CreateDescriptorHeap", call(d.device, 14, uintptr(unsafe.Pointer(&heapDesc)), uintptr(unsafe.Pointer(iidHeap)), uintptr(unsafe.Pointer(&heap)))); err != nil {
+		return err
+	}
+	release(d.batchHeap)
+	d.batchHeap = heap
+	d.batchHeapSize = count
+	call(d.batchHeap, 9, uintptr(unsafe.Pointer(&d.batchCPU)))
+	call(d.batchHeap, 10, uintptr(unsafe.Pointer(&d.batchGPU)))
+	return nil
 }
 
 func (d *nativeDriver) info() Info { return d.properties }
 func (d *nativeDriver) close() {
+	d.discard()
 	d.releaseOperators()
-	for _, o := range []*object{d.recorder, d.fence, d.command, d.allocator, d.queue, d.dml, d.device} {
+	for _, o := range []*object{d.batchTable, d.batchHeap, d.recorder, d.fence, d.command, d.allocator, d.queue, d.dml, d.device} {
 		release(o)
 	}
+	d.batchTable, d.batchHeap, d.batchHeapSize = nil, nil, 0
 	for i := len(d.dlls) - 1; i >= 0; i-- {
 		d.dlls[i].Release()
 	}
@@ -229,14 +263,17 @@ func (d *nativeDriver) uavBarrier() {
 	call(d.command, 26, 1, uintptr(unsafe.Pointer(&barrier)))
 }
 
-func (d *nativeDriver) submit(record func()) error {
+func (d *nativeDriver) submit(record func() error) error {
 	if err := hresult("Reset(allocator)", call(d.allocator, 8)); err != nil {
 		return err
 	}
 	if err := hresult("Reset(command)", call(d.command, 10, uintptr(unsafe.Pointer(d.allocator)), 0)); err != nil {
 		return err
 	}
-	record()
+	if err := record(); err != nil {
+		_ = hresult("Close(command)", call(d.command, 9))
+		return err
+	}
 	if err := hresult("Close(command)", call(d.command, 9)); err != nil {
 		return err
 	}
@@ -277,11 +314,5 @@ func (d *nativeDriver) submit(record func()) error {
 	return waitError
 }
 func (d *nativeDriver) copy(out, src *allocation, size uint64) error {
-	return d.submit(func() {
-		d.transition(src, 0, stateCopySource)
-		d.transition(out, 0, stateCopyDest)
-		call(d.command, 15, uintptr(unsafe.Pointer(out.native.(*object))), 0, uintptr(unsafe.Pointer(src.native.(*object))), 0, uintptr(size))
-		d.transition(src, stateCopySource, 0)
-		d.transition(out, stateCopyDest, 0)
-	})
+	return d.enqueue(queuedStep{kind: stepCopy, out: out, src: src, size: size})
 }

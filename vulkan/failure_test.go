@@ -31,7 +31,11 @@ func (d *failingDriver) pointwise(out, a, b *block, n, kind uint32, scalar float
 func (d *failingDriver) fusedBias(out, a, bias, residual *block, n, channels, kind uint32) error {
 	return d.computeFailure()
 }
-func (d *failingDriver) close() error { d.closed++; return nil }
+func (d *failingDriver) hasBatch() bool      { return false }
+func (d *failingDriver) flush() error        { return nil }
+func (d *failingDriver) discard()            {}
+func (d *failingDriver) setFlushHook(func()) {}
+func (d *failingDriver) close() error        { d.closed++; return nil }
 func (d *failingDriver) reduce(out, a, weight, bias *block, count, affineCount uint32, p reduceParams) error {
 	return d.computeFailure()
 }

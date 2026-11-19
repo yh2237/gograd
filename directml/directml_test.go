@@ -183,6 +183,9 @@ func TestDirectMLCacheAndPool(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := b.Synchronize(); err != nil {
+		t.Fatal(err)
+	}
 	stats := b.OperatorStats()
 	if stats.CachedOperators < 1 || stats.CachedOperators > 64 || stats.PersistentBytes+stats.TemporaryBytes > 256<<20 {
 		t.Fatal(stats)

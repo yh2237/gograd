@@ -5,17 +5,38 @@ package directml
 import (
 	"math"
 	"unsafe"
+
+	"github.com/yh2237/gograd/gpu"
 )
 
+type stepKind uint8
+
+const (
+	stepDispatch stepKind = iota
+	stepCopy
+	stepCopyView
+)
+
+type queuedStep struct {
+	kind    stepKind
+	key     opKey
+	out     *allocation
+	src     *allocation
+	size    uint64
+	inputs  []resourceBinding
+	view    gpu.View
+	run     int
+	regions int
+	scatter bool
+}
+
 type compiled struct {
-	operator, heap, table *object
+	operator              *object
 	temporary, persistent *allocation
-	desc                  bindingTableDesc
+	execDescriptors       uint32
 }
 
 func (d *nativeDriver) closeOperator(op *compiled) {
-	release(op.table)
-	release(op.heap)
 	if op.temporary != nil {
 		d.free(op.temporary)
 	}
@@ -163,22 +184,36 @@ func (d *nativeDriver) compile(key opKey) (_ *compiled, err error) {
 	}
 	defer release(initializer)
 	var initProps, execProps bindingProperties
-	// GetBindingProperties returns the descriptor count and the resource sizes
-	// by value, so the call fills the buffer instead of an HRESULT.
 	call(initializer, 8, uintptr(unsafe.Pointer(&initProps)))
 	call(op.operator, 8, uintptr(unsafe.Pointer(&execProps)))
-	heapDesc := descriptorHeapDesc{Count: max(1, max(initProps.Descriptors, execProps.Descriptors)), Flags: 1}
-	if err := hresult("CreateDescriptorHeap", call(d.device, 14, uintptr(unsafe.Pointer(&heapDesc)), uintptr(unsafe.Pointer(iidHeap)), uintptr(unsafe.Pointer(&op.heap)))); err != nil {
+	initDescs := max(1, initProps.Descriptors)
+	op.execDescriptors = max(1, execProps.Descriptors)
+	if err := d.ensureBatchHeap(max(initDescs, op.execDescriptors)); err != nil {
 		return nil, err
 	}
-	call(op.heap, 9, uintptr(unsafe.Pointer(&op.desc.CPU)))
-	call(op.heap, 10, uintptr(unsafe.Pointer(&op.desc.GPU)))
-	op.desc.Dispatchable, op.desc.Count = initializer, heapDesc.Count
-	if err := hresult("CreateBindingTable", call(d.dml, 12, uintptr(unsafe.Pointer(&op.desc)), uintptr(unsafe.Pointer(iidBindingTable)), uintptr(unsafe.Pointer(&op.table)))); err != nil {
-		return nil, err
-	}
-	if size := max(initProps.Temporary, execProps.Temporary); size != 0 {
-		op.temporary, err = d.alloc(size, heapDefault)
+	var initTemp *allocation
+	if initProps.Temporary != 0 {
+		if execProps.Temporary >= initProps.Temporary {
+			op.temporary, err = d.alloc(execProps.Temporary, heapDefault)
+			if err != nil {
+				return nil, err
+			}
+			initTemp = op.temporary
+		} else {
+			initTemp, err = d.alloc(initProps.Temporary, heapDefault)
+			if err != nil {
+				return nil, err
+			}
+			defer d.free(initTemp)
+			if execProps.Temporary != 0 {
+				op.temporary, err = d.alloc(execProps.Temporary, heapDefault)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	} else if execProps.Temporary != 0 {
+		op.temporary, err = d.alloc(execProps.Temporary, heapDefault)
 		if err != nil {
 			return nil, err
 		}
@@ -189,43 +224,31 @@ func (d *nativeDriver) compile(key opKey) (_ *compiled, err error) {
 			return nil, err
 		}
 	}
-	bind := func(index int, v *allocation) {
+	initDesc := bindingTableDesc{Dispatchable: initializer, CPU: d.batchCPU, GPU: d.batchGPU, Count: initDescs}
+	if err := hresult("Reset(init table)", call(d.batchTable, 12, uintptr(unsafe.Pointer(&initDesc)))); err != nil {
+		return nil, err
+	}
+	bindResource := func(index int, v *allocation) {
 		if v == nil {
 			return
 		}
 		buf := bufferBinding{Resource: v.native.(*object), Size: v.size}
-		desc := bindingDesc{Type: 1, Desc: &buf}
+		bdesc := bindingDesc{Type: 1, Desc: &buf}
 		if index == 9 {
-			call(op.table, index, 1, uintptr(unsafe.Pointer(&desc)))
+			call(d.batchTable, index, 1, uintptr(unsafe.Pointer(&bdesc)))
 		} else {
-			call(op.table, index, uintptr(unsafe.Pointer(&desc)))
+			call(d.batchTable, index, uintptr(unsafe.Pointer(&bdesc)))
 		}
 	}
-	if initProps.Temporary != 0 {
-		bind(10, op.temporary)
-	}
-	bind(9, op.persistent) // Initializer output initializes the persistent resource.
-	if err := d.recordDispatch(op, initializer, op.temporary, op.persistent); err != nil {
+	bindResource(10, initTemp)
+	bindResource(9, op.persistent)
+	if err := d.recordInit(initializer, initTemp, op.persistent); err != nil {
 		return nil, err
 	}
-	op.desc.Dispatchable = op.operator
-	if err := hresult("Reset(binding table)", call(op.table, 12, uintptr(unsafe.Pointer(&op.desc)))); err != nil {
-		return nil, err
-	}
-	if execProps.Temporary != 0 {
-		bind(10, op.temporary)
-	}
-	bind(11, op.persistent)
 	return op, nil
 }
 
-func (d *nativeDriver) recordDispatch(op *compiled, dispatchable *object, resources ...*allocation) error {
-	return d.submit(d.dispatchCommands(op, dispatchable, resources...))
-}
-
-func (d *nativeDriver) dispatchCommands(op *compiled, dispatchable *object, resources ...*allocation) func() {
-	// All default buffers are explicitly returned to COMMON before submission
-	// completes. That avoids relying on implicit promotion/decay between lists.
+func (d *nativeDriver) recordInit(initializer *object, resources ...*allocation) error {
 	var used []*allocation
 	for _, v := range resources {
 		if v == nil {
@@ -239,17 +262,36 @@ func (d *nativeDriver) dispatchCommands(op *compiled, dispatchable *object, reso
 			used = append(used, v)
 		}
 	}
-	return func() {
+	return d.submit(func() error {
 		for _, v := range used {
 			d.transition(v, 0, stateUAV)
 		}
-		call(d.command, 28, 1, uintptr(unsafe.Pointer(&op.heap)))
-		call(d.recorder, 8, uintptr(unsafe.Pointer(d.command)), uintptr(unsafe.Pointer(dispatchable)), uintptr(unsafe.Pointer(op.table)))
+		call(d.command, 28, 1, uintptr(unsafe.Pointer(&d.batchHeap)))
+		call(d.recorder, 8, uintptr(unsafe.Pointer(d.command)), uintptr(unsafe.Pointer(initializer)), uintptr(unsafe.Pointer(d.batchTable)))
 		d.uavBarrier()
 		for _, v := range used {
 			d.transition(v, stateUAV, 0)
 		}
+		return nil
+	})
+}
+
+func (d *nativeDriver) hasQueued() bool        { return len(d.queued) != 0 }
+func (d *nativeDriver) discard()               { d.queued = nil; d.queuedRegions = 0 }
+func (d *nativeDriver) setFlushHook(fn func()) { d.onFlush = fn }
+
+func (d *nativeDriver) enqueue(step queuedStep) error {
+	if step.regions > 0 && d.queuedRegions > 0 && d.queuedRegions+step.regions > maxCopyRegions {
+		if err := d.flush(); err != nil {
+			return err
+		}
 	}
+	d.queued = append(d.queued, step)
+	d.queuedRegions += step.regions
+	if len(d.queued) >= maxQueuedOps {
+		return d.flush()
+	}
+	return nil
 }
 
 func (d *nativeDriver) execute(key opKey, out *allocation, inputs ...*allocation) error {
@@ -261,55 +303,162 @@ func (d *nativeDriver) execute(key opKey, out *allocation, inputs ...*allocation
 }
 
 func (d *nativeDriver) executeAt(key opKey, out *allocation, inputs ...resourceBinding) error {
-	op, owned, err := d.acquireOperator(key, nil)
-	if err != nil {
-		return err
-	}
-	if owned {
-		defer d.closeOperator(op)
-	}
-	return d.submit(d.bindDispatch(op, key, out, inputs))
+	copied := append([]resourceBinding(nil), inputs...)
+	return d.enqueue(queuedStep{kind: stepDispatch, key: key, out: out, inputs: copied})
 }
 
-// Preparation is deliberately separate from recording. Initializers submit and
-// wait on the same command allocator, so every cold compile must finish before
-// opening the execution list. Pinned operators cannot be evicted while preparing
-// later steps. Uncached operators are released only after submit has waited.
 func (d *nativeDriver) executeBatch(steps []dispatch) error {
-	if len(steps) == 0 {
+	for _, step := range steps {
+		bindings := make([]resourceBinding, len(step.inputs))
+		for i, v := range step.inputs {
+			bindings[i].memory = v
+		}
+		if err := d.enqueue(queuedStep{kind: stepDispatch, key: step.key, out: step.out, inputs: bindings}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *nativeDriver) flush() error {
+	if len(d.queued) == 0 {
 		return nil
 	}
-	pinned := make(map[*compiled]bool)
-	slots := make(map[opKey]int)
-	commands := make([]func(), 0, len(steps))
-	for _, step := range steps {
-		key := step.key
-		key.bindingSlot = slots[step.key]
-		slots[step.key]++
-		op, owned, err := d.acquireOperator(key, pinned)
+	steps := d.queued
+	d.queued = nil
+	d.queuedRegions = 0
+	defer func() {
+		if d.onFlush != nil {
+			d.onFlush()
+		}
+	}()
+	for start := 0; start < len(steps); {
+		pinned := make(map[*compiled]bool)
+		ownedByKey := make(map[opKey]*compiled)
+		var owned []*compiled
+		resolved := make([]*compiled, 0, len(steps)-start)
+		var usedDescs uint32
+		end := start
+		var prepErr error
+		for end < len(steps) {
+			step := steps[end]
+			if step.kind != stepDispatch {
+				resolved = append(resolved, nil)
+				end++
+				continue
+			}
+			op, reused := ownedByKey[step.key]
+			var isOwned bool
+			if !reused {
+				var err error
+				op, isOwned, err = d.acquireOperator(step.key, pinned)
+				if err != nil {
+					prepErr = err
+					break
+				}
+			}
+			need := op.execDescriptors
+			if usedDescs > 0 && usedDescs+need > d.batchHeapSize {
+				if isOwned {
+					d.closeOperator(op)
+				}
+				break
+			}
+			if need > d.batchHeapSize {
+				if err := d.ensureBatchHeap(need); err != nil {
+					if isOwned {
+						d.closeOperator(op)
+					}
+					prepErr = err
+					break
+				}
+			}
+			if isOwned {
+				owned = append(owned, op)
+				ownedByKey[step.key] = op
+			}
+			pinned[op] = true
+			usedDescs += need
+			resolved = append(resolved, op)
+			end++
+		}
+		if prepErr != nil {
+			for _, op := range owned {
+				d.closeOperator(op)
+			}
+			return prepErr
+		}
+		err := d.submit(func() error {
+			state := make(map[*allocation]uint32)
+			ensureState := func(v *allocation, want uint32) {
+				if v == nil || v.heap != heapDefault {
+					return
+				}
+				if cur := state[v]; cur != want {
+					d.transition(v, cur, want)
+					state[v] = want
+				}
+			}
+			heapBound := false
+			var cursor uint32
+			for idx, step := range steps[start:end] {
+				switch step.kind {
+				case stepDispatch:
+					op := resolved[idx]
+					if !heapBound {
+						call(d.command, 28, 1, uintptr(unsafe.Pointer(&d.batchHeap)))
+						heapBound = true
+					}
+					ensureState(step.out, stateUAV)
+					ensureState(op.temporary, stateUAV)
+					ensureState(op.persistent, stateUAV)
+					for _, in := range step.inputs {
+						ensureState(in.memory, stateUAV)
+					}
+					bdesc := bindingTableDesc{
+						Dispatchable: op.operator,
+						CPU:          d.batchCPU + uint64(cursor)*d.descSize,
+						GPU:          d.batchGPU + uint64(cursor)*d.descSize,
+						Count:        op.execDescriptors,
+					}
+					cursor += op.execDescriptors
+					if err := hresult("Reset(batch table)", call(d.batchTable, 12, uintptr(unsafe.Pointer(&bdesc)))); err != nil {
+						return err
+					}
+					d.bindTable(d.batchTable, op, step.key, step.out, step.inputs)
+					call(d.recorder, 8, uintptr(unsafe.Pointer(d.command)), uintptr(unsafe.Pointer(op.operator)), uintptr(unsafe.Pointer(d.batchTable)))
+					d.uavBarrier()
+				case stepCopy:
+					ensureState(step.src, stateCopySource)
+					ensureState(step.out, stateCopyDest)
+					call(d.command, 15, uintptr(unsafe.Pointer(step.out.native.(*object))), 0, uintptr(unsafe.Pointer(step.src.native.(*object))), 0, uintptr(step.size))
+				case stepCopyView:
+					ensureState(step.src, stateCopySource)
+					ensureState(step.out, stateCopyDest)
+					d.recordCopyView(step.out, step.src, step.view, step.run, step.scatter)
+				}
+			}
+			for v, cur := range state {
+				if cur != 0 {
+					d.transition(v, cur, 0)
+				}
+			}
+			return nil
+		})
+		for _, op := range owned {
+			d.closeOperator(op)
+		}
 		if err != nil {
 			return err
 		}
-		if owned {
-			defer d.closeOperator(op)
-		}
-		pinned[op] = true
-		inputs := make([]resourceBinding, len(step.inputs))
-		for i, v := range step.inputs {
-			inputs[i].memory = v
-		}
-		commands = append(commands, d.bindDispatch(op, key, step.out, inputs))
+		start = end
 	}
-	return d.submit(func() {
-		for _, record := range commands {
-			record()
-		}
-	})
+	return nil
 }
 
 // owned means the caller must keep the operator alive until its fence completes
-// and then close it. Cache entries, including batch descriptor slots, remain
-// bounded even when every potential eviction candidate is pinned.
+// and then close it. Cache entries remain bounded even when every potential
+// eviction candidate is pinned.
 func (d *nativeDriver) acquireOperator(key opKey, pinned map[*compiled]bool) (_ *compiled, owned bool, err error) {
 	op := d.operators[key]
 	if op == nil {
@@ -357,19 +506,15 @@ func (d *nativeDriver) acquireOperator(key opKey, pinned map[*compiled]bool) (_ 
 	return op, false, nil
 }
 
-// Binding writes shader-visible descriptors immediately. Each repeated key in
-// a batch uses a separate cached slot so later bindings cannot overwrite an
-// earlier dispatch's descriptors before the GPU has consumed them.
-func (d *nativeDriver) bindDispatch(op *compiled, key opKey, out *allocation, inputs []resourceBinding) func() {
+func (d *nativeDriver) bindTable(table *object, op *compiled, key opKey, out *allocation, inputs []resourceBinding) {
 	if key.kind == opScalar || key.kind == opIdentity {
 		inputs = inputs[:1]
 	}
-	// GEMM has a third, optional C input. Bind NONE when Beta is zero.
 	if key.kind == opGEMM {
-		inputs = append(inputs, resourceBinding{})
+		inputs = append(append([]resourceBinding(nil), inputs...), resourceBinding{})
 	}
 	if key.kind == opNorm {
-		inputs = append(inputs, resourceBinding{}, resourceBinding{})
+		inputs = append(append([]resourceBinding(nil), inputs...), resourceBinding{}, resourceBinding{})
 	}
 	buffers := make([]bufferBinding, len(inputs))
 	descs := make([]bindingDesc, len(inputs))
@@ -379,13 +524,18 @@ func (d *nativeDriver) bindDispatch(op *compiled, key opKey, out *allocation, in
 			descs[i] = bindingDesc{Type: 1, Desc: &buffers[i]}
 		}
 	}
-	call(op.table, 8, uintptr(len(descs)), uintptr(unsafe.Pointer(&descs[0])))
+	call(table, 8, uintptr(len(descs)), uintptr(unsafe.Pointer(&descs[0])))
 	output := bufferBinding{Resource: out.native.(*object), Size: out.size}
 	outputDesc := bindingDesc{Type: 1, Desc: &output}
-	call(op.table, 9, 1, uintptr(unsafe.Pointer(&outputDesc)))
-	resources := []*allocation{out, op.temporary, op.persistent}
-	for _, v := range inputs {
-		resources = append(resources, v.memory)
+	call(table, 9, 1, uintptr(unsafe.Pointer(&outputDesc)))
+	if op.temporary != nil {
+		tb := bufferBinding{Resource: op.temporary.native.(*object), Size: op.temporary.size}
+		td := bindingDesc{Type: 1, Desc: &tb}
+		call(table, 10, uintptr(unsafe.Pointer(&td)))
 	}
-	return d.dispatchCommands(op, op.operator, resources...)
+	if op.persistent != nil {
+		pb := bufferBinding{Resource: op.persistent.native.(*object), Size: op.persistent.size}
+		pd := bindingDesc{Type: 1, Desc: &pb}
+		call(table, 11, uintptr(unsafe.Pointer(&pd)))
+	}
 }

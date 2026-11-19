@@ -54,6 +54,10 @@ type driver interface {
 	gemm(out, a, b *block, outCount, aCount, bCount uint32, params gemmParams, variant int) error
 	reduce(out, a, weight, bias *block, count, affineCount uint32, params reduceParams) error
 	conv1d(convBatch) error
+	hasBatch() bool
+	flush() error
+	discard()
+	setFlushHook(func())
 	close() error
 }
 
@@ -66,13 +70,15 @@ type poolKey struct {
 // instance; the registered default backend lives for the process lifetime.
 type Backend struct {
 	gpu.UnsupportedOps
-	once               sync.Once
-	mu                 sync.Mutex
-	driver             driver
-	err                error
-	closed, registered bool
-	pool               map[poolKey][]*block
-	stats              AllocationStats
+	once                sync.Once
+	mu                  sync.Mutex
+	driver              driver
+	err                 error
+	closed, registered  bool
+	pool                map[poolKey][]*block
+	pendingRelease      []*block
+	pendingReleaseBytes uint64
+	stats               AllocationStats
 }
 
 var _ gpu.Backend = (*Backend)(nil)
@@ -106,6 +112,9 @@ func (b *Backend) lock() error {
 		}
 		b.mu.Lock()
 		b.driver, b.err = d, err
+		if d != nil {
+			d.setFlushHook(b.drainPendingReleaseLocked)
+		}
 		b.mu.Unlock()
 	})
 	b.mu.Lock()
@@ -118,6 +127,9 @@ func (b *Backend) lock() error {
 		b.mu.Unlock()
 		return err
 	}
+	if b.driver != nil {
+		b.driver.setFlushHook(b.drainPendingReleaseLocked)
+	}
 	return nil
 }
 
@@ -129,14 +141,12 @@ func (b *Backend) Available() bool {
 	return true
 }
 
-// Synchronize waits behind any active operation. Every Vulkan operation already
-// waits for its fence before releasing mu, so no extra submission is necessary.
 func (b *Backend) Synchronize() error {
 	if err := b.lock(); err != nil {
 		return err
 	}
-	b.mu.Unlock()
-	return nil
+	defer b.mu.Unlock()
+	return b.flushLocked()
 }
 func (b *Backend) Err() error {
 	if err := b.lock(); err != nil {
@@ -159,8 +169,38 @@ func MemoryStats() AllocationStats   { return defaultBackend.MemoryStats() }
 func ReleasePool()                   { defaultBackend.ReleasePool() }
 func SetPoolCacheLimit(bytes uint64) { defaultBackend.SetPoolCacheLimit(bytes) }
 
+func (b *Backend) drainPendingReleaseLocked() {
+	if len(b.pendingRelease) == 0 {
+		return
+	}
+	pending := b.pendingRelease
+	b.pendingRelease = nil
+	b.pendingReleaseBytes = 0
+	for _, memory := range pending {
+		b.recycleLocked(memory)
+	}
+}
+
+func (b *Backend) flushLocked() error {
+	if b.driver == nil || !b.driver.hasBatch() {
+		b.drainPendingReleaseLocked()
+		return nil
+	}
+	err := b.driver.flush()
+	b.drainPendingReleaseLocked()
+	if err != nil {
+		return b.fail(err)
+	}
+	return nil
+}
+
 func (b *Backend) MemoryStats() AllocationStats { b.mu.Lock(); defer b.mu.Unlock(); return b.stats }
 func (b *Backend) releasePoolLocked() {
+	if b.driver != nil && b.driver.hasBatch() && b.err == nil {
+		_ = b.flushLocked()
+	} else {
+		b.drainPendingReleaseLocked()
+	}
 	for key, blocks := range b.pool {
 		for _, block := range blocks {
 			b.freeLocked(block)
@@ -174,7 +214,7 @@ func (b *Backend) SetPoolCacheLimit(bytes uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.stats.CacheLimitBytes = bytes
-	if b.stats.CachedBytes > bytes {
+	if b.stats.CachedBytes+b.pendingReleaseBytes > bytes {
 		b.releasePoolLocked()
 	}
 }
@@ -195,20 +235,28 @@ func (b *Backend) Close() error {
 	if b.stats.LiveBuffers != 0 {
 		return fmt.Errorf("%w: Vulkan backend still has live buffers", gpu.ErrInvalidArgument)
 	}
+	var flushErr error
+	if b.driver != nil && b.driver.hasBatch() && b.err == nil {
+		flushErr = b.flushLocked()
+	}
 	b.releasePoolLocked()
 	if b.driver != nil {
 		if err := b.driver.close(); err != nil {
-			return err // Retain driver ownership; a subsequent Close may retry once.
+			return errors.Join(flushErr, err)
 		}
 	}
 	b.stats.ReservedBytes, b.stats.QuarantinedBytes, b.stats.QuarantinedBuffers = 0, 0, 0
 	b.closed = true
-	return nil
+	return flushErr
 }
 
 func (b *Backend) fail(err error) error {
 	if err != nil {
 		b.err = fmt.Errorf("%w: Vulkan device failure: %w", gpu.ErrUnavailable, err)
+		if b.driver != nil {
+			b.driver.discard()
+		}
+		b.drainPendingReleaseLocked()
 		b.releasePoolLocked()
 	}
 	return err
@@ -240,6 +288,11 @@ func groupGrid(groups uint64, limits [3]uint32) (uint32, uint32, error) {
 }
 func (b *Backend) take(size uint64, host bool) (*block, error) {
 	key := poolKey{sizeClass(size), host}
+	if len(b.pool[key]) == 0 && b.pendingReleaseBytes > max(64<<20, b.stats.CacheLimitBytes/2) {
+		if err := b.flushLocked(); err != nil {
+			return nil, err
+		}
+	}
 	list := b.pool[key]
 	var memory *block
 	if len(list) != 0 {
@@ -262,9 +315,7 @@ func (b *Backend) take(size uint64, host bool) (*block, error) {
 	b.stats.LiveBuffers++
 	return memory, nil
 }
-func (b *Backend) put(memory *block) {
-	b.stats.LiveBytes -= memory.allocated
-	b.stats.LiveBuffers--
+func (b *Backend) recycleLocked(memory *block) {
 	if !b.closed && b.err == nil && memory.allocated <= b.stats.CacheLimitBytes-b.stats.CachedBytes {
 		if b.pool == nil {
 			b.pool = make(map[poolKey][]*block)
@@ -276,6 +327,16 @@ func (b *Backend) put(memory *block) {
 	} else {
 		b.freeLocked(memory)
 	}
+}
+func (b *Backend) put(memory *block) {
+	b.stats.LiveBytes -= memory.allocated
+	b.stats.LiveBuffers--
+	if !b.closed && b.err == nil && b.driver != nil && b.driver.hasBatch() {
+		b.pendingRelease = append(b.pendingRelease, memory)
+		b.pendingReleaseBytes += memory.allocated
+		return
+	}
+	b.recycleLocked(memory)
 }
 
 func (b *Backend) freeLocked(memory *block) {
@@ -351,13 +412,21 @@ func (b *Backend) CopyFrom(buffer *gpu.Buffer, values []float32) error {
 	if len(values) == 0 {
 		return nil
 	}
+	if b.driver.hasBatch() {
+		if err := b.flushLocked(); err != nil {
+			return err
+		}
+	}
 	staging, err := b.take(uint64(len(values))*4, true)
 	if err != nil {
 		return err
 	}
 	defer b.put(staging)
 	b.driver.write(staging, values)
-	return b.fail(b.driver.copy(memory, staging, uint64(len(values))*4))
+	if err := b.fail(b.driver.copy(memory, staging, uint64(len(values))*4)); err != nil {
+		return err
+	}
+	return b.flushLocked()
 }
 func (b *Backend) Download(buffer *gpu.Buffer, n int) ([]float32, error) {
 	if buffer == nil {
@@ -376,6 +445,9 @@ func (b *Backend) Download(buffer *gpu.Buffer, n int) ([]float32, error) {
 	}
 	values := make([]float32, n)
 	if n == 0 {
+		if err := b.flushLocked(); err != nil {
+			return nil, err
+		}
 		return values, nil
 	}
 	staging, err := b.take(uint64(n)*4, true)
@@ -384,6 +456,9 @@ func (b *Backend) Download(buffer *gpu.Buffer, n int) ([]float32, error) {
 	}
 	defer b.put(staging)
 	if err := b.fail(b.driver.copy(staging, memory, uint64(n)*4)); err != nil {
+		return nil, err
+	}
+	if err := b.flushLocked(); err != nil {
 		return nil, err
 	}
 	b.driver.read(staging, values)

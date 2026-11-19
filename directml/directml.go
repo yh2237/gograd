@@ -48,9 +48,6 @@ type opKey struct {
 	aLayout, bLayout, yLayout tensorLayout
 	conv                      gpu.Conv1dOptions
 	hasBias                   bool
-	// Repeated operators in one command list need independent descriptors.
-	// Slots are reused across batches, and count against the usual cache limits.
-	bindingSlot int
 }
 
 // Four-dimensional descriptors cover the baseline DirectML feature level.
@@ -102,6 +99,10 @@ type driver interface {
 	executeAt(key opKey, out *allocation, inputs ...resourceBinding) error
 	executeBatch([]dispatch) error
 	copyView(out, src *allocation, v gpu.View, scatter bool) error
+	hasQueued() bool
+	flush() error
+	discard()
+	setFlushHook(func())
 	operatorStats() OperatorStats
 	releaseOperators()
 	close()
@@ -113,13 +114,15 @@ type poolKey struct {
 }
 type Backend struct {
 	gpu.UnsupportedOps
-	once               sync.Once
-	mu                 sync.Mutex
-	driver             driver
-	err                error
-	closed, registered bool
-	pool               map[poolKey][]*allocation
-	stats              AllocationStats
+	once                sync.Once
+	mu                  sync.Mutex
+	driver              driver
+	err                 error
+	closed, registered  bool
+	pool                map[poolKey][]*allocation
+	pendingRelease      []*allocation
+	pendingReleaseBytes uint64
+	stats               AllocationStats
 }
 
 var _ gpu.Backend = (*Backend)(nil)
@@ -147,6 +150,9 @@ func (b *Backend) lock() error {
 		}
 		b.mu.Lock()
 		b.driver, b.err = d, err
+		if d != nil {
+			d.setFlushHook(b.drainPendingReleaseLocked)
+		}
 		b.mu.Unlock()
 	})
 	b.mu.Lock()
@@ -159,6 +165,9 @@ func (b *Backend) lock() error {
 		b.mu.Unlock()
 		return err
 	}
+	if b.driver != nil {
+		b.driver.setFlushHook(b.drainPendingReleaseLocked)
+	}
 	return nil
 }
 func (b *Backend) Available() bool {
@@ -169,14 +178,12 @@ func (b *Backend) Available() bool {
 	return true
 }
 
-// Synchronize waits behind active work. All current DirectML operations wait for
-// their fence while holding mu; consequently no extra command list is needed.
 func (b *Backend) Synchronize() error {
 	if err := b.lock(); err != nil {
 		return err
 	}
-	b.mu.Unlock()
-	return nil
+	defer b.mu.Unlock()
+	return b.flushLocked()
 }
 func (b *Backend) Err() error {
 	if err := b.lock(); err != nil {
@@ -210,7 +217,36 @@ func ReleasePool()                       { defaultBackend.ReleasePool() }
 func ReleaseOperators()                  { defaultBackend.ReleaseOperators() }
 func SetPoolCacheLimit(bytes uint64)     { defaultBackend.SetPoolCacheLimit(bytes) }
 
+func (b *Backend) drainPendingReleaseLocked() {
+	if len(b.pendingRelease) == 0 {
+		return
+	}
+	pending := b.pendingRelease
+	b.pendingRelease = nil
+	b.pendingReleaseBytes = 0
+	for _, v := range pending {
+		b.recycleLocked(v)
+	}
+}
+func (b *Backend) flushLocked() error {
+	if b.driver == nil || !b.driver.hasQueued() {
+		b.drainPendingReleaseLocked()
+		return nil
+	}
+	err := b.driver.flush()
+	b.drainPendingReleaseLocked()
+	if err != nil {
+		return b.fail(err)
+	}
+	return nil
+}
+
 func (b *Backend) releasePoolLocked() {
+	if b.driver != nil && b.driver.hasQueued() && b.err == nil {
+		_ = b.flushLocked()
+	} else {
+		b.drainPendingReleaseLocked()
+	}
 	for key, list := range b.pool {
 		for _, v := range list {
 			b.driver.free(v)
@@ -225,6 +261,9 @@ func (b *Backend) ReleaseOperators() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.driver != nil {
+		if b.driver.hasQueued() && b.err == nil {
+			_ = b.flushLocked()
+		}
 		b.driver.releaseOperators()
 	}
 }
@@ -232,7 +271,7 @@ func (b *Backend) SetPoolCacheLimit(bytes uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.stats.CacheLimitBytes = bytes
-	if b.stats.CachedBytes > bytes {
+	if b.stats.CachedBytes+b.pendingReleaseBytes > bytes {
 		b.releasePoolLocked()
 	}
 }
@@ -249,17 +288,25 @@ func (b *Backend) Close() error {
 	if b.stats.LiveBuffers != 0 {
 		return fmt.Errorf("%w: DirectML backend still has live buffers", gpu.ErrInvalidArgument)
 	}
+	var flushErr error
+	if b.driver != nil && b.driver.hasQueued() && b.err == nil {
+		flushErr = b.flushLocked()
+	}
 	b.releasePoolLocked()
 	if b.driver != nil {
 		b.driver.close()
 		b.driver = nil
 	}
 	b.closed = true
-	return nil
+	return flushErr
 }
 func (b *Backend) fail(err error) error {
 	if err != nil {
 		b.err = fmt.Errorf("%w: DirectML device failure: %v", gpu.ErrUnavailable, err)
+		if b.driver != nil {
+			b.driver.discard()
+		}
+		b.drainPendingReleaseLocked()
 		b.releasePoolLocked()
 		b.driver.releaseOperators()
 	}
@@ -274,6 +321,11 @@ func sizeClass(size uint64) uint64 {
 }
 func (b *Backend) take(size uint64, heap uint32) (*allocation, error) {
 	key := poolKey{sizeClass(size), heap}
+	if len(b.pool[key]) == 0 && b.pendingReleaseBytes > max(64<<20, b.stats.CacheLimitBytes/2) {
+		if err := b.flushLocked(); err != nil {
+			return nil, err
+		}
+	}
 	list := b.pool[key]
 	var v *allocation
 	if len(list) != 0 {
@@ -296,9 +348,7 @@ func (b *Backend) take(size uint64, heap uint32) (*allocation, error) {
 	b.stats.LiveBuffers++
 	return v, nil
 }
-func (b *Backend) put(v *allocation) {
-	b.stats.LiveBytes -= v.allocated
-	b.stats.LiveBuffers--
+func (b *Backend) recycleLocked(v *allocation) {
 	if !b.closed && b.err == nil && v.allocated <= b.stats.CacheLimitBytes-b.stats.CachedBytes {
 		if b.pool == nil {
 			b.pool = make(map[poolKey][]*allocation)
@@ -311,6 +361,16 @@ func (b *Backend) put(v *allocation) {
 		b.driver.free(v)
 		b.stats.ReservedBytes -= v.allocated
 	}
+}
+func (b *Backend) put(v *allocation) {
+	b.stats.LiveBytes -= v.allocated
+	b.stats.LiveBuffers--
+	if !b.closed && b.err == nil && b.driver != nil && b.driver.hasQueued() {
+		b.pendingRelease = append(b.pendingRelease, v)
+		b.pendingReleaseBytes += v.allocated
+		return
+	}
+	b.recycleLocked(v)
 }
 func (b *Backend) native(buffer *gpu.Buffer, n int) (*allocation, error) {
 	if err := gpu.CheckBuffer(b, buffer, n); err != nil {
@@ -384,6 +444,11 @@ func (b *Backend) upload(buffer *gpu.Buffer, values []float32, zero bool) error 
 	if n == 0 {
 		return nil
 	}
+	if b.driver.hasQueued() {
+		if err := b.flushLocked(); err != nil {
+			return err
+		}
+	}
 	staging, err := b.take(uint64(n)*4, heapUpload)
 	if err != nil {
 		return err
@@ -392,7 +457,10 @@ func (b *Backend) upload(buffer *gpu.Buffer, values []float32, zero bool) error 
 	if err := b.fail(b.driver.write(staging, values)); err != nil {
 		return err
 	}
-	return b.fail(b.driver.copy(out, staging, uint64(n)*4))
+	if err := b.fail(b.driver.copy(out, staging, uint64(n)*4)); err != nil {
+		return err
+	}
+	return b.flushLocked()
 }
 func (b *Backend) Download(buffer *gpu.Buffer, n int) ([]float32, error) {
 	if buffer == nil {
@@ -411,6 +479,9 @@ func (b *Backend) Download(buffer *gpu.Buffer, n int) ([]float32, error) {
 	}
 	values := make([]float32, n)
 	if n == 0 {
+		if err := b.flushLocked(); err != nil {
+			return nil, err
+		}
 		return values, nil
 	}
 	staging, err := b.take(uint64(n)*4, heapReadback)
@@ -419,6 +490,9 @@ func (b *Backend) Download(buffer *gpu.Buffer, n int) ([]float32, error) {
 	}
 	defer b.put(staging)
 	if err := b.fail(b.driver.copy(staging, x, uint64(n)*4)); err != nil {
+		return nil, err
+	}
+	if err := b.flushLocked(); err != nil {
 		return nil, err
 	}
 	if err := b.fail(b.driver.read(staging, values)); err != nil {

@@ -23,11 +23,11 @@ func TestDirectMLBatchSubmissions(t *testing.T) {
 	w := upload(t, b, []float32{1, 2, 3, 4})
 	bias := upload(t, b, []float32{.1, .2, .3, .4})
 	for _, tc := range []struct {
-		name  string
-		steps uint64
-		run   func() error
+		name      string
+		uniqueOps uint64
+		run       func() error
 	}{
-		{"gelu", 9, func() error { return b.GELU(y, x, len(values)) }},
+		{"gelu", 7, func() error { return b.GELU(y, x, len(values)) }},
 		{"layernorm", 3, func() error { return b.LayerNorm(y, x, w, bias, 2, 4, 1e-5) }},
 		{"groupnorm", 3, func() error { return b.GroupNorm(y, x, w, bias, 1, 2, 4, 2, 1e-5) }},
 	} {
@@ -37,14 +37,23 @@ func TestDirectMLBatchSubmissions(t *testing.T) {
 			if err := tc.run(); err != nil {
 				t.Fatal(err)
 			}
-			if delta := submissionSerial(b) - before; delta != tc.steps+1 {
-				t.Fatalf("cold submits=%d, want %d initializers + one execution", delta, tc.steps)
+			if submissionSerial(b) != before {
+				t.Fatalf("op flushed before Synchronize")
+			}
+			if err := b.Synchronize(); err != nil {
+				t.Fatal(err)
+			}
+			if delta := submissionSerial(b) - before; delta != tc.uniqueOps+1 {
+				t.Fatalf("cold submits=%d, want %d initializers + one execution", delta, tc.uniqueOps)
 			}
 			stats := b.OperatorStats()
 			memory := b.MemoryStats()
 			for i := 0; i < 4; i++ {
 				before = submissionSerial(b)
 				if err := tc.run(); err != nil {
+					t.Fatal(err)
+				}
+				if err := b.Synchronize(); err != nil {
 					t.Fatal(err)
 				}
 				if delta := submissionSerial(b) - before; delta != 1 {
@@ -57,6 +66,18 @@ func TestDirectMLBatchSubmissions(t *testing.T) {
 			if after := b.MemoryStats(); after != memory {
 				t.Fatal("warm batch grew buffer pool", memory, after)
 			}
+			before = submissionSerial(b)
+			for i := 0; i < 4; i++ {
+				if err := tc.run(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := b.Synchronize(); err != nil {
+				t.Fatal(err)
+			}
+			if delta := submissionSerial(b) - before; delta != 1 {
+				t.Fatalf("multi-op deferred submits=%d, want 1", delta)
+			}
 		})
 	}
 }
@@ -66,8 +87,6 @@ func TestDirectMLBatchCachePressure(t *testing.T) {
 	values := []float32{-3, -1, -.25, 0, .25, 1, 2, 3}
 	x := upload(t, b, values)
 	y := alloc(t, b, len(values))
-	// Make the first GELU step the oldest entry. It must remain pinned when
-	// preparation of the second step needs to evict from the full cache.
 	if err := b.Mul(y, x, x, len(values)); err != nil {
 		t.Fatal(err)
 	}
@@ -75,6 +94,9 @@ func TestDirectMLBatchCachePressure(t *testing.T) {
 		if err := b.MulScalar(y, x, len(values), float32(i+10)); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := b.Synchronize(); err != nil {
+		t.Fatal(err)
 	}
 	if stats := b.OperatorStats(); stats.CachedOperators != maxCachedOperators {
 		t.Fatal(stats)
@@ -108,8 +130,6 @@ func TestDirectMLBatchMoreThanCache(t *testing.T) {
 	x := upload(t, b, []float32{1, 2, 3, 4})
 	y := alloc(t, b, 4)
 	z := alloc(t, b, 4)
-	// Exercise the uncached path when every cache entry is pinned. Temporary
-	// operators must stay alive through execution without exceeding cache bounds.
 	run := func() error {
 		if err := b.lock(); err != nil {
 			return err
@@ -127,16 +147,21 @@ func TestDirectMLBatchMoreThanCache(t *testing.T) {
 		in := buffers[0]
 		for i := range steps {
 			out := buffers[1+i%2]
-			steps[i] = dispatch{opKey{kind: opScalar, n: 4, scalar: math.Float32bits(1), bias: math.Float32bits(.125)}, out, []*allocation{in}}
+			steps[i] = dispatch{opKey{kind: opScalar, n: 4, scalar: math.Float32bits(1), bias: math.Float32bits(float32(i+1) * .125)}, out, []*allocation{in}}
 			in = out
 		}
-		return b.fail(b.driver.executeBatch(steps))
+		if err := b.fail(b.driver.executeBatch(steps)); err != nil {
+			return err
+		}
+		return b.flushLocked()
 	}
+	sumBias := float32((maxCachedOperators+2)*(maxCachedOperators+3)/2) * .125
+	want := []float32{1 + sumBias, 2 + sumBias, 3 + sumBias, 4 + sumBias}
 	for i := 0; i < 2; i++ {
 		if err := run(); err != nil {
 			t.Fatal(err)
 		}
-		check(t, b, z, []float32{9.25, 10.25, 11.25, 12.25})
+		check(t, b, z, want)
 		if stats := b.OperatorStats(); stats.CachedOperators != maxCachedOperators || stats.PersistentBytes+stats.TemporaryBytes > operatorCacheBytes {
 			t.Fatal(stats)
 		}
@@ -144,5 +169,136 @@ func TestDirectMLBatchMoreThanCache(t *testing.T) {
 	b.ReleaseOperators()
 	if stats := b.OperatorStats(); stats != (OperatorStats{}) {
 		t.Fatal(stats)
+	}
+}
+
+func TestDirectMLDeferredBatchAndInterleavedCopy(t *testing.T) {
+	b := testBackend(t)
+	x := upload(t, b, []float32{1, 2, 3, 4})
+	y := alloc(t, b, 4)
+	z := alloc(t, b, 4)
+	if err := b.Add(y, x, x, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.MulScalar(z, y, 4, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Copy(y, z, 4); err != nil {
+		t.Fatal(err)
+	}
+	check(t, b, y, []float32{4, 8, 12, 16})
+
+	tmp := alloc(t, b, 4)
+	before := submissionSerial(b)
+	if err := b.Add(tmp, x, x, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.MulScalar(z, tmp, 4, 2); err != nil {
+		t.Fatal(err)
+	}
+	tmp.Close()
+	if err := b.Copy(y, z, 4); err != nil {
+		t.Fatal(err)
+	}
+	if submissionSerial(b) != before {
+		t.Fatalf("flushed early before Download")
+	}
+	got, err := b.Download(y, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if submissionSerial(b)-before != 1 {
+		t.Fatalf("got %d submissions for compute+copy+download, want 1", submissionSerial(b)-before)
+	}
+	for i, want := range []float32{4, 8, 12, 16} {
+		if got[i] != want {
+			t.Fatalf("[%d] got %g want %g", i, got[i], want)
+		}
+	}
+
+	// Descriptor chunk split when queued dispatches exceed batchHeapSize.
+	b.mu.Lock()
+	nd := b.driver.(*nativeDriver)
+	origHeapSize := nd.batchHeapSize
+	nd.batchHeapSize = 12
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		nd.batchHeapSize = origHeapSize
+		b.mu.Unlock()
+	}()
+	before = submissionSerial(b)
+	for i := 0; i < 6; i++ {
+		if err := b.Add(y, x, x, 4); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.Synchronize(); err != nil {
+		t.Fatal(err)
+	}
+	if submissionSerial(b)-before < 2 {
+		t.Fatalf("descriptor chunk split produced %d submissions, want >= 2", submissionSerial(b)-before)
+	}
+	check(t, b, y, []float32{2, 4, 6, 8})
+}
+
+func TestDirectMLRepeatedUncachedKeyCompiledOnce(t *testing.T) {
+	b := testBackend(t)
+	x := upload(t, b, []float32{1, 2, 3, 4})
+	y := alloc(t, b, 4)
+	z := alloc(t, b, 4)
+	if err := b.lock(); err != nil {
+		t.Fatal(err)
+	}
+	bx, err := b.native(x, 4)
+	if err != nil {
+		b.mu.Unlock()
+		t.Fatal(err)
+	}
+	by, err := b.native(y, 4)
+	if err != nil {
+		b.mu.Unlock()
+		t.Fatal(err)
+	}
+	bz, err := b.native(z, 4)
+	if err != nil {
+		b.mu.Unlock()
+		t.Fatal(err)
+	}
+	steps := make([]dispatch, 0, maxCachedOperators+5)
+	in := bx
+	for i := 0; i < maxCachedOperators; i++ {
+		out := by
+		if i%2 == 1 {
+			out = bz
+		}
+		steps = append(steps, dispatch{opKey{kind: opScalar, n: 4, scalar: math.Float32bits(1), bias: math.Float32bits(float32(i+1) * .125)}, out, []*allocation{in}})
+		in = out
+	}
+	repeated := opKey{kind: opScalar, n: 4, scalar: math.Float32bits(1), bias: math.Float32bits(10)}
+	for i := 0; i < 5; i++ {
+		out := by
+		if (maxCachedOperators+i)%2 == 1 {
+			out = bz
+		}
+		steps = append(steps, dispatch{repeated, out, []*allocation{in}})
+		in = out
+	}
+	b.driver.releaseOperators()
+	nd := b.driver.(*nativeDriver)
+	before := nd.serial
+	if err := b.driver.executeBatch(steps); err != nil {
+		b.mu.Unlock()
+		t.Fatal(err)
+	}
+	if err := b.flushLocked(); err != nil {
+		b.mu.Unlock()
+		t.Fatal(err)
+	}
+	delta := nd.serial - before
+	b.mu.Unlock()
+	// 64 cached initializers + 1 uncached initializer (reused 5x) + 1 execution submit.
+	if delta != maxCachedOperators+2 {
+		t.Fatalf("submits=%d, want %d (repeated uncached key must compile once)", delta, maxCachedOperators+2)
 	}
 }

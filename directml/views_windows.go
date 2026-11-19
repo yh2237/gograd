@@ -21,28 +21,31 @@ func (d *nativeDriver) copyView(out, src *allocation, v gpu.View, scatter bool) 
 		}
 		run *= v.Shape[i]
 	}
-	// A view whose innermost axis is not contiguous needs one copy region per
-	// element. The command list would grow with the element count, so a very
-	// strided view is rejected instead of allocating a huge command list.
-	if regions := (n + run - 1) / run; regions > maxCopyRegions {
+	regions := (n + run - 1) / run
+	if regions > maxCopyRegions {
 		return fmt.Errorf("%w: DirectML scatter of %d elements needs %d copy regions", gpu.ErrUnsupported, n, regions)
 	}
-	return d.submit(func() {
-		d.transition(src, 0, stateCopySource)
-		d.transition(out, 0, stateCopyDest)
-		for flat := 0; flat < n; flat += run {
-			index, rest := v.Offset, flat
-			for axis := len(v.Shape) - 1; axis >= 0; axis-- {
-				index += rest % v.Shape[axis] * v.Strides[axis]
-				rest /= v.Shape[axis]
-			}
-			dest, source := uint64(flat)*4, uint64(index)*4
-			if scatter {
-				dest, source = source, dest
-			}
-			call(d.command, 15, uintptr(unsafe.Pointer(out.native.(*object))), uintptr(dest), uintptr(unsafe.Pointer(src.native.(*object))), uintptr(source), uintptr(run)*4)
+	vc := gpu.View{
+		Buffer:  v.Buffer,
+		Shape:   append([]int(nil), v.Shape...),
+		Strides: append([]int(nil), v.Strides...),
+		Offset:  v.Offset,
+	}
+	return d.enqueue(queuedStep{kind: stepCopyView, out: out, src: src, view: vc, run: run, regions: regions, scatter: scatter})
+}
+
+func (d *nativeDriver) recordCopyView(out, src *allocation, v gpu.View, run int, scatter bool) {
+	n, _ := gpu.Elements(v.Shape...)
+	for flat := 0; flat < n; flat += run {
+		index, rest := v.Offset, flat
+		for axis := len(v.Shape) - 1; axis >= 0; axis-- {
+			index += rest % v.Shape[axis] * v.Strides[axis]
+			rest /= v.Shape[axis]
 		}
-		d.transition(src, stateCopySource, 0)
-		d.transition(out, stateCopyDest, 0)
-	})
+		dest, source := uint64(flat)*4, uint64(index)*4
+		if scatter {
+			dest, source = source, dest
+		}
+		call(d.command, 15, uintptr(unsafe.Pointer(out.native.(*object))), uintptr(dest), uintptr(unsafe.Pointer(src.native.(*object))), uintptr(source), uintptr(run)*4)
+	}
 }

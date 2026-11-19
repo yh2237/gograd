@@ -84,6 +84,10 @@ func (d *testDriver) computeFailure() error {
 	}
 	return nil
 }
+func (*testDriver) hasQueued() bool              { return false }
+func (*testDriver) flush() error                 { return nil }
+func (*testDriver) discard()                     {}
+func (*testDriver) setFlushHook(func())          {}
 func (*testDriver) operatorStats() OperatorStats { return OperatorStats{} }
 func (d *testDriver) releaseOperators()          { d.releasedOperators++ }
 func (d *testDriver) close()                     { d.closed++ }
@@ -433,4 +437,88 @@ func TestDirectMLPortableAlignedBindings(t *testing.T) {
 	if err := b.Synchronize(); !errors.Is(err, gpu.ErrClosed) {
 		t.Fatal(err)
 	}
+}
+
+type queuedFailureDriver struct {
+	testDriver
+	queued   int
+	flushErr error
+	flushes  int
+	discards int
+	onFlush  func()
+}
+
+func (d *queuedFailureDriver) hasQueued() bool        { return d.queued > 0 }
+func (d *queuedFailureDriver) setFlushHook(fn func()) { d.onFlush = fn }
+func (d *queuedFailureDriver) discard()               { d.queued = 0; d.discards++ }
+func (d *queuedFailureDriver) execute(key opKey, out *allocation, inputs ...*allocation) error {
+	if d.failure != nil {
+		return d.failure
+	}
+	d.queued++
+	return nil
+}
+func (d *queuedFailureDriver) flush() error {
+	if d.queued == 0 {
+		return nil
+	}
+	d.flushes++
+	d.queued = 0
+	if d.onFlush != nil {
+		d.onFlush()
+	}
+	return d.flushErr
+}
+
+func TestDirectMLQueuedFlushFailureAndClose(t *testing.T) {
+	t.Run("close_surfaces_flush_error", func(t *testing.T) {
+		d := &queuedFailureDriver{flushErr: errors.New("injected flush failure")}
+		b := NewBackend()
+		b.once.Do(func() { b.driver = d })
+		x, err := b.Alloc(4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		y, err := b.Alloc(4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Add(y, x, x, 4); err != nil {
+			t.Fatal(err)
+		}
+		x.Close()
+		y.Close()
+		if err := b.Close(); !errors.Is(err, d.flushErr) {
+			t.Fatalf("Close hid flush error: %v", err)
+		}
+		if d.freed != d.allocated || b.MemoryStats().ReservedBytes != 0 {
+			t.Fatalf("leaked on failed Close flush: freed=%d alloc=%d stats=%+v", d.freed, d.allocated, b.MemoryStats())
+		}
+	})
+
+	t.Run("enqueue_error_discards_queued_steps", func(t *testing.T) {
+		d := &queuedFailureDriver{}
+		b := NewBackend()
+		b.once.Do(func() { b.driver = d })
+		x, _ := b.Alloc(4)
+		y, _ := b.Alloc(4)
+		if err := b.Add(y, x, x, 4); err != nil {
+			t.Fatal(err)
+		}
+		d.failure = errors.New("enqueue failure")
+		if err := b.Mul(y, x, x, 4); !errors.Is(err, d.failure) {
+			t.Fatalf("got %v want %v", err, d.failure)
+		}
+		if d.queued != 0 || d.discards == 0 {
+			t.Fatalf("queued steps not discarded on failure: queued=%d discards=%d", d.queued, d.discards)
+		}
+		x.Close()
+		y.Close()
+		if err := b.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if d.freed != d.allocated {
+			t.Fatalf("freed=%d alloc=%d", d.freed, d.allocated)
+		}
+	})
 }

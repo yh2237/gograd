@@ -40,10 +40,14 @@ func newNativeRecorder() (*vkDriver, *nativeRecorder) {
 		sizes: make(map[uint64]uint64), memory: make(map[uint64][]float32),
 		descriptors: make(map[uint64][4]vkDescriptorBufferInfo),
 	}
+	sets := make([]uint64, maxBatchDescriptors)
+	for i := range sets {
+		sets[i] = uint64(10 + i)
+	}
 	d := &vkDriver{
 		device: 1, instance: 2, queue: 3, command: 4, commandPool: 5, fence: 6,
-		descriptorPool: 7, descriptorLayout: 8, descriptorSet: 10,
-		descriptorSets: [3]uint64{10, 11, 12}, pipelineLayout: 13,
+		descriptorPool: 7, descriptorLayout: 8, descriptorSet: sets[0],
+		descriptorSets: sets, pipelineLayout: 13,
 		pipeline: 14, convPipeline: 15, gemmPipelines: [4]uint64{16, 17, 18, 19},
 		properties: Info{MaxStorageBufferBytes: 1 << 30, MaxWorkGroupCount: [3]uint32{65535, 65535, 65535}},
 		procs:      map[string]uintptr{"vkDestroyInstance": 1}, callHook: r.call,
@@ -142,13 +146,13 @@ func TestNativeConv1dDescriptorSlots(t *testing.T) {
 	if err := d.initPipeline(); err != nil {
 		t.Fatal(err)
 	}
-	if r.poolSets != 3 || r.poolDescriptors != 12 || d.descriptorSet != d.descriptorSets[0] {
-		t.Fatalf("pool=%d/%d sets=%v default=%d", r.poolSets, r.poolDescriptors, d.descriptorSets, d.descriptorSet)
+	if r.poolSets != maxBatchDescriptors || r.poolDescriptors != 4*maxBatchDescriptors || d.descriptorSet != d.descriptorSets[0] {
+		t.Fatalf("pool=%d/%d len=%d default=%d", r.poolSets, r.poolDescriptors, len(d.descriptorSets), d.descriptorSet)
 	}
 	seen := make(map[uint64]bool)
 	for _, set := range d.descriptorSets {
 		if set == 0 || seen[set] {
-			t.Fatalf("non-independent descriptor slots: %v", d.descriptorSets)
+			t.Fatalf("non-independent descriptor slots")
 		}
 		seen[set] = true
 	}
@@ -284,6 +288,9 @@ func TestNativeConv1dBatch(t *testing.T) {
 				if err := b.Conv1d(out, x, w, v, o); err != nil {
 					t.Fatal(err)
 				}
+				if err := b.Synchronize(); err != nil {
+					t.Fatal(err)
+				}
 				if r.calls["vkQueueSubmit"]-before != 1 || r.calls["vkWaitForFences"] != iteration+1 || len(r.sets) != stages || len(r.pushes) != stages {
 					t.Fatalf("submits=%d sets=%v pushes=%d", r.calls["vkQueueSubmit"]-before, r.sets, len(r.pushes))
 				}
@@ -363,6 +370,9 @@ func TestNativeConv1dFailures(t *testing.T) {
 				r.results["vkDeviceWaitIdle"] = []int32{tc.idle}
 				o := gpu.Conv1dOptions{Batch: 1, InputLength: 6, InChannels: 3, OutChannels: 2, Kernel: 2, Stride: 1, Padding: 1, Dilation: 1}
 				err := b.Conv1d(out, x, w, v, o)
+				if err == nil {
+					err = b.Synchronize()
+				}
 				if err == nil || !strings.Contains(err.Error(), tc.op) || b.Available() || d.pending != tc.pending {
 					t.Fatalf("err=%v pending=%t", err, d.pending)
 				}
@@ -393,5 +403,124 @@ func TestNativeConv1dFailures(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestNativeDeferredBatchAndAutoFlush(t *testing.T) {
+	d, r := newNativeRecorder()
+	b := recorderBackend(d)
+	a := recorderAlloc(t, b, 16)
+	c := recorderAlloc(t, b, 16)
+	tmp := recorderAlloc(t, b, 16)
+	out := recorderAlloc(t, b, 16)
+
+	tmpNative, err := tmp.Native(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := r.calls["vkQueueSubmit"]
+	if err := b.Add(tmp, a, c, 16); err != nil {
+		t.Fatal(err)
+	}
+	tmp.Close()
+	fresh := recorderAlloc(t, b, 16)
+	freshNative, err := fresh.Native(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if freshNative == tmpNative {
+		t.Fatal("deferred native allocation was recycled before flush")
+	}
+	if err := b.Mul(out, a, fresh, 16); err != nil {
+		t.Fatal(err)
+	}
+	if r.calls["vkQueueSubmit"] != before {
+		t.Fatalf("submitted early: %d", r.calls["vkQueueSubmit"]-before)
+	}
+	// Close fresh while the batch is open and let auto-flush recycle both blocks.
+	fresh.Close()
+	for i := 0; i < maxBatchDescriptors; i++ {
+		if err := b.MulScalar(out, a, 16, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if r.calls["vkQueueSubmit"]-before != 1 {
+		t.Fatalf("auto-flush submits=%d, want 1", r.calls["vkQueueSubmit"]-before)
+	}
+	allocsBefore := r.calls["vkAllocateMemory"]
+	reused := recorderAlloc(t, b, 16)
+	if r.calls["vkAllocateMemory"] != allocsBefore {
+		t.Fatal("auto-flush did not recycle deferred buffers")
+	}
+	if err := b.Synchronize(); err != nil {
+		t.Fatal(err)
+	}
+	if r.calls["vkQueueSubmit"]-before != 2 {
+		t.Fatalf("final submits=%d, want 2", r.calls["vkQueueSubmit"]-before)
+	}
+
+	// Copy/Zero reserve zero descriptor slots, so op-count auto-flush must bound them.
+	before = r.calls["vkQueueSubmit"]
+	for i := 0; i < maxBatchOps+2; i++ {
+		if err := b.Copy(out, a, 16); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if r.calls["vkQueueSubmit"]-before != 1 {
+		t.Fatalf("transfer auto-flush submits=%d, want 1", r.calls["vkQueueSubmit"]-before)
+	}
+	if err := b.Synchronize(); err != nil {
+		t.Fatal(err)
+	}
+
+	reused.Close()
+	a.Close()
+	c.Close()
+	out.Close()
+	if err := b.Close(); err != nil || len(r.memory) != 0 {
+		t.Fatalf("cleanup: %v mem=%d", err, len(r.memory))
+	}
+
+	// Auto-flush failure must quarantine deferred releases when completion is unproven.
+	d2, r2 := newNativeRecorder()
+	b2 := recorderBackend(d2)
+	a2 := recorderAlloc(t, b2, 16)
+	o2 := recorderAlloc(t, b2, 16)
+	tmp2 := recorderAlloc(t, b2, 16)
+	if err := b2.Add(tmp2, a2, o2, 16); err != nil {
+		t.Fatal(err)
+	}
+	tmp2.Close()
+	r2.results["vkWaitForFences"] = []int32{-1}
+	r2.results["vkDeviceWaitIdle"] = []int32{-2, 0}
+	var flushErr error
+	for i := 0; i < maxBatchDescriptors; i++ {
+		if err := b2.MulScalar(o2, a2, 16, 1); err != nil {
+			flushErr = err
+			break
+		}
+	}
+	if flushErr == nil || !d2.pending || r2.calls["vkFreeMemory"] != 0 {
+		t.Fatalf("auto-flush failure: err=%v pending=%t freed=%d", flushErr, d2.pending, r2.calls["vkFreeMemory"])
+	}
+	a2.Close()
+	o2.Close()
+	if err := b2.Close(); err != nil || len(r2.memory) != 0 {
+		t.Fatalf("quarantine cleanup: %v mem=%d", err, len(r2.memory))
+	}
+
+	// Close must surface final-flush errors.
+	d3, r3 := newNativeRecorder()
+	b3 := recorderBackend(d3)
+	a3 := recorderAlloc(t, b3, 16)
+	o3 := recorderAlloc(t, b3, 16)
+	if err := b3.MulScalar(o3, a3, 16, 2); err != nil {
+		t.Fatal(err)
+	}
+	a3.Close()
+	o3.Close()
+	r3.results["vkEndCommandBuffer"] = []int32{-1}
+	if err := b3.Close(); err == nil || !strings.Contains(err.Error(), "vkEndCommandBuffer") {
+		t.Fatalf("Close hid final-flush error: %v", err)
 	}
 }

@@ -59,10 +59,41 @@ func TestVulkanConv1dSingleSubmission(t *testing.T) {
 				if err := b.Conv1d(out, x, w, biasBuffer, o); err != nil {
 					t.Fatal(err)
 				}
+				if submits-before != 0 {
+					t.Fatalf("iteration %d: Conv1d flushed early (%d submits)", iteration, submits-before)
+				}
+				if err := b.Synchronize(); err != nil {
+					t.Fatal(err)
+				}
 				if submits-before != 1 {
 					t.Fatalf("iteration %d: got %d submissions, want 1", iteration, submits-before)
 				}
 				checkValues(t, b, out, want)
+			}
+			// Mixed Copy + Conv1d + Add + Download must submit once with intact barriers.
+			copied := testAlloc(t, b, 4)
+			summed := testAlloc(t, b, 6)
+			before := submits
+			if err := b.Copy(copied, x, 4); err != nil {
+				t.Fatal(err)
+			}
+			if err := b.Conv1d(out, copied, w, biasBuffer, o); err != nil {
+				t.Fatal(err)
+			}
+			if err := b.Add(summed, out, out, 6); err != nil {
+				t.Fatal(err)
+			}
+			got, err := b.Download(summed, 6)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if submits-before != 1 {
+				t.Fatalf("mixed batch submits=%d, want 1", submits-before)
+			}
+			for i, wv := range want {
+				if got[i] != 2*wv {
+					t.Fatalf("mixed[%d]=%g want %g", i, got[i], 2*wv)
+				}
 			}
 		})
 	}

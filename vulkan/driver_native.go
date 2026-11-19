@@ -19,7 +19,7 @@ type vkDriver struct {
 	instance, physical, device, queue, command             uintptr
 	commandPool, fence                                     uint64
 	descriptorLayout, descriptorPool, descriptorSet        uint64
-	descriptorSets                                         [3]uint64
+	descriptorSets                                         []uint64
 	pipelineLayout, shader, pipeline                       uint64
 	viewShader, viewPipeline                               uint64
 	binaryShader, binaryPipeline                           uint64
@@ -31,6 +31,10 @@ type vkDriver struct {
 	// pending means completion has not been established, even after an emergency
 	// wait. Never reset commands, update descriptors, free memory or unload while set.
 	pending    bool
+	recording  bool
+	batchNext  int
+	batchOps   int
+	onFlush    func()
 	failure    error
 	quarantine []*block
 	callHook   func(string, ...uintptr) uintptr // driver-free native tests
@@ -217,6 +221,7 @@ func (d *vkDriver) selectPhysical() error {
 func (d *vkDriver) info() Info { return d.properties }
 
 func (d *vkDriver) close() error {
+	d.recording, d.batchNext, d.batchOps = false, 0, 0
 	if d.device != 0 {
 		if d.pending {
 			code := d.call("vkDeviceWaitIdle", d.device)
