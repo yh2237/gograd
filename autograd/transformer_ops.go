@@ -26,6 +26,9 @@ func Softmax(a *Tensor, axis int) *Tensor {
 	return softmax(a, axis, false)
 }
 func LogSoftmax(a *Tensor, axis int) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceLogSoftmax(a, axis)
+	}
 	dispatchBackend("log_softmax", a.Device)
 	return softmax(a, axis, true)
 }

@@ -154,10 +154,16 @@ func Transpose(a *Tensor, i, j int) *Tensor {
 	return Permute(a, axes...)
 }
 func Sum(a *Tensor, axes ...int) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceReduce(gpu.ReduceSum, "sum", a, axes...)
+	}
 	dispatchBackend("sum", a.Device)
 	return reduce(a, false, axes...)
 }
 func Mean(a *Tensor, axes ...int) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceReduce(gpu.ReduceMean, "mean", a, axes...)
+	}
 	dispatchBackend("mean", a.Device)
 	return reduce(a, true, axes...)
 }
@@ -552,7 +558,16 @@ func MatMul(a, b *Tensor) *Tensor {
 
 func matMulTransB(a, w *Tensor) *Tensor {
 	if inferenceDevice(a.Device) {
-		return MatMul(a, Transpose(w, 0, 1))
+		wt := Transpose(w, 0, 1)
+		defer func() {
+			if r := recover(); r != nil {
+				wt.Close()
+				panic(r)
+			}
+		}()
+		out := MatMul(a, wt)
+		wt.releaseRequested.Store(true)
+		return out
 	}
 	useCUDA := dispatchBackend("matmul", a.Device)
 	same(a, w)

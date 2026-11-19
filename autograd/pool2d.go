@@ -26,6 +26,9 @@ type AvgPool2dOptions struct {
 // MaxPool2d pools NCHW input. Padding acts as negative infinity; equal finite
 // maxima select the first row-major sample, while NaNs select the last NaN.
 func MaxPool2d(x *Tensor, options MaxPool2dOptions) *Tensor {
+	if inferenceDevice(x.Device) {
+		return inferenceMaxPool2d(x, options)
+	}
 	useCUDA := dispatchBackend("max_pool2d", x.Device)
 	x.assertOpen()
 	s, err := pool2dShape(x.Shape, options.KernelSize, options.Stride, options.Padding, options.Dilation, options.CeilMode)
@@ -41,6 +44,9 @@ func MaxPool2d(x *Tensor, options MaxPool2dOptions) *Tensor {
 
 // AvgPool2d pools NCHW input with zero padding and the requested divisor.
 func AvgPool2d(x *Tensor, options AvgPool2dOptions) *Tensor {
+	if inferenceDevice(x.Device) {
+		return inferenceAvgPool2d(x, options)
+	}
 	useCUDA := dispatchBackend("avg_pool2d", x.Device)
 	x.assertOpen()
 	s, err := pool2dShape(x.Shape, options.KernelSize, options.Stride, options.Padding, [2]int{1, 1}, options.CeilMode)
@@ -61,6 +67,9 @@ func AvgPool2d(x *Tensor, options AvgPool2dOptions) *Tensor {
 // AdaptiveAvgPool2d averages NCHW input into a positive [height,width] size.
 // Non-divisible bins overlap; output dimensions may exceed the input dimensions.
 func AdaptiveAvgPool2d(x *Tensor, outputSize [2]int) *Tensor {
+	if inferenceDevice(x.Device) {
+		return inferenceAdaptiveAvgPool2d(x, outputSize)
+	}
 	useCUDA := dispatchBackend("adaptive_avg_pool2d", x.Device)
 	x.assertOpen()
 	s, err := adaptivePool2dShape(x.Shape, outputSize)

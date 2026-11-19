@@ -58,6 +58,56 @@ type identityDesc struct {
 	ScaleBias *scaleBias
 }
 type unaryDesc struct{ In, Out *tensorDesc }
+type clipDesc struct {
+	In, Out   *tensorDesc
+	ScaleBias *scaleBias
+	Min, Max  float32
+}
+type powDesc struct {
+	In, Out   *tensorDesc
+	ScaleBias *scaleBias
+	Exponent  float32
+	_         uint32
+}
+type softplusDesc struct {
+	In, Out   *tensorDesc
+	Steepness float32
+	_         uint32
+}
+type reduceDesc struct {
+	Function  uint32
+	_         uint32
+	In, Out   *tensorDesc
+	AxisCount uint32
+	_         uint32
+	Axes      *uint32
+}
+type avgPoolDesc struct {
+	In, Out                           *tensorDesc
+	Dimensions                        uint32
+	_                                 uint32
+	Strides, Window, StartPad, EndPad *uint32
+	IncludePad                        uint32
+	_                                 uint32
+}
+type maxPoolDesc struct {
+	In, Out                           *tensorDesc
+	Dimensions                        uint32
+	_                                 uint32
+	Strides, Window, StartPad, EndPad *uint32
+}
+type maxPool2Desc struct {
+	In, Out, OutIndices                          *tensorDesc
+	Dimensions                                   uint32
+	_                                            uint32
+	Strides, Window, StartPad, EndPad, Dilations *uint32
+}
+type batchNormDesc struct {
+	In, Mean, Variance, Scale, Bias, Out *tensorDesc
+	Spatial                              uint32
+	Epsilon                              float32
+	Fused                                *operatorDesc
+}
 type normDesc struct {
 	In, Scale, Bias, Out            *tensorDesc
 	CrossChannel, NormalizeVariance uint32
@@ -118,6 +168,12 @@ func checkABI() error {
 		{"binding properties", unsafe.Sizeof(bindingProperties{}), 24}, {"binding table", unsafe.Sizeof(bindingTableDesc{}), 32},
 		{"buffer binding", unsafe.Sizeof(bufferBinding{}), 24}, {"binding", unsafe.Sizeof(bindingDesc{}), 16},
 		{"feature query", unsafe.Sizeof(featureQuery{}), 16},
+		{"identity", unsafe.Sizeof(identityDesc{}), 24}, {"binary", unsafe.Sizeof(binaryDesc{}), 24},
+		{"unary", unsafe.Sizeof(unaryDesc{}), 16}, {"clip", unsafe.Sizeof(clipDesc{}), 32},
+		{"constant pow", unsafe.Sizeof(powDesc{}), 32}, {"softplus", unsafe.Sizeof(softplusDesc{}), 24},
+		{"reduce", unsafe.Sizeof(reduceDesc{}), 40}, {"average pooling", unsafe.Sizeof(avgPoolDesc{}), 64},
+		{"max pooling", unsafe.Sizeof(maxPoolDesc{}), 56}, {"max pooling 2", unsafe.Sizeof(maxPool2Desc{}), 72},
+		{"batch normalization", unsafe.Sizeof(batchNormDesc{}), 64},
 	} {
 		if c.got != c.want {
 			return fmt.Errorf("directml: ABI mismatch for %s: %d != %d", c.name, c.got, c.want)

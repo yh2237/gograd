@@ -79,10 +79,32 @@ func inferenceResult(buffer *gpu.Buffer, shape []int, context *ExecutionContext,
 }
 
 func inferenceBinary(name string, a, b *Tensor) *Tensor {
-	if name != "add" && name != "mul" {
+	var extraOp gpu.BinaryOp
+	var isExtra bool
+	switch name {
+	case "add", "mul":
+	case "sub":
+		extraOp, isExtra = gpu.BinarySub, true
+	case "div":
+		extraOp, isExtra = gpu.BinaryDiv, true
+	case "max":
+		extraOp, isExtra = gpu.BinaryMax, true
+	case "min":
+		extraOp, isExtra = gpu.BinaryMin, true
+	default:
 		panic(fmt.Errorf("%w: %s on %s", gpu.ErrUnsupported, name, a.Device))
 	}
 	backend, context := inferenceOperands(a, b)
+	var viewExtra gpu.ViewBinaryOpBackend
+	var flatExtra gpu.BinaryOpBackend
+	var hasViewExtra, hasFlatExtra bool
+	if isExtra {
+		viewExtra, hasViewExtra = backend.(gpu.ViewBinaryOpBackend)
+		flatExtra, hasFlatExtra = backend.(gpu.BinaryOpBackend)
+		if !hasViewExtra && !hasFlatExtra {
+			panic(fmt.Errorf("%w: %s on %s", gpu.ErrUnsupported, name, a.Device))
+		}
+	}
 	shape, err := gpu.BroadcastShape(a.Shape, b.Shape)
 	if err != nil {
 		panic(err)
@@ -109,6 +131,28 @@ func inferenceBinary(name string, a, b *Tensor) *Tensor {
 			panic(r)
 		}
 	}()
+	if isExtra {
+		if hasViewExtra {
+			err = viewExtra.BinaryOpViews(extraOp, out, av, bv)
+			if err == nil {
+				return inferenceResult(out, shape, context, a, b)
+			}
+			if !errors.Is(err, gpu.ErrUnsupported) {
+				panic(err)
+			}
+		}
+		if !hasFlatExtra {
+			panic(fmt.Errorf("%w: %s on %s", gpu.ErrUnsupported, name, a.Device))
+		}
+		x, releaseA := inferenceBuffer(backend, av)
+		defer releaseA()
+		y, releaseB := inferenceBuffer(backend, bv)
+		defer releaseB()
+		if err = flatExtra.BinaryOp(extraOp, out, x, y, n); err != nil {
+			panic(err)
+		}
+		return inferenceResult(out, shape, context, a, b)
+	}
 	if views, ok := backend.(gpu.ViewBinaryBackend); ok {
 		if name == "add" {
 			err = views.AddViews(out, av, bv)
@@ -135,6 +179,78 @@ func inferenceBinary(name string, a, b *Tensor) *Tensor {
 		panic(err)
 	}
 	return inferenceResult(out, shape, context, a, b)
+}
+
+func inferenceScalarOp(op gpu.ScalarOp, name string, a *Tensor, value float32) *Tensor {
+	backend, context := inferenceOperands(a)
+	ops, ok := backend.(gpu.ScalarOpBackend)
+	if !ok {
+		panic(fmt.Errorf("%w: %s on %s", gpu.ErrUnsupported, name, a.Device))
+	}
+	x, release := inferenceBuffer(backend, inferenceView(a))
+	defer release()
+	out, err := backend.Alloc(a.Numel())
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			out.Close()
+			panic(r)
+		}
+	}()
+	if err := ops.ScalarOp(op, out, x, a.Numel(), value); err != nil {
+		panic(err)
+	}
+	return inferenceResult(out, a.Shape, context, a)
+}
+
+func inferenceUnaryOp(op gpu.UnaryOp, name string, a *Tensor) *Tensor {
+	backend, context := inferenceOperands(a)
+	ops, ok := backend.(gpu.UnaryOpBackend)
+	if !ok {
+		panic(fmt.Errorf("%w: %s on %s", gpu.ErrUnsupported, name, a.Device))
+	}
+	x, release := inferenceBuffer(backend, inferenceView(a))
+	defer release()
+	out, err := backend.Alloc(a.Numel())
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			out.Close()
+			panic(r)
+		}
+	}()
+	if err := ops.UnaryOp(op, out, x, a.Numel()); err != nil {
+		panic(err)
+	}
+	return inferenceResult(out, a.Shape, context, a)
+}
+
+func inferenceClamp(a *Tensor, lo, hi float32) *Tensor {
+	backend, context := inferenceOperands(a)
+	ops, ok := backend.(gpu.UnaryOpBackend)
+	if !ok {
+		panic(fmt.Errorf("%w: clamp on %s", gpu.ErrUnsupported, a.Device))
+	}
+	x, release := inferenceBuffer(backend, inferenceView(a))
+	defer release()
+	out, err := backend.Alloc(a.Numel())
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			out.Close()
+			panic(r)
+		}
+	}()
+	if err := ops.Clamp(out, x, a.Numel(), lo, hi); err != nil {
+		panic(err)
+	}
+	return inferenceResult(out, a.Shape, context, a)
 }
 
 func inferenceMulScalar(a *Tensor, scalar float32) *Tensor {

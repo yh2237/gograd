@@ -44,6 +44,9 @@ func Conv2d(x, w, b *Tensor, options Conv2dOptions) *Tensor {
 	if x == nil || w == nil {
 		panic("autograd: Conv2d requires input and weight")
 	}
+	if inferenceDevice(x.Device) {
+		return inferenceConv2d(x, w, b, options)
+	}
 	useCUDA := dispatchBackend("conv2d", x.Device)
 	same(x, w, b)
 	spec, err := conv2dShape(x.Shape, w.Shape, options)

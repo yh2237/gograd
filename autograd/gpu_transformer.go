@@ -57,7 +57,23 @@ func inferenceGELU(a *Tensor, approx bool) *Tensor {
 }
 
 func inferenceSoftmax(a *Tensor, axis int) *Tensor {
-	a.assertOpen()
+	return inferenceSoftmaxAxis(a, axis, false)
+}
+
+func inferenceLogSoftmax(a *Tensor, axis int) *Tensor {
+	return inferenceSoftmaxAxis(a, axis, true)
+}
+
+func inferenceSoftmaxAxis(a *Tensor, axis int, logmode bool) *Tensor {
+	backend, _ := inferenceOperands(a)
+	var ls gpu.LogSoftmaxBackend
+	if logmode {
+		var ok bool
+		ls, ok = backend.(gpu.LogSoftmaxBackend)
+		if !ok {
+			panic(fmt.Errorf("%w: log_softmax on %s", gpu.ErrUnsupported, a.Device))
+		}
+	}
 	if axis < 0 {
 		axis += len(a.Shape)
 	}
@@ -65,8 +81,6 @@ func inferenceSoftmax(a *Tensor, axis int) *Tensor {
 		panic(fmt.Errorf("%w: softmax axis", gpu.ErrInvalidArgument))
 	}
 	v := inferenceView(a)
-	// The backend ABI reduces contiguous rows. Move a non-last axis to the
-	// end with metadata, gather once, then return an inverse-permuted view.
 	axes := make([]int, 0, len(a.Shape))
 	for i := range a.Shape {
 		if i != axis {
@@ -81,12 +95,238 @@ func inferenceSoftmax(a *Tensor, axis int) *Tensor {
 	v.Shape, v.Strides = shape, stride
 	cols := a.Shape[axis]
 	out := inferenceForward(shape, []*Tensor{a}, []gpu.View{v}, func(b gpu.Backend, out *gpu.Buffer, inputs []*gpu.Buffer) error {
+		if logmode {
+			return ls.LogSoftmax(out, inputs[0], a.Numel()/cols, cols)
+		}
 		return b.Softmax(out, inputs[0], a.Numel()/cols, cols)
 	})
 	if axis == len(a.Shape)-1 {
 		return out
 	}
-	return Permute(out, inverse...)
+	res := Permute(out, inverse...)
+	out.releaseRequested.Store(true)
+	return res
+}
+
+func inferenceReduce(op gpu.ReduceOp, name string, a *Tensor, axes ...int) *Tensor {
+	backend, _ := inferenceOperands(a)
+	red, ok := backend.(gpu.ReduceBackend)
+	if !ok {
+		panic(fmt.Errorf("%w: %s on %s", gpu.ErrUnsupported, name, a.Device))
+	}
+	selected := make([]bool, len(a.Shape))
+	normAxes := make([]int, 0, len(axes))
+	for _, ax := range axes {
+		if ax < 0 {
+			ax += len(selected)
+		}
+		if ax < 0 || ax >= len(selected) || selected[ax] {
+			panic(fmt.Errorf("%w: invalid axis", gpu.ErrInvalidArgument))
+		}
+		selected[ax] = true
+		normAxes = append(normAxes, ax)
+	}
+	outShape := make([]int, 0, len(a.Shape)-len(normAxes))
+	for i, d := range a.Shape {
+		if !selected[i] {
+			outShape = append(outShape, d)
+		}
+	}
+	return inferenceForward(outShape, []*Tensor{a}, nil, func(_ gpu.Backend, out *gpu.Buffer, inputs []*gpu.Buffer) error {
+		return red.Reduce(op, out, inputs[0], a.Shape, normAxes)
+	})
+}
+
+func inferenceConv2d(x, w, b *Tensor, options Conv2dOptions) *Tensor {
+	inputs := []*Tensor{x, w}
+	if b != nil {
+		inputs = append(inputs, b)
+	}
+	backend, _ := inferenceOperands(inputs...)
+	vis, ok := backend.(gpu.VisionBackend)
+	if !ok {
+		panic(fmt.Errorf("%w: conv2d on %s", gpu.ErrUnsupported, x.Device))
+	}
+	spec, err := conv2dShape(x.Shape, w.Shape, options)
+	if err != nil {
+		panic(err)
+	}
+	if b != nil && (len(b.Shape) != 1 || b.Shape[0] != spec.co) {
+		panic("autograd: Conv2d bias must have shape [out_channels]")
+	}
+	o := gpu.Conv2dOptions{
+		Batch: spec.batch, InChannels: spec.ci, Height: spec.h, Width: spec.width,
+		OutChannels: spec.co, KernelH: spec.kh, KernelW: spec.kw,
+		StrideH: spec.options.Stride[0], StrideW: spec.options.Stride[1],
+		PadH: spec.options.Padding[0], PadW: spec.options.Padding[1],
+		DilationH: spec.options.Dilation[0], DilationW: spec.options.Dilation[1],
+		Groups: spec.options.Groups,
+	}
+	return inferenceForward(spec.outputShape(), inputs, nil, func(_ gpu.Backend, out *gpu.Buffer, values []*gpu.Buffer) error {
+		var biasBuf *gpu.Buffer
+		if b != nil {
+			biasBuf = values[2]
+		}
+		return vis.Conv2d(out, values[0], values[1], biasBuf, o)
+	})
+}
+
+func poolEndPad(in, out, k, st, p, d int) int {
+	need := (out-1)*st + d*(k-1) + 1 - in - p
+	return max(p, need)
+}
+
+func inferenceMaxPool2d(x *Tensor, options MaxPool2dOptions) *Tensor {
+	backend, _ := inferenceOperands(x)
+	vis, ok := backend.(gpu.VisionBackend)
+	if !ok {
+		panic(fmt.Errorf("%w: max_pool2d on %s", gpu.ErrUnsupported, x.Device))
+	}
+	s, err := pool2dShape(x.Shape, options.KernelSize, options.Stride, options.Padding, options.Dilation, options.CeilMode)
+	if err != nil {
+		panic(err)
+	}
+	po := gpu.Pool2dOptions{
+		Batch: s.batch, Channels: s.channels, Height: s.h, Width: s.w,
+		KernelH: s.kernel[0], KernelW: s.kernel[1],
+		StrideH: s.stride[0], StrideW: s.stride[1],
+		PadH: s.padding[0], PadW: s.padding[1],
+		EndPadH:   poolEndPad(s.h, s.oh, s.kernel[0], s.stride[0], s.padding[0], s.dilation[0]),
+		EndPadW:   poolEndPad(s.w, s.ow, s.kernel[1], s.stride[1], s.padding[1], s.dilation[1]),
+		DilationH: s.dilation[0], DilationW: s.dilation[1],
+		OutH: s.oh, OutW: s.ow,
+	}
+	return inferenceForward(s.outputShape(), []*Tensor{x}, nil, func(_ gpu.Backend, out *gpu.Buffer, values []*gpu.Buffer) error {
+		return vis.MaxPool2d(out, values[0], po)
+	})
+}
+
+func inferenceAvgPool2d(x *Tensor, options AvgPool2dOptions) *Tensor {
+	backend, _ := inferenceOperands(x)
+	vis, ok := backend.(gpu.VisionBackend)
+	if !ok {
+		panic(fmt.Errorf("%w: avg_pool2d on %s", gpu.ErrUnsupported, x.Device))
+	}
+	s, err := pool2dShape(x.Shape, options.KernelSize, options.Stride, options.Padding, [2]int{1, 1}, options.CeilMode)
+	if err != nil {
+		panic(err)
+	}
+	if options.DivisorOverride < 0 || options.DivisorOverride > 1<<31-1 {
+		panic("autograd: invalid AvgPool2d divisor override")
+	}
+	if options.DivisorOverride != 0 {
+		panic(fmt.Errorf("%w: AvgPool2d DivisorOverride on %s", gpu.ErrUnsupported, x.Device))
+	}
+	endPadH := poolEndPad(s.h, s.oh, s.kernel[0], s.stride[0], s.padding[0], 1)
+	endPadW := poolEndPad(s.w, s.ow, s.kernel[1], s.stride[1], s.padding[1], 1)
+	if (endPadH > s.padding[0] || endPadW > s.padding[1]) && !options.ExcludePad {
+		panic(fmt.Errorf("%w: AvgPool2d CeilMode with included padding on %s", gpu.ErrUnsupported, x.Device))
+	}
+	po := gpu.Pool2dOptions{
+		Batch: s.batch, Channels: s.channels, Height: s.h, Width: s.w,
+		KernelH: s.kernel[0], KernelW: s.kernel[1],
+		StrideH: s.stride[0], StrideW: s.stride[1],
+		PadH: s.padding[0], PadW: s.padding[1],
+		EndPadH: endPadH, EndPadW: endPadW,
+		DilationH: 1, DilationW: 1,
+		OutH: s.oh, OutW: s.ow,
+		IncludePad: !options.ExcludePad,
+	}
+	return inferenceForward(s.outputShape(), []*Tensor{x}, nil, func(_ gpu.Backend, out *gpu.Buffer, values []*gpu.Buffer) error {
+		return vis.AvgPool2d(out, values[0], po)
+	})
+}
+
+func inferenceAdaptiveAvgPool2d(x *Tensor, outputSize [2]int) *Tensor {
+	backend, _ := inferenceOperands(x)
+	if _, ok := backend.(gpu.VisionBackend); !ok {
+		panic(fmt.Errorf("%w: adaptive_avg_pool2d on %s", gpu.ErrUnsupported, x.Device))
+	}
+	s, err := adaptivePool2dShape(x.Shape, outputSize)
+	if err != nil {
+		panic(err)
+	}
+	if s.h%s.oh != 0 || s.w%s.ow != 0 {
+		panic(fmt.Errorf("%w: non-divisible AdaptiveAvgPool2d on %s", gpu.ErrUnsupported, x.Device))
+	}
+	kh, kw := s.h/s.oh, s.w/s.ow
+	return inferenceAvgPool2d(x, AvgPool2dOptions{KernelSize: [2]int{kh, kw}, Stride: [2]int{kh, kw}})
+}
+
+func inferenceBatchNormEval(x, weight, bias, mean, variance, count *Tensor, options BatchNormOptions) *Tensor {
+	if options.Training {
+		panic(gpu.ErrInferenceOnly)
+	}
+	all := []*Tensor{x, weight, bias, mean, variance, count}
+	live := make([]*Tensor, 0, len(all))
+	for _, t := range all {
+		if t != nil {
+			live = append(live, t)
+		}
+	}
+	backend, context := inferenceOperands(live...)
+	bn, ok := backend.(gpu.BatchNormBackend)
+	if !ok {
+		panic(fmt.Errorf("%w: batch_norm on %s", gpu.ErrUnsupported, x.Device))
+	}
+	o, err := options.normalized()
+	if err != nil {
+		panic(err)
+	}
+	s, err := batchNormShape(x.Shape, o.ChannelsLast, false)
+	if err != nil {
+		panic(err)
+	}
+	if mean == nil || variance == nil {
+		panic("autograd: BatchNorm requires paired running statistics for evaluation")
+	}
+	for _, v := range []*Tensor{weight, bias, mean, variance} {
+		if v != nil && (len(v.Shape) != 1 || v.Shape[0] != s.channels) {
+			panic("autograd: BatchNorm channel vector shape")
+		}
+	}
+	for _, v := range []*Tensor{mean, variance, count} {
+		if v != nil && (v.RequiresGrad || !v.IsContiguous()) {
+			panic("autograd: BatchNorm state must be contiguous non-gradient buffers")
+		}
+	}
+	if count != nil && len(count.Shape) != 0 {
+		panic("autograd: BatchNorm counter requires scalar tracked state")
+	}
+	for i := 3; i < len(all); i++ {
+		if all[i] == nil {
+			continue
+		}
+		for j, v := range all {
+			if j != i && v != nil && all[i].storage == v.storage {
+				panic("autograd: BatchNorm running state aliases an input")
+			}
+		}
+	}
+	inputs := []*Tensor{x, mean, variance}
+	weightIdx, biasIdx := -1, -1
+	if weight != nil {
+		weightIdx = len(inputs)
+		inputs = append(inputs, weight)
+	}
+	if bias != nil {
+		biasIdx = len(inputs)
+		inputs = append(inputs, bias)
+	}
+	out := inferenceForward(x.Shape, inputs, nil, func(_ gpu.Backend, out *gpu.Buffer, values []*gpu.Buffer) error {
+		var wBuf, bBuf *gpu.Buffer
+		if weightIdx >= 0 {
+			wBuf = values[weightIdx]
+		}
+		if biasIdx >= 0 {
+			bBuf = values[biasIdx]
+		}
+		return bn.BatchNormEval(out, values[0], wBuf, bBuf, values[1], values[2], s.outer, s.channels, s.inner, o.Eps)
+	})
+	if out.execution == nil {
+		out.execution = context
+	}
+	return out
 }
 
 func inferenceLayerNorm(x, w, bias *Tensor, eps float32) *Tensor {

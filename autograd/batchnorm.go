@@ -2,7 +2,6 @@ package autograd
 
 import (
 	"fmt"
-	"github.com/yh2237/gograd/gpu"
 	"math"
 
 	"github.com/yh2237/gograd/tensor"
@@ -33,8 +32,8 @@ func (o BatchNormOptions) normalized() (BatchNormOptions, error) {
 // them. Training uses biased variance for output and unbiased variance for the
 // running update. Running buffers are never differentiated.
 func BatchNorm(x, weight, bias, runningMean, runningVar *Tensor, options BatchNormOptions) *Tensor {
-	if inferenceDevice(x.Device) && options.Training {
-		panic(gpu.ErrInferenceOnly)
+	if inferenceDevice(x.Device) {
+		return inferenceBatchNormEval(x, weight, bias, runningMean, runningVar, nil, options)
 	}
 	useCUDA := dispatchBackend("batch_norm", x.Device)
 	return batchNorm(x, weight, bias, runningMean, runningVar, nil, options, false, useCUDA)

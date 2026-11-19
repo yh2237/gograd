@@ -3,8 +3,6 @@ package autograd
 
 import (
 	"errors"
-	"github.com/yh2237/gograd/cuda"
-	"github.com/yh2237/gograd/tensor"
 	"math"
 	"math/bits"
 	"runtime"
@@ -12,6 +10,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/yh2237/gograd/cuda"
+	"github.com/yh2237/gograd/gpu"
+	"github.com/yh2237/gograd/tensor"
 )
 
 type Tensor struct {
@@ -737,6 +739,9 @@ func cpuScalar(a *Tensor, value float32, op int) *Tensor {
 	})
 }
 func AddScalar(a *Tensor, v float32) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceScalarOp(gpu.ScalarAdd, "add_scalar", a, v)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("add_scalar", a.Device) {
 		return gpuScalar(a, v, 0)
@@ -744,6 +749,9 @@ func AddScalar(a *Tensor, v float32) *Tensor {
 	return cpuScalar(a, v, 0)
 }
 func SubScalar(a *Tensor, v float32) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceScalarOp(gpu.ScalarSub, "sub_scalar", a, v)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("sub_scalar", a.Device) {
 		return gpuScalar(a, v, 1)
@@ -761,6 +769,9 @@ func MulScalar(a *Tensor, v float32) *Tensor {
 	return cpuScalar(a, v, 2)
 }
 func DivScalar(a *Tensor, v float32) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceScalarOp(gpu.ScalarDiv, "div_scalar", a, v)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("div_scalar", a.Device) {
 		return gpuScalar(a, v, 3)
@@ -790,6 +801,9 @@ func unary(a *Tensor, f, d func(float32) float32) *Tensor {
 	})
 }
 func Exp(a *Tensor) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceUnaryOp(gpu.UnaryExp, "exp", a)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("exp", a.Device) {
 		return gpuUnary(a, 0)
@@ -797,6 +811,9 @@ func Exp(a *Tensor) *Tensor {
 	return unary(a, func(x float32) float32 { return float32(math.Exp(float64(x))) }, func(x float32) float32 { return float32(math.Exp(float64(x))) })
 }
 func Log(a *Tensor) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceUnaryOp(gpu.UnaryLog, "log", a)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("log", a.Device) {
 		return gpuUnary(a, 1)
@@ -804,6 +821,9 @@ func Log(a *Tensor) *Tensor {
 	return unary(a, func(x float32) float32 { return float32(math.Log(float64(x))) }, func(x float32) float32 { return 1 / x })
 }
 func Abs(a *Tensor) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceUnaryOp(gpu.UnaryAbs, "abs", a)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("abs", a.Device) {
 		return gpuUnary(a, 2)
@@ -819,6 +839,9 @@ func Abs(a *Tensor) *Tensor {
 	})
 }
 func Tanh(a *Tensor) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceUnaryOp(gpu.UnaryTanh, "tanh", a)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("tanh", a.Device) {
 		return gpuUnary(a, 3)
@@ -828,6 +851,9 @@ func Tanh(a *Tensor) *Tensor {
 
 // Sin applies sine elementwise.
 func Sin(a *Tensor) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceUnaryOp(gpu.UnarySin, "sin", a)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("sin", a.Device) {
 		return gpuUnary(a, 7)
@@ -837,6 +863,9 @@ func Sin(a *Tensor) *Tensor {
 
 // Cos applies cosine elementwise.
 func Cos(a *Tensor) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceUnaryOp(gpu.UnaryCos, "cos", a)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("cos", a.Device) {
 		return gpuUnary(a, 10)
@@ -847,6 +876,9 @@ func Cos(a *Tensor) *Tensor {
 // Sqrt applies the square root elementwise. The derivative is infinite at zero,
 // matching the reference.
 func Sqrt(a *Tensor) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceUnaryOp(gpu.UnarySqrt, "sqrt", a)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("sqrt", a.Device) {
 		return gpuUnary(a, 8)
@@ -858,6 +890,9 @@ func Sqrt(a *Tensor) *Tensor {
 
 // Sigmoid applies the logistic function elementwise.
 func Sigmoid(a *Tensor) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceUnaryOp(gpu.UnarySigmoid, "sigmoid", a)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("sigmoid", a.Device) {
 		return gpuUnary(a, 9)
@@ -875,6 +910,9 @@ func sigmoid32(x float32) float32 {
 // Softplus applies log(1+exp(x)) elementwise. The forward pass is evaluated as
 // max(x,0)+log1p(exp(-|x|)) so that large magnitudes do not overflow.
 func Softplus(a *Tensor) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceUnaryOp(gpu.UnarySoftplus, "softplus", a)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("softplus", a.Device) {
 		return gpuUnary(a, 11)
@@ -886,6 +924,9 @@ func Softplus(a *Tensor) *Tensor {
 
 // Erf applies the Gauss error function elementwise.
 func Erf(a *Tensor) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceUnaryOp(gpu.UnaryErf, "erf", a)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("erf", a.Device) {
 		return gpuUnary(a, 12)
@@ -922,6 +963,9 @@ func Expm1(a *Tensor) *Tensor {
 // Clamp limits each element to [lo, hi]. The gradient passes through where the
 // input lies inside the interval, endpoints included.
 func Clamp(a *Tensor, lo, hi float32) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceClamp(a, lo, hi)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("clamp", a.Device) {
 		return gpuClamp(a, lo, hi)
@@ -936,6 +980,9 @@ func Clamp(a *Tensor, lo, hi float32) *Tensor {
 
 // PowScalar raises each element to a constant power.
 func PowScalar(a *Tensor, p float32) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceScalarOp(gpu.ScalarPow, "pow_scalar", a, p)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("pow_scalar", a.Device) {
 		return gpuPowScalar(a, p)
@@ -948,6 +995,9 @@ func PowScalar(a *Tensor, p float32) *Tensor {
 	})
 }
 func ReLU(a *Tensor) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceUnaryOp(gpu.UnaryReLU, "relu", a)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("relu", a.Device) {
 		return gpuUnary(a, 4)

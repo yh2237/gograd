@@ -47,7 +47,12 @@ type opKey struct {
 	batch                     int
 	aLayout, bLayout, yLayout tensorLayout
 	conv                      gpu.Conv1dOptions
+	spatial                   spatialKey
 	hasBias                   bool
+}
+
+type spatialKey struct {
+	stride, dilation, start, end, window [2]uint32
 }
 
 // Four-dimensional descriptors cover the baseline DirectML feature level.

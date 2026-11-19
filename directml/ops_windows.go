@@ -157,6 +157,62 @@ func (d *nativeDriver) compile(key opKey) (_ *compiled, err error) {
 		desc = operatorDesc{Type: 48, Desc: unsafe.Pointer(&unary)}
 	case opNorm:
 		desc = operatorDesc{Type: 73, Desc: unsafe.Pointer(&norm)}
+	case opDiv, opMax, opMin, opSub:
+		desc = operatorDesc{Type: key.kind - sdkOp, Desc: unsafe.Pointer(&binary)}
+	case opAbs, opCos, opExp, opLog, opSin, opSqrt, opErf:
+		identity.ScaleBias = nil
+		desc = operatorDesc{Type: key.kind - sdkOp, Desc: unsafe.Pointer(&identity)}
+	case opLogSoftmax, opReLU, opSigmoid:
+		desc = operatorDesc{Type: key.kind - sdkOp, Desc: unsafe.Pointer(&unary)}
+	case opClip:
+		clip := clipDesc{In: &a.tensor, Out: &out.tensor, Min: scale.Scale, Max: scale.Bias}
+		desc = operatorDesc{Type: 8, Desc: unsafe.Pointer(&clip)}
+	case opPow:
+		pow := powDesc{In: &a.tensor, Out: &out.tensor, Exponent: scale.Scale}
+		desc = operatorDesc{Type: 26, Desc: unsafe.Pointer(&pow)}
+	case opSoftplus:
+		softplus := softplusDesc{In: &a.tensor, Out: &out.tensor, Steepness: 1}
+		desc = operatorDesc{Type: 49, Desc: unsafe.Pointer(&softplus)}
+	case opReduce:
+		var axes [4]uint32
+		var count uint32
+		for axis := range axes {
+			if key.bias&(1<<axis) != 0 {
+				axes[count] = uint32(axis)
+				count++
+			}
+		}
+		reduce := reduceDesc{Function: key.scalar, In: &a.tensor, Out: &out.tensor, AxisCount: count, Axes: &axes[0]}
+		desc = operatorDesc{Type: 55, Desc: unsafe.Pointer(&reduce)}
+	case opConv2d:
+		s := &key.spatial
+		convolution = convDesc{In: &a.tensor, Filter: &b.tensor, Out: &out.tensor, Mode: 1, Dimensions: 2,
+			Strides: &s.stride[0], Dilations: &s.dilation[0], Start: &s.start[0], End: &s.end[0],
+			OutputPadding: &outputPadding[0], Groups: key.scalar}
+		if key.hasBias {
+			convBias = layoutTensor(compactLayout(1, key.yLayout.sizes[1], 1, 1))
+			convolution.Bias = &convBias.tensor
+		}
+		desc = operatorDesc{Type: 53, Desc: unsafe.Pointer(&convolution)}
+	case opAvgPool:
+		s := &key.spatial
+		pool := avgPoolDesc{In: &a.tensor, Out: &out.tensor, Dimensions: 2, Strides: &s.stride[0],
+			Window: &s.window[0], StartPad: &s.start[0], EndPad: &s.end[0], IncludePad: key.scalar}
+		desc = operatorDesc{Type: 56, Desc: unsafe.Pointer(&pool)}
+	case opMaxPool:
+		s := &key.spatial
+		pool := maxPoolDesc{In: &a.tensor, Out: &out.tensor, Dimensions: 2, Strides: &s.stride[0],
+			Window: &s.window[0], StartPad: &s.start[0], EndPad: &s.end[0]}
+		desc = operatorDesc{Type: 58, Desc: unsafe.Pointer(&pool)}
+	case opMaxPool2:
+		s := &key.spatial
+		pool := maxPool2Desc{In: &a.tensor, Out: &out.tensor, Dimensions: 2, Strides: &s.stride[0],
+			Window: &s.window[0], StartPad: &s.start[0], EndPad: &s.end[0], Dilations: &s.dilation[0]}
+		desc = operatorDesc{Type: 110, Desc: unsafe.Pointer(&pool)}
+	case opBatchNorm:
+		bn := batchNormDesc{In: &a.tensor, Mean: &b.tensor, Variance: &b.tensor, Scale: &b.tensor,
+			Bias: &b.tensor, Out: &out.tensor, Spatial: 1, Epsilon: scale.Scale}
+		desc = operatorDesc{Type: 72, Desc: unsafe.Pointer(&bn)}
 	case opConv:
 		o := key.conv
 		a = layoutTensor(ntcLayout(o.Batch, o.InputLength, o.InChannels))
@@ -526,8 +582,12 @@ func (d *nativeDriver) bindTable(table *object, op *compiled, key opKey, out *al
 	}
 	call(table, 8, uintptr(len(descs)), uintptr(unsafe.Pointer(&descs[0])))
 	output := bufferBinding{Resource: out.native.(*object), Size: out.size}
-	outputDesc := bindingDesc{Type: 1, Desc: &output}
-	call(table, 9, 1, uintptr(unsafe.Pointer(&outputDesc)))
+	outputDescs := [2]bindingDesc{{Type: 1, Desc: &output}}
+	outputCount := uintptr(1)
+	if key.kind == opMaxPool2 {
+		outputCount = 2
+	}
+	call(table, 9, outputCount, uintptr(unsafe.Pointer(&outputDescs[0])))
 	if op.temporary != nil {
 		tb := bufferBinding{Resource: op.temporary.native.(*object), Size: op.temporary.size}
 		td := bindingDesc{Type: 1, Desc: &tb}
