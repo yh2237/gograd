@@ -164,6 +164,45 @@ func auditLossShapeRegressions(t *testing.T, device tensor.Device) {
 		conv2dClose(t, "broadcast logits dt", conv2dHost(t, y, true), []float32{-.5, -.5, -.5, -.5}, 1e-6, 1e-6)
 		conv2dClose(t, "broadcast weights dw", conv2dHost(t, w, true), []float32{float32(math.Log1p(math.Exp(1))) - .25}, 1e-6, 1e-6)
 	})
+	for _, tc := range []struct {
+		name string
+		loss func(*Tensor, *Tensor, LossOptions) *Tensor
+		want float32
+		dx   []float32
+		dw   []float32
+	}{
+		{"MSE", MSELoss, 19, []float32{.25, 0, 2.25, 1, 0, 4.5}, []float32{-2.625, -1.125, .875}},
+		{"L1", L1Loss, 4, []float32{.125, 0, .375, .125, 0, .375}, []float32{-.375, -.125, .125}},
+		{"SmoothL1", SmoothL1Loss, 3.5, []float32{.125, 0, .375, .125, 0, .375}, []float32{-.375, -.125, .125}},
+	} {
+		run("BroadcastWeightedMean/"+tc.name, func(t *testing.T) {
+			x := conv2dTestTensor(t, []float32{1, 2, 3, 4, 5, 6}, []int{2, 3}, device, true)
+			y := conv2dTestTensor(t, []float32{0}, nil, device, false)
+			w := conv2dTestTensor(t, []float32{1, 0, 3}, []int{3}, device, true)
+			loss := tc.loss(x, y, LossOptions{Weight: w})
+			defer loss.ReleaseGraph()
+			conv2dClose(t, "loss", conv2dHost(t, loss, false), []float32{tc.want}, 1e-6, 1e-6)
+			if err := loss.Backward(); err != nil {
+				t.Fatal(err)
+			}
+			conv2dClose(t, "dx", conv2dHost(t, x, true), tc.dx, 1e-6, 1e-6)
+			conv2dClose(t, "dw", conv2dHost(t, w, true), tc.dw, 1e-6, 1e-6)
+		})
+	}
+	run("EmptyWeightedMean", func(t *testing.T) {
+		x := conv2dTestTensor(t, nil, []int{0, 3}, device, true)
+		y := conv2dTestTensor(t, nil, []int{0, 3}, device, false)
+		w := conv2dTestTensor(t, []float32{1, 2, 3}, []int{3}, device, true)
+		loss := MSELoss(x, y, LossOptions{Weight: w})
+		defer loss.ReleaseGraph()
+		if got := conv2dHost(t, loss, false); len(got) != 1 || !math.IsNaN(float64(got[0])) {
+			t.Fatalf("empty weighted mean = %v, want NaN", got)
+		}
+		if err := loss.Backward(); err != nil {
+			t.Fatal(err)
+		}
+		conv2dClose(t, "dw", conv2dHost(t, w, true), []float32{0, 0, 0}, 0, 0)
+	})
 	run("BCEEmptyAndScalar", func(t *testing.T) {
 		x := conv2dTestTensor(t, nil, []int{0}, device, true)
 		y := conv2dTestTensor(t, nil, []int{0}, device, false)

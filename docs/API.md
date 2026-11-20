@@ -82,7 +82,7 @@ CPU / CUDAの学習・推論および共通ユーティリティのAPI仕様で�
 ### 損失関数
 
 - `MSELoss`、`L1Loss`、`SmoothL1Loss`（`|d|<1` で `0.5*d^2`、以外で `|d|-0.5`）、`BCEWithLogitsLoss`（`max(x,0)-x*y+log(1+exp(-|x|))`、targetは `[0,1]`）はスカラーを返す。
-- `LossOptions.Reduction` は `ReductionMean`（既定）または `ReductionSum`。`Weight` 指定時、MSE / L1のmeanは重み和で除算（0重み除外）、BCEのmeanは要素数で除算。
+- `LossOptions.Reduction` は `ReductionMean`（既定）または `ReductionSum`。`Weight` は要素ごとの損失にブロードキャストして掛ける。重み付きの MSE・L1・Smooth L1 の平均は、ブロードキャスト後の重みの合計で割る。重みなしの平均と BCE の平均は要素数で割る。
 - `MaskedLoss` はrank 3専用。NaNフレームを除外し、有効フレーム数 × channelsで平均する（有効0件時は損失0）。
 
 ## Optimizer・勾配蓄積・学習再開

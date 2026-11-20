@@ -10,29 +10,18 @@ import (
 type Reduction int
 
 const (
-	// ReductionMean divides the weighted values by the sum of the weights, or by
-	// the element count when there is no weight. This is the zero value.
+	// ReductionMean is the default reduction.
 	ReductionMean Reduction = iota
 	// ReductionSum adds the weighted values without dividing.
 	ReductionSum
 )
 
-// LossOptions configures the elementwise losses. Weight is an optional
-// per-element weight with the prediction's shape and device: it scales each
-// element, and a zero weight ignores that element for ReductionMean because the
-// divisor is the sum of weights. A nil Weight counts every element once.
-//
-// The losses return a scalar, so ReductionNone (an unreduced tensor) is not
-// available; use elementwise operators when per-element values are needed.
-//
-// Weighted ReductionMean follows PyTorch's per-loss divisor, which is not
-// uniform: MSELoss and L1Loss divide by the sum of weights, while
-// BCEWithLogitsLoss divides by the element count. Zero weights therefore leave
-// the divisor of a BCE mean alone; use ReductionSum with your own divisor when
-// they must not count.
 type LossOptions struct {
 	Reduction Reduction
-	Weight    *Tensor
+	// Weight broadcasts with the elementwise loss on the same device. A
+	// weighted mean divides by the sum of the broadcast weights for MSELoss,
+	// L1Loss and SmoothL1Loss, or by the element count for BCEWithLogitsLoss.
+	Weight *Tensor
 }
 
 // lossAxes lists every axis of a shape so a reduction covers all elements. Sum
@@ -45,24 +34,26 @@ func lossAxes(shape []int) []int {
 	return axes
 }
 
-// reduceLoss applies the reduction. divideByWeightSum selects the mean divisor:
-// true divides by the sum of weights, false by the element count, matching the
-// reference implementation of each loss.
 func reduceLoss(elementwise *Tensor, options LossOptions, divideByWeightSum bool) *Tensor {
 	if options.Reduction != ReductionMean && options.Reduction != ReductionSum {
 		panic("autograd: invalid loss reduction")
 	}
 	weighted := elementwise
-	if options.Weight != nil {
-		same(elementwise, options.Weight)
-		weighted = Mul(elementwise, options.Weight)
+	weight := options.Weight
+	if weight != nil {
+		same(elementwise, weight)
+		weighted = Mul(elementwise, weight)
 	}
 	axes := lossAxes(weighted.Shape)
 	if options.Reduction == ReductionSum {
 		return Sum(weighted, axes...)
 	}
-	if options.Weight != nil && divideByWeightSum {
-		return Div(Sum(weighted, axes...), Sum(options.Weight, lossAxes(options.Weight.Shape)...))
+	if weight != nil && divideByWeightSum && weighted.Numel() != 0 {
+		divisor := Sum(weight, lossAxes(weight.Shape)...)
+		if copies := weighted.Numel() / weight.Numel(); copies != 1 {
+			divisor = MulScalar(divisor, float32(copies))
+		}
+		return Div(Sum(weighted, axes...), divisor)
 	}
 	return Mean(weighted, axes...)
 }
@@ -97,12 +88,13 @@ func SmoothL1Loss(prediction, target *Tensor, options LossOptions) *Tensor {
 		return reduceLoss(gpuSmoothL1(prediction.Contiguous(), target.Contiguous()), options, true)
 	}
 	prediction, target = prediction.Contiguous(), target.Contiguous()
-	equal := slices.Equal(prediction.Shape, shape) && slices.Equal(target.Shape, shape)
+	predIndex, targetIndex := makeBroadcastIndex(shape, prediction.Shape), makeBroadcastIndex(shape, target.Shape)
+	equal := predIndex.kind == 1 && targetIndex.kind == 1
 	indices := func(i int) (int, int) {
 		if equal {
 			return i, i
 		}
-		return bindex(i, shape, prediction.Shape), bindex(i, shape, target.Shape)
+		return predIndex.at(i), targetIndex.at(i)
 	}
 	v := cpuAllocUninit(numel(shape))
 	parallelFor(len(v), func(start, end int) {
@@ -179,12 +171,13 @@ func BCEWithLogitsLoss(logits, target *Tensor, options LossOptions) *Tensor {
 		return reduceLoss(gpuBCELogits(logits.Contiguous(), target.Contiguous()), options, false)
 	}
 	logits, target = logits.Contiguous(), target.Contiguous()
-	equal := slices.Equal(logits.Shape, shape) && slices.Equal(target.Shape, shape)
+	logitIndex, targetIndex := makeBroadcastIndex(shape, logits.Shape), makeBroadcastIndex(shape, target.Shape)
+	equal := logitIndex.kind == 1 && targetIndex.kind == 1
 	indices := func(i int) (int, int) {
 		if equal {
 			return i, i
 		}
-		return bindex(i, shape, logits.Shape), bindex(i, shape, target.Shape)
+		return logitIndex.at(i), targetIndex.at(i)
 	}
 	v := cpuAlloc(numel(shape))
 	parallelFor(len(v), func(start, end int) {

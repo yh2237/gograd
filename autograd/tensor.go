@@ -551,23 +551,6 @@ func bshape(a, b []int) []int {
 	}
 	return s
 }
-func bindex(flat int, out, src []int) int {
-	return bindexStrided(flat, out, strides(out), src, strides(src))
-}
-
-// bindexStrided is bindex with the row-major strides hoisted out of the loop
-// that walks the batch axis.
-func bindexStrided(flat int, out, outStrides, src, srcStrides []int) int {
-	j := 0
-	d := len(out) - len(src)
-	for i := range src {
-		c := (flat / outStrides[i+d]) % out[i+d]
-		if src[i] != 1 {
-			j += c * srcStrides[i]
-		}
-	}
-	return j
-}
 
 // broadcastIndex maps an output element to one operand. Ranks up to three use
 // the packed fields; higher ranks keep the stride vectors and walk only the
@@ -579,14 +562,14 @@ type broadcastIndex struct {
 }
 
 func makeBroadcastIndex(out, src []int) broadcastIndex {
+	if slices.Equal(out, src) {
+		return broadcastIndex{kind: 1}
+	}
+	if numel(src) == 1 {
+		return broadcastIndex{kind: 2}
+	}
 	if len(out) > 3 {
-		q := broadcastIndex{kind: 5, out: out, outStrides: strides(out), src: src, srcStrides: strides(src)}
-		if slices.Equal(out, src) {
-			q.kind = 1
-		} else if numel(src) == 1 {
-			q.kind = 2
-		}
-		return q
+		return broadcastIndex{kind: 5, out: out, outStrides: strides(out), src: src, srcStrides: strides(src)}
 	}
 	o := [3]int{1, 1, 1}
 	v := [3]int{1, 1, 1}
@@ -597,23 +580,6 @@ func makeBroadcastIndex(out, src []int) broadcastIndex {
 		v[3-len(src)+i] = x
 	}
 	q := broadcastIndex{d1: o[1], d2: o[2]}
-	if len(out) == len(src) {
-		equal := true
-		for i := range out {
-			if out[i] != src[i] {
-				equal = false
-				break
-			}
-		}
-		if equal {
-			q.kind = 1
-			return q
-		}
-	}
-	if numel(src) == 1 {
-		q.kind = 2
-		return q
-	}
 	if len(src) == 1 && src[0] == out[len(out)-1] {
 		q.kind = 3
 		return q

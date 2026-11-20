@@ -184,6 +184,18 @@ func referenceCPUSoftmax(x, g []float32, shape []int, axis int, logmode bool) ([
 	return y, dx
 }
 
+func referenceBatchIndex(flat int, out, src []int) int {
+	index, stride := 0, 1
+	for i, j := len(src)-1, len(out)-1; i >= 0; i, j = i-1, j-1 {
+		if src[i] != 1 {
+			index += (flat % out[j]) * stride
+		}
+		flat /= out[j]
+		stride *= src[i]
+	}
+	return index
+}
+
 func TestCPUMatMulGradientSelection(t *testing.T) {
 	for _, tc := range []struct{ a, b []int }{
 		{[]int{37, 19}, []int{19, 11}},
@@ -216,8 +228,8 @@ func TestCPUMatMulGradientSelection(t *testing.T) {
 					up[i] = float32(i%7-3) / 8
 				}
 				for z := 0; z < numel(batch); z++ {
-					ai := bindex(z, batch, tc.a[:len(tc.a)-2]) * m * k
-					bi := bindex(z, batch, tc.b[:len(tc.b)-2]) * k * n
+					ai := referenceBatchIndex(z, batch, tc.a[:len(tc.a)-2]) * m * k
+					bi := referenceBatchIndex(z, batch, tc.b[:len(tc.b)-2]) * k * n
 					for i := 0; i < m; i++ {
 						for j := 0; j < n; j++ {
 							o := (z*m+i)*n + j
