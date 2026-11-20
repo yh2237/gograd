@@ -52,7 +52,10 @@ void main() {
         sum = sumReduce(sum);
         if (p.kind == 3u) {
             float lse = log(sum);
-            for (uint j = lane; j < p.cols; j += 128u) y[row*p.cols+j] = x[row*p.cols+j] - mx - lse;
+            for (uint j = lane; j < p.cols; j += 128u) {
+                precise float value = (x[row*p.cols+j] - mx) - lse;
+                y[row*p.cols+j] = value;
+            }
         } else {
             for (uint j = lane; j < p.cols; j += 128u) y[row*p.cols+j] = exp(x[row*p.cols+j]-mx)/sum;
         }

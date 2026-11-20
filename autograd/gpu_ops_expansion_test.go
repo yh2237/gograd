@@ -180,6 +180,16 @@ func TestInferenceOpsExpansion(t *testing.T) {
 					return LogSoftmax(x, axis), func() { x.Close() }
 				})
 			}
+			t.Run("LogSoftmax/large_offset", func(t *testing.T) {
+				values := []float32{1e8, 1e8, 1e8 - 8, 1e8 - 16, -1e8, -1e8, -1e8 - 8, -1e8 - 16}
+				runCPUAndDevice(t, dev, "LogSoftmax", 1e-6, 1e-6, func(c *ExecutionContext, d tensor.Device) (*Tensor, func()) {
+					x, err := c.New(values, []int{2, 4}, d, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return LogSoftmax(x, -1), x.Close
+				})
+			})
 			{
 				c := NewExecutionContext()
 				emptyAxis, err := c.Zeros([]int{2, 0}, dev, false)
