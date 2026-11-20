@@ -251,6 +251,51 @@ func TestLogSoftmaxSpecialValues(t *testing.T) {
 	checkExtra(t, b, out, b.LogSoftmax(out, x, len(data)/cols, cols), want)
 }
 
+func TestLogSoftmaxRowShapes(t *testing.T) {
+	b := testBackend(t)
+	for _, shape := range [][2]int{{257, 1}, {257, 4}, {7, 33}, {6, 257}, {6, 16384}, {6, 16385}} {
+		rows, cols := shape[0], shape[1]
+		t.Run(fmt.Sprintf("%dx%d", rows, cols), func(t *testing.T) {
+			data, want := make([]float32, rows*cols), make([]float32, rows*cols)
+			for r := range rows {
+				start := r * cols
+				row := data[start : start+cols]
+				for c := range row {
+					row[c] = float32((r+c)%11 - 5)
+					switch r % 6 {
+					case 2:
+						row[c] = float32(math.Inf(-1))
+					case 3:
+						row[c] = 1e8 + 8*row[c]
+					}
+				}
+				switch r % 6 {
+				case 0:
+					row[cols-1] = float32(math.NaN())
+				case 1:
+					row[cols-1] = float32(math.Inf(1))
+				case 4:
+					row[cols-1] = float32(math.Inf(-1))
+				}
+				maximum := row[0]
+				for _, v := range row[1:] {
+					maximum = max(maximum, v)
+				}
+				var sum float64
+				for _, v := range row {
+					sum += math.Exp(float64(v - maximum))
+				}
+				normalizer := float32(math.Log(sum))
+				for c, v := range row {
+					want[start+c] = (v - maximum) - normalizer
+				}
+			}
+			x, out := upload(t, b, data), alloc(t, b, len(data))
+			checkExtra(t, b, out, b.LogSoftmax(out, x, rows, cols), want)
+		})
+	}
+}
+
 func TestExtraReduce(t *testing.T) {
 	b := testBackend(t)
 	for _, tc := range []struct{ shape, axes []int }{

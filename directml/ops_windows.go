@@ -352,7 +352,8 @@ func (d *nativeDriver) enqueue(step queuedStep) error {
 }
 
 func (d *nativeDriver) execute(key opKey, out *allocation, inputs ...*allocation) error {
-	if key.kind == opClamp || key.kind == opPow {
+	switch key.kind {
+	case opClamp, opPow, opLogSoftmax:
 		if err := d.initUnaryShader(key.kind); err != nil {
 			return err
 		}

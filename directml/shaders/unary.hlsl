@@ -8,7 +8,7 @@ cbuffer UnaryArgs : register(b0) {
     uint parameter;
     uint extra;
     uint rowStride;
-    uint powLower;
+    uint option;
     uint powUpper;
 };
 
@@ -81,7 +81,7 @@ uint powBits(uint bits, uint exponentBits, uint exponentClass) {
         } else if ((bits & signBit) == 0 || exponentClass != 0) {
             if (magnitude == one || exponentMagnitude < smallestNormal) {
                 result = sign | one;
-            } else if (magnitude < powLower) {
+            } else if (magnitude < option) {
                 result = sign | (inverse ? infinity : 0);
             } else if (magnitude >= powUpper) {
                 result = sign | (inverse ? 0 : infinity);
@@ -98,4 +98,68 @@ uint powBits(uint bits, uint exponentBits, uint exponentClass) {
 void powMain(uint3 thread : SV_DispatchThreadID) {
     uint i = thread.x + thread.y * rowStride;
     if (i < count) outputBits[i] = powBits(inputBits[i], parameter, extra);
+}
+
+groupshared uint rowMaxima[256];
+groupshared float rowSums[256];
+
+[RootSignature(UnaryRoot)]
+[numthreads(256, 1, 1)]
+void logSoftmaxMain(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+    uint lanesPerRow = option;
+    uint rowsPerGroup = 256 / lanesPerRow;
+    uint row = group.x * rowsPerGroup + group.y * rowStride + lane / lanesPerRow;
+    bool active = row < parameter;
+    if (extra == 1) {
+        if (active) outputBits[row] = (inputBits[row] & ~signBit) < infinity ? 0 : quietNaN;
+        return;
+    }
+
+    uint rowLane = lane % lanesPerRow;
+    uint start = row * extra;
+    const uint negativeInfKey = ordered(signBit | infinity);
+    const uint positiveInfKey = ordered(infinity);
+    uint maxKey = negativeInfKey;
+    if (active) {
+        for (uint c = rowLane; c < extra; c += lanesPerRow) {
+            uint bits = inputBits[start + c];
+            uint value = (bits & ~signBit) > infinity ? positiveInfKey : ordered(bits);
+            maxKey = max(maxKey, value);
+        }
+    }
+    if (lanesPerRow > 1) {
+        rowMaxima[lane] = maxKey;
+        GroupMemoryBarrierWithGroupSync();
+        for (uint maxStride = lanesPerRow / 2; maxStride > 0; maxStride >>= 1) {
+            if (rowLane < maxStride) rowMaxima[lane] = max(rowMaxima[lane], rowMaxima[lane + maxStride]);
+            GroupMemoryBarrierWithGroupSync();
+        }
+        maxKey = rowMaxima[lane - rowLane];
+    }
+
+    bool valid = maxKey > negativeInfKey && maxKey < positiveInfKey;
+    float maximum = asfloat(maxKey ^ ((maxKey & signBit) != 0 ? signBit : 0xffffffffu));
+    float sum = 0.0;
+    if (valid) {
+        for (uint sumCol = rowLane; sumCol < extra; sumCol += lanesPerRow) {
+            sum += exp(asfloat(inputBits[start + sumCol]) - maximum);
+        }
+    }
+    if (lanesPerRow > 1) {
+        rowSums[lane] = sum;
+        GroupMemoryBarrierWithGroupSync();
+        for (uint sumStride = lanesPerRow / 2; sumStride > 0; sumStride >>= 1) {
+            if (rowLane < sumStride) rowSums[lane] += rowSums[lane + sumStride];
+            GroupMemoryBarrierWithGroupSync();
+        }
+        sum = rowSums[lane - rowLane];
+    }
+
+    if (active) {
+        float normalizer = log(sum);
+        for (uint outCol = rowLane; outCol < extra; outCol += lanesPerRow) {
+            precise float result = (asfloat(inputBits[start + outCol]) - maximum) - normalizer;
+            outputBits[start + outCol] = valid ? asuint(result) : quietNaN;
+        }
+    }
 }

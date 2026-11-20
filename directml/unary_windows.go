@@ -5,12 +5,14 @@ package directml
 import (
 	_ "embed"
 	"math"
+	"math/bits"
 	"unsafe"
 )
 
 //go:generate fxc /nologo /T rootsig_1_0 /E UnaryRoot /Fo shaders/unary.rootsig shaders/unary.hlsl
 //go:generate fxc /nologo /T cs_5_1 /E clampMain /O3 /Qstrip_reflect /Qstrip_rootsignature /Fo shaders/clamp.cso shaders/unary.hlsl
 //go:generate fxc /nologo /T cs_5_1 /E powMain /O3 /Qstrip_reflect /Qstrip_rootsignature /Fo shaders/pow.cso shaders/unary.hlsl
+//go:generate fxc /nologo /T cs_5_1 /E logSoftmaxMain /O3 /Qstrip_reflect /Qstrip_rootsignature /Fo shaders/logsoftmax.cso shaders/unary.hlsl
 
 //go:embed shaders/unary.rootsig
 var unaryRootSignature []byte
@@ -21,7 +23,10 @@ var clampShader []byte
 //go:embed shaders/pow.cso
 var powShader []byte
 
-var unaryShaderBytecode = [...][]byte{clampShader, powShader}
+//go:embed shaders/logsoftmax.cso
+var logSoftmaxShader []byte
+
+var unaryShaderBytecode = [...][]byte{clampShader, powShader, logSoftmaxShader}
 
 var (
 	iidRootSignature = iid("c54a6b66-72df-4ee8-8be5-a946a1429214")
@@ -65,10 +70,20 @@ func (d *nativeDriver) initUnaryShader(kind uint32) error {
 
 func (d *nativeDriver) recordUnaryShader(key opKey, out, in *allocation) {
 	const threads, maxGroups = 256, 65535
-	groups := (key.n + threads - 1) / threads
+	items, itemsPerGroup := key.n, threads
+	args := [6]uint32{uint32(key.n), key.scalar, key.bias}
+	if key.kind == opLogSoftmax {
+		lanesPerRow := 1
+		if key.bias > 8 {
+			lanesPerRow = 1 << min(bits.Len32(key.bias-1), 8)
+		}
+		items, itemsPerGroup = int(key.scalar), threads/lanesPerRow
+		args[4] = uint32(lanesPerRow)
+	}
+	groups := (items + itemsPerGroup - 1) / itemsPerGroup
 	groupsX := min(groups, maxGroups)
 	groupsY := (groups + groupsX - 1) / groupsX
-	args := [6]uint32{uint32(key.n), key.scalar, key.bias, uint32(groupsX * threads)}
+	args[3] = uint32(groupsX * itemsPerGroup)
 	if key.kind == opPow {
 		args[4], args[5] = powBounds(float64(math.Float32frombits(key.scalar)))
 	}

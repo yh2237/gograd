@@ -94,6 +94,12 @@ func (b *Backend) LogSoftmax(out, a *gpu.Buffer, rows, cols int) error {
 	if err != nil || n == 0 {
 		return err
 	}
+	// The reduction operators distribute long rows across more thread groups.
+	const maxShaderColumns = 16384
+	if cols == 1 || (cols <= maxShaderColumns && !b.driver.info().isWARP()) {
+		key := opKey{kind: opLogSoftmax, n: n, scalar: uint32(rows), bias: uint32(cols)}
+		return b.fail(b.driver.execute(key, y, inputs...))
+	}
 	rowValues, err := b.take(uint64(rows)*4, heapDefault)
 	if err != nil {
 		return err
@@ -108,7 +114,6 @@ func (b *Backend) LogSoftmax(out, a *gpu.Buffer, rows, cols int) error {
 	maximum := opKey{kind: opReduce, n: n, scalar: reduceMax, bias: 1 << 3, aLayout: layout, yLayout: rowLayout}
 	logSumExp := maximum
 	logSumExp.scalar = reduceLogSumExp
-	// The native activation can return finite values for rows containing NaN.
 	return b.fail(b.driver.executeBatch([]dispatch{
 		{maximum, rowValues, inputs},
 		{subtract, y, []*allocation{inputs[0], rowValues}},
@@ -420,8 +425,7 @@ func (b *Backend) Conv2d(out, input, weight, bias *gpu.Buffer, o gpu.Conv2dOptio
 	// input whose spatial extent on that axis equals the undilated kernel.
 	if oh == 1 && ow == 1 &&
 		((o.DilationH > 1 && o.Height == o.KernelH) || (o.DilationW > 1 && o.Width == o.KernelW)) {
-		info := b.driver.info()
-		if info.VendorID == 0x1414 && info.DeviceID == 0x008c {
+		if b.driver.info().isWARP() {
 			return gpu.ErrUnsupported
 		}
 	}

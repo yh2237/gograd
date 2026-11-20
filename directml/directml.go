@@ -19,6 +19,10 @@ type Info struct {
 	DedicatedVideoMemory             uint64
 }
 
+func (i Info) isWARP() bool {
+	return i.VendorID == 0x1414 && i.DeviceID == 0x008c
+}
+
 // AllocationStats covers tensor and staging resources, not driver-internal
 // heaps or compiled operators. OperatorStats reports the separate bounded cache.
 type AllocationStats struct {
@@ -86,6 +90,7 @@ const (
 	opIdentity
 	opClamp
 	opPow
+	opLogSoftmax
 )
 const (
 	heapDefault  uint32 = 1
