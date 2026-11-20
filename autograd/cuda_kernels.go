@@ -86,6 +86,10 @@ extern "C" __global__ void copy_values(const float* a,float* y,int n){int i=bloc
 extern "C" __global__ void f32_to_bf16(const float* x,unsigned short* y,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){unsigned int bits=__float_as_uint(x[i]);unsigned int round=0x7fffu+((bits>>16)&1u);y[i]=(unsigned short)((bits+round)>>16);}}
 __device__ unsigned short round_bf16(float x){unsigned int bits=__float_as_uint(x);return (unsigned short)((bits+0x7fffu+((bits>>16)&1u))>>16);}
 extern "C" __global__ void set_one(float* x){x[0]=1.0f;}
+extern "C" __global__ void seed_grad(float* x, float seed, int accumulate) {
+    if (accumulate) x[0] += seed;
+    else x[0] = seed;
+}
 extern "C" __global__ void write_clip_entry(unsigned long long* ptrs,int* sizes,int index,unsigned long long address,int size){ptrs[index]=address;sizes[index]=size;}
 struct Axes6 {int d[6];};
 __device__ int view_index(int i,Axes6 shape,Axes6 stride,int offset){int j=offset;for(int axis=5;axis>=0;axis--){int dim=shape.d[axis];int c=i%dim;i/=dim;j+=c*stride.d[axis];}return j;}
@@ -670,7 +674,7 @@ extern "C" __global__ void scale_all_grads(const unsigned long long* ptrs,const 
 var graphCache cuda.KernelCache
 
 func graphKernel(name string) *cuda.Kernel {
-	functions, err := graphCache.Get(graphSource, "reduce_scalar_f", "reduce_last_f", "copy_values", "f32_to_bf16", "set_one", "write_clip_entry", "view_gather", "view_gather_bf16", "view_scatter", "binary_nd_f", "binary_nd_bf16_f", "binary_nd_b", "reduce_nd_f", "reduce_nd_b", "split_heads_f", "split_heads_bf16_f", "split_heads_b", "merge_heads_f", "merge_heads_bf16_f", "merge_heads_b", "softmax_f", "softmax_b", "attn_softmax_f", "attn_softmax_b", "flash_attention_tiled_f", "flash_attention_tiled_f128", "flash_attention_delta", "flash_attention_tiled_b", "flash_attention_tiled_b128", "flash_attention_tiled_b_kv", "flash_attention_tiled_b_kv128", "layernorm_f", "layernorm_b", "layernorm_bf16_f", "bias_gelu_f", "bias_gelu_bf16_f", "bias_gelu_b", "bias_residual_f", "bias_residual_bf16_f", "bias_residual_b", "dropout_f", "dropout_b", "ce_f", "ce_finish", "ce_b", "bce_logits_f", "bce_logits_b", "smooth_l1_f", "smooth_l1_b", "graph_adam_inc", "graph_adamw", "add_values", "scalar_f", "scalar_b", "clamp_f", "clamp_b", "pow_scalar_f", "pow_scalar_b", "binary_same_f", "binary_same_bf16_f", "binary_same_b", "bias_add_f", "bias_add_bf16_f", "bias_add_b", "binary_f", "binary_b", "binary_bf16_f", "unary_f", "unary_b", "permute_f", "permute_b", "concat_f", "concat_b", "slice_f", "slice_b", "embedding_f", "embedding_b", "reduce_f", "reduce_b", "group_stats", "group_f", "group_backstats", "group_b", "masked_f", "masked_finish", "masked_b", "scale_grad", "global_norm_parts", "scale_all_grads")
+	functions, err := graphCache.Get(graphSource, "reduce_scalar_f", "reduce_last_f", "copy_values", "f32_to_bf16", "set_one", "seed_grad", "write_clip_entry", "view_gather", "view_gather_bf16", "view_scatter", "binary_nd_f", "binary_nd_bf16_f", "binary_nd_b", "reduce_nd_f", "reduce_nd_b", "split_heads_f", "split_heads_bf16_f", "split_heads_b", "merge_heads_f", "merge_heads_bf16_f", "merge_heads_b", "softmax_f", "softmax_b", "attn_softmax_f", "attn_softmax_b", "flash_attention_tiled_f", "flash_attention_tiled_f128", "flash_attention_delta", "flash_attention_tiled_b", "flash_attention_tiled_b128", "flash_attention_tiled_b_kv", "flash_attention_tiled_b_kv128", "layernorm_f", "layernorm_b", "layernorm_bf16_f", "bias_gelu_f", "bias_gelu_bf16_f", "bias_gelu_b", "bias_residual_f", "bias_residual_bf16_f", "bias_residual_b", "dropout_f", "dropout_b", "ce_f", "ce_finish", "ce_b", "bce_logits_f", "bce_logits_b", "smooth_l1_f", "smooth_l1_b", "graph_adam_inc", "graph_adamw", "add_values", "scalar_f", "scalar_b", "clamp_f", "clamp_b", "pow_scalar_f", "pow_scalar_b", "binary_same_f", "binary_same_bf16_f", "binary_same_b", "bias_add_f", "bias_add_bf16_f", "bias_add_b", "binary_f", "binary_b", "binary_bf16_f", "unary_f", "unary_b", "permute_f", "permute_b", "concat_f", "concat_b", "slice_f", "slice_b", "embedding_f", "embedding_b", "reduce_f", "reduce_b", "group_stats", "group_f", "group_backstats", "group_b", "masked_f", "masked_finish", "masked_b", "scale_grad", "global_norm_parts", "scale_all_grads")
 	if err != nil {
 		panic(err)
 	}
@@ -700,3 +704,10 @@ func addDevice(dst, src *cuda.Buffer, n int) {
 	launch("add_values", n, unsafe.Pointer(&a), unsafe.Pointer(&b), unsafe.Pointer(&z))
 }
 func setOne(dst *cuda.Buffer) { p := ptr(dst); launch("set_one", 1, unsafe.Pointer(&p)) }
+func seedGrad(dst *cuda.Buffer, seed float32, accumulate bool) {
+	p, add := ptr(dst), int32(0)
+	if accumulate {
+		add = 1
+	}
+	launch("seed_grad", 1, unsafe.Pointer(&p), unsafe.Pointer(&seed), unsafe.Pointer(&add))
+}

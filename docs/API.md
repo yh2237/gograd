@@ -91,7 +91,8 @@ CPU / CUDAの学習・推論および共通ユーティリティのAPI仕様で�
 - **SGD**：coupled weight decay、`Momentum`、`Dampening`、`Nesterov`（`Momentum > 0 && Dampening == 0` 必須）、`Maximize`（生勾配のみ反転）。初回momentumはdampeningなし。勾配nilのパラメータは更新スキップ、0勾配は更新対象。
 - **パラメータグループ**：`NewSGDGroups` / `NewAdamWGroups` は全パラメータを重複なく1回ずつ含む `ParameterGroupSpec{Name, Params, LRScale, WeightDecay}` を受け取る（`LRScale == 0` は基準学習率1倍、`NewSGDGroups` では `options.WeightDecay == 0` 必須）。
 - **CUDAグラフ連携**：`PrepareGraph` / `GraphStepCount` / `SyncGraphStepCount` を使用する。`ZeroGrad` はCUDAグラフ用勾配バッファを解放せず0埋めする。state保存前・eager復帰時はステップ数を同期し、構成変更時は古いグラフを破棄する。
-- **勾配蓄積とクリップ**：`GradAccumulator` は損失を `1/groups` 倍して `Backward` する（端数groupも同スケール）。`ClipGradNorm` はCPUではクリップ前ノルム、CUDAではホスト同期を避けるため `NaN` を返す（CUDA上のノルム取得は `GradientNormToHost`）。
+- `GradAccumulator.Backward` は `1/groups` を初期勾配として逆伝播する。端数のグループにも同じ係数を使い、逆伝播後も損失の値は読み取れる。
+- `ClipGradNorm` はCPUではクリップ前ノルム、CUDAではホスト同期を避けるため `NaN` を返す（CUDA上のノルム取得は `GradientNormToHost`）。
 - **TrainingLoop**：group先頭で `ZeroGrad`、更新完了時に `Optimizer.Step` と `Schedule.Step` を1回呼ぶ。`Accumulate >= 2` で途中キャンセル時は未完了勾配を破棄し、Samplerをgroup先頭へ戻して `Save` を呼ぶ（running統計・外部乱数状態は呼び出し側管理）。
 - **checkpoint**：`SaveTrainingCheckpoint` / `LoadTrainingCheckpoint` は `gograd-training-1` 形式のsafetensorsでmodel / optimizer / OneCycle / metadataをアトミック保存・検証復元する（`optimizer_kind` 省略時はAdamW互換）。train/evalモード・dropout seed・データ同一性は呼び出し側で管理する。
 

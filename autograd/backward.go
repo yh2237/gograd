@@ -18,6 +18,10 @@ type BackwardOptions struct {
 // RetainGraph is true. Leaf gradients accumulate; intermediate gradients are
 // fresh per pass so a repeated backward never propagates an old adjoint twice.
 func (t *Tensor) BackwardWithOptions(options BackwardOptions) error {
+	return t.backwardScalar(options, 1, false)
+}
+
+func (t *Tensor) backwardScalar(options BackwardOptions, seed float32, keepOutput bool) error {
 	if err := t.checkOpen(); err != nil {
 		return err
 	}
@@ -85,8 +89,12 @@ func (t *Tensor) BackwardWithOptions(options BackwardOptions) error {
 	// Non-gradient branches still own values/auxiliaries. Mark their lifetimes
 	// before CUDA starts dropping completed nodes' edges. Gradient nodes are
 	// protected by inBackward until their own callback has finished.
-	if t.Device == tensor.CUDA && !options.RetainGraph {
+	reclaimCUDA := t.Device == tensor.CUDA && !options.RetainGraph
+	if reclaimCUDA {
 		for _, v := range t.collectLifetime() {
+			if keepOutput && v == t {
+				continue
+			}
 			if v.intermediate || v.ephemeral {
 				v.releaseRequested.Store(true)
 			}
@@ -104,16 +112,10 @@ func (t *Tensor) BackwardWithOptions(options BackwardOptions) error {
 		}
 	}()
 	if t.Device == tensor.CUDA {
-		if t.intermediate {
-			setOne(t.ensureGradGPU())
-		} else {
-			one := mustAlloc(1)
-			setOne(one)
-			addDevice(t.ensureGradGPU(), one, 1)
-			one.Free()
-		}
+		dst, beta := t.allocGradGPU()
+		seedGrad(dst, seed, beta != 0)
 	} else {
-		t.addGrad([]float32{1})
+		t.addGrad([]float32{seed})
 	}
 	for i := len(topo) - 1; i >= 0; i-- {
 		v := topo[i]
@@ -151,14 +153,11 @@ func (t *Tensor) BackwardWithOptions(options BackwardOptions) error {
 				v.releaseSaved()
 			}
 		}
-		if v.Device == tensor.CUDA && !options.RetainGraph && (v.intermediate || v.ephemeral) {
-			v.releaseRequested.Store(true)
-		}
 		v.inBackward.Store(false)
 		v.maybeDispose()
 	}
-	if t.Device == tensor.CUDA && !options.RetainGraph {
-		t.ReleaseGraph()
+	if reclaimCUDA && keepOutput {
+		t.dropParents()
 	}
 	return nil
 }
