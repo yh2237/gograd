@@ -4,22 +4,33 @@ package tensor
 import (
 	"fmt"
 	"math"
+	"runtime"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/yh2237/gograd/cuda"
 	"github.com/yh2237/gograd/gpu"
 )
 
-// Tensor is a contiguous, row-major float32 device tensor.
+// Tensor is a contiguous, row-major float32 device tensor. Use it by pointer.
 type Tensor struct {
-	buf    *cuda.Buffer
-	data   []float32
-	device Device
-	shape  []int
-	// owned is false for a Reshape view: the parent keeps the allocation, so
-	// closing the view must not return the shared buffer to the pool.
-	owned  bool
-	closed bool
+	storage *cudaStorage
+	cleanup runtime.Cleanup
+	data    []float32
+	device  Device
+	shape   []int
+	closed  bool
+}
+
+type cudaStorage struct {
+	buffer *cuda.Buffer
+	refs   atomic.Int64
+}
+
+func (s *cudaStorage) release() {
+	if s.refs.Add(-1) == 0 {
+		s.buffer.Free()
+	}
 }
 
 // Device selects storage at construction time.
@@ -75,7 +86,7 @@ func NewOn(device Device, shape ...int) (*Tensor, error) {
 		return nil, fmt.Errorf("tensor: oversized shape %v", shape)
 	}
 	if device == CPU {
-		return &Tensor{data: make([]float32, n), device: CPU, shape: append([]int(nil), shape...), owned: true}, nil
+		return &Tensor{data: make([]float32, n), device: CPU, shape: append([]int(nil), shape...)}, nil
 	}
 	if device != CUDA {
 		return nil, fmt.Errorf("tensor: unknown device %q", device)
@@ -84,7 +95,9 @@ func NewOn(device Device, shape ...int) (*Tensor, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Tensor{buf: buf, device: CUDA, shape: append([]int(nil), shape...), owned: true}, nil
+	storage := &cudaStorage{buffer: buf}
+	storage.refs.Store(1)
+	return &Tensor{storage: storage, device: CUDA, shape: append([]int(nil), shape...)}, nil
 }
 
 // Zeros returns a zero-filled tensor.
@@ -132,12 +145,13 @@ func (t *Tensor) Shape() []int { return append([]int(nil), t.shape...) }
 // Numel returns the element count.
 func (t *Tensor) Numel() int { return Numel(t.shape) }
 
-// Buffer returns the underlying device buffer, or nil for CPU or closed tensors.
+// Buffer borrows the device buffer. Keep the tensor reachable while using it
+// and release it through Tensor.Close. CPU tensors return nil.
 func (t *Tensor) Buffer() *cuda.Buffer {
-	if t.closed {
+	if t.storage == nil {
 		return nil
 	}
-	return t.buf
+	return t.storage.buffer
 }
 
 // Device returns the storage device.
@@ -160,7 +174,9 @@ func (t *Tensor) ToHost() ([]float32, error) {
 		return append([]float32(nil), t.data...), nil
 	}
 	out := make([]float32, t.Numel())
-	if err := t.buf.CopyToHost(bytesOf(out)); err != nil {
+	err := t.storage.buffer.CopyToHost(bytesOf(out))
+	runtime.KeepAlive(t)
+	if err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -178,7 +194,9 @@ func (t *Tensor) CopyFrom(data []float32) error {
 		copy(t.data, data)
 		return nil
 	}
-	return t.buf.CopyFromHost(bytesOf(data))
+	err := t.storage.buffer.CopyFromHost(bytesOf(data))
+	runtime.KeepAlive(t)
+	return err
 }
 
 // Zero clears the tensor.
@@ -190,11 +208,14 @@ func (t *Tensor) Zero() error {
 		clear(t.data)
 		return nil
 	}
-	return t.buf.Memset(0, t.buf.Size())
+	buf := t.storage.buffer
+	err := buf.Memset(0, buf.Size())
+	runtime.KeepAlive(t)
+	return err
 }
 
-// Reshape returns a view with a new shape that shares the same buffer. The
-// view borrows the allocation: closing it does not free the parent's buffer.
+// Reshape shares the allocation with a new shape. Close the returned handle
+// to release its share of the allocation.
 func (t *Tensor) Reshape(shape ...int) (*Tensor, error) {
 	if t.closed {
 		return nil, fmt.Errorf("tensor: tensor is closed")
@@ -206,21 +227,30 @@ func (t *Tensor) Reshape(shape ...int) (*Tensor, error) {
 	if n != t.Numel() {
 		return nil, fmt.Errorf("tensor: reshape element count mismatch")
 	}
-	return &Tensor{buf: t.buf, data: t.data, device: t.device, shape: append([]int(nil), shape...)}, nil
+	view := &Tensor{storage: t.storage, data: t.data, device: t.device, shape: append([]int(nil), shape...)}
+	if view.storage != nil {
+		view.storage.refs.Add(1)
+		// Older callers may let a borrowed view go out of scope without Close.
+		view.cleanup = runtime.AddCleanup(view, (*cudaStorage).release, view.storage)
+		runtime.KeepAlive(t)
+	}
+	return view, nil
 }
 
-// Close ends this handle. A Reshape view borrows its parent's allocation, so
-// closing the view leaves the parent usable; closing the owner returns the
-// device memory to the pool.
+// Close ends this handle. CUDA memory returns to the pool when the final
+// handle releases the allocation.
 func (t *Tensor) Close() {
 	if t.closed {
 		return
 	}
 	t.closed = true
-	if t.owned && t.buf != nil {
-		t.buf.Free()
+	t.data = nil
+	if storage := t.storage; storage != nil {
+		t.cleanup.Stop()
+		t.storage = nil
+		storage.release()
+		runtime.KeepAlive(t)
 	}
-	t.buf = nil
 }
 
 func bytesOf(values []float32) []byte {

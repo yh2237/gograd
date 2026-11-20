@@ -36,6 +36,7 @@ func TestTensorRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer view.Close()
 	if shape := view.Shape(); shape[0] != 3 || shape[1] != 2 {
 		t.Fatalf("reshape shape %v", shape)
 	}

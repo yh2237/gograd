@@ -2,8 +2,11 @@ package tensor
 
 import (
 	"math"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yh2237/gograd/cuda"
 )
@@ -34,8 +37,6 @@ func TestAuditReshapeRejectsNegativeDimensions(t *testing.T) {
 	}
 }
 
-// A Reshape view borrows the parent allocation: closing the view must not free
-// the parent's buffer.
 func TestAuditReshapeViewCloseKeepsParent(t *testing.T) {
 	tr, err := FromHostOn(CPU, []int{2, 3}, []float32{1, 2, 3, 4, 5, 6})
 	if err != nil {
@@ -58,8 +59,6 @@ func TestAuditReshapeViewCloseKeepsParent(t *testing.T) {
 	}
 }
 
-// The device path has the same lifetime rule: closing the view used to return
-// the shared buffer to the pool and make the parent unusable.
 func TestAuditReshapeViewCloseKeepsParentCUDA(t *testing.T) {
 	if !cuda.Available() {
 		t.Skip("cuda unavailable")
@@ -82,6 +81,69 @@ func TestAuditReshapeViewCloseKeepsParentCUDA(t *testing.T) {
 		if got[i] != want {
 			t.Fatalf("parent[%d]=%v want %v", i, got[i], want)
 		}
+	}
+}
+
+func TestReshapeKeepsStorageAfterParentClose(t *testing.T) {
+	for _, device := range []Device{CPU, CUDA} {
+		t.Run(string(device), func(t *testing.T) {
+			if device == CUDA && !cuda.Available() {
+				t.Skip("cuda unavailable")
+			}
+			before := cuda.MemoryStats().LiveBytes
+			tr, err := FromHostOn(device, []int{2, 2}, []float32{1, 2, 3, 4})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tr.Close()
+			view, err := tr.Reshape(4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer view.Close()
+			tr.Close()
+			child, err := view.Reshape(1, 4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer child.Close()
+			view.Close()
+			got, err := child.ToHost()
+			if err != nil || !slices.Equal(got, []float32{1, 2, 3, 4}) {
+				t.Fatalf("view after parent close: %v, %v", got, err)
+			}
+			child.Close()
+			if device == CUDA && cuda.MemoryStats().LiveBytes != before {
+				t.Fatal("closing all handles did not release device memory")
+			}
+		})
+	}
+}
+
+func TestCUDAReshapeReleasesUnclosedView(t *testing.T) {
+	if !cuda.Available() {
+		t.Skip("cuda unavailable")
+	}
+	before := cuda.MemoryStats().LiveBytes
+	func() {
+		tr, err := NewOn(CUDA, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tr.Close()
+		view, err := tr.Reshape(2, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime.KeepAlive(view)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for cuda.MemoryStats().LiveBytes != before {
+		runtime.GC()
+		if time.Now().After(deadline) {
+			t.Fatal("unreachable reshape view retained device memory")
+		}
+		runtime.Gosched()
 	}
 }
 
