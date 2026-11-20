@@ -170,10 +170,9 @@ func auditLossShapeRegressions(t *testing.T, device tensor.Device) {
 		for _, r := range []Reduction{ReductionSum, ReductionMean} {
 			loss := BCEWithLogitsLoss(x, y, LossOptions{Reduction: r})
 			value := conv2dHost(t, loss, false)[0]
-			// Preserve each reduction backend's pre-existing empty semantics.
-			if r == ReductionMean && device == tensor.CPU {
+			if r == ReductionMean {
 				if !math.IsNaN(float64(value)) {
-					t.Fatalf("empty CPU mean = %v, want NaN", value)
+					t.Fatalf("empty mean = %v, want NaN", value)
 				}
 			} else if value != 0 {
 				t.Fatalf("empty reduction = %v, want 0", value)

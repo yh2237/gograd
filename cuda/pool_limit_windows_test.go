@@ -17,3 +17,33 @@ func TestDefaultPoolCacheLimitFitsPlatformInt(t *testing.T) {
 		t.Fatalf("initial pool cache limit = %d, want %d", got, defaultPoolCacheLimit)
 	}
 }
+
+func TestEmptyAllocationsDoNotEnterPool(t *testing.T) {
+	if !Available() {
+		t.Skip("CUDA unavailable")
+	}
+	if err := ReleasePool(); err != nil {
+		t.Fatal(err)
+	}
+	before := MemoryStats()
+	first, err := Alloc(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Free()
+	second, err := Alloc(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Free()
+	if err := second.Free(); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Free(); err != nil {
+		t.Fatal(err)
+	}
+	after := MemoryStats()
+	if after.CachedBuffers != before.CachedBuffers || after.LiveBytes != before.LiveBytes {
+		t.Fatalf("empty allocations changed memory stats: %+v -> %+v", before, after)
+	}
+}

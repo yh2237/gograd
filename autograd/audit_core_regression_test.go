@@ -2,6 +2,7 @@ package autograd
 
 import (
 	"math"
+	"slices"
 	"testing"
 
 	"github.com/yh2237/gograd/cuda"
@@ -48,6 +49,59 @@ func auditCoreRegressions(t *testing.T, device tensor.Device) {
 		defer mean.ReleaseGraph()
 		if got := mean.Shape; len(got) != 1 || got[0] != 0 {
 			t.Fatalf("mean shape %v, want [0]", got)
+		}
+	})
+	for _, tc := range []struct {
+		name        string
+		shape, axes []int
+		output      []int
+	}{
+		{"EmptyScalarReduction", []int{0}, []int{0}, nil},
+		{"EmptyVectorReduction", []int{2, 0}, []int{1}, []int{2}},
+		{"EmptyNDReduction", []int{1, 0, 2, 1}, []int{0, 1, 3}, []int{2}},
+	} {
+		run(tc.name, func(t *testing.T) {
+			x := conv2dTestTensor(t, nil, tc.shape, device, true)
+			results := []*Tensor{Sum(x, tc.axes...), Mean(x, tc.axes...)}
+			for i, result := range results {
+				defer result.ReleaseGraph()
+				if !slices.Equal(result.Shape, tc.output) {
+					t.Fatalf("shape = %v, want %v", result.Shape, tc.output)
+				}
+				for _, value := range conv2dHost(t, result, false) {
+					if (i == 0 && value != 0) || (i == 1 && !math.IsNaN(float64(value))) {
+						t.Fatalf("reduction %d returned %v", i, value)
+					}
+				}
+				loss := result
+				if len(result.Shape) != 0 {
+					loss = Sum(result, 0)
+				}
+				defer loss.ReleaseGraph()
+				if err := loss.Backward(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if grad := conv2dHost(t, x, true); len(grad) != 0 {
+				t.Fatalf("gradient = %v, want empty", grad)
+			}
+		})
+	}
+	run("BroadcastEmptyLastAxis", func(t *testing.T) {
+		x := conv2dTestTensor(t, nil, []int{2, 0}, device, true)
+		bias := conv2dTestTensor(t, nil, []int{0}, device, true)
+		out := Add(x, bias)
+		defer out.ReleaseGraph()
+		if !slices.Equal(out.Shape, []int{2, 0}) || len(conv2dHost(t, out, false)) != 0 {
+			t.Fatalf("output shape = %v, want [2 0]", out.Shape)
+		}
+		loss := Sum(out, 0, 1)
+		defer loss.ReleaseGraph()
+		if err := loss.Backward(); err != nil {
+			t.Fatal(err)
+		}
+		if len(conv2dHost(t, x, true)) != 0 || len(conv2dHost(t, bias, true)) != 0 {
+			t.Fatal("nonempty gradient for empty operand")
 		}
 	})
 	run("TransposeNegativeAxis", func(t *testing.T) {

@@ -553,6 +553,9 @@ func Alloc(size int) (*Buffer, error) {
 	// allocated. Freeing it on another stream must not let that stream reuse
 	// memory the owning stream may still be reading.
 	stream := currentStreamHandle()
+	if size == 0 {
+		return &Buffer{device: device, stream: stream}, nil
+	}
 	key := poolKey{device: device, stream: stream, size: capacity}
 	poolMu.Lock()
 	list := poolTable[key]
@@ -610,6 +613,9 @@ func (b *Buffer) Free() error {
 		return nil
 	}
 	b.freed = true
+	if b.capacity == 0 {
+		return nil
+	}
 	poolMu.Lock()
 	liveBytes -= b.capacity
 	if state := launchStateForThread(); state.capturing && state.touched != nil {
@@ -722,6 +728,9 @@ func (b *Buffer) MemsetAsync(value byte, size int) error {
 func (b *Buffer) memsetAsync(value byte, size int) error {
 	if size < 0 || size > b.size {
 		return fmt.Errorf("cuda: memset size %d exceeds buffer size %d", size, b.size)
+	}
+	if size == 0 {
+		return nil
 	}
 	a, err := load()
 	if err != nil {

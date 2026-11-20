@@ -59,6 +59,7 @@ CPU / CUDAの学習・推論および共通ユーティリティのAPI仕様で�
 - `Max` / `Min` は同値時に勾配を右辺へ送る。`Clamp` は境界を含めて勾配を通す。`Sqrt` の0での微分は無限大。
 - `Softplus` は `max(x,0)+log1p(exp(-|x|))`、`Log1p` / `Expm1` は0近傍の桁落ちを回避する。
 - `Flatten(a, start, end)` は両端を含む（負軸可、スカラーは `[1]`）。
+- 縮約する軸の長さが 0 なら、`Sum` は出力を 0、`Mean` は `NaN` で埋める。長さ 0 の軸が縮約後も残る場合、出力は空になる。
 - `Dropout` は `seed` と要素indexのhashでマスクを生成する（PyTorch乱数列とは異なる）。
 - `RotaryHalf(x, theta)`：`[batch,heads,seq,headDim]`（偶数 `headDim`、正の `theta`）に半回転RoPEを適用。
 - `GeGLU(x)`：最終軸を2分割し `GELU(前半, false) * 後半`。

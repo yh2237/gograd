@@ -345,12 +345,29 @@ func isLastAxisOnly(selected []bool) bool {
 	return true
 }
 func gpuReduce(a *Tensor, s []int, selected []bool, mean bool) *Tensor {
+	if len(a.Shape) > 6 {
+		panic("autograd: CUDA reduction rank > 6")
+	}
+	outCount := numel(s)
+	if a.Numel() == 0 {
+		out := mustAlloc(outCount)
+		var fill byte
+		if mean {
+			fill = 0xff // 0xffffffff represents a float32 NaN.
+		}
+		if err := out.Memset(fill, out.Size()); err != nil {
+			out.Free()
+			panic(err)
+		}
+		return resultGPU(out, s, []*Tensor{a}, func(*cuda.Buffer) {
+			a.ensureGradGPU()
+		})
+	}
 	if len(a.Shape) > 3 {
 		return gpuReduceND(a, s, selected, mean)
 	}
-	outCount := numel(s)
 	out := mustAlloc(outCount)
-	lastOnly := isLastAxisOnly(selected) && outCount > 1 && a.Shape[len(a.Shape)-1] > 0
+	lastOnly := isLastAxisOnly(selected) && outCount > 1
 	if !lastOnly {
 		if e := out.Memset(0, out.Size()); e != nil {
 			panic(e)
@@ -369,13 +386,7 @@ func gpuReduce(a *Tensor, s []int, selected []bool, mean bool) *Tensor {
 	n, d1, d2 := int32(a.Numel()), inDims[1], inDims[2]
 	scale := float32(1)
 	if mean {
-		divisor := 0
-		if outCount > 0 {
-			divisor = a.Numel() / outCount
-		}
-		if divisor > 0 {
-			scale = 1 / float32(divisor)
-		}
+		scale = 1 / float32(a.Numel()/outCount)
 	}
 	ap, yp := ptr(a.buf), ptr(out)
 	if outCount == 1 {
@@ -410,14 +421,10 @@ func gpuReduceND(a *Tensor, s []int, selected []bool, mean bool) *Tensor {
 	outCount := numel(s)
 	scale := float32(1)
 	if mean {
-		if outCount > 0 {
-			if divisor := a.Numel() / outCount; divisor > 0 {
-				scale = 1 / float32(divisor)
-			}
-		}
+		scale = 1 / float32(a.Numel()/outCount)
 	}
 	out := mustAlloc(outCount)
-	lastOnly := isLastAxisOnly(selected) && outCount > 1 && a.Shape[len(a.Shape)-1] > 0
+	lastOnly := isLastAxisOnly(selected) && outCount > 1
 	if !lastOnly {
 		if err := out.Memset(0, out.Size()); err != nil {
 			panic(err)
