@@ -1,6 +1,7 @@
 package data
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,8 +21,22 @@ func TestSamplerMidEpochResume(t *testing.T) {
 	if err := a.Advance(7); err != nil {
 		t.Fatal(err)
 	}
-	payload, err := a.MarshalBinary()
+	snapshot := a.SnapshotPosition()
+	want, err := a.MarshalBinary()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.NextEpoch(); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := snapshot.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(want, payload) {
+		t.Fatal("deferred snapshot changed after advancing the sampler")
+	}
+	if err := a.UnmarshalBinary(want); err != nil {
 		t.Fatal(err)
 	}
 	b, err := NewIndexSampler(19, options)

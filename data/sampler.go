@@ -1,6 +1,7 @@
 package data
 
 import (
+	"encoding"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -56,6 +57,7 @@ func NewIndexSampler(size int, options SamplerOptions) (*IndexSampler, error) {
 	return s, nil
 }
 func (s *IndexSampler) resetOrder() {
+	// Position snapshots can still reference the previous order.
 	s.order = make([]int, s.size)
 	for i := range s.order {
 		s.order[i] = i
@@ -99,8 +101,22 @@ func (s *IndexSampler) NextEpoch() error {
 func (s *IndexSampler) Epoch() uint64 { return s.epoch }
 
 func (s *IndexSampler) State() IndexSamplerState {
+	state := s.snapshotState()
+	state.Order = slices.Clone(state.Order)
+	return state
+}
+
+func (s *IndexSampler) snapshotState() IndexSamplerState {
 	random, _ := s.source.MarshalBinary()
-	return IndexSamplerState{1, s.size, s.position, s.options.Shuffle, s.options.Seed, s.epoch, slices.Clone(s.order), random}
+	return IndexSamplerState{1, s.size, s.position, s.options.Shuffle, s.options.Seed, s.epoch, s.order, random}
+}
+
+// SnapshotPosition returns a copy of the sampler for later serialization.
+// The copy shares the epoch's immutable order, so capturing it costs O(1).
+func (s *IndexSampler) SnapshotPosition() encoding.BinaryMarshaler {
+	snapshot, source := *s, *s.source
+	snapshot.source = &source
+	return &snapshot
 }
 func (s *IndexSampler) LoadState(state IndexSamplerState) error {
 	if state.Version != 1 || state.Size != s.size || state.Shuffle != s.options.Shuffle || state.Seed != s.options.Seed || state.Position < 0 || state.Position > s.size || len(state.Order) != s.size {
@@ -120,7 +136,7 @@ func (s *IndexSampler) LoadState(state IndexSamplerState) error {
 	s.source, s.order, s.position, s.epoch = source, slices.Clone(state.Order), state.Position, state.Epoch
 	return nil
 }
-func (s *IndexSampler) MarshalBinary() ([]byte, error) { return json.Marshal(s.State()) }
+func (s *IndexSampler) MarshalBinary() ([]byte, error) { return json.Marshal(s.snapshotState()) }
 func (s *IndexSampler) UnmarshalBinary(payload []byte) error {
 	var state IndexSamplerState
 	if err := json.Unmarshal(payload, &state); err != nil {

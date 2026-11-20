@@ -2,9 +2,12 @@ package autograd
 
 import (
 	"context"
+	"encoding"
 	"errors"
 	"fmt"
 	"io"
+
+	"reflect"
 )
 
 // BatchReader reads one collated batch per call in sampler order. It returns
@@ -17,10 +20,28 @@ type BatchReader[B any] interface {
 }
 
 // PositionSampler saves and restores sampled positions as an opaque payload.
-// *data.IndexSampler satisfies this interface.
+// To defer encoding, SnapshotPosition() encoding.BinaryMarshaler can return
+// an independent snapshot of the sampler's concrete type.
 type PositionSampler interface {
 	MarshalBinary() ([]byte, error)
 	UnmarshalBinary([]byte) error
+}
+
+func capturePosition(sampler PositionSampler) (func() ([]byte, error), error) {
+	if source, ok := sampler.(interface {
+		SnapshotPosition() encoding.BinaryMarshaler
+	}); ok {
+		snapshot := source.SnapshotPosition()
+		// An embedding wrapper may have its own checkpoint format.
+		if reflect.TypeOf(snapshot) == reflect.TypeOf(sampler) {
+			return snapshot.MarshalBinary, nil
+		}
+	}
+	payload, err := sampler.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	return func() ([]byte, error) { return payload, nil }, nil
 }
 
 // UpdateSchedule sets the learning rate after every optimizer update and
@@ -34,25 +55,14 @@ type UpdateSchedule interface {
 // restored from a checkpoint counts those updates.
 func (c *OneCycle) Updates() int { return c.StepCount }
 
-// TrainingLoop applies optimizer updates to the batches of a BatchReader.
-//
-// The caller builds and back-propagates every micro-batch in Step. The loop
-// owns the update boundary instead: zeroing gradients at the start of an update
-// or of an accumulation group, stepping the optimizer and the schedule once per
-// update, reporting the loss at a fixed cadence, and saving state when the run
-// stops.
-//
-// If ctx ends in the middle of an accumulation group, the loop drops the
-// pending gradients and rewinds the sampler to the group's first micro-batch,
-// so the model, optimizer and schedule keep describing the last completed
-// update. Save receives that rewound payload. Only the sampler is rewound;
-// forward passes that change other state, such as running statistics or
-// counters, must be restored by the caller.
+// TrainingLoop groups micro-batches into optimizer updates. A canceled read
+// discards the unfinished group's gradients and passes its starting sampler
+// position to Save when set. The caller handles forward-pass state such as running
+// statistics and counters when resuming.
 type TrainingLoop[B any] struct {
 	// Reader supplies collated batches in sampler order. Required.
 	Reader BatchReader[B]
-	// Sampler is required for accumulation, which rewinds it when a group is
-	// interrupted.
+	// Sampler is required for accumulation and supplies each group's starting position.
 	Sampler PositionSampler
 	// Optimizer owns the updated parameters. Required.
 	Optimizer Optimizer
@@ -77,15 +87,12 @@ type TrainingLoop[B any] struct {
 	Step func(ctx context.Context, batch B, accumulator *GradAccumulator) (loss float64, complete bool, err error)
 	// Report is called for the first, every LogEvery'th and the last update.
 	Report func(update int, loss float64)
-	// Save is called once when the run stops after the planned updates or when
-	// ctx ends. savepoint rewinds a partially accumulated group and is nil
-	// otherwise. A read or step error stops the run without calling Save.
+	// Save is called after the planned updates or a canceled read. A non-nil
+	// savepoint identifies the first batch of an unfinished group.
 	Save func(savepoint []byte) error
 }
 
-// Run applies updates until the planned count is reached, the context ends or
-// a read/step fails. When the context ends, it saves the state of the last
-// completed update through Save and returns the context error.
+// Run applies updates until the planned count is reached or a read or step fails.
 func (l *TrainingLoop[B]) Run(ctx context.Context) error {
 	if l.Reader == nil || l.Optimizer == nil || l.Step == nil {
 		return fmt.Errorf("autograd: training loop needs a reader, an optimizer and a step")
@@ -110,14 +117,13 @@ func (l *TrainingLoop[B]) Run(ctx context.Context) error {
 	}
 	// A resumed run reports its own first update, not the absolute first.
 	start := l.Applied
-	var savepoint []byte
-	var rewind []byte
+	var savepoint func() ([]byte, error)
 	var stopped error
 	awaitingFirstBatch := false
 	for l.Applied < l.Updates {
 		if accumulator.Pending() == 0 {
 			if groups > 1 {
-				savepoint, err = l.Sampler.MarshalBinary()
+				savepoint, err = capturePosition(l.Sampler)
 				if err != nil {
 					return err
 				}
@@ -142,7 +148,8 @@ func (l *TrainingLoop[B]) Run(ctx context.Context) error {
 				// replays those micro-batches after a resume.
 				l.Optimizer.ZeroGrad()
 				accumulator.Reset()
-				rewind = savepoint
+			} else {
+				savepoint = nil
 			}
 			stopped = err
 			break
@@ -178,6 +185,13 @@ func (l *TrainingLoop[B]) Run(ctx context.Context) error {
 		return stopped
 	}
 	if l.Save != nil {
+		var rewind []byte
+		if savepoint != nil {
+			rewind, err = savepoint()
+			if err != nil {
+				return errors.Join(stopped, err)
+			}
+		}
 		if err := l.Save(rewind); err != nil {
 			return errors.Join(stopped, err)
 		}

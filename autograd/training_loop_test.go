@@ -369,6 +369,29 @@ func TestTrainingLoopReadErrorSkipsSave(t *testing.T) {
 	}
 }
 
+type wrappedPositionSampler struct {
+	*data.IndexSampler
+}
+
+func (*wrappedPositionSampler) MarshalBinary() ([]byte, error) {
+	return []byte("wrapped format"), nil
+}
+
+func TestCapturePositionKeepsWrapperFormat(t *testing.T) {
+	sampler, err := data.NewIndexSampler(1, data.SamplerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	save, err := capturePosition(&wrappedPositionSampler{sampler})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := save()
+	if err != nil || string(got) != "wrapped format" {
+		t.Fatalf("savepoint format = %q, %v", got, err)
+	}
+}
+
 func TestTrainingLoopRejectsEmptyEpoch(t *testing.T) {
 	sampler, err := data.NewIndexSampler(1, data.SamplerOptions{})
 	if err != nil {
