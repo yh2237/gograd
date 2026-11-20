@@ -124,6 +124,33 @@ func checkTransformerAfter(t *testing.T, b *Backend, out *gpu.Buffer, err error,
 	checkTransformer(t, b, out, want)
 }
 
+func TestPowScalarZeroAndOne(t *testing.T) {
+	b := testBackend(t)
+	negativeZero := math.Float32frombits(0x80000000)
+	data := []float32{0, negativeZero, float32(math.Inf(1)), float32(math.Inf(-1)), math.Float32frombits(0x7fc01234), math.SmallestNonzeroFloat32, -2}
+	x, out := upload(t, b, data), alloc(t, b, len(data))
+	for _, exponent := range []float32{0, negativeZero, 1} {
+		t.Run(fmt.Sprintf("%08x", math.Float32bits(exponent)), func(t *testing.T) {
+			if err := b.ScalarOp(gpu.ScalarPow, out, x, len(data), exponent); err != nil {
+				t.Fatal(err)
+			}
+			got, err := b.Download(out, len(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, v := range got {
+				want := data[i]
+				if exponent == 0 {
+					want = 1
+				}
+				if g, w := math.Float32bits(v), math.Float32bits(want); g != w {
+					t.Errorf("[%d] = %08x, want %08x", i, g, w)
+				}
+			}
+		})
+	}
+}
+
 func TestLogSoftmaxSpecialValues(t *testing.T) {
 	b := testBackend(t)
 	nan := float32(math.NaN())
@@ -388,6 +415,7 @@ func TestExtraValidationDoesNotPoison(t *testing.T) {
 		b.BinaryOp(gpu.BinarySub, x, x, x, 4), b.BinaryOp(gpu.BinaryDiv, y, x, x, 5),
 		b.BinaryOpViews(gpu.BinaryMin, x, view, view), b.ScalarOp(gpu.ScalarAdd, x, x, 4, 1),
 		b.ScalarOp(gpu.ScalarDiv, x, x, 4, 0), b.UnaryOp(gpu.UnaryExp, x, x, 4), b.Clamp(x, x, 4, 0, 1),
+		b.ScalarOp(gpu.ScalarPow, x, x, 4, 0), b.ScalarOp(gpu.ScalarPow, x, x, 4, 1),
 		b.LogSoftmax(x, x, 2, 2), b.LogSoftmax(y, x, 2, 0),
 		b.Reduce(gpu.ReduceSum, x, x, []int{2, 2}, []int{0}), b.Reduce(gpu.ReduceMean, y, x, []int{2, 2}, []int{-1, 1}),
 		b.Reduce(gpu.ReduceMean, y, x, []int{2, 2}, []int{2}), b.Conv2d(x, x, y, nil, conv), b.Conv2d(y, x, x, y, conv),
@@ -411,6 +439,7 @@ func TestExtraValidationDoesNotPoison(t *testing.T) {
 	for _, err := range []error{
 		b.UnaryOp(gpu.UnaryLog, emptyOut, empty, 0), b.Clamp(emptyOut, empty, 0, 0, 1),
 		b.ScalarOp(gpu.ScalarDiv, emptyOut, empty, 0, 0), b.BinaryOp(gpu.BinarySub, emptyOut, empty, empty, 0),
+		b.ScalarOp(gpu.ScalarPow, emptyOut, empty, 0, 0), b.ScalarOp(gpu.ScalarPow, emptyOut, empty, 0, 1),
 		b.LogSoftmax(emptyOut, empty, 0, 4),
 	} {
 		if err != nil {

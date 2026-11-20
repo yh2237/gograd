@@ -125,6 +125,12 @@ func (b *Backend) ScalarOp(op gpu.ScalarOp, out, a *gpu.Buffer, n int, value flo
 	case gpu.ScalarAdd:
 		key.bias = math.Float32bits(value)
 	case gpu.ScalarPow:
+		switch value {
+		case 0:
+			return b.powZero(out, a, n)
+		case 1:
+			return b.Copy(out, a, n)
+		}
 		key.kind = opPow
 		key.scalar = math.Float32bits(value)
 	case gpu.ScalarDiv:
@@ -139,6 +145,30 @@ func (b *Backend) ScalarOp(op gpu.ScalarOp, out, a *gpu.Buffer, n int, value flo
 		return gpu.ErrInvalidArgument
 	}
 	return b.unary(out, a, n, key)
+}
+
+func (b *Backend) powZero(out, a *gpu.Buffer, n int) error {
+	if err := b.lock(); err != nil {
+		return err
+	}
+	defer b.mu.Unlock()
+	y, _, err := b.opBuffers(out, n, bufferArg{a, n})
+	if err != nil || n == 0 {
+		return err
+	}
+	if n == 1 {
+		return b.fillLocked(y, 1, 1)
+	}
+	scalar, err := b.take(4, heapDefault)
+	if err != nil {
+		return err
+	}
+	defer b.put(scalar)
+	if err := b.fillLocked(scalar, 1, 1); err != nil {
+		return err
+	}
+	layout := tensorLayout{sizes: [4]uint32{1, 1, 1, uint32(n)}}
+	return b.fail(b.driver.execute(opKey{kind: opIdentity, n: n, aLayout: layout}, y, scalar))
 }
 
 func (b *Backend) scalarDivide(out, a *gpu.Buffer, n int, value float32) error {
