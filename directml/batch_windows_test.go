@@ -183,13 +183,17 @@ func TestDirectMLDeferredBatchAndInterleavedCopy(t *testing.T) {
 	if err := b.Clamp(z, y, 4, -1, 6); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.MulScalar(y, z, 4, 2); err != nil {
+	if err := b.ScalarOp(gpu.ScalarPow, y, z, 4, 2); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Copy(z, y, 4); err != nil {
+	if err := b.MulScalar(z, y, 4, 2); err != nil {
 		t.Fatal(err)
 	}
-	check(t, b, z, []float32{4, 8, 12, 12})
+	if err := b.Copy(y, z, 4); err != nil {
+		t.Fatal(err)
+	}
+	want := []float32{8, 32, 72, 72}
+	check(t, b, y, want)
 
 	tmp := alloc(t, b, 4)
 	before := submissionSerial(b)
@@ -200,26 +204,21 @@ func TestDirectMLDeferredBatchAndInterleavedCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 	tmp.Close()
-	if err := b.MulScalar(z, y, 4, 2); err != nil {
+	if err := b.ScalarOp(gpu.ScalarPow, z, y, 4, 2); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Copy(y, z, 4); err != nil {
+	if err := b.MulScalar(y, z, 4, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Copy(z, y, 4); err != nil {
 		t.Fatal(err)
 	}
 	if submissionSerial(b) != before {
 		t.Fatalf("flushed early before Download")
 	}
-	got, err := b.Download(y, 4)
-	if err != nil {
-		t.Fatal(err)
-	}
+	check(t, b, z, want)
 	if submissionSerial(b)-before != 1 {
 		t.Fatalf("got %d submissions for compute+copy+download, want 1", submissionSerial(b)-before)
-	}
-	for i, want := range []float32{4, 8, 12, 12} {
-		if got[i] != want {
-			t.Fatalf("[%d] got %g want %g", i, got[i], want)
-		}
 	}
 
 	// Descriptor chunk split when queued dispatches exceed batchHeapSize.

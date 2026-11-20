@@ -85,6 +85,7 @@ const (
 	opSoftmax
 	opIdentity
 	opClamp
+	opPow
 )
 const (
 	heapDefault  uint32 = 1

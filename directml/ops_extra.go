@@ -26,7 +26,6 @@ const (
 	opLog              = sdkOp + 13
 	opMax              = sdkOp + 21
 	opMin              = sdkOp + 23
-	opPow              = sdkOp + 26
 	opSin              = sdkOp + 28
 	opSqrt             = sdkOp + 29
 	opSub              = sdkOp + 30
@@ -135,6 +134,14 @@ func (b *Backend) ScalarOp(op gpu.ScalarOp, out, a *gpu.Buffer, n int, value flo
 		}
 		key.kind = opPow
 		key.scalar = math.Float32bits(value)
+		exponent := float64(value)
+		if exponent == math.Trunc(exponent) {
+			const evenExponent, oddExponent = 1, 2
+			key.bias = evenExponent
+			if math.Abs(exponent) < 0x1p24 && int32(exponent)&1 != 0 {
+				key.bias = oddExponent
+			}
+		}
 	case gpu.ScalarDiv:
 		scale := 1 / value
 		magnitude := math.Abs(float64(scale))

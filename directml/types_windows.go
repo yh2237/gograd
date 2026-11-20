@@ -58,12 +58,6 @@ type identityDesc struct {
 	ScaleBias *scaleBias
 }
 type unaryDesc struct{ In, Out *tensorDesc }
-type powDesc struct {
-	In, Out   *tensorDesc
-	ScaleBias *scaleBias
-	Exponent  float32
-	_         uint32
-}
 type softplusDesc struct {
 	In, Out   *tensorDesc
 	Steepness float32
@@ -165,7 +159,7 @@ func checkABI() error {
 		{"feature query", unsafe.Sizeof(featureQuery{}), 16},
 		{"identity", unsafe.Sizeof(identityDesc{}), 24}, {"binary", unsafe.Sizeof(binaryDesc{}), 24},
 		{"unary", unsafe.Sizeof(unaryDesc{}), 16}, {"compute pipeline state", unsafe.Sizeof(computePipelineDesc{}), 56},
-		{"constant pow", unsafe.Sizeof(powDesc{}), 32}, {"softplus", unsafe.Sizeof(softplusDesc{}), 24},
+		{"softplus", unsafe.Sizeof(softplusDesc{}), 24},
 		{"reduce", unsafe.Sizeof(reduceDesc{}), 40}, {"average pooling", unsafe.Sizeof(avgPoolDesc{}), 64},
 		{"max pooling", unsafe.Sizeof(maxPoolDesc{}), 56}, {"max pooling 2", unsafe.Sizeof(maxPool2Desc{}), 72},
 		{"batch normalization", unsafe.Sizeof(batchNormDesc{}), 64},

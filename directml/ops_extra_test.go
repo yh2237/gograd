@@ -160,6 +160,43 @@ func TestPowScalarZeroAndOne(t *testing.T) {
 	}
 }
 
+func TestPowScalarSpecialValues(t *testing.T) {
+	b := testBackend(t)
+	negativeZero := math.Float32frombits(0x80000000)
+	positiveInf, negativeInf := float32(math.Inf(1)), float32(math.Inf(-1))
+	nan := float32(math.NaN())
+	const subnormal float32 = math.SmallestNonzeroFloat32
+	data := []float32{
+		negativeInf, -2, -1, -0x1p-70, -subnormal, negativeZero, 0, subnormal, 2.938737e-39, 0x1p-70, .25, .5,
+		math.Nextafter32(1, 0), 1, math.Nextafter32(1, 2), 1.0000887, 2, 4.8740836e25, positiveInf, nan,
+	}
+	x, out := upload(t, b, data), alloc(t, b, len(data))
+	for _, exponent := range []float32{
+		.5, -.5, 2, -2, 3, -3, -1, 149, 150, 0x1p24, 1e6, -1e6, 1e9, -1e9,
+		subnormal, -subnormal, positiveInf, negativeInf, nan,
+	} {
+		t.Run(fmt.Sprintf("%08x", math.Float32bits(exponent)), func(t *testing.T) {
+			if err := b.ScalarOp(gpu.ScalarPow, out, x, len(data), exponent); err != nil {
+				t.Fatal(err)
+			}
+			got, err := b.Download(out, len(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, v := range got {
+				want := float32(math.Pow(float64(data[i]), float64(exponent)))
+				if math.Float32bits(v) == math.Float32bits(want) || math.IsNaN(float64(v)) && math.IsNaN(float64(want)) {
+					continue
+				}
+				if want != 0 && !math.IsInf(float64(want), 0) && math.Abs(float64(v)-float64(want)) <= 1e-5*math.Abs(float64(want)) {
+					continue
+				}
+				t.Errorf("pow(%g, %g) = %g (%08x), want %g (%08x)", data[i], exponent, v, math.Float32bits(v), want, math.Float32bits(want))
+			}
+		})
+	}
+}
+
 func TestClampFloat32SpecialValues(t *testing.T) {
 	b := testBackend(t)
 	negativeZero := math.Float32frombits(0x80000000)
