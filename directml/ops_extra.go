@@ -18,30 +18,29 @@ var (
 )
 
 const (
-	sdkOp        uint32 = 256
-	opAbs               = sdkOp + 2
-	opClip              = sdkOp + 8
-	opCos               = sdkOp + 9
-	opDiv               = sdkOp + 10
-	opExp               = sdkOp + 11
-	opLog               = sdkOp + 13
-	opMax               = sdkOp + 21
-	opMin               = sdkOp + 23
-	opPow               = sdkOp + 26
-	opSin               = sdkOp + 28
-	opSqrt              = sdkOp + 29
-	opSub               = sdkOp + 30
-	opLogSoftmax        = sdkOp + 41
-	opReLU              = sdkOp + 44
-	opSigmoid           = sdkOp + 47
-	opSoftplus          = sdkOp + 49
-	opConv2d            = sdkOp + 53
-	opReduce            = sdkOp + 55
-	opAvgPool           = sdkOp + 56
-	opMaxPool           = sdkOp + 58
-	opBatchNorm         = sdkOp + 72
-	opErf               = sdkOp + 81
-	opMaxPool2          = sdkOp + 110
+	sdkOp       uint32 = 256
+	opAbs              = sdkOp + 2
+	opClip             = sdkOp + 8
+	opCos              = sdkOp + 9
+	opDiv              = sdkOp + 10
+	opExp              = sdkOp + 11
+	opLog              = sdkOp + 13
+	opMax              = sdkOp + 21
+	opMin              = sdkOp + 23
+	opPow              = sdkOp + 26
+	opSin              = sdkOp + 28
+	opSqrt             = sdkOp + 29
+	opSub              = sdkOp + 30
+	opReLU             = sdkOp + 44
+	opSigmoid          = sdkOp + 47
+	opSoftplus         = sdkOp + 49
+	opConv2d           = sdkOp + 53
+	opReduce           = sdkOp + 55
+	opAvgPool          = sdkOp + 56
+	opMaxPool          = sdkOp + 58
+	opBatchNorm        = sdkOp + 72
+	opErf              = sdkOp + 81
+	opMaxPool2         = sdkOp + 110
 )
 
 var binaryKinds = [...]uint32{opSub, opDiv, opMax, opMin}
@@ -79,7 +78,42 @@ func (b *Backend) Clamp(out, a *gpu.Buffer, n int, lo, hi float32) error {
 }
 
 func (b *Backend) LogSoftmax(out, a *gpu.Buffer, rows, cols int) error {
-	return b.softmax(out, a, rows, cols, opLogSoftmax)
+	n, err := gpu.Elements(rows, cols)
+	if err != nil {
+		return err
+	}
+	if cols == 0 {
+		return gpu.ErrInvalidArgument
+	}
+	if err := b.lock(); err != nil {
+		return err
+	}
+	defer b.mu.Unlock()
+	y, inputs, err := b.opBuffers(out, n, bufferArg{a, n})
+	if err != nil || n == 0 {
+		return err
+	}
+	rowValues, err := b.take(uint64(rows)*4, heapDefault)
+	if err != nil {
+		return err
+	}
+	defer b.put(rowValues)
+	layout := compactLayout(1, 1, uint32(rows), uint32(cols))
+	rowLayout := compactLayout(1, 1, uint32(rows), 1)
+	broadcast := rowLayout
+	broadcast.sizes[3], broadcast.strides[3] = uint32(cols), 0
+	subtract := opKey{kind: opSub, n: n, aLayout: layout, bLayout: broadcast, yLayout: layout}
+	const reduceLogSumExp, reduceMax = 6, 7
+	maximum := opKey{kind: opReduce, n: n, scalar: reduceMax, bias: 1 << 3, aLayout: layout, yLayout: rowLayout}
+	logSumExp := maximum
+	logSumExp.scalar = reduceLogSumExp
+	// The native activation can return finite values for rows containing NaN.
+	return b.fail(b.driver.executeBatch([]dispatch{
+		{maximum, rowValues, inputs},
+		{subtract, y, []*allocation{inputs[0], rowValues}},
+		{logSumExp, rowValues, []*allocation{y}},
+		{subtract, y, []*allocation{y, rowValues}},
+	}))
 }
 
 func (b *Backend) ScalarOp(op gpu.ScalarOp, out, a *gpu.Buffer, n int, value float32) error {

@@ -98,10 +98,6 @@ func (b *Backend) GELU(out, a *gpu.Buffer, n int) error {
 }
 
 func (b *Backend) Softmax(out, a *gpu.Buffer, rows, cols int) error {
-	return b.softmax(out, a, rows, cols, opSoftmax)
-}
-
-func (b *Backend) softmax(out, a *gpu.Buffer, rows, cols int, kind uint32) error {
 	n, err := gpu.Elements(rows, cols)
 	if err != nil {
 		return err
@@ -110,7 +106,7 @@ func (b *Backend) softmax(out, a *gpu.Buffer, rows, cols int, kind uint32) error
 		return gpu.ErrInvalidArgument
 	}
 	layout := compactLayout(1, 1, uint32(rows), uint32(cols))
-	return b.unary(out, a, n, opKey{kind: kind, n: n, aLayout: layout, yLayout: layout})
+	return b.unary(out, a, n, opKey{kind: opSoftmax, n: n, aLayout: layout, yLayout: layout})
 }
 
 func validEps(eps float32) bool {

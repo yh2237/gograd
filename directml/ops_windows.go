@@ -162,7 +162,7 @@ func (d *nativeDriver) compile(key opKey) (_ *compiled, err error) {
 	case opAbs, opCos, opExp, opLog, opSin, opSqrt, opErf:
 		identity.ScaleBias = nil
 		desc = operatorDesc{Type: key.kind - sdkOp, Desc: unsafe.Pointer(&identity)}
-	case opLogSoftmax, opReLU, opSigmoid:
+	case opReLU, opSigmoid:
 		desc = operatorDesc{Type: key.kind - sdkOp, Desc: unsafe.Pointer(&unary)}
 	case opClip:
 		clip := clipDesc{In: &a.tensor, Out: &out.tensor, Min: scale.Scale, Max: scale.Bias}

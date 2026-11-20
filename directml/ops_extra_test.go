@@ -124,6 +124,32 @@ func checkTransformerAfter(t *testing.T, b *Backend, out *gpu.Buffer, err error,
 	checkTransformer(t, b, out, want)
 }
 
+func TestLogSoftmaxSpecialValues(t *testing.T) {
+	b := testBackend(t)
+	nan := float32(math.NaN())
+	posInf, negInf := float32(math.Inf(1)), float32(math.Inf(-1))
+	const cols = 4
+	data := []float32{
+		1, negInf, 1, negInf,
+		1, nan, 2, negInf,
+		1, posInf, 2, negInf,
+		negInf, negInf, negInf, negInf,
+		1e8, 1e8, 1e8, 1e8,
+		0, -1000, 0, -1000,
+	}
+	half, quarter := -float32(math.Log(2)), -float32(math.Log(4))
+	want := []float32{
+		half, negInf, half, negInf,
+		nan, nan, nan, nan,
+		nan, nan, nan, nan,
+		nan, nan, nan, nan,
+		quarter, quarter, quarter, quarter,
+		half, half - 1000, half, half - 1000,
+	}
+	x, out := upload(t, b, data), alloc(t, b, len(data))
+	checkExtra(t, b, out, b.LogSoftmax(out, x, len(data)/cols, cols), want)
+}
+
 func TestExtraReduce(t *testing.T) {
 	b := testBackend(t)
 	for _, tc := range []struct{ shape, axes []int }{
