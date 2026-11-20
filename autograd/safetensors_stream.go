@@ -43,7 +43,7 @@ func OpenSafeTensorFile(path string) (*SafeTensorFile, error) {
 		return closeOnError(err)
 	}
 	hlen := encodingbinary.LittleEndian.Uint64(prefix[:])
-	if hlen > 16<<20 || hlen > uint64(stat.Size()-8) {
+	if hlen > safeTensorHeaderLimit || hlen > uint64(stat.Size()-8) {
 		return closeOnError(fmt.Errorf("autograd: invalid safetensors header length"))
 	}
 	headerBytes := make([]byte, int(hlen))
@@ -57,13 +57,14 @@ func OpenSafeTensorFile(path string) (*SafeTensorFile, error) {
 	metadata := map[string]string{}
 	if value, ok := raw["__metadata__"]; ok {
 		if err := json.Unmarshal(value, &metadata); err != nil {
-			return closeOnError(err)
+			return closeOnError(fmt.Errorf("autograd: invalid safetensors metadata: %w", err))
 		}
 		delete(raw, "__metadata__")
 	}
 	entries := make(map[string]safeHeader, len(raw))
 	var ranges [][2]int
 	dataSize := stat.Size() - 8 - int64(hlen)
+	limit := int(min(dataSize, math.MaxInt) / 4)
 	for name, value := range raw {
 		var h safeHeader
 		if err := json.Unmarshal(value, &h); err != nil {
@@ -72,12 +73,9 @@ func OpenSafeTensorFile(path string) (*SafeTensorFile, error) {
 		if h.DType != "F32" {
 			return closeOnError(fmt.Errorf("autograd: incompatible dtype %s for %s", h.DType, name))
 		}
-		if dataSize/4 > int64(int(^uint(0)>>1)) {
-			return closeOnError(fmt.Errorf("autograd: oversized tensor data"))
-		}
-		count, err := safeNumel(h.Shape, int(dataSize/4))
+		count, err := safeNumel(h.Shape, limit)
 		if err != nil {
-			return closeOnError(fmt.Errorf("autograd: %s: %w", name, err))
+			return closeOnError(fmt.Errorf("autograd: invalid shape %s: %w", name, err))
 		}
 		start, end := h.Offsets[0], h.Offsets[1]
 		if start < 0 || end < start || int64(end) > dataSize || end-start != count*4 {
@@ -129,14 +127,18 @@ func (s *SafeTensorFile) ReadF32(name string) ([]float32, []int, error) {
 		return values, slices.Clone(h.Shape), nil
 	}
 	s.cacheMu.RUnlock()
-	n := (h.Offsets[1] - h.Offsets[0]) / 4
-	raw := make([]byte, n*4)
-	if _, err := s.file.ReadAt(raw, s.dataBase+int64(h.Offsets[0])); err != nil {
-		return nil, nil, err
-	}
-	values := make([]float32, n)
-	for i := range values {
-		values[i] = math.Float32frombits(encodingbinary.LittleEndian.Uint32(raw[i*4:]))
+	values := make([]float32, (h.Offsets[1]-h.Offsets[0])/4)
+	raw := make([]byte, min(len(values), safeTensorChunkValues)*4)
+	offset := s.dataBase + int64(h.Offsets[0])
+	for chunk := range slices.Chunk(values, safeTensorChunkValues) {
+		size := len(chunk) * 4
+		if _, err := s.file.ReadAt(raw[:size], offset); err != nil {
+			return nil, nil, err
+		}
+		for i := range chunk {
+			chunk[i] = math.Float32frombits(encodingbinary.LittleEndian.Uint32(raw[i*4:]))
+		}
+		offset += int64(size)
 	}
 	return values, slices.Clone(h.Shape), nil
 }

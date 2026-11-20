@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -77,5 +78,42 @@ func TestSafetensorsIOAuditLayout(t *testing.T) {
 	entries, _, err := readSafetensors(path)
 	if err != nil || entries["a"].Values[0] != 1.25 || entries["b"].Values[0] != -2.5 || len(entries["empty"].Values) != 0 {
 		t.Fatalf("entries=%v err=%v", entries, err)
+	}
+}
+
+func TestSafetensorsChunkedRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chunked.safetensors")
+	weights := make([]float32, 2*safeTensorChunkValues+3)
+	for i := range weights {
+		weights[i] = float32(i) / -32
+	}
+	weights[safeTensorChunkValues] = math.Float32frombits(0x7fc00023)
+	entries := map[string]safeTensorEntry{
+		"bias":   {Values: []float32{0.25}},
+		"empty":  {Shape: []int{0}},
+		"weight": {Values: weights, Shape: []int{len(weights)}},
+	}
+	metadata := map[string]string{"format": "gograd-training-1", "user": `{"epoch":"3"}`}
+	if err := writeSafetensors(path, entries, metadata); err != nil {
+		t.Fatal(err)
+	}
+	user, err := TrainingCheckpointMetadata(path)
+	if err != nil || user["epoch"] != "3" {
+		t.Fatalf("metadata = %v, %v", user, err)
+	}
+	loaded, _, err := readSafetensors(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range entries {
+		got, ok := loaded[name]
+		if !ok || !slices.Equal(got.Shape, want.Shape) || len(got.Values) != len(want.Values) {
+			t.Fatalf("invalid tensor %s", name)
+		}
+		for i, value := range got.Values {
+			if math.Float32bits(value) != math.Float32bits(want.Values[i]) {
+				t.Fatalf("%s[%d] = %08x, want %08x", name, i, math.Float32bits(value), math.Float32bits(want.Values[i]))
+			}
+		}
 	}
 }

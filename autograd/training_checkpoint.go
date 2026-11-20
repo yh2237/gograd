@@ -7,9 +7,9 @@ import (
 	"strings"
 )
 
-// SaveTrainingCheckpoint stores model/buffers, optimizer state (AdamW or SGD),
-// OneCycle position, and caller metadata in one atomically replaced
-// safetensors file. Sampler/trainer state can be JSON in caller metadata.
+// SaveTrainingCheckpoint writes model state, optimizer state, OneCycle
+// position and caller metadata to a temporary safetensors file before
+// replacing path.
 func SaveTrainingCheckpoint(path string, module *Module, optimizer CheckpointOptimizer, scheduler *OneCycle, metadata map[string]string) error {
 	if module == nil || optimizer == nil || scheduler == nil {
 		return fmt.Errorf("autograd: model, optimizer and scheduler are required")
@@ -57,17 +57,18 @@ func SaveTrainingCheckpoint(path string, module *Module, optimizer CheckpointOpt
 	return writeSafetensors(path, entries, optMeta)
 }
 
-// TrainingCheckpointMetadata reads caller metadata without mutating live state.
+// TrainingCheckpointMetadata reads caller metadata from the header.
 func TrainingCheckpointMetadata(path string) (map[string]string, error) {
-	_, metadata, err := readSafetensors(path)
+	file, err := OpenSafeTensorFile(path)
 	if err != nil {
 		return nil, err
 	}
-	if metadata["format"] != "gograd-training-1" {
+	defer file.Close()
+	if file.Metadata["format"] != "gograd-training-1" {
 		return nil, fmt.Errorf("autograd: not a training checkpoint")
 	}
 	var user map[string]string
-	if err := json.Unmarshal([]byte(metadata["user"]), &user); err != nil {
+	if err := json.Unmarshal([]byte(file.Metadata["user"]), &user); err != nil {
 		return nil, err
 	}
 	return user, nil

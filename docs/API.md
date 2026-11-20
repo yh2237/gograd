@@ -94,7 +94,7 @@ CPU / CUDAの学習・推論および共通ユーティリティのAPI仕様で�
 - `GradAccumulator.Backward` は `1/groups` を初期勾配として逆伝播する。端数のグループにも同じ係数を使い、逆伝播後も損失の値は読み取れる。
 - `ClipGradNorm` はCPUではクリップ前ノルム、CUDAではホスト同期を避けるため `NaN` を返す（CUDA上のノルム取得は `GradientNormToHost`）。
 - **TrainingLoop**：group先頭で `ZeroGrad`、更新完了時に `Optimizer.Step` と `Schedule.Step` を1回呼ぶ。`Accumulate >= 2` で途中キャンセル時は未完了勾配を破棄し、Samplerをgroup先頭へ戻して `Save` を呼ぶ（running統計・外部乱数状態は呼び出し側管理）。
-- **checkpoint**：`SaveTrainingCheckpoint` / `LoadTrainingCheckpoint` は `gograd-training-1` 形式のsafetensorsでmodel / optimizer / OneCycle / metadataをアトミック保存・検証復元する（`optimizer_kind` 省略時はAdamW互換）。train/evalモード・dropout seed・データ同一性は呼び出し側で管理する。
+- `SaveTrainingCheckpoint` はモデル、オプティマイザー、OneCycle、メタデータを `gograd-training-1` 形式のsafetensorsに書き、一時ファイルで保存先を置き換える。`LoadTrainingCheckpoint` は復元前に状態を検証し、`optimizer_kind` がなければ AdamW として扱う。学習・評価モード、dropoutのシード、データの同一性は呼び出し側が管理する。
 
 ## ホストデータ処理・評価指標・ユーティリティ
 
