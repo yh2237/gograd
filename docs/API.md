@@ -94,7 +94,8 @@ CPU / CUDAの学習・推論および共通ユーティリティのAPI仕様で�
 - **CUDAグラフ連携**：`PrepareGraph` / `GraphStepCount` / `SyncGraphStepCount` を使用する。`ZeroGrad` はCUDAグラフ用勾配バッファを解放せず0埋めする。state保存前・eager復帰時はステップ数を同期し、構成変更時は古いグラフを破棄する。
 - `GradAccumulator.Backward` は `1/groups` を初期勾配として逆伝播する。端数のグループにも同じ係数を使い、逆伝播後も損失の値は読み取れる。
 - `ClipGradNorm` はCPUではクリップ前ノルム、CUDAではホスト同期を避けるため `NaN` を返す（CUDA上のノルム取得は `GradientNormToHost`）。
-- `TrainingLoop` はグループの先頭で `ZeroGrad` を呼ぶ。グループが完了すると `Optimizer.Step` を1回呼び、`Schedule` が設定されていれば `Schedule.Step` も1回呼ぶ。新しいエポックにバッチがなければエラーを返す。勾配の蓄積中にバッチ取得がキャンセルされると、未完了グループの勾配を破棄し、`Save` が設定されていればグループ先頭のサンプラー状態を渡す。running統計と外部乱数状態は呼び出し側が管理する。
+- `TrainingLoop` はグループの先頭で `ZeroGrad` を呼ぶ。グループが完了すると `Optimizer.Step` を1回呼び、`Schedule` が設定されていれば `Schedule.Step` も1回呼ぶ。新しいエポックにバッチがなければエラーを返す。
+- バッチ取得や `Step` がキャンセルされたときは、未完了の勾配を破棄する。`Step` のキャンセル時にチェックポイントを保存するには `Sampler` が必要。未完了のグループをやり直す場合、`TrainingLoop` は `Save` にグループ先頭のサンプラー状態を渡す。`Save` はその状態をチェックポイントに記録する。running統計と外部乱数状態は呼び出し側が管理する。
 - `SaveTrainingCheckpoint` はモデル、オプティマイザー、OneCycle、メタデータを `gograd-training-1` 形式のsafetensorsに書き、一時ファイルで保存先を置き換える。`LoadTrainingCheckpoint` は復元前に状態を検証し、`optimizer_kind` がなければ AdamW として扱う。学習・評価モード、dropoutのシード、データの同一性は呼び出し側が管理する。
 
 ## ホストデータ処理・評価指標・ユーティリティ

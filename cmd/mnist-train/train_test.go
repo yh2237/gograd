@@ -252,15 +252,11 @@ func TestMNISTCancelSavesCheckpoint(t *testing.T) {
 	assertCheckpointValues(t, tensor.CPU, full.Out+".training.safetensors", resume.Out+".training.safetensors")
 }
 
-// Cancellation after micro-batch 5 rewinds across an epoch boundary: with 13
-// samples and batch size 4, group 2 includes the tail of epoch 0 and epoch 1.
 func TestMNISTCanceledAccumulationResume(t *testing.T) {
-	// The interruption point is the end of the first epoch, where the sampler
-	// has to rewind across the epoch boundary.
 	const after = 5
 	for _, kind := range []string{"adamw", "sgd"} {
 		for _, device := range []tensor.Device{tensor.CPU, tensor.CUDA} {
-			for _, workers := range []int{0} {
+			for _, workers := range []int{0, 2} {
 				t.Run(kind+"/"+string(device)+"/workers"+strconv.Itoa(workers)+"/micro"+strconv.Itoa(after), func(t *testing.T) {
 					if device == tensor.CUDA && !cuda.Available() {
 						t.Skip("CUDA unavailable")
@@ -327,6 +323,7 @@ func TestMNISTCanceledAccumulationResume(t *testing.T) {
 							micro++
 							if micro == after {
 								cancel()
+								return loss, complete, ctx.Err()
 							}
 							return loss, complete, nil
 						},

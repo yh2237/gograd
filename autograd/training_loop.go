@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-
 	"reflect"
 )
 
@@ -55,14 +54,14 @@ type UpdateSchedule interface {
 // restored from a checkpoint counts those updates.
 func (c *OneCycle) Updates() int { return c.StepCount }
 
-// TrainingLoop groups micro-batches into optimizer updates. A canceled read
-// discards the unfinished group's gradients and passes its starting sampler
-// position to Save when set. The caller handles forward-pass state such as running
-// statistics and counters when resuming.
+// TrainingLoop groups micro-batches into optimizer updates. Cancellation
+// discards unfinished gradients. When an unfinished group must be replayed,
+// Save receives its starting sampler position. The caller handles forward-pass
+// state such as running statistics when resuming.
 type TrainingLoop[B any] struct {
 	// Reader supplies collated batches in sampler order. Required.
 	Reader BatchReader[B]
-	// Sampler is required for accumulation and supplies each group's starting position.
+	// Sampler is required for accumulation and to checkpoint a canceled Step.
 	Sampler PositionSampler
 	// Optimizer owns the updated parameters. Required.
 	Optimizer Optimizer
@@ -87,8 +86,9 @@ type TrainingLoop[B any] struct {
 	Step func(ctx context.Context, batch B, accumulator *GradAccumulator) (loss float64, complete bool, err error)
 	// Report is called for the first, every LogEvery'th and the last update.
 	Report func(update int, loss float64)
-	// Save is called after the planned updates or a canceled read. A non-nil
-	// savepoint identifies the first batch of an unfinished group.
+	// Save is called after the planned updates, after a canceled read, or when
+	// Step returns a context error and a sampler position is available. A
+	// non-nil savepoint replaces the reader's current position in the checkpoint.
 	Save func(savepoint []byte) error
 }
 
@@ -117,12 +117,13 @@ func (l *TrainingLoop[B]) Run(ctx context.Context) error {
 	}
 	// A resumed run reports its own first update, not the absolute first.
 	start := l.Applied
+	captureStart := groups > 1 || (l.Sampler != nil && l.Save != nil)
 	var savepoint func() ([]byte, error)
 	var stopped error
 	awaitingFirstBatch := false
 	for l.Applied < l.Updates {
 		if accumulator.Pending() == 0 {
-			if groups > 1 {
+			if captureStart {
 				savepoint, err = capturePosition(l.Sampler)
 				if err != nil {
 					return err
@@ -157,7 +158,16 @@ func (l *TrainingLoop[B]) Run(ctx context.Context) error {
 		awaitingFirstBatch = false
 		loss, complete, err := l.Step(ctx, batch, accumulator)
 		if err != nil {
-			return err
+			if !isTrainingCancellation(err) {
+				return err
+			}
+			l.Optimizer.ZeroGrad()
+			accumulator.Reset()
+			if savepoint == nil {
+				return err
+			}
+			stopped = err
+			break
 		}
 		if !complete {
 			continue
@@ -181,7 +191,7 @@ func (l *TrainingLoop[B]) Run(ctx context.Context) error {
 		}
 		return l.Save(nil)
 	}
-	if !errors.Is(stopped, context.Canceled) && !errors.Is(stopped, context.DeadlineExceeded) {
+	if !isTrainingCancellation(stopped) {
 		return stopped
 	}
 	if l.Save != nil {
@@ -197,4 +207,8 @@ func (l *TrainingLoop[B]) Run(ctx context.Context) error {
 		}
 	}
 	return stopped
+}
+
+func isTrainingCancellation(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }

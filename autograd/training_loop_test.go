@@ -283,11 +283,12 @@ func TestTrainingLoopValidation(t *testing.T) {
 
 func TestTrainingLoopInterruption(t *testing.T) {
 	pool2dDevices(t, func(t *testing.T, device tensor.Device) {
-		// One micro-batch, a group boundary and the last group cover the
-		// savepoint arithmetic.
-		for _, tc := range []struct{ groups, after int }{{1, 1}, {3, 4}, {3, 6}} {
+		for _, tc := range []struct {
+			groups, after int
+			inStep        bool
+		}{{1, 1, false}, {3, 4, false}, {3, 6, false}, {1, 2, true}, {3, 1, true}, {3, 3, true}, {3, 5, true}} {
 			groups, after := tc.groups, tc.after
-			t.Run(fmt.Sprintf("groups%d/micro%d", groups, after), func(t *testing.T) {
+			t.Run(fmt.Sprintf("groups%d/micro%d/inStep=%t", groups, after, tc.inStep), func(t *testing.T) {
 				pool2dContext(t, device)
 				model := newLoopModel(t, device, 7)
 				execution := NewExecutionContext()
@@ -315,6 +316,9 @@ func TestTrainingLoopInterruption(t *testing.T) {
 						micro++
 						if micro == after {
 							cancel()
+							if tc.inStep {
+								return loss, complete, fmt.Errorf("step: %w", ctx.Err())
+							}
 						}
 						return loss, complete, nil
 					},
@@ -330,13 +334,16 @@ func TestTrainingLoopInterruption(t *testing.T) {
 				if saves != 1 {
 					t.Fatalf("Save ran %d times", saves)
 				}
-				// The update count only counts completed groups.
-				if loop.Applied != after/groups {
-					t.Fatalf("applied=%d, want %d", loop.Applied, after/groups)
+				completed := after
+				if tc.inStep {
+					completed--
 				}
-				wantSavepoint := fmt.Sprintf("position=%d", (after-1)/groups*groups)
-				if after%groups == 0 {
-					wantSavepoint = ""
+				if loop.Applied != completed/groups {
+					t.Fatalf("applied=%d, want %d", loop.Applied, completed/groups)
+				}
+				var wantSavepoint string
+				if tc.inStep || after%groups != 0 {
+					wantSavepoint = fmt.Sprintf("position=%d", completed/groups*groups)
 				}
 				if string(saved) != wantSavepoint {
 					t.Fatalf("savepoint %q, want %q", saved, wantSavepoint)

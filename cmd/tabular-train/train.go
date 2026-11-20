@@ -346,10 +346,13 @@ func train(ctx context.Context, c trainConfig, log io.Writer) (trainingStats, er
 			stats.TrainLoss = loss
 			fmt.Fprintf(log, "device=%s step=%d train_mse=%.6f epoch=%d\n", device, update, loss, sampler.Epoch())
 		},
-		Save: func([]byte) error {
+		Save: func(savepoint []byte) error {
 			loaderState, err := loader.State()
 			if err != nil {
 				return err
+			}
+			if savepoint != nil {
+				loaderState.Sampler = savepoint
 			}
 			payload, err := json.Marshal(checkpointState{Identity: identity, Loader: loaderState, Standardizer: standardizer.State()})
 			if err != nil {
