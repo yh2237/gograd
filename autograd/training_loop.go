@@ -9,6 +9,7 @@ import (
 
 // BatchReader reads one collated batch per call in sampler order. It returns
 // io.EOF at the end of an epoch, and NextEpoch advances to the next one.
+// Each newly started epoch must contain at least one batch.
 // *data.Loader[T, B] satisfies this interface.
 type BatchReader[B any] interface {
 	Next(ctx context.Context) (B, error)
@@ -112,6 +113,7 @@ func (l *TrainingLoop[B]) Run(ctx context.Context) error {
 	var savepoint []byte
 	var rewind []byte
 	var stopped error
+	awaitingFirstBatch := false
 	for l.Applied < l.Updates {
 		if accumulator.Pending() == 0 {
 			if groups > 1 {
@@ -124,10 +126,15 @@ func (l *TrainingLoop[B]) Run(ctx context.Context) error {
 		}
 		batch, err := l.Reader.Next(ctx)
 		if errors.Is(err, io.EOF) {
-			if err := l.Reader.NextEpoch(); err != nil {
-				return err
+			if awaitingFirstBatch {
+				err = fmt.Errorf("autograd: training epoch contains no batches")
+			} else {
+				if err := l.Reader.NextEpoch(); err != nil {
+					return err
+				}
+				awaitingFirstBatch = true
+				continue
 			}
-			continue
 		}
 		if err != nil {
 			if accumulator.Pending() != 0 {
@@ -140,6 +147,7 @@ func (l *TrainingLoop[B]) Run(ctx context.Context) error {
 			stopped = err
 			break
 		}
+		awaitingFirstBatch = false
 		loss, complete, err := l.Step(ctx, batch, accumulator)
 		if err != nil {
 			return err

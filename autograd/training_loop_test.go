@@ -8,7 +8,9 @@ import (
 	"math/rand"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/yh2237/gograd/data"
 	"github.com/yh2237/gograd/tensor"
 )
 
@@ -187,7 +189,8 @@ func TestTrainingLoopAppliesUpdatesAndReports(t *testing.T) {
 		optimizer := NewAdamW(model.module.NamedParameters(), .01, 0)
 		t.Cleanup(optimizer.Close)
 		schedule := NewOneCycle(.01, 6, .5)
-		reader := &loopReader{batches: loopBatches(3)}
+		batches := loopBatches(3)
+		reader := &loopReader{batches: batches, cursor: len(batches)}
 		var reported []int
 		var losses []float64
 		loop := TrainingLoop[loopBatch]{
@@ -202,11 +205,10 @@ func TestTrainingLoopAppliesUpdatesAndReports(t *testing.T) {
 				return nil
 			},
 		}
-		// Three batches per epoch supply twelve micro-batches for six updates.
 		if err := loop.Run(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if loop.Applied != 6 || reader.epochs != 3 {
+		if loop.Applied != 6 || reader.epochs != 4 {
 			t.Fatalf("applied=%d epoch rolls=%d", loop.Applied, reader.epochs)
 		}
 		if schedule.Updates() != 6 {
@@ -364,5 +366,39 @@ func TestTrainingLoopReadErrorSkipsSave(t *testing.T) {
 	}
 	if loop.Applied != 1 {
 		t.Fatalf("applied=%d, want 1", loop.Applied)
+	}
+}
+
+func TestTrainingLoopRejectsEmptyEpoch(t *testing.T) {
+	sampler, err := data.NewIndexSampler(1, data.SamplerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := data.NewLoader(data.SliceDataset[int]{1}, sampler, func(samples []int) ([]int, error) {
+		return samples, nil
+	}, data.LoaderOptions{BatchSize: 2, DropLast: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	model := newLoopModel(t, tensor.CPU, 1)
+	optimizer := NewAdamW(model.module.NamedParameters(), .01, 0)
+	defer optimizer.Close()
+	loop := TrainingLoop[[]int]{
+		Reader: reader, Optimizer: optimizer, Updates: 1,
+		Step: func(context.Context, []int, *GradAccumulator) (float64, bool, error) {
+			t.Fatal("step called without a batch")
+			return 0, false, nil
+		},
+		Save: func([]byte) error {
+			t.Error("save called for an empty epoch")
+			return nil
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err = loop.Run(ctx)
+	if err == nil || errors.Is(err, context.DeadlineExceeded) || sampler.Epoch() != 1 || loop.Applied != 0 {
+		t.Fatalf("err=%v, epoch=%d, applied=%d", err, sampler.Epoch(), loop.Applied)
 	}
 }
