@@ -3,6 +3,7 @@ package tensor
 
 import (
 	"fmt"
+	"math"
 	"unsafe"
 
 	"github.com/yh2237/gograd/cuda"
@@ -42,6 +43,20 @@ func Numel(shape []int) int {
 	return n
 }
 
+func checkedNumel(shape []int) (int, error) {
+	n := 1
+	for _, d := range shape {
+		if d < 0 {
+			return 0, fmt.Errorf("tensor: negative dimension")
+		}
+		if d != 0 && n > math.MaxInt/d {
+			return 0, fmt.Errorf("tensor: oversized shape %v", shape)
+		}
+		n *= d
+	}
+	return n, nil
+}
+
 // New allocates an uninitialized tensor with the given shape.
 func New(shape ...int) (*Tensor, error) {
 	return NewOn(CUDA, shape...)
@@ -52,27 +67,18 @@ func NewOn(device Device, shape ...int) (*Tensor, error) {
 	if device == Vulkan || device == DirectML {
 		return nil, fmt.Errorf("%w: %s tensor integration is not implemented yet", gpu.ErrUnavailable, device)
 	}
-	// A product that overflows int would wrap to a plausible element count and
-	// pass the later size checks.
-	limit := int(^uint(0) >> 1)
-	n := 1
-	for _, d := range shape {
-		if d < 0 {
-			return nil, fmt.Errorf("tensor: negative dimension")
-		}
-		if d != 0 && n > limit/d {
-			return nil, fmt.Errorf("tensor: oversized shape %v", shape)
-		}
-		n *= d
+	n, err := checkedNumel(shape)
+	if err != nil {
+		return nil, err
+	}
+	if n > math.MaxInt/4 {
+		return nil, fmt.Errorf("tensor: oversized shape %v", shape)
 	}
 	if device == CPU {
 		return &Tensor{data: make([]float32, n), device: CPU, shape: append([]int(nil), shape...), owned: true}, nil
 	}
 	if device != CUDA {
 		return nil, fmt.Errorf("tensor: unknown device %q", device)
-	}
-	if n > limit/4 {
-		return nil, fmt.Errorf("tensor: oversized shape %v", shape)
 	}
 	buf, err := cuda.Alloc(n * 4)
 	if err != nil {
@@ -193,12 +199,11 @@ func (t *Tensor) Reshape(shape ...int) (*Tensor, error) {
 	if t.closed {
 		return nil, fmt.Errorf("tensor: tensor is closed")
 	}
-	for _, d := range shape {
-		if d < 0 {
-			return nil, fmt.Errorf("tensor: negative dimension")
-		}
+	n, err := checkedNumel(shape)
+	if err != nil {
+		return nil, err
 	}
-	if Numel(shape) != t.Numel() {
+	if n != t.Numel() {
 		return nil, fmt.Errorf("tensor: reshape element count mismatch")
 	}
 	return &Tensor{buf: t.buf, data: t.data, device: t.device, shape: append([]int(nil), shape...)}, nil

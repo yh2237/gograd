@@ -1,6 +1,7 @@
 package tensor
 
 import (
+	"math"
 	"testing"
 
 	"github.com/yh2237/gograd/cuda"
@@ -61,10 +62,10 @@ func TestTensorRoundTrip(t *testing.T) {
 // A shape whose element count or byte size overflows int must be rejected
 // instead of wrapping to a plausible size.
 func TestAuditNewOnRejectsOverflowingShape(t *testing.T) {
-	if _, err := NewOn(CPU, 1<<32, 1<<32); err == nil {
+	if _, err := NewOn(CPU, math.MaxInt/2+1, 4); err == nil {
 		t.Fatal("NewOn accepted a shape whose element count overflows int")
 	}
-	if _, err := NewOn(CUDA, 1<<31, 1<<31); err == nil {
+	if _, err := NewOn(CUDA, math.MaxInt/4+1); err == nil {
 		t.Fatal("NewOn accepted a shape whose byte size overflows int")
 	}
 }

@@ -1,11 +1,26 @@
 package tensor
 
 import (
+	"math"
 	"strings"
 	"testing"
 
 	"github.com/yh2237/gograd/cuda"
 )
+
+func TestOversizedTensorShape(t *testing.T) {
+	if _, err := NewOn(CPU, math.MaxInt/4+1); err == nil {
+		t.Fatal("oversized CPU allocation accepted")
+	}
+	tr, err := NewOn(CPU, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	if _, err := tr.Reshape(4, math.MaxInt/2+2); err == nil {
+		t.Fatal("reshape accepted an overflowing element count")
+	}
+}
 
 // A negative dimension can cancel another negative dimension in Numel.
 func TestAuditReshapeRejectsNegativeDimensions(t *testing.T) {

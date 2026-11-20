@@ -169,17 +169,13 @@ func strides(s []int) []int {
 	return out
 }
 
-// validateShape rejects dimensions that cannot describe storage. A negative
-// dimension can otherwise cancel another negative dimension in numel, and a
-// product that overflows int can wrap to a plausible element count.
 func validateShape(shape []int) error {
-	limit := int(^uint(0) >> 1)
 	n := 1
 	for _, d := range shape {
 		if d < 0 {
 			return errors.New("autograd: negative dimension")
 		}
-		if d != 0 && n > limit/d {
+		if d != 0 && n > math.MaxInt/d {
 			return errors.New("autograd: oversized shape")
 		}
 		n *= d
@@ -214,8 +210,11 @@ func New(data []float32, shape []int, device tensor.Device, grad bool) (*Tensor,
 		}
 		return &Tensor{Shape: append([]int(nil), shape...), Strides: strides(shape), DType: Float32, Device: device, buf: buf, storage: deviceStorage(buf), RequiresGrad: grad}, nil
 	}
-	values := append([]float32(nil), data...)
-	return &Tensor{Data: values, storage: cpuStorage(values, false), Shape: append([]int(nil), shape...), Strides: strides(shape), DType: Float32, Device: device, RequiresGrad: grad}, nil
+	return newCPUTensor(append([]float32(nil), data...), shape, grad), nil
+}
+
+func newCPUTensor(values []float32, shape []int, grad bool) *Tensor {
+	return &Tensor{Data: values, storage: cpuStorage(values, false), Shape: append([]int(nil), shape...), Strides: strides(shape), DType: Float32, Device: tensor.CPU, RequiresGrad: grad}
 }
 func floatBytes(data []float32) []byte {
 	if len(data) == 0 {
@@ -353,8 +352,13 @@ func Zeros(shape []int, device tensor.Device, grad bool) (*Tensor, error) {
 	if err := validateShape(shape); err != nil {
 		return nil, err
 	}
-	if device == tensor.CUDA {
-		buf, e := cuda.Alloc(numel(shape) * 4)
+	n := numel(shape)
+	if n > math.MaxInt/4 {
+		return nil, errors.New("autograd: oversized shape")
+	}
+	switch device {
+	case tensor.CUDA:
+		buf, e := cuda.Alloc(n * 4)
 		if e != nil {
 			return nil, e
 		}
@@ -363,8 +367,15 @@ func Zeros(shape []int, device tensor.Device, grad bool) (*Tensor, error) {
 			return nil, e
 		}
 		return &Tensor{Shape: append([]int(nil), shape...), Strides: strides(shape), DType: Float32, Device: device, buf: buf, storage: deviceStorage(buf), RequiresGrad: grad}, nil
+	case tensor.CPU:
+		var values []float32
+		if n != 0 {
+			values = make([]float32, n)
+		}
+		return newCPUTensor(values, shape, grad), nil
+	default:
+		return nil, errors.New("autograd: invalid device")
 	}
-	return New(make([]float32, numel(shape)), shape, device, grad)
 }
 func (t *Tensor) Detach() *Tensor {
 	t.assertOpen()

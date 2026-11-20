@@ -4,11 +4,20 @@ import (
 	"math"
 	"math/rand"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/yh2237/gograd/tensor"
 )
+
+func TestAuditZerosRejectsByteCountOverflow(t *testing.T) {
+	for _, device := range []tensor.Device{tensor.CPU, tensor.CUDA} {
+		if _, err := Zeros([]int{math.MaxInt/4 + 1}, device, false); err == nil || !strings.Contains(err.Error(), "oversized shape") {
+			t.Fatalf("Zeros on %s: got %v, want an oversized shape error", device, err)
+		}
+	}
+}
 
 // A negative dimension can cancel another negative dimension in numel and
 // slip past the element-count check.
@@ -141,10 +150,11 @@ func TestAuditMatMulKeepsZeroBatchDimension(t *testing.T) {
 
 // A shape whose element count overflows int must not pass the data-length check.
 func TestAuditNewRejectsOverflowingShape(t *testing.T) {
-	if _, err := New([]float32{}, []int{1 << 32, 1 << 32}, tensor.CPU, true); err == nil {
+	shape := []int{math.MaxInt/2 + 1, 4}
+	if _, err := New([]float32{}, shape, tensor.CPU, true); err == nil {
 		t.Fatal("New accepted a shape whose element count overflows int")
 	}
-	if _, err := Zeros([]int{1 << 32, 1 << 32}, tensor.CPU, false); err == nil {
+	if _, err := Zeros(shape, tensor.CPU, false); err == nil {
 		t.Fatal("Zeros accepted a shape whose element count overflows int")
 	}
 }
@@ -152,8 +162,11 @@ func TestAuditNewRejectsOverflowingShape(t *testing.T) {
 // The device kernel reads int32 indices, so a wider value must be rejected
 // instead of wrapping. The check runs before any allocation.
 func TestAuditIndexBufferRejectsWideIndex(t *testing.T) {
-	if _, err := NewIndexBuffer([]int{math.MaxInt32 + 1}); err == nil {
-		t.Fatal("NewIndexBuffer accepted an index wider than int32")
+	if strconv.IntSize > 32 {
+		index := int64(math.MaxInt32) + 1
+		if _, err := NewIndexBuffer([]int{int(index)}); err == nil {
+			t.Fatal("NewIndexBuffer accepted an index wider than int32")
+		}
 	}
 	if _, err := NewIndexBuffer([]int{-1}); err == nil {
 		t.Fatal("NewIndexBuffer accepted a negative index")
