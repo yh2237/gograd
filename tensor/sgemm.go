@@ -112,8 +112,35 @@ func SGEMMOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 	sgemmOpWorkers(c, a, b, m, n, k, transA, transB, maxWorkers, nil)
 }
 
+const sgemmSmallDim = 8
+
+func sgemmSmall(c, a, b []float32, m, n, k int, transA, transB bool) {
+	aRow, aDepth := k, 1
+	bDepth, bCol := n, 1
+	if transA {
+		aRow, aDepth = 1, m
+	}
+	if transB {
+		bDepth, bCol = 1, k
+	}
+	var out [sgemmSmallDim * sgemmSmallDim]float32
+	for i := 0; i < m; i++ {
+		for j := 0; j < n; j++ {
+			ai, bi := i*aRow, j*bCol
+			var sum float32
+			for d := 0; d < k; d++ {
+				sum += a[ai] * b[bi]
+				ai += aDepth
+				bi += bDepth
+			}
+			out[i*n+j] = sum
+		}
+	}
+	copy(c, out[:m*n])
+}
+
 func sgemmOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWorkers int, packed *PackedB) {
-	if len(a) != m*k || (packed == nil && len(b) != k*n) || len(c) != m*n {
+	if m < 0 || n < 0 || k < 0 || len(a) != m*k || (packed == nil && len(b) != k*n) || len(c) != m*n {
 		panic("tensor: SGEMM shape mismatch")
 	}
 	if m == 0 || n == 0 {
@@ -121,6 +148,10 @@ func sgemmOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 	}
 	if k == 0 {
 		clear(c)
+		return
+	}
+	if packed == nil && max(m, n, k) <= sgemmSmallDim {
+		sgemmSmall(c, a, b, m, n, k, transA, transB)
 		return
 	}
 	// A short row block keeps enough tiles to spread over the workers when m is

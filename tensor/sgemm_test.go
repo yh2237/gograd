@@ -28,9 +28,7 @@ func TestSGEMMWorkerScheduling(t *testing.T) {
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
 			useAVX2FMA, use4x16 = backend.avx, backend.wide
-			// One single-tile shape and one multi-tile shape cover the serial
-			// and the parallel path.
-			for _, shape := range [][3]int{{1, 1, 1}, {129, 17, 319}} {
+			for _, shape := range [][3]int{{1, 1, 1}, {7, 5, 3}, {129, 17, 319}} {
 				m, n, k := shape[0], shape[1], shape[2]
 				a, b := make([]float32, m*k), make([]float32, k*n)
 				for i := range a {
@@ -114,6 +112,23 @@ func TestSGEMMEdges(t *testing.T) {
 			if d < -.0001 || d > .0001 {
 				t.Fatalf("shape %v entry %d: %g != %g", shape, i, got[i], want[i])
 			}
+		}
+	}
+}
+
+func TestSGEMMSmallAliasedOutput(t *testing.T) {
+	a := [4]float32{1, 2, 3, 4}
+	b := [4]float32{2, 1, 4, 3}
+	want := [4]float32{10, 7, 22, 15}
+	for _, aliasA := range []bool{true, false} {
+		left, right := a, b
+		out := right[:]
+		if aliasA {
+			out = left[:]
+		}
+		SGEMM(out, left[:], right[:], 2, 2, 2)
+		if [4]float32(out) != want {
+			t.Fatalf("alias A %t: got %v, want %v", aliasA, out, want)
 		}
 	}
 }

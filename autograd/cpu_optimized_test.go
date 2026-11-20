@@ -193,6 +193,7 @@ func TestCPUMatMulGradientSelection(t *testing.T) {
 		{[]int{2, 65, 17}, []int{2, 17, 19}},
 		{[]int{7, 5}, []int{3, 5, 9}},
 		{[]int{2, 1, 7, 5}, []int{1, 3, 5, 9}},
+		{[]int{2, 1, 2, 1, 3, 5}, []int{1, 3, 1, 2, 5, 4}},
 		{[]int{5, 0}, []int{0, 7}},
 	} {
 		for _, requires := range [][2]bool{{false, false}, {true, false}, {false, true}, {true, true}} {

@@ -73,19 +73,12 @@ func SetBLASStream(stream *cuda.Stream) error {
 	}
 	return nil
 }
-func matrixBatchStride(shape, batch []int, matrixSize int) (int64, bool) {
-	if numel(shape) == 1 {
+func matrixBatchStride(matrices, count, matrixSize int) (int64, bool) {
+	if matrices == 1 {
 		return 0, true
 	}
-	if len(shape) != len(batch) {
-		return 0, false
-	}
-	for i, d := range shape {
-		if d != batch[i] {
-			return 0, false
-		}
-	}
-	return int64(matrixSize), true
+	// Compatible batch shapes with equal element counts need no repetition.
+	return int64(matrixSize), matrices == count
 }
 func gpuMatMul(a, b *Tensor, s []int, m, n, k int, batch []int, transB bool) *Tensor {
 	options := executionOptions(a, b)
@@ -93,8 +86,8 @@ func gpuMatMul(a, b *Tensor, s []int, m, n, k int, batch []int, transB bool) *Te
 	ab := a.Shape[:len(a.Shape)-2]
 	bb := b.Shape[:len(b.Shape)-2]
 	count := numel(batch)
-	as, aRegular := matrixBatchStride(ab, batch, m*k)
-	bs, bRegular := matrixBatchStride(bb, batch, k*n)
+	as, aRegular := matrixBatchStride(numel(ab), count, m*k)
+	bs, bRegular := matrixBatchStride(numel(bb), count, k*n)
 	regular := aRegular && bRegular && count > 1
 	flatLinear := regular && as != 0 && bs == 0
 	prepared := regular || count == 1
@@ -123,9 +116,10 @@ func gpuMatMul(a, b *Tensor, s []int, m, n, k int, batch []int, transB bool) *Te
 				return options.gemmBatchedPrepared(m, n, k, false, transB, a.buf.Pointer(), ap16, as, b.buf.Pointer(), bp16, bs, out.Pointer(), int64(m*n), count, 0)
 			})
 		} else {
+			aIndex, bIndex := makeBroadcastIndex(batch, ab), makeBroadcastIndex(batch, bb)
 			for z := 0; z < count; z++ {
-				ai := bindex(z, batch, ab) * m * k
-				bi := bindex(z, batch, bb) * k * n
+				ai := aIndex.at(z) * m * k
+				bi := bIndex.at(z) * k * n
 				timedGPU("matmul_sgemm", func() error {
 					return options.gemmSingle(m, n, k, false, transB, a.buf.Pointer()+uintptr(ai*4), b.buf.Pointer()+uintptr(bi*4), out.Pointer()+uintptr(z*m*n*4), 0)
 				})
@@ -183,9 +177,10 @@ func gpuMatMul(a, b *Tensor, s []int, m, n, k int, batch []int, transB bool) *Te
 		if needB {
 			db = b.ensureGradGPU()
 		}
+		aIndex, bIndex := makeBroadcastIndex(batch, ab), makeBroadcastIndex(batch, bb)
 		for z := 0; z < count; z++ {
-			ai := bindex(z, batch, ab) * m * k
-			bi := bindex(z, batch, bb) * k * n
+			ai := aIndex.at(z) * m * k
+			bi := bIndex.at(z) * k * n
 			gp := g.Pointer() + uintptr(z*m*n*4)
 			if needA {
 				timedGPU("matmul_dx_sgemm", func() error {

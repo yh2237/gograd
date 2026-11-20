@@ -429,19 +429,29 @@ func parallelBatches(count int, fn func(int)) {
 		}
 		return
 	}
-	jobs := make(chan int, count)
+	chunk := max(1, count/workers/4)
+	jobs := make(chan int, (count-1)/chunk+1)
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for z := range jobs {
-				fn(z)
+			if chunk == 1 {
+				for z := range jobs {
+					fn(z)
+				}
+				return
+			}
+			for start := range jobs {
+				end := start + min(chunk, count-start)
+				for z := start; z < end; z++ {
+					fn(z)
+				}
 			}
 		}()
 	}
-	for z := 0; z < count; z++ {
-		jobs <- z
+	for start := 0; start < count; start += min(chunk, count-start) {
+		jobs <- start
 	}
 	close(jobs)
 	wg.Wait()
@@ -465,7 +475,8 @@ func MatMul(a, b *Tensor) *Tensor {
 	s := append(append([]int(nil), batch...), m, n)
 	count := numel(batch)
 	aBatch, bBatch := a.Shape[:len(a.Shape)-2], b.Shape[:len(b.Shape)-2]
-	flatLinear := count > 1 && numel(aBatch) == count && numel(bBatch) == 1
+	aMatrices, bMatrices := numel(aBatch), numel(bBatch)
+	flatLinear := count > 1 && aMatrices == count && bMatrices == 1
 	transposedB := b.Offset == 0 && lastTwoTranspose(b.Shape, b.Strides, b.Offset) &&
 		((!useCUDA && len(b.Data) == b.Numel()) || (useCUDA && b.buf != nil && b.buf.Size() == b.Numel()*4))
 	if !transposedB {
@@ -478,12 +489,19 @@ func MatMul(a, b *Tensor) *Tensor {
 	// particular, an ordinary rank-two product must not be capped at one core.
 	gemmWorkers := max(1, runtime.GOMAXPROCS(0)/max(1, count))
 	v := cpuAlloc(numel(s))
+	var indices *[2]broadcastIndex
 	if flatLinear || count == 1 {
 		tensor.SGEMMOp(v, a.Data, b.Data, count*m, n, k, false, transposedB)
 	} else {
+		if aMatrices != count || bMatrices != count {
+			indices = &[2]broadcastIndex{makeBroadcastIndex(batch, aBatch), makeBroadcastIndex(batch, bBatch)}
+		}
 		parallelBatches(count, func(z int) {
-			ai := bindex(z, batch, aBatch) * m * k
-			bi := bindex(z, batch, bBatch) * k * n
+			ai, bi := z*m*k, z*k*n
+			if indices != nil {
+				ai = indices[0].at(z) * m * k
+				bi = indices[1].at(z) * k * n
+			}
 			tensor.SGEMMOpWorkers(v[z*m*n:(z+1)*m*n], a.Data[ai:ai+m*k], b.Data[bi:bi+k*n], m, n, k, false, transposedB, gemmWorkers)
 		})
 	}
@@ -509,10 +527,10 @@ func MatMul(a, b *Tensor) *Tensor {
 			}
 			return
 		}
-		if count > 1 && numel(aBatch) == count && numel(bBatch) == count {
+		if count > 1 && indices == nil {
 			parallelBatches(count, func(z int) {
-				ai := bindex(z, batch, aBatch) * m * k
-				bi := bindex(z, batch, bBatch) * k * n
+				ai := z * m * k
+				bi := z * k * n
 				gg := g[z*m*n : (z+1)*m*n]
 				if a.RequiresGrad {
 					tensor.SGEMMOpWorkers(da[ai:ai+m*k], gg, b.Data[bi:bi+k*n], m, k, n, false, !transposedB, gemmWorkers)
@@ -535,8 +553,8 @@ func MatMul(a, b *Tensor) *Tensor {
 			defer cpuRelease(tmpB)
 		}
 		for z := 0; z < count; z++ {
-			ai := bindex(z, batch, a.Shape[:len(a.Shape)-2]) * m * k
-			bi := bindex(z, batch, b.Shape[:len(b.Shape)-2]) * k * n
+			ai := indices[0].at(z) * m * k
+			bi := indices[1].at(z) * k * n
 			gg := g[z*m*n : (z+1)*m*n]
 			if a.RequiresGrad {
 				tensor.SGEMMOp(tmpA, gg, b.Data[bi:bi+k*n], m, k, n, false, !transposedB)

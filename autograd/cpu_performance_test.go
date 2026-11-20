@@ -115,6 +115,7 @@ func BenchmarkCPUMatMul(b *testing.B) {
 		{"matrix", []int{512, 256}, []int{256, 512}},
 		{"linear", []int{4, 128, 256}, []int{256, 512}},
 		{"batched", []int{8, 64, 64}, []int{8, 64, 64}},
+		{"batched_small", []int{512, 4, 4}, []int{512, 4, 4}},
 	} {
 		for _, training := range []bool{false, true} {
 			mode := "/forward"

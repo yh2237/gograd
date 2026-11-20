@@ -51,11 +51,14 @@ func TestAuditMatMulBatchedTransposedView(t *testing.T) {
 		for x := range kv {
 			kv[x] = float32(x%5-2) / 4
 		}
-		a := conv2dTestTensor(t, av, []int{n, i, d}, device, true)
+		a := conv2dTestTensor(t, av, []int{1, n, i, d}, device, true)
 		defer a.Close()
 		k := conv2dTestTensor(t, kv, []int{n, j, d}, device, true)
 		defer k.Close()
 		y := MatMul(a, Transpose(k, 1, 2))
+		if !slices.Equal(y.Shape, []int{1, n, i, j}) {
+			t.Fatalf("output shape %v, want [1 %d %d %d]", y.Shape, n, i, j)
+		}
 		got := conv2dHost(t, y, false)
 		want := make([]float32, n*i*j)
 		for b := 0; b < n; b++ {
@@ -74,7 +77,7 @@ func TestAuditMatMulBatchedTransposedView(t *testing.T) {
 				t.Fatalf("output[%d] = %g, want %g", x, got[x], want[x])
 			}
 		}
-		loss := Sum(y, 0, 1, 2)
+		loss := Sum(y, 0, 1, 2, 3)
 		if err := loss.Backward(); err != nil {
 			t.Fatal(err)
 		}
