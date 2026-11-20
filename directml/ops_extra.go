@@ -74,6 +74,9 @@ func (b *Backend) Clamp(out, a *gpu.Buffer, n int, lo, hi float32) error {
 	if lo > hi || math.IsNaN(float64(lo)) || math.IsNaN(float64(hi)) {
 		return gpu.ErrUnsupported
 	}
+	if math.IsInf(float64(lo), -1) && math.IsInf(float64(hi), 1) {
+		return b.Copy(out, a, n)
+	}
 	return b.unary(out, a, n, opKey{kind: opClip, n: n, scalar: math.Float32bits(lo), bias: math.Float32bits(hi)})
 }
 

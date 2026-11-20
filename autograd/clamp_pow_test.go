@@ -9,15 +9,19 @@ import (
 
 func TestClampParity(t *testing.T) {
 	sinTestDevices(t, func(t *testing.T, device tensor.Device) {
-		values := []float32{-10, -2, -1, -.5, 0, .5, 1, 2, 10}
+		nan := float32(math.NaN())
+		values := []float32{-10, -1, -.5, 0, .5, 1, 10, float32(math.Inf(-1)), float32(math.Inf(1)), nan}
 		x := conv2dTestTensor(t, values, []int{len(values)}, device, false)
-		y := Clamp(x, -1, 1)
-		defer y.ReleaseGraph()
-		got := conv2dHost(t, y, false)
-		for i, v := range values {
-			want := min(max(v, -1), 1)
-			if got[i] != want {
-				t.Fatalf("Clamp(%g) = %g, want %g", v, got[i], want)
+		for _, bounds := range [][2]float32{{-1, 1}, {nan, 1}, {-1, nan}} {
+			lo, hi := bounds[0], bounds[1]
+			y := Clamp(x, lo, hi)
+			got := conv2dHost(t, y, false)
+			y.ReleaseGraph()
+			for i, v := range values {
+				want := min(max(v, lo), hi)
+				if got[i] != want && !(math.IsNaN(float64(got[i])) && math.IsNaN(float64(want))) {
+					t.Errorf("Clamp(%g, %g, %g) = %g, want %g", v, lo, hi, got[i], want)
+				}
 			}
 		}
 	})

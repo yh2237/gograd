@@ -151,6 +151,24 @@ func TestPowScalarZeroAndOne(t *testing.T) {
 	}
 }
 
+func TestClampUnbounded(t *testing.T) {
+	b := testBackend(t)
+	data := []float32{float32(math.Inf(-1)), -2, math.Float32frombits(0x80000000), math.SmallestNonzeroFloat32, float32(math.Inf(1)), math.Float32frombits(0x7fc01234)}
+	x, out := upload(t, b, data), alloc(t, b, len(data))
+	if err := b.Clamp(out, x, len(data), float32(math.Inf(-1)), float32(math.Inf(1))); err != nil {
+		t.Fatal(err)
+	}
+	got, err := b.Download(out, len(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range got {
+		if g, w := math.Float32bits(v), math.Float32bits(data[i]); g != w {
+			t.Errorf("[%d] = %08x, want %08x", i, g, w)
+		}
+	}
+}
+
 func TestLogSoftmaxSpecialValues(t *testing.T) {
 	b := testBackend(t)
 	nan := float32(math.NaN())

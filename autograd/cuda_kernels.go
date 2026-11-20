@@ -598,7 +598,12 @@ extern "C" __global__ void graph_adamw(float* p,const float* g,float* m,float* v
 extern "C" __global__ void add_values(float* a,const float* b,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)a[i]+=b[i];}
 extern "C" __global__ void scalar_f(const float* a,float* out,int n,float value,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float x=a[i];out[i]=op==0?x+value:op==1?x-value:op==2?x*value:x/value;}}
 extern "C" __global__ void scalar_b(const float* g,float* da,int n,float value,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)da[i]+=g[i]*(op==2?value:op==3?1.0f/value:1.0f);}
-extern "C" __global__ void clamp_f(const float* a,float* out,int n,float lo,float hi){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=fminf(fmaxf(a[i],lo),hi);}
+extern "C" __global__ void clamp_f(const float* a, float* out, int n, float lo, float hi) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float x = a[i];
+  out[i] = (isnan(x) || isnan(lo) || isnan(hi)) ? __int_as_float(0x7fc00000) : fminf(fmaxf(x, lo), hi);
+}
 extern "C" __global__ void clamp_b(const float* a,const float* g,float* da,int n,float lo,float hi){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n&&a[i]>=lo&&a[i]<=hi)da[i]+=g[i];}
 extern "C" __global__ void pow_scalar_f(const float* a,float* out,int n,float p){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=powf(a[i],p);}
 extern "C" __global__ void pow_scalar_b(const float* a,const float* g,float* da,int n,float p){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)da[i]+=g[i]*(p==0.0f?0.0f:p*powf(a[i],p-1.0f));}
