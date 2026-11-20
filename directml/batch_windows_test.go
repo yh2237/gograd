@@ -180,23 +180,29 @@ func TestDirectMLDeferredBatchAndInterleavedCopy(t *testing.T) {
 	if err := b.Add(y, x, x, 4); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.MulScalar(z, y, 4, 2); err != nil {
+	if err := b.Clamp(z, y, 4, -1, 6); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Copy(y, z, 4); err != nil {
+	if err := b.MulScalar(y, z, 4, 2); err != nil {
 		t.Fatal(err)
 	}
-	check(t, b, y, []float32{4, 8, 12, 16})
+	if err := b.Copy(z, y, 4); err != nil {
+		t.Fatal(err)
+	}
+	check(t, b, z, []float32{4, 8, 12, 12})
 
 	tmp := alloc(t, b, 4)
 	before := submissionSerial(b)
 	if err := b.Add(tmp, x, x, 4); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.MulScalar(z, tmp, 4, 2); err != nil {
+	if err := b.Clamp(y, tmp, 4, -1, 6); err != nil {
 		t.Fatal(err)
 	}
 	tmp.Close()
+	if err := b.MulScalar(z, y, 4, 2); err != nil {
+		t.Fatal(err)
+	}
 	if err := b.Copy(y, z, 4); err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +216,7 @@ func TestDirectMLDeferredBatchAndInterleavedCopy(t *testing.T) {
 	if submissionSerial(b)-before != 1 {
 		t.Fatalf("got %d submissions for compute+copy+download, want 1", submissionSerial(b)-before)
 	}
-	for i, want := range []float32{4, 8, 12, 16} {
+	for i, want := range []float32{4, 8, 12, 12} {
 		if got[i] != want {
 			t.Fatalf("[%d] got %g want %g", i, got[i], want)
 		}

@@ -27,6 +27,7 @@ type nativeDriver struct {
 	dlls                                                    []*syscall.DLL
 	device, dml, queue, allocator, command, fence, recorder *object
 	batchHeap, batchTable                                   *object
+	clampRoot, clampPipeline                                *object
 	batchHeapSize                                           uint32
 	batchCPU, batchGPU, descSize                            uint64
 	serial                                                  uint64

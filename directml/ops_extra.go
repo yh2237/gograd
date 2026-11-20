@@ -20,7 +20,6 @@ var (
 const (
 	sdkOp       uint32 = 256
 	opAbs              = sdkOp + 2
-	opClip             = sdkOp + 8
 	opCos              = sdkOp + 9
 	opDiv              = sdkOp + 10
 	opExp              = sdkOp + 11
@@ -77,7 +76,7 @@ func (b *Backend) Clamp(out, a *gpu.Buffer, n int, lo, hi float32) error {
 	if math.IsInf(float64(lo), -1) && math.IsInf(float64(hi), 1) {
 		return b.Copy(out, a, n)
 	}
-	return b.unary(out, a, n, opKey{kind: opClip, n: n, scalar: math.Float32bits(lo), bias: math.Float32bits(hi)})
+	return b.unary(out, a, n, opKey{kind: opClamp, n: n, scalar: math.Float32bits(lo), bias: math.Float32bits(hi)})
 }
 
 func (b *Backend) LogSoftmax(out, a *gpu.Buffer, rows, cols int) error {

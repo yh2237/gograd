@@ -1,5 +1,5 @@
 // Package directml implements float32 inference using DirectML and D3D12.
-// Drivers are loaded lazily. No SDK, cgo, shaders or extra Go modules are needed.
+// Drivers are loaded lazily. No SDK, cgo or extra Go modules are needed.
 package directml
 
 import (
@@ -84,6 +84,7 @@ const (
 	opConv
 	opSoftmax
 	opIdentity
+	opClamp
 )
 const (
 	heapDefault  uint32 = 1

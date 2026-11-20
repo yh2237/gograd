@@ -124,47 +124,66 @@ func checkTransformerAfter(t *testing.T, b *Backend, out *gpu.Buffer, err error,
 	checkTransformer(t, b, out, want)
 }
 
+func checkExtraBits(t *testing.T, b *Backend, out *gpu.Buffer, err error, want []float32) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := b.Download(out, len(want))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range got {
+		if g, w := math.Float32bits(v), math.Float32bits(want[i]); g != w {
+			t.Errorf("[%d] = %08x, want %08x", i, g, w)
+		}
+	}
+}
+
 func TestPowScalarZeroAndOne(t *testing.T) {
 	b := testBackend(t)
 	negativeZero := math.Float32frombits(0x80000000)
 	data := []float32{0, negativeZero, float32(math.Inf(1)), float32(math.Inf(-1)), math.Float32frombits(0x7fc01234), math.SmallestNonzeroFloat32, -2}
 	x, out := upload(t, b, data), alloc(t, b, len(data))
+	ones := make([]float32, len(data))
+	for i := range ones {
+		ones[i] = 1
+	}
 	for _, exponent := range []float32{0, negativeZero, 1} {
 		t.Run(fmt.Sprintf("%08x", math.Float32bits(exponent)), func(t *testing.T) {
-			if err := b.ScalarOp(gpu.ScalarPow, out, x, len(data), exponent); err != nil {
-				t.Fatal(err)
+			want := data
+			if exponent == 0 {
+				want = ones
 			}
-			got, err := b.Download(out, len(data))
-			if err != nil {
-				t.Fatal(err)
-			}
-			for i, v := range got {
-				want := data[i]
-				if exponent == 0 {
-					want = 1
-				}
-				if g, w := math.Float32bits(v), math.Float32bits(want); g != w {
-					t.Errorf("[%d] = %08x, want %08x", i, g, w)
-				}
-			}
+			checkExtraBits(t, b, out, b.ScalarOp(gpu.ScalarPow, out, x, len(data), exponent), want)
 		})
 	}
 }
 
-func TestClampUnbounded(t *testing.T) {
+func TestClampFloat32SpecialValues(t *testing.T) {
 	b := testBackend(t)
-	data := []float32{float32(math.Inf(-1)), -2, math.Float32frombits(0x80000000), math.SmallestNonzeroFloat32, float32(math.Inf(1)), math.Float32frombits(0x7fc01234)}
-	x, out := upload(t, b, data), alloc(t, b, len(data))
-	if err := b.Clamp(out, x, len(data), float32(math.Inf(-1)), float32(math.Inf(1))); err != nil {
-		t.Fatal(err)
-	}
-	got, err := b.Download(out, len(data))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i, v := range got {
-		if g, w := math.Float32bits(v), math.Float32bits(data[i]); g != w {
-			t.Errorf("[%d] = %08x, want %08x", i, g, w)
+	negativeZero := math.Float32frombits(0x80000000)
+	negativeInf, positiveInf := float32(math.Inf(-1)), float32(math.Inf(1))
+	nan, negativeNaN := math.Float32frombits(0x7fc01234), math.Float32frombits(0xffc05678)
+	const subnormal float32 = math.SmallestNonzeroFloat32
+	special := []float32{nan, -2, negativeZero, 0, subnormal, -subnormal, positiveInf, negativeNaN, negativeInf, 2}
+	for _, data := range [][]float32{{nan}, special} {
+		x, out := upload(t, b, data), alloc(t, b, len(data))
+		for _, bounds := range [][2]float32{
+			{-1, 1}, {-2, -2}, {negativeInf, 1}, {-1, positiveInf}, {negativeInf, positiveInf},
+			{-2, 0}, {-2, negativeZero}, {negativeZero, 2}, {0, 2}, {0, negativeZero}, {-subnormal, subnormal},
+		} {
+			lo, hi := bounds[0], bounds[1]
+			t.Run(fmt.Sprintf("%d/%08x_%08x", len(data), math.Float32bits(lo), math.Float32bits(hi)), func(t *testing.T) {
+				want := make([]float32, len(data))
+				for i, v := range data {
+					want[i] = v
+					if !math.IsNaN(float64(v)) {
+						want[i] = min(max(v, lo), hi)
+					}
+				}
+				checkExtraBits(t, b, out, b.Clamp(out, x, len(data), lo, hi), want)
+			})
 		}
 	}
 }

@@ -13,6 +13,7 @@ type stepKind uint8
 
 const (
 	stepDispatch stepKind = iota
+	stepClamp
 	stepCopy
 	stepCopyView
 )
@@ -59,6 +60,9 @@ func (d *nativeDriver) operatorStats() OperatorStats {
 	return s
 }
 func (d *nativeDriver) releaseOperators() {
+	release(d.clampPipeline)
+	release(d.clampRoot)
+	d.clampPipeline, d.clampRoot = nil, nil
 	for _, op := range d.operators {
 		d.closeOperator(op)
 	}
@@ -164,9 +168,6 @@ func (d *nativeDriver) compile(key opKey) (_ *compiled, err error) {
 		desc = operatorDesc{Type: key.kind - sdkOp, Desc: unsafe.Pointer(&identity)}
 	case opReLU, opSigmoid:
 		desc = operatorDesc{Type: key.kind - sdkOp, Desc: unsafe.Pointer(&unary)}
-	case opClip:
-		clip := clipDesc{In: &a.tensor, Out: &out.tensor, Min: scale.Scale, Max: scale.Bias}
-		desc = operatorDesc{Type: 8, Desc: unsafe.Pointer(&clip)}
 	case opPow:
 		pow := powDesc{In: &a.tensor, Out: &out.tensor, Exponent: scale.Scale}
 		desc = operatorDesc{Type: 26, Desc: unsafe.Pointer(&pow)}
@@ -351,6 +352,12 @@ func (d *nativeDriver) enqueue(step queuedStep) error {
 }
 
 func (d *nativeDriver) execute(key opKey, out *allocation, inputs ...*allocation) error {
+	if key.kind == opClamp {
+		if err := d.initClamp(); err != nil {
+			return err
+		}
+		return d.enqueue(queuedStep{kind: stepClamp, key: key, out: out, src: inputs[0]})
+	}
 	bindings := make([]resourceBinding, len(inputs))
 	for i, v := range inputs {
 		bindings[i].memory = v
@@ -483,6 +490,11 @@ func (d *nativeDriver) flush() error {
 					}
 					d.bindTable(d.batchTable, op, step.key, step.out, step.inputs)
 					call(d.recorder, 8, uintptr(unsafe.Pointer(d.command)), uintptr(unsafe.Pointer(op.operator)), uintptr(unsafe.Pointer(d.batchTable)))
+					d.uavBarrier()
+				case stepClamp:
+					ensureState(step.src, stateUAV)
+					ensureState(step.out, stateUAV)
+					d.recordClamp(step.key, step.out, step.src)
 					d.uavBarrier()
 				case stepCopy:
 					ensureState(step.src, stateCopySource)

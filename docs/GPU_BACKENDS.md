@@ -30,7 +30,8 @@ DirectML / Vulkan ともに以下の推論演算に対応します（未対応�
 - **DirectML固有の制限**：
   - Feature Level要件：`Erf` はFL 2.0以上、dilation付き `MaxPool2d` はFL 2.1以上、erf版 `GELU` はFL 5.1以上。
   - `Conv1d` で `dilation > 1 && outLen == 1 && inLen == kernel` の条件、およびWARP上の `Conv2d` で単一出力位置のdilatedカーネルが軸長と一致する条件は、DirectMLが0を返す不具合回避のため `gpu.ErrUnsupported` とする。
-  - `ScalarDiv` のsubnormal除数、`Clamp` の `lo > hi` またはNaN、`AvgPool2d` の `DivisorOverride != 0` および `CeilMode` でパディング拡張かつ `!ExcludePad` の組み合わせ、`AdaptiveAvgPool2d` の割り切れないサイズはいずれも `gpu.ErrUnsupported`。
+  - `Clamp` は入力の `NaN` を保持し、境界との比較では `-0` を `+0` より小さい値として扱う。`lo > hi` または境界値が `NaN` の場合は `gpu.ErrUnsupported`。
+  - `ScalarDiv` のsubnormal除数、`AvgPool2d` の `DivisorOverride != 0` および `CeilMode` でパディング拡張かつ `!ExcludePad` の組み合わせ、`AdaptiveAvgPool2d` の割り切れないサイズはいずれも `gpu.ErrUnsupported`。
 - **Vulkan固有の制限**：`Erf` および erf版 `GELU` は最大誤差 `1.5e-7` の多項式近似。`Conv1d` / `Conv2d` の im2col バッファが `MaxStorageBufferBytes` を超える場合は `gpu.ErrUnsupported`。`AvgPool2d` / `AdaptiveAvgPool2d` の制約は DirectML と同一。
 - **サイズ単位・スレッド安全性**：`gpu` 共通APIのサイズ・stride・offsetはfloat32要素数単位（負のstride不可）。バックエンド内部はmutex同期のためOSスレッド固定不要。
 - **プール・キャッシュ・寿命**：バッファプール既定上限は256 MiB（`MemoryStats` / `SetPoolCacheLimit` / `ReleasePool`）。DirectML演算子キャッシュは最大64件・合計256 MiB（`OperatorStats` / `ReleaseOperators`）。`NewBackend()` の独立バックエンドは全バッファ解放後に `Close()` する（登録済み既定バックエンドは `Close()` 不可）。Vulkanで完了確認できない割当は `QuarantinedBytes` / `QuarantinedBuffers` に隔離報告される。
@@ -38,6 +39,8 @@ DirectML / Vulkan ともに以下の推論演算に対応します（未対応�
 ## シェーダの再生成
 
 Vulkanの `.comp` ファイルを変更した場合は、`glslang` 16.6.0を `PATH` に通して `go generate ./vulkan` で `.spv`（Vulkan 1.1対象）を再生成する。CIの `vulkan-shaders` ジョブで、同じバージョンで再生成した `.spv` がコミット済みのファイルと一致することを確認する。通常ビルドには `glslang` は不要。
+
+DirectML の `directml/shaders/clamp.hlsl` を変更した場合は、Windows SDK の `fxc` を `PATH` に追加し、Windows amd64 で `go generate ./directml` を実行して `clamp.cso` と `clamp.rootsig` を更新する。
 
 ## テスト
 
