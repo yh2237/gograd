@@ -37,7 +37,7 @@ DirectML / Vulkan ともに以下の推論演算に対応します（未対応�
 
 ## シェーダの再生成
 
-Vulkanの `.comp` ファイルを変更した場合のみ、`glslang`（Vulkan 1.1対象）を `PATH` に通して `go generate ./vulkan` で `.spv` を再生成する。通常ビルドには不要。
+Vulkanの `.comp` ファイルを変更した場合は、`glslang` 16.6.0を `PATH` に通して `go generate ./vulkan` で `.spv`（Vulkan 1.1対象）を再生成する。CIの `vulkan-shaders` ジョブで、同じバージョンで再生成した `.spv` がコミット済みのファイルと一致することを確認する。通常ビルドには `glslang` は不要。
 
 ## テスト
 

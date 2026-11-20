@@ -39,6 +39,35 @@ jobs:
             exit 1
           fi
 
+  vulkan-shaders:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - name: Verify generated Vulkan shaders
+        shell: bash
+        env:
+          GLSLANG_VERSION: "16.6.0"
+          GLSLANG_SHA256: "2c34071f56ecf39d16233294d3739cf43f981fd39080f2fd9dccb782101191ce"
+        run: |
+          install_dir=$(mktemp -d "$RUNNER_TEMP/glslang.XXXXXX")
+          archive="$install_dir/glslang-${GLSLANG_VERSION}-linux-x86_64-release.tar.gz"
+          curl -fsSL --retry 3 -o "$archive" "https://github.com/KhronosGroup/glslang/releases/download/${GLSLANG_VERSION}/${archive##*/}"
+          printf '%s  %s\n' "$GLSLANG_SHA256" "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$install_dir"
+          export PATH="$install_dir/bin:$PATH"
+
+          go generate ./vulkan
+          changes=$(git status --porcelain --untracked-files=all -- 'vulkan/shaders/*.spv')
+          if [ -n "$changes" ]; then
+            printf '%s\n' "$changes"
+            echo "::error::Regenerate and commit the Vulkan SPIR-V files using glslang $GLSLANG_VERSION and go generate ./vulkan."
+            exit 1
+          fi
+
   # The race detector needs cgo and a C toolchain, which only the test build
   # uses. The library itself stays cgo-free.
   race:
