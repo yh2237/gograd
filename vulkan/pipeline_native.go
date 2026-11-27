@@ -137,7 +137,7 @@ func (d *vkDriver) createCompute(shader uint64, specialization *vkSpecialization
 	return handle, err
 }
 
-func (d *vkDriver) hasBatch() bool         { return d.recording }
+func (d *vkDriver) hasBatch() bool { return d.recording }
 func (d *vkDriver) discard() {
 	d.recording, d.batchNext, d.batchOps = false, 0, 0
 	clear(d.batchTouched)

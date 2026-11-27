@@ -31,15 +31,15 @@ type vkDriver struct {
 	memory                                                         vkMemoryProperties
 	// pending means completion has not been established, even after an emergency
 	// wait. Never reset commands, update descriptors, free memory or unload while set.
-	pending    bool
+	pending      bool
 	recording    bool
 	batchNext    int
 	batchOps     int
 	batchTouched map[*block]bool
-	onFlush    func()
-	failure    error
-	quarantine []*block
-	callHook   func(string, ...uintptr) uintptr // driver-free native tests
+	onFlush      func()
+	failure      error
+	quarantine   []*block
+	callHook     func(string, ...uintptr) uintptr // driver-free native tests
 }
 
 func result(op string, value uintptr) error {
