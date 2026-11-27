@@ -163,6 +163,10 @@ func (d *nativeDriver) compile(key opKey) (_ *compiled, err error) {
 	case opSoftmax:
 		desc = operatorDesc{Type: 48, Desc: unsafe.Pointer(&unary)}
 	case opNorm:
+		if key.bLayout.sizes[0] != 0 {
+			norm.Scale = &b.tensor
+			norm.Bias = &b.tensor
+		}
 		desc = operatorDesc{Type: 73, Desc: unsafe.Pointer(&norm)}
 	case opDiv, opMax, opMin, opSub:
 		desc = operatorDesc{Type: key.kind - sdkOp, Desc: unsafe.Pointer(&binary)}
@@ -353,11 +357,15 @@ func (d *nativeDriver) enqueue(step queuedStep) error {
 
 func (d *nativeDriver) execute(key opKey, out *allocation, inputs ...*allocation) error {
 	switch key.kind {
-	case opClamp, opPow, opLogSoftmax, opLog1p, opExpm1:
+	case opClamp, opPow, opLogSoftmax, opLog1p, opExpm1, opBiasGELU, opBiasResidual, opGELUTanh:
 		if err := d.initUnaryShader(key.kind); err != nil {
 			return err
 		}
-		return d.enqueue(queuedStep{kind: stepUnaryShader, key: key, out: out, src: inputs[0]})
+		bindings := make([]resourceBinding, len(inputs))
+		for i, v := range inputs {
+			bindings[i].memory = v
+		}
+		return d.enqueue(queuedStep{kind: stepUnaryShader, key: key, out: out, src: inputs[0], inputs: bindings})
 	}
 	bindings := make([]resourceBinding, len(inputs))
 	for i, v := range inputs {
@@ -493,9 +501,11 @@ func (d *nativeDriver) flush() error {
 					call(d.recorder, 8, uintptr(unsafe.Pointer(d.command)), uintptr(unsafe.Pointer(op.operator)), uintptr(unsafe.Pointer(d.batchTable)))
 					d.uavBarrier()
 				case stepUnaryShader:
-					ensureState(step.src, stateUAV)
+					for _, in := range step.inputs {
+						ensureState(in.memory, stateUAV)
+					}
 					ensureState(step.out, stateUAV)
-					d.recordUnaryShader(step.key, step.out, step.src)
+					d.recordUnaryShader(step.key, step.out, step.inputs)
 					d.uavBarrier()
 				case stepCopy:
 					ensureState(step.src, stateCopySource)
@@ -576,24 +586,27 @@ func (d *nativeDriver) acquireOperator(key opKey, pinned map[*compiled]bool) (_ 
 }
 
 func (d *nativeDriver) bindTable(table *object, op *compiled, key opKey, out *allocation, inputs []resourceBinding) {
+	var inBuf [8]resourceBinding
+	nIn := copy(inBuf[:], inputs)
 	if key.kind == opScalar || key.kind == opIdentity {
-		inputs = inputs[:1]
+		nIn = 1
+	} else if key.kind == opGEMM {
+		inBuf[nIn] = resourceBinding{}
+		nIn++
+	} else if key.kind == opNorm && nIn == 1 {
+		inBuf[1] = resourceBinding{}
+		inBuf[2] = resourceBinding{}
+		nIn = 3
 	}
-	if key.kind == opGEMM {
-		inputs = append(append([]resourceBinding(nil), inputs...), resourceBinding{})
-	}
-	if key.kind == opNorm {
-		inputs = append(append([]resourceBinding(nil), inputs...), resourceBinding{}, resourceBinding{})
-	}
-	buffers := make([]bufferBinding, len(inputs))
-	descs := make([]bindingDesc, len(inputs))
-	for i, v := range inputs {
-		if v.memory != nil {
+	var buffers [8]bufferBinding
+	var descs [8]bindingDesc
+	for i := 0; i < nIn; i++ {
+		if v := inBuf[i]; v.memory != nil {
 			buffers[i] = bufferBinding{Resource: v.memory.native.(*object), Offset: v.offset, Size: v.memory.size - v.offset}
 			descs[i] = bindingDesc{Type: 1, Desc: &buffers[i]}
 		}
 	}
-	call(table, 8, uintptr(len(descs)), uintptr(unsafe.Pointer(&descs[0])))
+	call(table, 8, uintptr(nIn), uintptr(unsafe.Pointer(&descs[0])))
 	output := bufferBinding{Resource: out.native.(*object), Size: out.size}
 	outputDescs := [2]bindingDesc{{Type: 1, Desc: &output}}
 	outputCount := uintptr(1)

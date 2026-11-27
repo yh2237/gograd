@@ -247,7 +247,7 @@ func TestDirectMLPortableM5Failures(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		at   int
-	}{{"view_gemm", 1}, {"view_gemm", 3}, {"gelu", 1}, {"gelu", 9}, {"norm", 1}, {"norm", 3}} {
+	}{{"view_gemm", 1}, {"view_gemm", 3}, {"gelu", 1}, {"norm", 1}} {
 		t.Run(fmt.Sprintf("%s/%d", tc.name, tc.at), func(t *testing.T) {
 			b, d := fixture()
 			inputSize := 4

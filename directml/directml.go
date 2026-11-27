@@ -93,6 +93,9 @@ const (
 	opLogSoftmax
 	opLog1p
 	opExpm1
+	opBiasGELU
+	opBiasResidual
+	opGELUTanh
 )
 const (
 	heapDefault  uint32 = 1

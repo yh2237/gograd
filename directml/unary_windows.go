@@ -15,6 +15,9 @@ import (
 //go:generate fxc /nologo /T cs_5_1 /E logSoftmaxMain /O3 /Qstrip_reflect /Qstrip_rootsignature /Fo shaders/logsoftmax.cso shaders/unary.hlsl
 //go:generate fxc /nologo /T cs_5_1 /E log1pMain /O3 /Qstrip_reflect /Qstrip_rootsignature /Fo shaders/log1p.cso shaders/unary.hlsl
 //go:generate fxc /nologo /T cs_5_1 /E expm1Main /O3 /Qstrip_reflect /Qstrip_rootsignature /Fo shaders/expm1.cso shaders/unary.hlsl
+//go:generate fxc /nologo /T cs_5_1 /E biasGeluMain /O3 /Qstrip_reflect /Qstrip_rootsignature /Fo shaders/biasgelu.cso shaders/unary.hlsl
+//go:generate fxc /nologo /T cs_5_1 /E biasResidualMain /O3 /Qstrip_reflect /Qstrip_rootsignature /Fo shaders/biasresidual.cso shaders/unary.hlsl
+//go:generate fxc /nologo /T cs_5_1 /E geluMain /O3 /Qstrip_reflect /Qstrip_rootsignature /Fo shaders/gelu.cso shaders/unary.hlsl
 
 //go:embed shaders/unary.rootsig
 var unaryRootSignature []byte
@@ -34,7 +37,16 @@ var log1pShader []byte
 //go:embed shaders/expm1.cso
 var expm1Shader []byte
 
-var unaryShaderBytecode = [...][]byte{clampShader, powShader, logSoftmaxShader, log1pShader, expm1Shader}
+//go:embed shaders/biasgelu.cso
+var biasGeluShader []byte
+
+//go:embed shaders/biasresidual.cso
+var biasResidualShader []byte
+
+//go:embed shaders/gelu.cso
+var geluShader []byte
+
+var unaryShaderBytecode = [...][]byte{clampShader, powShader, logSoftmaxShader, log1pShader, expm1Shader, biasGeluShader, biasResidualShader, geluShader}
 
 var (
 	iidRootSignature = iid("c54a6b66-72df-4ee8-8be5-a946a1429214")
@@ -76,7 +88,7 @@ func (d *nativeDriver) initUnaryShader(kind uint32) error {
 	return nil
 }
 
-func (d *nativeDriver) recordUnaryShader(key opKey, out, in *allocation) {
+func (d *nativeDriver) recordUnaryShader(key opKey, out *allocation, inputs []resourceBinding) {
 	const threads, maxGroups = 256, 65535
 	items, itemsPerGroup := key.n, threads
 	args := [6]uint32{uint32(key.n), key.scalar, key.bias}
@@ -95,11 +107,22 @@ func (d *nativeDriver) recordUnaryShader(key opKey, out, in *allocation) {
 	if key.kind == opPow {
 		args[4], args[5] = powBounds(float64(math.Float32frombits(key.scalar)))
 	}
+	in0 := inputs[0].memory
+	in1 := in0
+	if len(inputs) > 1 && inputs[1].memory != nil {
+		in1 = inputs[1].memory
+	}
+	in2 := in0
+	if len(inputs) > 2 && inputs[2].memory != nil {
+		in2 = inputs[2].memory
+	}
 	call(d.command, 25, uintptr(unsafe.Pointer(d.unaryPipelines[key.kind-opClamp])))
 	call(d.command, 29, uintptr(unsafe.Pointer(d.unaryRoot)))
-	call(d.command, 41, 0, call(in.native.(*object), 11))
+	call(d.command, 41, 0, call(in0.native.(*object), 11))
 	call(d.command, 41, 1, call(out.native.(*object), 11))
-	call(d.command, 35, 2, uintptr(len(args)), uintptr(unsafe.Pointer(&args[0])), 0)
+	call(d.command, 41, 2, call(in1.native.(*object), 11))
+	call(d.command, 41, 3, call(in2.native.(*object), 11))
+	call(d.command, 35, 4, uintptr(len(args)), uintptr(unsafe.Pointer(&args[0])), 0)
 	call(d.command, 14, uintptr(groupsX), uintptr(groupsY), 1)
 }
 

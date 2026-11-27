@@ -19,7 +19,7 @@ DirectML / Vulkan ともに以下の推論演算に対応します（未対応�
 ## 実装方式
 
 - **Vulkan**：埋め込みSPIR-V（`vulkan/shaders/*.spv`、計8シェーダ）、device-localバッファ、host-visible/coherentステージングを使用。演算・コピーは1コマンドバッファへ遅延記録し（上限512 descriptor set / 512 op）、`Download` / `CopyFrom` / `Synchronize` / `ReleasePool` / `Close` またはプール圧力時に一括submitしてフェンス待機する。`gpu.ViewBinaryBackend` / `gpu.ViewBinaryOpBackend` および `gpu.FusedBiasBackend`（`BiasGELU` / `BiasResidual`）は1 dispatchで評価する。`Conv2d` はGPU上im2col＋バッチGEMM（＋任意bias）、`BatchNorm` 評価は正規化＋任意affineで評価する。
-- **DirectML**：純GoのCOM呼び出しでD3D12 `DEFAULT` / `UPLOAD` / `READBACK` リソースを使用。コマンドキューへ遅延蓄積し（上限512 op / 1,048,576 copy region）、2フェーズflush（1: 演算子のコンパイル・キャッシュpin、2: チャンク全体のリソース状態遷移追跡と単一の拡張可能shader-visible descriptor heap〔初期4096記述子〕・再利用 `IDMLBindingTable` による記録・submit・フェンス待機）を実行する。rank 4以下かつ16バイト境界に揃うGEMM・二項演算は記述子で直接読み取り、対応する非連続 `Gather` は `ScaleBias` なしの `Identity` 演算子を使用する。
+- **DirectML**：純GoのCOM呼び出しでD3D12 `DEFAULT` / `UPLOAD` / `READBACK` リソースを使用。コマンドキューへ遅延蓄積し（上限512 op / 1,048,576 copy region）、2フェーズflush（1: 演算子のコンパイル・キャッシュpin、2: チャンク全体のリソース状態遷移追跡と単一の拡張可能shader-visible descriptor heap〔初期4096記述子〕・再利用 `IDMLBindingTable` による記録・submit・フェンス待機）を実行する。rank 4以下かつ16バイト境界に揃うGEMM・二項演算は記述子で直接読み取り、対応する非連続 `Gather` は `ScaleBias` なしの `Identity` 演算子を使用する。`LayerNorm` / `GroupNorm` は `DML_MEAN_VARIANCE_NORMALIZATION` の scale/bias 入力へ統合して1 dispatchで評価し、`GELU`（tanh近似）および `gpu.FusedBiasBackend`（`BiasGELU` / `BiasResidual`）は埋め込みHLSL計算シェーダで1 dispatch評価する。
 
 両バックエンドとも、バッチ実行中に解放されたバッファは `pendingRelease` へ退避し、flush完了（フェンス通過）後にプールへ回収する。
 

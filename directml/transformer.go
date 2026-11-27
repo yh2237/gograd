@@ -7,7 +7,10 @@ import (
 	"github.com/yh2237/gograd/gpu"
 )
 
-var _ gpu.ExactGELUBackend = (*Backend)(nil)
+var (
+	_ gpu.ExactGELUBackend = (*Backend)(nil)
+	_ gpu.FusedBiasBackend = (*Backend)(nil)
+)
 
 func compactLayout(a, b, c, d uint32) tensorLayout {
 	return tensorLayout{sizes: [4]uint32{a, b, c, d}, strides: [4]uint32{b * c * d, c * d, d, 1}}
@@ -49,52 +52,8 @@ func (b *Backend) GELUExact(out, a *gpu.Buffer, n int) error {
 	return b.unary(out, a, n, opKey{kind: opGELUExact, n: n})
 }
 
-// GELU preserves the backend's tanh-approximation contract. DML_ACTIVATION_GELU
-// is the erf-based variant, so build this variant from GPU arithmetic and tanh.
 func (b *Backend) GELU(out, a *gpu.Buffer, n int) error {
-	if err := b.lock(); err != nil {
-		return err
-	}
-	defer b.mu.Unlock()
-	x, err := b.native(a, n)
-	if err != nil {
-		return err
-	}
-	y, err := b.native(out, n)
-	if err != nil {
-		return err
-	}
-	if y == x {
-		return gpu.ErrInvalidArgument
-	}
-	if n == 0 {
-		return nil
-	}
-	u, err := b.take(uint64(n)*4, heapDefault)
-	if err != nil {
-		return err
-	}
-	defer b.put(u)
-	v, err := b.take(uint64(n)*4, heapDefault)
-	if err != nil {
-		return err
-	}
-	defer b.put(v)
-	scalar := func(out, in *allocation, scale, bias float32) dispatch {
-		return dispatch{opKey{kind: opScalar, n: n, scalar: math.Float32bits(scale), bias: math.Float32bits(bias)}, out, []*allocation{in}}
-	}
-	steps := []dispatch{
-		{opKey{kind: opMul, n: n}, u, []*allocation{x, x}},
-		{opKey{kind: opMul, n: n}, v, []*allocation{u, x}},
-		scalar(u, v, .044715, 0),
-		{opKey{kind: opAdd, n: n}, v, []*allocation{x, u}},
-		scalar(u, v, float32(math.Sqrt(2/math.Pi)), 0),
-		{opKey{kind: opTanh, n: n}, v, []*allocation{u}},
-		scalar(u, v, 1, 1),
-		{opKey{kind: opMul, n: n}, v, []*allocation{x, u}},
-		scalar(y, v, .5, 0),
-	}
-	return b.fail(b.driver.executeBatch(steps))
+	return b.unary(out, a, n, opKey{kind: opGELUTanh, n: n})
 }
 
 func (b *Backend) Softmax(out, a *gpu.Buffer, rows, cols int) error {
@@ -120,7 +79,9 @@ func (b *Backend) LayerNorm(out, a, weight, bias *gpu.Buffer, rows, cols int, ep
 	if cols == 0 || !validEps(eps) {
 		return gpu.ErrInvalidArgument
 	}
-	return b.normalization(out, a, weight, bias, n, cols, compactLayout(uint32(rows), 1, 1, uint32(cols)), cols, eps)
+	layout := compactLayout(uint32(rows), 1, 1, uint32(cols))
+	affine := tensorLayout{sizes: [4]uint32{uint32(rows), 1, 1, uint32(cols)}, strides: [4]uint32{0, 0, 0, 1}}
+	return b.normalization(out, a, weight, bias, n, cols, layout, affine, cols, eps)
 }
 func (b *Backend) GroupNorm(out, a, weight, bias *gpu.Buffer, batch, frames, channels, groups int, eps float32) error {
 	n, err := gpu.Elements(batch, frames, channels)
@@ -130,13 +91,13 @@ func (b *Backend) GroupNorm(out, a, weight, bias *gpu.Buffer, batch, frames, cha
 	if frames == 0 || channels == 0 || groups < 1 || channels%groups != 0 || !validEps(eps) {
 		return gpu.ErrInvalidArgument
 	}
-	layout := tensorLayout{sizes: [4]uint32{uint32(batch), uint32(groups), uint32(frames), uint32(channels / groups)}, strides: [4]uint32{uint32(frames * channels), uint32(channels / groups), uint32(channels), 1}}
-	return b.normalization(out, a, weight, bias, n, channels, layout, frames*(channels/groups), eps)
+	cg := uint32(channels / groups)
+	layout := tensorLayout{sizes: [4]uint32{uint32(batch), uint32(groups), uint32(frames), cg}, strides: [4]uint32{uint32(frames * channels), cg, uint32(channels), 1}}
+	affine := tensorLayout{sizes: [4]uint32{uint32(batch), uint32(groups), uint32(frames), cg}, strides: [4]uint32{0, cg, 0, 1}}
+	return b.normalization(out, a, weight, bias, n, channels, layout, affine, frames*(channels/groups), eps)
 }
 
-// normalization applies a normalization followed by the per-channel affine
-// transform. reduced is the number of elements that form one group.
-func (b *Backend) normalization(out, a, weight, bias *gpu.Buffer, n, channels int, layout tensorLayout, reduced int, eps float32) error {
+func (b *Backend) normalization(out, a, weight, bias *gpu.Buffer, n, channels int, layout, affine tensorLayout, reduced int, eps float32) error {
 	if err := b.lock(); err != nil {
 		return err
 	}
@@ -163,35 +124,54 @@ func (b *Backend) normalization(out, a, weight, bias *gpu.Buffer, n, channels in
 	if n == 0 {
 		return nil
 	}
-	norm, err := b.take(uint64(n)*4, heapDefault)
-	if err != nil {
-		return err
-	}
-	defer b.put(norm)
-	scaled, err := b.take(uint64(n)*4, heapDefault)
-	if err != nil {
-		return err
-	}
-	defer b.put(scaled)
-	flat := compactLayout(1, 1, uint32(n/channels), uint32(channels))
-	affine := flat
-	affine.strides = [4]uint32{0, 0, 0, 1}
 	if reduced == 1 {
-		// A group with a single element normalizes to zero, so the result is
-		// the bias alone. The normalization operator is not used here: some
-		// DirectML implementations report a NaN variance for a one-element
-		// group, which would poison the whole tensor.
-		key := opKey{kind: opIdentity, n: n, aLayout: affine, yLayout: flat}
+		// Some DirectML implementations report NaN variance for a 1-element group.
+		flat := compactLayout(1, 1, uint32(n/channels), uint32(channels))
+		flatAffine := flat
+		flatAffine.strides = [4]uint32{0, 0, 0, 1}
+		key := opKey{kind: opIdentity, n: n, aLayout: flatAffine, yLayout: flat}
 		return b.fail(b.driver.executeAt(key, y, resourceBinding{v, 0}))
 	}
-	key := opKey{kind: opMul, n: n, aLayout: flat, bLayout: affine, yLayout: flat}
-	addKey := key
-	addKey.kind = opAdd
-	return b.fail(b.driver.executeBatch([]dispatch{
-		{opKey{kind: opNorm, n: n, scalar: math.Float32bits(eps), aLayout: layout, yLayout: layout}, norm, []*allocation{x}},
-		{key, scaled, []*allocation{norm, w}},
-		{addKey, y, []*allocation{scaled, v}},
-	}))
+	key := opKey{kind: opNorm, n: n, scalar: math.Float32bits(eps), aLayout: layout, bLayout: affine, yLayout: layout}
+	return b.fail(b.driver.execute(key, y, x, w, v))
+}
+
+func (b *Backend) BiasGELU(out, a, bias *gpu.Buffer, rows, cols int) error {
+	n, err := gpu.Elements(rows, cols)
+	if err != nil {
+		return err
+	}
+	if cols < 1 {
+		return gpu.ErrInvalidArgument
+	}
+	if err := b.lock(); err != nil {
+		return err
+	}
+	defer b.mu.Unlock()
+	y, inputs, err := b.opBuffers(out, n, bufferArg{a, n}, bufferArg{bias, cols})
+	if err != nil || n == 0 {
+		return err
+	}
+	return b.fail(b.driver.execute(opKey{kind: opBiasGELU, n: n, scalar: uint32(cols)}, y, inputs...))
+}
+
+func (b *Backend) BiasResidual(out, a, bias, residual *gpu.Buffer, rows, cols int) error {
+	n, err := gpu.Elements(rows, cols)
+	if err != nil {
+		return err
+	}
+	if cols < 1 {
+		return gpu.ErrInvalidArgument
+	}
+	if err := b.lock(); err != nil {
+		return err
+	}
+	defer b.mu.Unlock()
+	y, inputs, err := b.opBuffers(out, n, bufferArg{a, n}, bufferArg{bias, cols}, bufferArg{residual, n})
+	if err != nil || n == 0 {
+		return err
+	}
+	return b.fail(b.driver.execute(opKey{kind: opBiasResidual, n: n, scalar: uint32(cols)}, y, inputs...))
 }
 
 func (b *Backend) Conv1d(out, input, weight, bias *gpu.Buffer, o gpu.Conv1dOptions) error {

@@ -304,3 +304,67 @@ func TestDirectMLConv1dRejectsSinglePositionDilatedWindow(t *testing.T) {
 		t.Fatalf("Conv1d error = %v, want ErrUnsupported", err)
 	}
 }
+
+func TestDirectMLFusedBias(t *testing.T) {
+	b := testBackend(t)
+	for _, dims := range [][2]int{{0, 7}, {1, 1}, {2, 7}, {3, 129}, {74, 3072}} {
+		t.Run(fmt.Sprint(dims), func(t *testing.T) {
+			rows, cols := dims[0], dims[1]
+			n := rows * cols
+			x, bias, residual := make([]float32, n), make([]float32, cols), make([]float32, n)
+			for i := range x {
+				x[i] = float32(i%97-48) / 8
+				residual[i] = float32(i%31-15) / 16
+			}
+			for i := range bias {
+				bias[i] = float32(i%13-6) / 4
+			}
+			a, w, r, y := upload(t, b, x), upload(t, b, bias), upload(t, b, residual), alloc(t, b, n)
+			want := make([]float32, n)
+			if err := b.BiasGELU(y, a, w, rows, cols); err != nil {
+				t.Fatal(err)
+			}
+			for i := range want {
+				v := float64(x[i] + bias[i%cols])
+				want[i] = float32(.5 * v * (1 + math.Erf(v/math.Sqrt2)))
+			}
+			checkTransformer(t, b, y, want)
+			if err := b.BiasResidual(y, a, w, r, rows, cols); err != nil {
+				t.Fatal(err)
+			}
+			for i := range want {
+				want[i] = (x[i] + bias[i%cols]) + residual[i]
+			}
+			checkTransformer(t, b, y, want)
+			if err := b.BiasResidual(y, a, w, a, rows, cols); err != nil {
+				t.Fatal(err)
+			}
+			for i := range want {
+				want[i] = (x[i] + bias[i%cols]) + x[i]
+			}
+			checkTransformer(t, b, y, want)
+		})
+	}
+	x := upload(t, b, []float32{1e20, 12, -12, -1e20})
+	bias := upload(t, b, []float32{-1e20, -12, 12, 1e20})
+	r := upload(t, b, []float32{1, 2, 3, 4})
+	y := alloc(t, b, 4)
+	if err := b.BiasResidual(y, x, bias, r, 1, 4); err != nil {
+		t.Fatal(err)
+	}
+	check(t, b, y, []float32{1, 2, 3, 4})
+	if err := b.BiasGELU(y, x, bias, 1, 4); err != nil {
+		t.Fatal(err)
+	}
+	check(t, b, y, []float32{0, 0, 0, 0})
+	for _, err := range []error{
+		b.BiasGELU(y, x, bias, -1, 4),
+		b.BiasGELU(y, x, bias, 1, 0),
+		b.BiasGELU(x, x, bias, 1, 4),
+		b.BiasResidual(r, x, bias, r, 1, 4),
+	} {
+		if !errors.Is(err, gpu.ErrInvalidArgument) {
+			t.Fatal(err)
+		}
+	}
+}

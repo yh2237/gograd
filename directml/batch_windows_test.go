@@ -27,9 +27,9 @@ func TestDirectMLBatchSubmissions(t *testing.T) {
 		uniqueOps uint64
 		run       func() error
 	}{
-		{"gelu", 7, func() error { return b.GELU(y, x, len(values)) }},
-		{"layernorm", 3, func() error { return b.LayerNorm(y, x, w, bias, 2, 4, 1e-5) }},
-		{"groupnorm", 3, func() error { return b.GroupNorm(y, x, w, bias, 1, 2, 4, 2, 1e-5) }},
+		{"gelu", 0, func() error { return b.GELU(y, x, len(values)) }},
+		{"layernorm", 1, func() error { return b.LayerNorm(y, x, w, bias, 2, 4, 1e-5) }},
+		{"groupnorm", 1, func() error { return b.GroupNorm(y, x, w, bias, 1, 2, 4, 2, 1e-5) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b.ReleaseOperators()

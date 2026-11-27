@@ -1,7 +1,9 @@
-#define UnaryRoot "UAV(u0), UAV(u1), RootConstants(num32BitConstants=6, b0)"
+#define UnaryRoot "UAV(u0), UAV(u1), UAV(u2), UAV(u3), RootConstants(num32BitConstants=6, b0)"
 
 RWStructuredBuffer<uint> inputBits : register(u0);
 RWStructuredBuffer<uint> outputBits : register(u1);
+RWStructuredBuffer<uint> biasBits : register(u2);
+RWStructuredBuffer<uint> residualBits : register(u3);
 
 cbuffer UnaryArgs : register(b0) {
     uint count;
@@ -225,4 +227,51 @@ void expm1Main(uint3 thread : SV_DispatchThreadID) {
     } else {
         outputBits[i] = asuint(exp(v) - 1.0);
     }
+}
+
+float erfApprox(float v) {
+    float res = v;
+    if (!isnan(v)) {
+        float av = abs(v);
+        if (av > 6.0) {
+            res = v < 0.0 ? -1.0 : 1.0;
+        } else {
+            float t = 1.0 / (1.0 + 0.3275911 * av);
+            float e = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-av * av);
+            res = v < 0.0 ? -e : e;
+        }
+    }
+    return res;
+}
+
+[RootSignature(UnaryRoot)]
+[numthreads(256, 1, 1)]
+void biasGeluMain(uint3 thread : SV_DispatchThreadID) {
+    uint i = thread.x + thread.y * rowStride;
+    if (i >= count) return;
+    float v = asfloat(inputBits[i]) + asfloat(biasBits[i % parameter]);
+    if (v > 10.0) { outputBits[i] = asuint(v); return; }
+    if (v < -10.0) { outputBits[i] = 0; return; }
+    outputBits[i] = asuint(0.5 * v * (1.0 + erfApprox(v * 0.7071067812)));
+}
+
+[RootSignature(UnaryRoot)]
+[numthreads(256, 1, 1)]
+void biasResidualMain(uint3 thread : SV_DispatchThreadID) {
+    uint i = thread.x + thread.y * rowStride;
+    if (i >= count) return;
+    precise float sum = asfloat(inputBits[i]) + asfloat(biasBits[i % parameter]);
+    outputBits[i] = asuint(sum + asfloat(residualBits[i]));
+}
+
+[RootSignature(UnaryRoot)]
+[numthreads(256, 1, 1)]
+void geluMain(uint3 thread : SV_DispatchThreadID) {
+    uint i = thread.x + thread.y * rowStride;
+    if (i >= count) return;
+    float v = asfloat(inputBits[i]);
+    if (v > 10.0) { outputBits[i] = asuint(v); return; }
+    if (v < -10.0) { outputBits[i] = 0; return; }
+    float inner = 0.7978845608 * (v + 0.044715 * v * v * v);
+    outputBits[i] = asuint(0.5 * v * (1.0 + tanh(inner)));
 }
