@@ -1,9 +1,10 @@
 #version 450
 // 128 invocations and 8320 bytes of shared memory fit Vulkan 1.1's minimum
-// limits. Each workgroup computes a 64-row by 64-column output tile (8x4 per thread).
+// limits. Each workgroup computes a 64x64 (SMALL_M=0) or 32x64 (SMALL_M=1) tile.
 layout(local_size_x = 16, local_size_y = 8) in;
 layout(constant_id = 0) const uint TRANS_A = 0u;
 layout(constant_id = 1) const uint TRANS_B = 0u;
+layout(constant_id = 2) const uint SMALL_M = 0u;
 layout(set = 0, binding = 0, std430) readonly buffer A { float a[]; };
 layout(set = 0, binding = 1, std430) readonly buffer B { float b[]; };
 layout(set = 0, binding = 2, std430) writeonly buffer C { float c[]; };
@@ -28,9 +29,9 @@ uint indexB(uint depth, uint col) {
 void main() {
     uint tile = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
     uint batch = tile / p.tilesPerMatrix;
-    if (batch >= p.batch) return; // Uniform across the entire workgroup.
+    if (batch >= p.batch) return;
     uint matrixTile = tile % p.tilesPerMatrix;
-    uint tileM = (matrixTile / p.tileCols) * 64u;
+    uint tileM = (matrixTile / p.tileCols) * (SMALL_M != 0u ? 32u : 64u);
     uint tileN = (matrixTile % p.tileCols) * 64u;
     uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
     uint tid = ly * 16u + lx;
@@ -43,10 +44,11 @@ void main() {
         bo += coord*p.bBatchStrides[axis];
     }
 
+    const uint ROWS = SMALL_M != 0u ? 4u : 8u;
     float acc[8][4];
-    for (uint r = 0u; r < 8u; ++r) {
-        for (uint c = 0u; c < 4u; ++c) {
-            acc[r][c] = 0.0;
+    for (uint r = 0u; r < ROWS; ++r) {
+        for (uint cc = 0u; cc < 4u; ++cc) {
+            acc[r][cc] = 0.0;
         }
     }
 
@@ -55,9 +57,18 @@ void main() {
             uint kLocal = tid & 15u;
             uint mBase = tid >> 4u;
             uint da = base + kLocal;
-            for (uint s = 0u; s < 8u; ++s) {
+            for (uint s = 0u; s < ROWS; ++s) {
                 uint mLocal = mBase + s * 8u;
                 uint row = tileM + mLocal;
+                tileA[kLocal][mLocal] = (row < p.m && da < p.k) ? a[ao + indexA(row, da)] : 0.0;
+            }
+        } else if (SMALL_M != 0u) {
+            uint mLocal = tid & 31u;
+            uint kBase = tid >> 5u;
+            uint row = tileM + mLocal;
+            for (uint s = 0u; s < 4u; ++s) {
+                uint kLocal = kBase + s * 4u;
+                uint da = base + kLocal;
                 tileA[kLocal][mLocal] = (row < p.m && da < p.k) ? a[ao + indexA(row, da)] : 0.0;
             }
         } else {
@@ -95,16 +106,16 @@ void main() {
 
         for (uint d = 0u; d < 16u; ++d) {
             float aReg[8];
-            for (uint r = 0u; r < 8u; ++r) {
+            for (uint r = 0u; r < ROWS; ++r) {
                 aReg[r] = tileA[d][ly + r * 8u];
             }
             float bReg[4];
-            for (uint c = 0u; c < 4u; ++c) {
-                bReg[c] = tileB[d][lx + c * 16u];
+            for (uint cc = 0u; cc < 4u; ++cc) {
+                bReg[cc] = tileB[d][lx + cc * 16u];
             }
-            for (uint r = 0u; r < 8u; ++r) {
-                for (uint c = 0u; c < 4u; ++c) {
-                    acc[r][c] = fma(aReg[r], bReg[c], acc[r][c]);
+            for (uint r = 0u; r < ROWS; ++r) {
+                for (uint cc = 0u; cc < 4u; ++cc) {
+                    acc[r][cc] = fma(aReg[r], bReg[cc], acc[r][cc]);
                 }
             }
         }
@@ -113,7 +124,7 @@ void main() {
     }
 
     uint batchBase = batch * p.m;
-    for (uint r = 0u; r < 8u; ++r) {
+    for (uint r = 0u; r < ROWS; ++r) {
         uint row = tileM + ly + r * 8u;
         if (row >= p.m) continue;
         uint rowBase = (batchBase + row) * p.n;

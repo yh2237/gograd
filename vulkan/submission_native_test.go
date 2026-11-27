@@ -48,7 +48,7 @@ func newNativeRecorder() (*vkDriver, *nativeRecorder) {
 		device: 1, instance: 2, queue: 3, command: 4, commandPool: 5, fence: 6,
 		descriptorPool: 7, descriptorLayout: 8, descriptorSet: sets[0],
 		descriptorSets: sets, pipelineLayout: 13,
-		pipeline: 14, convPipeline: 15, gemmPipelines: [4]uint64{16, 17, 18, 19},
+		pipeline: 14, convPipeline: 15, gemmPipelines: [8]uint64{16, 17, 18, 19, 20, 21, 22, 23},
 		properties: Info{MaxStorageBufferBytes: 1 << 30, MaxWorkGroupCount: [3]uint32{65535, 65535, 65535}},
 		procs:      map[string]uintptr{"vkDestroyInstance": 1}, callHook: r.call,
 	}

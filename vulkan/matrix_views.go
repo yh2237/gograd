@@ -254,6 +254,12 @@ func matrixParams(a, b gpu.View, shape []int) (gemmParams, int) {
 		variant |= 1
 	}
 	p.TileCols = (p.N + 63) / 64
-	p.TilesPerMatrix = ((p.M + 63) / 64) * p.TileCols
+	tiles64 := ((p.M + 63) / 64) * p.TileCols
+	if p.M <= 96 || uint64(p.Batch)*uint64(tiles64) < 32 {
+		variant |= 4
+		p.TilesPerMatrix = ((p.M + 31) / 32) * p.TileCols
+	} else {
+		p.TilesPerMatrix = tiles64
+	}
 	return p, variant
 }

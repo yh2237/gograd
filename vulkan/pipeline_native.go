@@ -79,10 +79,10 @@ func (d *vkDriver) initPipeline() error {
 	if d.gemmShader, err = d.createShader(gemmSPV); err != nil {
 		return err
 	}
-	entries := [2]vkSpecializationMapEntry{{ID: 0, Size: 4}, {ID: 1, Offset: 4, Size: 4}}
+	entries := [3]vkSpecializationMapEntry{{ID: 0, Size: 4}, {ID: 1, Offset: 4, Size: 4}, {ID: 2, Offset: 8, Size: 4}}
 	for variant := range d.gemmPipelines {
-		data := [2]uint32{uint32(variant >> 1), uint32(variant & 1)}
-		specialization := vkSpecializationInfo{Count: 2, Entries: &entries[0], DataSize: 8, Data: &data[0]}
+		data := [3]uint32{uint32((variant >> 1) & 1), uint32(variant & 1), uint32((variant >> 2) & 1)}
+		specialization := vkSpecializationInfo{Count: 3, Entries: &entries[0], DataSize: 12, Data: &data[0]}
 		if d.gemmPipelines[variant], err = d.createCompute(d.gemmShader, &specialization); err != nil {
 			return err
 		}
@@ -138,7 +138,10 @@ func (d *vkDriver) createCompute(shader uint64, specialization *vkSpecialization
 }
 
 func (d *vkDriver) hasBatch() bool         { return d.recording }
-func (d *vkDriver) discard()               { d.recording, d.batchNext, d.batchOps = false, 0, 0 }
+func (d *vkDriver) discard() {
+	d.recording, d.batchNext, d.batchOps = false, 0, 0
+	clear(d.batchTouched)
+}
 func (d *vkDriver) setFlushHook(fn func()) { d.onFlush = fn }
 
 func (d *vkDriver) ensureBatch(slots int) ([]uint64, error) {
@@ -182,6 +185,7 @@ func (d *vkDriver) flush() (err error) {
 		d.recording = false
 		d.batchNext = 0
 		d.batchOps = 0
+		clear(d.batchTouched)
 		if err != nil {
 			d.failure = err
 		}
@@ -261,6 +265,9 @@ func (d *vkDriver) afterTransfer(memory *block) {
 }
 
 func (d *vkDriver) beforeCompute(out *block, inputs ...*block) {
+	if d.batchTouched == nil {
+		d.batchTouched = make(map[*block]bool, 32)
+	}
 	if d.batchOps == 0 {
 		for i, in := range inputs {
 			seen := false
@@ -273,11 +280,19 @@ func (d *vkDriver) beforeCompute(out *block, inputs ...*block) {
 			if !seen {
 				d.before(in, accessShaderRead, stageCompute)
 			}
+			d.batchTouched[in] = true
 		}
 		d.before(out, accessShaderWrite, stageCompute)
+		d.batchTouched[out] = true
 		return
 	}
-	d.barrier(out, accessShaderRead|accessShaderWrite|accessTransferRead|accessTransferWrite, accessShaderWrite, stageCompute|stageTransfer, stageCompute)
+	for _, in := range inputs {
+		d.batchTouched[in] = true
+	}
+	if d.batchTouched[out] {
+		d.barrier(out, accessShaderRead|accessShaderWrite|accessTransferRead|accessTransferWrite, accessShaderWrite, stageCompute|stageTransfer, stageCompute)
+	}
+	d.batchTouched[out] = true
 }
 
 func (d *vkDriver) copy(out, src *block, size uint64) error {
@@ -323,13 +338,19 @@ func (d *vkDriver) pointwise(out, a, b *block, n, kind uint32, scalar, scalar2 f
 }
 
 func (d *vkDriver) bindBuffersSet(set uint64, out, a, b *block, outCount, aCount, bCount uint32) {
+	d.bindBuffersSet4(set, out, a, b, a, outCount, aCount, bCount, aCount)
+}
+
+func (d *vkDriver) bindBuffersSet4(set uint64, out, a, b, c *block, outCount, aCount, bCount, cCount uint32) {
 	if d.failure != nil {
 		return
 	}
-	// Binding 3 is statically used by pointwise's fused residual branch. Bind a
-	// valid dummy even for other operations; a dynamic branch is not sufficient
-	// to leave a shader-visible descriptor uninitialized. Reductions override it.
-	infos := [4]vkDescriptorBufferInfo{{Buffer: a.buffer, Range: uint64(aCount) * 4}, {Buffer: b.buffer, Range: uint64(bCount) * 4}, {Buffer: out.buffer, Range: uint64(outCount) * 4}, {Buffer: a.buffer, Range: uint64(aCount) * 4}}
+	infos := [4]vkDescriptorBufferInfo{
+		{Buffer: a.buffer, Range: uint64(aCount) * 4},
+		{Buffer: b.buffer, Range: uint64(bCount) * 4},
+		{Buffer: out.buffer, Range: uint64(outCount) * 4},
+		{Buffer: c.buffer, Range: uint64(cCount) * 4},
+	}
 	writes := [4]vkDescriptorWrite{}
 	for i := range writes {
 		writes[i] = vkDescriptorWrite{vkHeader: header(35), Set: set, Binding: uint32(i), Count: 1, Type: 7, BufferInfo: &infos[i]}
@@ -346,10 +367,7 @@ func (d *vkDriver) fusedBias(out, a, bias, residual *block, n, channels, kind ui
 	if err != nil {
 		return err
 	}
-	d.bindBuffersSet(sets[0], out, a, bias, n, n, channels)
-	info := vkDescriptorBufferInfo{Buffer: residual.buffer, Range: uint64(n) * 4}
-	write := vkDescriptorWrite{vkHeader: header(35), Set: sets[0], Binding: 3, Count: 1, Type: 7, BufferInfo: &info}
-	d.call("vkUpdateDescriptorSets", d.device, 1, uintptr(unsafe.Pointer(&write)), 0, 0)
+	d.bindBuffersSet4(sets[0], out, a, bias, residual, n, n, channels, n)
 	d.beforeCompute(out, a, bias, residual)
 	push := vkPointwisePush{N: n, Kind: kind, Channels: channels}
 	d.bindComputeSet(sets[0], d.pipeline, unsafe.Pointer(&push), unsafe.Sizeof(push))
@@ -430,10 +448,7 @@ func (d *vkDriver) reduce(out, a, weight, bias *block, count, affineCount uint32
 	if err != nil {
 		return err
 	}
-	d.bindBuffersSet(sets[0], out, a, weight, count, count, affineCount)
-	info := vkDescriptorBufferInfo{Buffer: bias.buffer, Range: uint64(affineCount) * 4}
-	write := vkDescriptorWrite{vkHeader: header(35), Set: sets[0], Binding: 3, Count: 1, Type: 7, BufferInfo: &info}
-	d.call("vkUpdateDescriptorSets", d.device, 1, uintptr(unsafe.Pointer(&write)), 0, 0)
+	d.bindBuffersSet4(sets[0], out, a, weight, bias, count, count, affineCount, affineCount)
 	d.beforeCompute(out, a, weight, bias)
 	d.bindComputeSet(sets[0], d.reducePipeline, unsafe.Pointer(&p), unsafe.Sizeof(p))
 	d.call("vkCmdDispatch", d.command, uintptr(x), uintptr(y), 1)

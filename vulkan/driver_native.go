@@ -24,7 +24,7 @@ type vkDriver struct {
 	viewShader, viewPipeline                                       uint64
 	binaryShader, binaryPipeline                                   uint64
 	gemmShader                                                     uint64
-	gemmPipelines                                                  [4]uint64
+	gemmPipelines                                                  [8]uint64
 	reduceShader, reducePipeline, convShader, convPipeline         uint64
 	ndReduceShader, ndReducePipeline, visionShader, visionPipeline uint64
 	properties                                                     Info
@@ -32,9 +32,10 @@ type vkDriver struct {
 	// pending means completion has not been established, even after an emergency
 	// wait. Never reset commands, update descriptors, free memory or unload while set.
 	pending    bool
-	recording  bool
-	batchNext  int
-	batchOps   int
+	recording    bool
+	batchNext    int
+	batchOps     int
+	batchTouched map[*block]bool
 	onFlush    func()
 	failure    error
 	quarantine []*block
