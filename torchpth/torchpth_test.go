@@ -2,7 +2,10 @@ package torchpth
 
 import (
 	"archive/zip"
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -114,5 +117,74 @@ func TestOfficialVoice(t *testing.T) {
 	}
 	if !reflect.DeepEqual(v.Shape, []int{510, 1, 256}) || v.Data[0] != -0.25429046154022217 || v.Data[123] != 0.18424998223781586 {
 		t.Fatalf("voice shape %v first %g sample %g", v.Shape, v.Data[0], v.Data[123])
+	}
+}
+
+func TestDoubleStorageAndMemoOrderedDict(t *testing.T) {
+	// Build a minimal zip with root-level data.pkl containing an OrderedDict
+	// stored in memo before SETITEM and a DoubleStorage tensor.
+	var pkl bytes.Buffer
+	pkl.Write([]byte{0x80, 0x02})
+	pkl.WriteString("ccollections\nOrderedDict\n)Rq\x00")
+	// key "w"
+	pkl.Write([]byte{0x8c, 1, 'w'})
+	// _rebuild_tensor_v2(storage(DoubleStorage, "0", "cpu", 4), 0, (2, 2), (2, 1))
+	pkl.WriteString("ctorch._utils\n_rebuild_tensor_v2\n(")
+	pkl.Write([]byte{'('})
+	pkl.Write([]byte{0x8c, 7})
+	pkl.WriteString("storage")
+	pkl.WriteString("ctorch\nDoubleStorage\n")
+	pkl.Write([]byte{0x8c, 1, '0'})
+	pkl.Write([]byte{0x8c, 3})
+	pkl.WriteString("cpu")
+	pkl.Write([]byte{'K', 4, 't', 'Q'})
+	pkl.Write([]byte{'K', 0})
+	pkl.Write([]byte{'K', 2, 'K', 2, 0x86})
+	pkl.Write([]byte{'K', 2, 'K', 1, 0x86})
+	pkl.Write([]byte{'t', 'R', 's'})
+	// Drop dict and retrieve via memo 0 to ensure SETITEM updated the memoized OrderedDict.
+	pkl.Write([]byte{'h', 0, '.'})
+
+	name := filepath.Join(t.TempDir(), "double.pth")
+	f, err := os.Create(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	z := zip.NewWriter(f)
+	w, err := z.Create("data.pkl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(pkl.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := z.Create("data/0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []float32{1.5, -2.25, 3.75, 0.5}
+	for _, v := range want {
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], math.Float64bits(float64(v)))
+		if _, err := raw.Write(buf[:]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := z.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Read(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tensor, ok := got["w"]
+	if !ok {
+		t.Fatalf("missing key w in %v", got)
+	}
+	if !reflect.DeepEqual(tensor.Shape, []int{2, 2}) || !reflect.DeepEqual(tensor.Data, want) {
+		t.Fatalf("got %+v want shape [2 2] data %v", tensor, want)
 	}
 }

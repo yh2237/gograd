@@ -47,7 +47,7 @@ func Read(filename string) (map[string]Tensor, error) {
 	var pickle *zip.File
 	for _, f := range z.File {
 		files[f.Name] = f
-		if strings.HasSuffix(f.Name, "/data.pkl") {
+		if f.Name == "data.pkl" || strings.HasSuffix(f.Name, "/data.pkl") {
 			pickle = f
 		}
 	}
@@ -84,8 +84,8 @@ func Read(filename string) (map[string]Tensor, error) {
 					return e
 				}
 			}
-		case ordered:
-			for _, p := range x {
+		case *ordered:
+			for _, p := range *x {
 				n := p.key
 				if name != "" {
 					n = name + "." + n
@@ -242,7 +242,7 @@ func (d *decoder) run() (any, error) {
 			d.pos++
 			g := module + " " + name
 			switch g {
-			case "collections OrderedDict", "torch._utils _rebuild_tensor_v2", "torch._utils _rebuild_parameter", "torch FloatStorage", "torch HalfStorage", "torch BFloat16Storage":
+			case "collections OrderedDict", "torch._utils _rebuild_tensor_v2", "torch._utils _rebuild_parameter", "torch FloatStorage", "torch DoubleStorage", "torch HalfStorage", "torch BFloat16Storage":
 				d.stack = append(d.stack, global(g))
 			default:
 				return nil, fmt.Errorf("torchpth: forbidden global %s", g)
@@ -341,7 +341,7 @@ func (d *decoder) run() (any, error) {
 			var result any
 			switch g {
 			case "collections OrderedDict":
-				result = ordered{}
+				result = &ordered{}
 			case "torch._utils _rebuild_tensor_v2":
 				if len(a) < 4 {
 					return nil, fmt.Errorf("torchpth: short tensor args")
@@ -395,9 +395,8 @@ func (d *decoder) run() (any, error) {
 			switch m := obj.(type) {
 			case map[string]any:
 				m[key] = v
-			case ordered:
-				m = append(m, pair{key, v})
-				obj = m
+			case *ordered:
+				*m = append(*m, pair{key, v})
 			default:
 				return nil, fmt.Errorf("torchpth: not a dict")
 			}
@@ -422,9 +421,8 @@ func (d *decoder) run() (any, error) {
 				switch m := obj.(type) {
 				case map[string]any:
 					m[k] = items[i+1]
-				case ordered:
-					m = append(m, pair{k, items[i+1]})
-					obj = m
+				case *ordered:
+					*m = append(*m, pair{k, items[i+1]})
 				default:
 					return nil, fmt.Errorf("torchpth: not a dict")
 				}
@@ -469,14 +467,49 @@ func (d *decoder) tensor(s storage, off int, shape, stride []int) (Tensor, error
 	if e != nil {
 		return Tensor{}, e
 	}
-	size := 4
-	if s.kind != "torch FloatStorage" {
+	var size int
+	switch s.kind {
+	case "torch FloatStorage":
+		size = 4
+	case "torch DoubleStorage":
+		size = 8
+	case "torch HalfStorage", "torch BFloat16Storage":
 		size = 2
+	default:
+		return Tensor{}, fmt.Errorf("torchpth: unsupported storage %s", s.kind)
 	}
 	if len(raw) != s.count*size {
 		return Tensor{}, fmt.Errorf("torchpth: storage length mismatch")
 	}
 	result := Tensor{Shape: shape, Data: make([]float32, n)}
+	if n == 0 {
+		return result, nil
+	}
+	if isContiguous(shape, stride) {
+		if off+n > s.count {
+			return Tensor{}, fmt.Errorf("torchpth: tensor view outside storage")
+		}
+		base := raw[off*size:]
+		switch s.kind {
+		case "torch FloatStorage":
+			for i := range result.Data {
+				result.Data[i] = math.Float32frombits(binary.LittleEndian.Uint32(base[i*4:]))
+			}
+		case "torch DoubleStorage":
+			for i := range result.Data {
+				result.Data[i] = float32(math.Float64frombits(binary.LittleEndian.Uint64(base[i*8:])))
+			}
+		case "torch BFloat16Storage":
+			for i := range result.Data {
+				result.Data[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(base[i*2:])) << 16)
+			}
+		case "torch HalfStorage":
+			for i := range result.Data {
+				result.Data[i] = half(binary.LittleEndian.Uint16(base[i*2:]))
+			}
+		}
+		return result, nil
+	}
 	for i := 0; i < n; i++ {
 		index := off
 		remaining := i
@@ -492,6 +525,8 @@ func (d *decoder) tensor(s storage, off int, shape, stride []int) (Tensor, error
 		switch s.kind {
 		case "torch FloatStorage":
 			result.Data[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[index*4:]))
+		case "torch DoubleStorage":
+			result.Data[i] = float32(math.Float64frombits(binary.LittleEndian.Uint64(raw[index*8:])))
 		case "torch BFloat16Storage":
 			result.Data[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(raw[index*2:])) << 16)
 		case "torch HalfStorage":
@@ -499,6 +534,17 @@ func (d *decoder) tensor(s storage, off int, shape, stride []int) (Tensor, error
 		}
 	}
 	return result, nil
+}
+
+func isContiguous(shape, stride []int) bool {
+	expected := 1
+	for i := len(shape) - 1; i >= 0; i-- {
+		if shape[i] > 1 && stride[i] != expected {
+			return false
+		}
+		expected *= shape[i]
+	}
+	return true
 }
 func half(h uint16) float32 {
 	sign := uint32(h&0x8000) << 16
