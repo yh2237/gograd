@@ -5,8 +5,6 @@ import (
 	"sync"
 )
 
-// binaryScalar is small enough to inline, which keeps the elementwise loops
-// free of indirect calls.
 func binaryScalar(op int, x, y float32) float32 {
 	switch op {
 	case 0:
@@ -25,9 +23,8 @@ func binaryScalar(op int, x, y float32) float32 {
 	panic("autograd: unknown binary op")
 }
 
-// binaryGrad splits the incoming gradient between the operands. For max and min
-// the comparison is strict on the left, so ties send the whole gradient right
-// and no element is counted twice.
+// For max and min the comparison is strict on the left, so ties send the whole
+// gradient right and no element is counted twice.
 func binaryGrad(op int, up, x, y float32) (float32, float32) {
 	switch op {
 	case 0:
@@ -52,40 +49,80 @@ func binaryGrad(op int, up, x, y float32) (float32, float32) {
 	panic("autograd: unknown binary op")
 }
 
-// cpuBinaryOp accumulates directly into gradients when the indices are
-// one-to-one. Broadcast gradients use one partial per worker, avoiding atomics
-// and full-size temporary gradients.
 func cpuBinaryOp(a, b *Tensor, op int) *Tensor {
 	same(a, b)
 	s := bshape(a.Shape, b.Shape)
 	ai, bi := makeBroadcastIndex(s, a.Shape), makeBroadcastIndex(s, b.Shape)
 	identity := ai.kind == 1 && bi.kind == 1
-	// A right operand that repeats along the last axis is the common bias case;
-	// a counter replaces the per-element modulo.
 	lastAxis := ai.kind == 1 && bi.kind == 3 && bi.d2 > 0
 	out := cpuAllocUninit(numel(s))
+	ad, bd := a.Data, b.Data
 	switch {
 	case identity:
 		parallelFor(len(out), func(start, end int) {
-			for i := start; i < end; i++ {
-				out[i] = binaryScalar(op, a.Data[i], b.Data[i])
+			os, as, bs := out[start:end], ad[start:end], bd[start:end]
+			switch op {
+			case 0:
+				for i, x := range as {
+					os[i] = x + bs[i]
+				}
+			case 1:
+				for i, x := range as {
+					os[i] = x - bs[i]
+				}
+			case 2:
+				for i, x := range as {
+					os[i] = x * bs[i]
+				}
+			case 3:
+				for i, x := range as {
+					os[i] = x / bs[i]
+				}
+			default:
+				for i, x := range as {
+					os[i] = binaryScalar(op, x, bs[i])
+				}
 			}
 		})
 	case lastAxis:
 		m := bi.d2
 		parallelFor(len(out), func(start, end int) {
 			j := start % m
-			for i := start; i < end; i++ {
-				out[i] = binaryScalar(op, a.Data[i], b.Data[j])
-				if j++; j == m {
-					j = 0
+			switch op {
+			case 0:
+				for i := start; i < end; i++ {
+					out[i] = ad[i] + bd[j]
+					if j++; j == m {
+						j = 0
+					}
+				}
+			case 1:
+				for i := start; i < end; i++ {
+					out[i] = ad[i] - bd[j]
+					if j++; j == m {
+						j = 0
+					}
+				}
+			case 2:
+				for i := start; i < end; i++ {
+					out[i] = ad[i] * bd[j]
+					if j++; j == m {
+						j = 0
+					}
+				}
+			default:
+				for i := start; i < end; i++ {
+					out[i] = binaryScalar(op, ad[i], bd[j])
+					if j++; j == m {
+						j = 0
+					}
 				}
 			}
 		})
 	default:
 		parallelFor(len(out), func(start, end int) {
 			for i := start; i < end; i++ {
-				out[i] = binaryScalar(op, a.Data[ai.at(i)], b.Data[bi.at(i)])
+				out[i] = binaryScalar(op, ad[ai.at(i)], bd[bi.at(i)])
 			}
 		})
 	}
@@ -106,8 +143,6 @@ func cpuBinaryOp(a, b *Tensor, op int) *Tensor {
 		localsA, localsB := make([][]float32, workers), make([][]float32, workers)
 		run := func(worker, start, end int) {
 			var da, db []float32
-			// Only a broadcast operand needs a per-worker partial; an identity
-			// operand writes disjoint indices, so the shared gradient is safe.
 			if a.RequiresGrad {
 				da = a.Grad
 				if ai.kind != 1 && workers > 1 {
@@ -125,8 +160,33 @@ func cpuBinaryOp(a, b *Tensor, op int) *Tensor {
 			if lastAxis {
 				m := bi.d2
 				j := start % m
+				if op == 0 {
+					if da != nil && db != nil {
+						for i := start; i < end; i++ {
+							gv := g[i]
+							da[i] += gv
+							db[j] += gv
+							if j++; j == m {
+								j = 0
+							}
+						}
+					} else if da != nil {
+						das, gs := da[start:end], g[start:end]
+						for i, gv := range gs {
+							das[i] += gv
+						}
+					} else if db != nil {
+						for i := start; i < end; i++ {
+							db[j] += g[i]
+							if j++; j == m {
+								j = 0
+							}
+						}
+					}
+					return
+				}
 				for i := start; i < end; i++ {
-					ga, gb := binaryGrad(op, g[i], a.Data[i], b.Data[j])
+					ga, gb := binaryGrad(op, g[i], ad[i], bd[j])
 					if da != nil {
 						da[i] += ga
 					}
@@ -139,12 +199,66 @@ func cpuBinaryOp(a, b *Tensor, op int) *Tensor {
 				}
 				return
 			}
-			for i := start; i < end; i++ {
-				ia, ib := i, i
-				if !identity {
-					ia, ib = ai.at(i), bi.at(i)
+			if identity {
+				gs := g[start:end]
+				switch op {
+				case 0:
+					if da != nil {
+						das := da[start:end]
+						for i, gv := range gs {
+							das[i] += gv
+						}
+					}
+					if db != nil {
+						dbs := db[start:end]
+						for i, gv := range gs {
+							dbs[i] += gv
+						}
+					}
+					return
+				case 1:
+					if da != nil {
+						das := da[start:end]
+						for i, gv := range gs {
+							das[i] += gv
+						}
+					}
+					if db != nil {
+						dbs := db[start:end]
+						for i, gv := range gs {
+							dbs[i] -= gv
+						}
+					}
+					return
+				case 2:
+					if da != nil {
+						das, bs := da[start:end], bd[start:end]
+						for i, gv := range gs {
+							das[i] += gv * bs[i]
+						}
+					}
+					if db != nil {
+						dbs, as := db[start:end], ad[start:end]
+						for i, gv := range gs {
+							dbs[i] += gv * as[i]
+						}
+					}
+					return
 				}
-				ga, gb := binaryGrad(op, g[i], a.Data[ia], b.Data[ib])
+				for i := start; i < end; i++ {
+					ga, gb := binaryGrad(op, g[i], ad[i], bd[i])
+					if da != nil {
+						da[i] += ga
+					}
+					if db != nil {
+						db[i] += gb
+					}
+				}
+				return
+			}
+			for i := start; i < end; i++ {
+				ia, ib := ai.at(i), bi.at(i)
+				ga, gb := binaryGrad(op, g[i], ad[ia], bd[ib])
 				if da != nil {
 					da[ia] += ga
 				}

@@ -59,36 +59,73 @@ func softmax(a *Tensor, axis int, logmode bool) *Tensor {
 		})
 	}
 	v := cpuAllocUninit(a.Numel())
-	parallelForWork(outer*inner, dim, func(start, end int) {
-		for row := start; row < end; row++ {
-			base := (row/inner)*dim*inner + row%inner
-			mx := float32(math.Inf(-1))
-			for k := 0; k < dim; k++ {
-				mx = max(mx, a.Data[base+k*inner])
-			}
-			var sum float32
-			for k := 0; k < dim; k++ {
-				idx := base + k*inner
-				e := float32(math.Exp(float64(a.Data[idx] - mx)))
-				sum += e
-				if !logmode {
-					v[idx] = e
+	if inner == 1 {
+		parallelForWork(outer, dim, func(start, end int) {
+			for row := start; row < end; row++ {
+				base := row * dim
+				ar := a.Data[base : base+dim]
+				vr := v[base : base+dim]
+				mx := float32(math.Inf(-1))
+				for _, x := range ar {
+					if x > mx {
+						mx = x
+					}
+				}
+				var sum float32
+				if logmode {
+					for _, x := range ar {
+						sum += float32(math.Exp(float64(x - mx)))
+					}
+					ls := float32(math.Log(float64(sum)))
+					for k, x := range ar {
+						vr[k] = x - mx - ls
+					}
+				} else {
+					for k, x := range ar {
+						e := float32(math.Exp(float64(x - mx)))
+						sum += e
+						vr[k] = e
+					}
+					inv := 1 / sum
+					for k := range vr {
+						vr[k] *= inv
+					}
 				}
 			}
-			if logmode {
-				ls := float32(math.Log(float64(sum)))
+		})
+	} else {
+		parallelForWork(outer*inner, dim, func(start, end int) {
+			for row := start; row < end; row++ {
+				base := (row/inner)*dim*inner + row%inner
+				mx := float32(math.Inf(-1))
+				for k := 0; k < dim; k++ {
+					mx = max(mx, a.Data[base+k*inner])
+				}
+				var sum float32
 				for k := 0; k < dim; k++ {
 					idx := base + k*inner
-					v[idx] = a.Data[idx] - mx - ls
+					e := float32(math.Exp(float64(a.Data[idx] - mx)))
+					sum += e
+					if !logmode {
+						v[idx] = e
+					}
 				}
-			} else {
-				for k := 0; k < dim; k++ {
-					idx := base + k*inner
-					v[idx] /= sum
+				if logmode {
+					ls := float32(math.Log(float64(sum)))
+					for k := 0; k < dim; k++ {
+						idx := base + k*inner
+						v[idx] = a.Data[idx] - mx - ls
+					}
+				} else {
+					inv := 1 / sum
+					for k := 0; k < dim; k++ {
+						idx := base + k*inner
+						v[idx] *= inv
+					}
 				}
 			}
-		}
-	})
+		})
+	}
 	return result(v, a.Shape, []*Tensor{a}, func(g []float32) {
 		if !a.RequiresGrad {
 			return
@@ -97,6 +134,33 @@ func softmax(a *Tensor, axis int, logmode bool) *Tensor {
 			a.Grad = make([]float32, a.Numel())
 		}
 		grad := a.Grad
+		if inner == 1 {
+			parallelForWork(outer, dim, func(start, end int) {
+				for row := start; row < end; row++ {
+					base := row * dim
+					gr := g[base : base+dim]
+					vr := v[base : base+dim]
+					dr := grad[base : base+dim]
+					var dot float32
+					if logmode {
+						for _, gv := range gr {
+							dot += gv
+						}
+						for k, gv := range gr {
+							dr[k] += gv - float32(math.Exp(float64(vr[k])))*dot
+						}
+					} else {
+						for k, gv := range gr {
+							dot += gv * vr[k]
+						}
+						for k, gv := range gr {
+							dr[k] += vr[k] * (gv - dot)
+						}
+					}
+				}
+			})
+			return
+		}
 		parallelForWork(outer*inner, dim, func(start, end int) {
 			for row := start; row < end; row++ {
 				base := (row/inner)*dim*inner + row%inner

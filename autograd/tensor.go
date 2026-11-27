@@ -997,6 +997,28 @@ func ReLU(a *Tensor) *Tensor {
 		return 0
 	})
 }
+func erfApprox32(x float32) float32 {
+	if math.IsNaN(float64(x)) {
+		return x
+	}
+	ax := x
+	if ax < 0 {
+		ax = -ax
+	}
+	if ax > 6 {
+		if x < 0 {
+			return -1
+		}
+		return 1
+	}
+	t := 1 / (1 + 0.3275911*ax)
+	e := 1 - (((((1.061405429*t-1.453152027)*t)+1.421413741)*t-0.284496736)*t+0.254829592)*t*float32(math.Exp(float64(-ax*ax)))
+	if x < 0 {
+		return -e
+	}
+	return e
+}
+
 func GELU(a *Tensor, approx bool) *Tensor {
 	if inferenceDevice(a.Device) {
 		return inferenceGELU(a, approx)
@@ -1009,9 +1031,50 @@ func GELU(a *Tensor, approx bool) *Tensor {
 		return gpuUnary(a, 5)
 	}
 	if !approx {
-		return unary(a, func(x float32) float32 { v := float64(x); return float32(.5 * v * (1 + math.Erf(v/math.Sqrt2))) }, func(x float32) float32 {
-			v := float64(x)
-			return float32(.5*(1+math.Erf(v/math.Sqrt2)) + v*math.Exp(-v*v/2)*invSqrt2Pi)
+		ad := a.Data
+		out := cpuAllocUninit(len(ad))
+		const invSqrt2 = float32(1 / math.Sqrt2)
+		const invSqrt2Pi32 = float32(invSqrt2Pi)
+		parallelFor(len(ad), func(start, end int) {
+			os, as := out[start:end], ad[start:end]
+			for i, x := range as {
+				if x > 10 {
+					os[i] = x
+				} else if x < -10 {
+					os[i] = 0
+				} else {
+					os[i] = 0.5 * x * (1 + erfApprox32(x*invSqrt2))
+				}
+			}
+		})
+		return result(out, a.Shape, []*Tensor{a}, func(g []float32) {
+			if !a.RequiresGrad {
+				return
+			}
+			if a.Grad == nil {
+				a.Grad = make([]float32, len(ad))
+			}
+			grad := a.Grad
+			parallelFor(len(ad), func(start, end int) {
+				as, gs, ds := ad[start:end], g[start:end], grad[start:end]
+				for i, x := range as {
+					if x > 10 {
+						ds[i] += gs[i]
+					} else if x >= -10 {
+						e := float32(math.Exp(float64(-0.5 * x * x)))
+						ax := x * invSqrt2
+						if ax < 0 {
+							ax = -ax
+						}
+						t := 1 / (1 + 0.3275911*ax)
+						erfVal := 1 - (((((1.061405429*t-1.453152027)*t)+1.421413741)*t-0.284496736)*t+0.254829592)*t*e
+						if x < 0 {
+							erfVal = -erfVal
+						}
+						ds[i] += gs[i] * (0.5*(1+erfVal) + x*e*invSqrt2Pi32)
+					}
+				}
+			})
 		})
 	}
 	return unary(a, func(x float32) float32 {
