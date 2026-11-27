@@ -134,4 +134,24 @@ void main() {
     else if (op == 25u) y[i] = erfApprox(a[i]);
     else if (op == 26u) y[i] = fminGo(fmaxGo(a[i], p.scalar), p.scalar2);
     else if (op == 27u) y[i] = p.scalar;
+    else if (op == 28u) {
+        float v = a[i];
+        if (isnan(v) || v < -1.0) y[i] = uintBitsToFloat(0x7fc00000u);
+        else if (v == -1.0) y[i] = uintBitsToFloat(0xff800000u);
+        else if (isinf(v)) y[i] = uintBitsToFloat(0x7f800000u);
+        else if (abs(v) < 1e-4) y[i] = v * (1.0 + v * (-0.5 + v * (1.0 / 3.0)));
+        else {
+            float s = 1.0 + v;
+            y[i] = (s == 1.0) ? v : log(s) * (v / (s - 1.0));
+        }
+    }
+    else if (op == 29u) {
+        float v = a[i];
+        if (isnan(v)) y[i] = uintBitsToFloat(0x7fc00000u);
+        else if (v == 0.0) y[i] = v;
+        else if (v < -25.0) y[i] = -1.0;
+        else if (v > 88.722839) y[i] = uintBitsToFloat(0x7f800000u);
+        else if (abs(v) < 0.1) y[i] = v * (1.0 + v * (0.5 + v * (1.0 / 6.0 + v * (1.0 / 24.0 + v / 120.0))));
+        else y[i] = exp(v) - 1.0;
+    }
 }

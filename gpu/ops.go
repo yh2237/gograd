@@ -46,6 +46,8 @@ const (
 	UnarySigmoid
 	UnarySoftplus
 	UnaryErf
+	UnaryLog1p
+	UnaryExpm1
 )
 
 type UnaryOpBackend interface {

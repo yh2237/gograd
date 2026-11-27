@@ -45,6 +45,7 @@ var binaryKinds = [...]uint32{opSub, opDiv, opMax, opMin}
 var unaryKinds = [...]uint32{
 	opExp, opLog, opAbs, opTanh, opReLU, opSin,
 	opCos, opSqrt, opSigmoid, opSoftplus, opErf,
+	opLog1p, opExpm1,
 }
 
 func (b *Backend) BinaryOp(op gpu.BinaryOp, out, a, right *gpu.Buffer, n int) error {

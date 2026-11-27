@@ -163,3 +163,66 @@ void logSoftmaxMain(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
         }
     }
 }
+
+[RootSignature(UnaryRoot)]
+[numthreads(256, 1, 1)]
+void log1pMain(uint3 thread : SV_DispatchThreadID) {
+    uint i = thread.x + thread.y * rowStride;
+    if (i >= count) return;
+    uint bits = inputBits[i];
+    uint mag = bits & ~signBit;
+    if (mag > infinity) {
+        outputBits[i] = quietNaN;
+        return;
+    }
+    if (mag == 0) {
+        outputBits[i] = bits;
+        return;
+    }
+    if (mag == infinity) {
+        outputBits[i] = (bits & signBit) != 0 ? quietNaN : infinity;
+        return;
+    }
+    float v = asfloat(bits);
+    if (v < -1.0) {
+        outputBits[i] = quietNaN;
+    } else if (v == -1.0) {
+        outputBits[i] = signBit | infinity;
+    } else if (abs(v) < 1e-4) {
+        outputBits[i] = asuint(v * (1.0 + v * (-0.5 + v * (1.0 / 3.0))));
+    } else {
+        float s = 1.0 + v;
+        outputBits[i] = asuint(s == 1.0 ? v : log(s) * (v / (s - 1.0)));
+    }
+}
+
+[RootSignature(UnaryRoot)]
+[numthreads(256, 1, 1)]
+void expm1Main(uint3 thread : SV_DispatchThreadID) {
+    uint i = thread.x + thread.y * rowStride;
+    if (i >= count) return;
+    uint bits = inputBits[i];
+    uint mag = bits & ~signBit;
+    if (mag > infinity) {
+        outputBits[i] = quietNaN;
+        return;
+    }
+    if (mag == 0) {
+        outputBits[i] = bits;
+        return;
+    }
+    if (mag == infinity) {
+        outputBits[i] = (bits & signBit) != 0 ? asuint(-1.0) : infinity;
+        return;
+    }
+    float v = asfloat(bits);
+    if (v < -25.0) {
+        outputBits[i] = asuint(-1.0);
+    } else if (v > 88.722839) {
+        outputBits[i] = infinity;
+    } else if (abs(v) < 0.1) {
+        outputBits[i] = asuint(v * (1.0 + v * (0.5 + v * (1.0 / 6.0 + v * (1.0 / 24.0 + v / 120.0)))));
+    } else {
+        outputBits[i] = asuint(exp(v) - 1.0);
+    }
+}

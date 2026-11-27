@@ -13,6 +13,8 @@ import (
 //go:generate fxc /nologo /T cs_5_1 /E clampMain /O3 /Qstrip_reflect /Qstrip_rootsignature /Fo shaders/clamp.cso shaders/unary.hlsl
 //go:generate fxc /nologo /T cs_5_1 /E powMain /O3 /Qstrip_reflect /Qstrip_rootsignature /Fo shaders/pow.cso shaders/unary.hlsl
 //go:generate fxc /nologo /T cs_5_1 /E logSoftmaxMain /O3 /Qstrip_reflect /Qstrip_rootsignature /Fo shaders/logsoftmax.cso shaders/unary.hlsl
+//go:generate fxc /nologo /T cs_5_1 /E log1pMain /O3 /Qstrip_reflect /Qstrip_rootsignature /Fo shaders/log1p.cso shaders/unary.hlsl
+//go:generate fxc /nologo /T cs_5_1 /E expm1Main /O3 /Qstrip_reflect /Qstrip_rootsignature /Fo shaders/expm1.cso shaders/unary.hlsl
 
 //go:embed shaders/unary.rootsig
 var unaryRootSignature []byte
@@ -26,7 +28,13 @@ var powShader []byte
 //go:embed shaders/logsoftmax.cso
 var logSoftmaxShader []byte
 
-var unaryShaderBytecode = [...][]byte{clampShader, powShader, logSoftmaxShader}
+//go:embed shaders/log1p.cso
+var log1pShader []byte
+
+//go:embed shaders/expm1.cso
+var expm1Shader []byte
+
+var unaryShaderBytecode = [...][]byte{clampShader, powShader, logSoftmaxShader, log1pShader, expm1Shader}
 
 var (
 	iidRootSignature = iid("c54a6b66-72df-4ee8-8be5-a946a1429214")

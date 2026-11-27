@@ -91,6 +91,8 @@ const (
 	opClamp
 	opPow
 	opLogSoftmax
+	opLog1p
+	opExpm1
 )
 const (
 	heapDefault  uint32 = 1

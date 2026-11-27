@@ -916,6 +916,9 @@ func Erf(a *Tensor) *Tensor {
 // Log1p applies log(1+x) elementwise. It keeps precision for x near zero where
 // log(1+x) would cancel.
 func Log1p(a *Tensor) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceUnaryOp(gpu.UnaryLog1p, "log1p", a)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("log1p", a.Device) {
 		return gpuUnary(a, 13)
@@ -928,6 +931,9 @@ func Log1p(a *Tensor) *Tensor {
 // Expm1 applies exp(x)-1 elementwise. It keeps precision for x near zero where
 // exp(x)-1 would cancel.
 func Expm1(a *Tensor) *Tensor {
+	if inferenceDevice(a.Device) {
+		return inferenceUnaryOp(gpu.UnaryExpm1, "expm1", a)
+	}
 	a = a.Contiguous()
 	if dispatchBackend("expm1", a.Device) {
 		return gpuUnary(a, 14)

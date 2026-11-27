@@ -46,7 +46,7 @@ var (
 	binaryOpCodes   = [...]uint32{7, 8, 9, 10}
 	binaryViewCodes = [...]uint32{2, 3, 4, 5}
 	scalarOpCodes   = [...]uint32{11, 12, 13, 14}
-	unaryOpCodes    = [...]uint32{15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25}
+	unaryOpCodes    = [...]uint32{15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 28, 29}
 )
 
 func (b *Backend) BinaryOp(op gpu.BinaryOp, out, a, right *gpu.Buffer, n int) error {

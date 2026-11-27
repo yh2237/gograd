@@ -353,7 +353,7 @@ func (d *nativeDriver) enqueue(step queuedStep) error {
 
 func (d *nativeDriver) execute(key opKey, out *allocation, inputs ...*allocation) error {
 	switch key.kind {
-	case opClamp, opPow, opLogSoftmax:
+	case opClamp, opPow, opLogSoftmax, opLog1p, opExpm1:
 		if err := d.initUnaryShader(key.kind); err != nil {
 			return err
 		}
