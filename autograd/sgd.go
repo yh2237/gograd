@@ -196,29 +196,38 @@ func (o *SGD) Step() {
 		}
 		first := !o.initialized[index]
 		lr, decay := o.groupScale(index)
-		if o.options.Momentum > 0 && first {
+		momentum := o.options.Momentum
+		oneMinusDamp := 1 - o.options.Dampening
+		nesterov := o.options.Nesterov
+		maximize := o.options.Maximize
+		if momentum > 0 && first {
 			o.buffers[index] = make([]float32, v.Numel())
 		}
-		for i, g := range v.Grad {
-			if o.options.Maximize {
-				g = -g
-			}
-			g += decay * v.Data[i]
-			if o.options.Momentum > 0 {
-				if first {
-					o.buffers[index][i] = g
-				} else {
-					o.buffers[index][i] = float32(o.options.Momentum*o.buffers[index][i]) + float32((1-o.options.Dampening)*g)
+		buf := o.buffers[index]
+		data, grad := v.Data, v.Grad
+		parallelFor(len(grad), func(start, end int) {
+			for i := start; i < end; i++ {
+				g := grad[i]
+				if maximize {
+					g = -g
 				}
-				if o.options.Nesterov {
-					g += float32(o.options.Momentum * o.buffers[index][i])
-				} else {
-					g = o.buffers[index][i]
+				g += decay * data[i]
+				if momentum > 0 {
+					if first {
+						buf[i] = g
+					} else {
+						buf[i] = momentum*buf[i] + oneMinusDamp*g
+					}
+					if nesterov {
+						g += momentum * buf[i]
+					} else {
+						g = buf[i]
+					}
 				}
+				data[i] -= lr * g
 			}
-			v.Data[i] -= float32(lr * g)
-		}
-		if o.options.Momentum > 0 {
+		})
+		if momentum > 0 {
 			o.initialized[index] = true
 		}
 		v.storage.version.Add(1)
