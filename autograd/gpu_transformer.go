@@ -444,6 +444,73 @@ func inferenceConcat(axis int, inputs ...*Tensor) *Tensor {
 	return inferenceResult(out, shape, context, inputs...)
 }
 
+func inferenceEmbedding(weight *Tensor, ids []int, shape []int, paddingIdx int) *Tensor {
+	backend, context := inferenceOperands(weight)
+	if len(weight.Shape) != 2 || numel(shape) != len(ids) {
+		panic("autograd: embedding shape")
+	}
+	if paddingIdx < -1 || paddingIdx >= weight.Shape[0] {
+		panic("autograd: padding index")
+	}
+	for _, id := range ids {
+		if id < 0 || id >= weight.Shape[0] {
+			panic("autograd: embedding index")
+		}
+	}
+	dim := weight.Shape[1]
+	outShape := append(append([]int(nil), shape...), dim)
+	n, err := gpu.Elements(outShape...)
+	if err != nil {
+		panic(err)
+	}
+	views, ok := backend.(gpu.ViewBackend)
+	if !ok {
+		panic(fmt.Errorf("%w: Embedding needs device view copies", gpu.ErrUnsupported))
+	}
+	out, err := backend.Alloc(n)
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			out.Close()
+			panic(r)
+		}
+	}()
+	if n == 0 {
+		return inferenceResult(out, outShape, context, weight)
+	}
+	src, release := inferenceBuffer(backend, inferenceView(weight))
+	defer release()
+	contiguous := true
+	for i := 1; i < len(ids); i++ {
+		if ids[i] != ids[i-1]+1 {
+			contiguous = false
+			break
+		}
+	}
+	if contiguous {
+		if err := views.Gather(out, gpu.View{Buffer: src, Shape: []int{n}, Strides: []int{1}, Offset: ids[0] * dim}); err != nil {
+			panic(err)
+		}
+		return inferenceResult(out, outShape, context, weight)
+	}
+	tmp, err := backend.Alloc(dim)
+	if err != nil {
+		panic(err)
+	}
+	defer tmp.Close()
+	for i, id := range ids {
+		if err := views.Gather(tmp, gpu.View{Buffer: src, Shape: []int{dim}, Strides: []int{1}, Offset: id * dim}); err != nil {
+			panic(err)
+		}
+		if err := views.Scatter(gpu.View{Buffer: out, Shape: []int{dim}, Strides: []int{1}, Offset: i * dim}, tmp); err != nil {
+			panic(err)
+		}
+	}
+	return inferenceResult(out, outShape, context, weight)
+}
+
 // The portable materialized attention path composes GEMM, a device mask add,
 // and Softmax. FlashAttention remains unsupported on inference backends.
 func inferenceAttention(q, k, v, mask *Tensor) *Tensor {

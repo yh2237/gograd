@@ -621,12 +621,18 @@ func matMulTransB(a, w *Tensor) *Tensor {
 	})
 }
 func Embedding(weight *Tensor, ids []int, shape []int) *Tensor {
+	if inferenceDevice(weight.Device) {
+		return inferenceEmbedding(weight, ids, shape, -1)
+	}
 	dispatchBackend("embedding", weight.Device)
 	return EmbeddingWithPadding(weight, ids, shape, -1)
 }
 
 // EmbeddingWithPadding gathers rows and leaves the padding row's gradient zero.
 func EmbeddingWithPadding(weight *Tensor, ids []int, shape []int, paddingIdx int) *Tensor {
+	if inferenceDevice(weight.Device) {
+		return inferenceEmbedding(weight, ids, shape, paddingIdx)
+	}
 	useCUDA := dispatchBackend("embedding_padding", weight.Device)
 	weight = weight.Contiguous()
 	if len(weight.Shape) != 2 || numel(shape) != len(ids) {

@@ -4,7 +4,7 @@ VulkanとDirectMLは `autograd` 経由で利用するFP32推論専用バック�
 
 ## 対応演算
 
-DirectML / Vulkan ともに以下の推論演算に対応します（未対応演算は CPU へ自動フォールバックせず `gpu.ErrUnsupported` を返します。`Embedding`, `FlashAttention` は両バックエンド未対応）。
+DirectML / Vulkan ともに以下の推論演算に対応します（未対応演算は CPU へ自動フォールバックせず `gpu.ErrUnsupported` を返します。`FlashAttention` は両バックエンド未対応）。
 
 | カテゴリ | 対応演算 |
 | --- | --- |
@@ -13,8 +13,8 @@ DirectML / Vulkan ともに以下の推論演算に対応します（未対応�
 | 単項演算 | `Exp`, `Log`, `Log1p`, `Expm1`, `Abs`, `Tanh`, `ReLU`, `Sin`, `Cos`, `Sqrt`, `Sigmoid`, `Softplus`, `Erf`（DirectML は FL 2.0+）, `Clamp`, `GELU`（tanh近似 / erf、DirectML の erf は FL 5.1+） |
 | Reduction / 正規化 / 確率 | `Sum`, `Mean`（rank 0〜6）, `Softmax`, `LogSoftmax`, `LayerNorm`, `GroupNorm`, `BatchNorm`（評価のみ）, `RMSNormLast` |
 | 畳み込み・Pooling | `Conv1d`, `Conv2d`, `MaxPool2d`（DirectML の dilation は FL 2.1+）, `AvgPool2d`, `AdaptiveAvgPool2d`（割り切れるサイズ） |
-| 行列積・view・形状 | `MatMul`（転置4通り、rank 6まで）, `Reshape`, `Unsqueeze`, `Squeeze`, `Flatten`, `Permute`, `Transpose`, `Slice`, `Expand`, `Concat`, `Stack`, `Gather` / `Scatter` |
-| Attention・ブロック・モデル | `ScaledDotProductAttention`（実体化経路）, `KeyPaddingAttention`, `RotaryHalf`, `GeGLU`, `SwiGLUProjection`, `LinearLayer`, `Conv1dLayer`, `Conv2dLayer`, `MaxPool2dLayer`, `AvgPool2dLayer`, `AdaptiveAvgPool2dLayer`, `BatchNormLayer`（評価）, `TransformerEncoderLayer`（評価） |
+| 行列積・view・形状 | `MatMul`（転置4通り、rank 6まで）, `Reshape`, `Unsqueeze`, `Squeeze`, `Flatten`, `Permute`, `Transpose`, `Slice`, `Expand`, `Concat`, `Stack`, `Gather` / `Scatter`, `Embedding` / `EmbeddingWithPadding` |
+| Attention・ブロック・モデル | `ScaledDotProductAttention`（実体化経路）, `KeyPaddingAttention`, `RotaryHalf`, `GeGLU`, `SwiGLUProjection`, `EmbeddingLayer`, `LinearLayer`, `Conv1dLayer`, `Conv2dLayer`, `MaxPool2dLayer`, `AvgPool2dLayer`, `AdaptiveAvgPool2dLayer`, `BatchNormLayer`（評価）, `TransformerEncoderLayer`（評価） |
 
 ## 実装方式
 
