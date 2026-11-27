@@ -1040,7 +1040,13 @@ func GELU(a *Tensor, approx bool) *Tensor {
 		const invSqrt2Pi32 = float32(invSqrt2Pi)
 		parallelFor(len(ad), func(start, end int) {
 			os, as := out[start:end], ad[start:end]
-			for i, x := range as {
+			i := 0
+			if useCPUAVX2 && len(as) >= 8 {
+				geluFwdAVX(&os[0], &as[0], len(as))
+				i = len(as) &^ 7
+			}
+			for ; i < len(as); i++ {
+				x := as[i]
 				if x > 10 {
 					os[i] = x
 				} else if x < -10 {
@@ -1060,7 +1066,13 @@ func GELU(a *Tensor, approx bool) *Tensor {
 			grad := a.Grad
 			parallelFor(len(ad), func(start, end int) {
 				as, gs, ds := ad[start:end], g[start:end], grad[start:end]
-				for i, x := range as {
+				i := 0
+				if useCPUAVX2 && len(as) >= 8 {
+					geluBwdAVX(&ds[0], &as[0], &gs[0], len(as))
+					i = len(as) &^ 7
+				}
+				for ; i < len(as); i++ {
+					x := as[i]
 					if x > 10 {
 						ds[i] += gs[i]
 					} else if x >= -10 {

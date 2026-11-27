@@ -81,8 +81,13 @@ func softmax(a *Tensor, axis int, logmode bool) *Tensor {
 						vr[k] = x - mx - ls
 					}
 				} else {
-					for k, x := range ar {
-						e := float32(math.Exp(float64(x - mx)))
+					k := 0
+					if useCPUAVX2 && dim >= 8 && !math.IsNaN(float64(mx)) && !math.IsInf(float64(mx), 0) {
+						sum = expSubMaxAVX(&vr[0], &ar[0], dim, mx)
+						k = dim &^ 7
+					}
+					for ; k < dim; k++ {
+						e := float32(math.Exp(float64(ar[k] - mx)))
 						sum += e
 						vr[k] = e
 					}

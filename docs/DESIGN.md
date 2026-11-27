@@ -9,7 +9,7 @@
 
 ## バックエンド実装
 
-- **CPU**：AVX2/FMAの4×16 SGEMMマイクロカーネルを実行時選択（`GOGRAD_SGEMM_4X16=0` で4×8、非対応時は純Go）。要素演算・reduction・`LayerNorm`・`GroupNorm`・`MultiheadAttention` は並列化する。
+- **CPU**：AVX2/FMAの6×16 SGEMMマイクロカーネルを実行時選択（`GOGRAD_SGEMM_4X16=0` で4×8、非対応時は純Go）。要素演算・reduction・`LayerNorm`・`GroupNorm`・`MultiheadAttention` は並列化し、AVX2/FMA環境では `GELU`（erf版）・`Softmax` の指数計算もベクトル化する。
 - **CUDA**：
   - 行列積はcuBLAS（`transB` 直接指定、strided-batched GEMM、ブロードキャスト重み勾配の平坦化）を使用する。BF16有効時はGEMMオペランドに2D BF16シャドウキャッシュ（`cuda.CaptureID()` でCUDAグラフ記録中も安全に更新）を使い、累積・master weight・勾配・optimizer stateはFP32で保持する。
   - rank 6までのview・broadcast・reduction・要素演算・正規化・`SmoothL1Loss`・`CrossEntropy`・`Dropout` 等はNVRTCカーネルで実装する。`MultiheadAttention` のself-attentionはQKV一括投影とhead分割/統合カーネルを使用し、初回勾配書き込み時は `beta=0` 経路で事前のゼロ埋めを省略する。
@@ -28,7 +28,7 @@
 
 | 実行条件 | ステップ時間 |
 | --- | ---: |
-| CPU FP32 | 622.1 ms |
+| CPU FP32 | 431.9–470.3 ms |
 | CUDA FP32 eager | 19.0 ms |
 | CUDA FP32 graph replay | 26.7 ms |
 | CUDA BF16 eager | 12.8–15.3 ms |
