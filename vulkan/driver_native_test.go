@@ -118,7 +118,7 @@ func TestVulkanTwoDimensionalDispatch(t *testing.T) {
 
 func TestVulkanTwoDimensionalGEMM(t *testing.T) {
 	b := testBackend(t)
-	b.driver.(*vkDriver).properties.MaxWorkGroupCount[0] = 5
+	b.driver.(*vkDriver).properties.MaxWorkGroupCount[0] = 2
 	a, right, want := make([]float32, 3*9*13), make([]float32, 13*17), make([]float32, 3*9*17)
 	for i := range a {
 		a[i] = float32(i%17-8) / 16

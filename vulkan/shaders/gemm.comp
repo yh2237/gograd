@@ -1,6 +1,6 @@
 #version 450
-// 128 invocations and 1536 bytes of shared memory fit Vulkan 1.1's minimum
-// limits. Each workgroup computes an 8-row by 16-column output tile.
+// 128 invocations and 8320 bytes of shared memory fit Vulkan 1.1's minimum
+// limits. Each workgroup computes a 64-row by 64-column output tile (8x4 per thread).
 layout(local_size_x = 16, local_size_y = 8) in;
 layout(constant_id = 0) const uint TRANS_A = 0u;
 layout(constant_id = 1) const uint TRANS_B = 0u;
@@ -15,8 +15,8 @@ layout(push_constant) uniform Params {
     uint batchShape[4]; uint aBatchStrides[4]; uint bBatchStrides[4];
     uint tileCols; uint tilesPerMatrix;
 } p;
-shared float tileA[8][16];
-shared float tileB[16][16];
+shared float tileA[16][65];
+shared float tileB[16][65];
 
 uint indexA(uint row, uint depth) {
     return TRANS_A != 0u ? row*p.aCol + depth*p.aRow : row*p.aRow + depth*p.aCol;
@@ -24,14 +24,17 @@ uint indexA(uint row, uint depth) {
 uint indexB(uint depth, uint col) {
     return TRANS_B != 0u ? depth*p.bCol + col*p.bRow : depth*p.bRow + col*p.bCol;
 }
+
 void main() {
     uint tile = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
     uint batch = tile / p.tilesPerMatrix;
     if (batch >= p.batch) return; // Uniform across the entire workgroup.
     uint matrixTile = tile % p.tilesPerMatrix;
+    uint tileM = (matrixTile / p.tileCols) * 64u;
+    uint tileN = (matrixTile % p.tileCols) * 64u;
     uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
-    uint row = (matrixTile/p.tileCols)*8u + ly;
-    uint col = (matrixTile%p.tileCols)*16u + lx;
+    uint tid = ly * 16u + lx;
+
     uint rest = batch, ao = p.aOffset, bo = p.bOffset;
     for (int axis = int(p.batchRank)-1; axis >= 0; --axis) {
         uint coord = rest % p.batchShape[axis];
@@ -39,15 +42,86 @@ void main() {
         ao += coord*p.aBatchStrides[axis];
         bo += coord*p.bBatchStrides[axis];
     }
-    float sum = 0.0;
+
+    float acc[8][4];
+    for (uint r = 0u; r < 8u; ++r) {
+        for (uint c = 0u; c < 4u; ++c) {
+            acc[r][c] = 0.0;
+        }
+    }
+
     for (uint base = 0u; base < p.k; base += 16u) {
-        uint da = base+lx, db0 = base+ly, db1 = base+ly+8u;
-        tileA[ly][lx] = row < p.m && da < p.k ? a[ao+indexA(row, da)] : 0.0;
-        tileB[ly][lx] = db0 < p.k && col < p.n ? b[bo+indexB(db0, col)] : 0.0;
-        tileB[ly+8u][lx] = db1 < p.k && col < p.n ? b[bo+indexB(db1, col)] : 0.0;
+        if (TRANS_A == 0u) {
+            uint kLocal = tid & 15u;
+            uint mBase = tid >> 4u;
+            uint da = base + kLocal;
+            for (uint s = 0u; s < 8u; ++s) {
+                uint mLocal = mBase + s * 8u;
+                uint row = tileM + mLocal;
+                tileA[kLocal][mLocal] = (row < p.m && da < p.k) ? a[ao + indexA(row, da)] : 0.0;
+            }
+        } else {
+            uint mLocal = tid & 63u;
+            uint kBase = tid >> 6u;
+            uint row = tileM + mLocal;
+            for (uint s = 0u; s < 8u; ++s) {
+                uint kLocal = kBase + s * 2u;
+                uint da = base + kLocal;
+                tileA[kLocal][mLocal] = (row < p.m && da < p.k) ? a[ao + indexA(row, da)] : 0.0;
+            }
+        }
+
+        if (TRANS_B == 0u) {
+            uint nLocal = tid & 63u;
+            uint kBase = tid >> 6u;
+            uint col = tileN + nLocal;
+            for (uint s = 0u; s < 8u; ++s) {
+                uint kLocal = kBase + s * 2u;
+                uint db = base + kLocal;
+                tileB[kLocal][nLocal] = (db < p.k && col < p.n) ? b[bo + indexB(db, col)] : 0.0;
+            }
+        } else {
+            uint kLocal = tid & 15u;
+            uint nBase = tid >> 4u;
+            uint db = base + kLocal;
+            for (uint s = 0u; s < 8u; ++s) {
+                uint nLocal = nBase + s * 8u;
+                uint col = tileN + nLocal;
+                tileB[kLocal][nLocal] = (db < p.k && col < p.n) ? b[bo + indexB(db, col)] : 0.0;
+            }
+        }
+
         barrier();
-        for (uint d = 0u; d < 16u; ++d) sum = fma(tileA[ly][d], tileB[d][lx], sum);
+
+        for (uint d = 0u; d < 16u; ++d) {
+            float aReg[8];
+            for (uint r = 0u; r < 8u; ++r) {
+                aReg[r] = tileA[d][ly + r * 8u];
+            }
+            float bReg[4];
+            for (uint c = 0u; c < 4u; ++c) {
+                bReg[c] = tileB[d][lx + c * 16u];
+            }
+            for (uint r = 0u; r < 8u; ++r) {
+                for (uint c = 0u; c < 4u; ++c) {
+                    acc[r][c] = fma(aReg[r], bReg[c], acc[r][c]);
+                }
+            }
+        }
+
         barrier();
     }
-    if (row < p.m && col < p.n) c[(batch*p.m+row)*p.n+col] = sum;
+
+    uint batchBase = batch * p.m;
+    for (uint r = 0u; r < 8u; ++r) {
+        uint row = tileM + ly + r * 8u;
+        if (row >= p.m) continue;
+        uint rowBase = (batchBase + row) * p.n;
+        for (uint cc = 0u; cc < 4u; ++cc) {
+            uint col = tileN + lx + cc * 16u;
+            if (col < p.n) {
+                c[rowBase + col] = acc[r][cc];
+            }
+        }
+    }
 }

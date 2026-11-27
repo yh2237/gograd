@@ -253,7 +253,7 @@ func matrixParams(a, b gpu.View, shape []int) (gemmParams, int) {
 		p.BRow, p.BCol = p.BCol, p.BRow
 		variant |= 1
 	}
-	p.TileCols = (p.N + 15) / 16
-	p.TilesPerMatrix = ((p.M + 7) / 8) * p.TileCols
+	p.TileCols = (p.N + 63) / 64
+	p.TilesPerMatrix = ((p.M + 63) / 64) * p.TileCols
 	return p, variant
 }
