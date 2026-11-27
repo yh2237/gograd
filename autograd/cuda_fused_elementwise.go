@@ -38,6 +38,17 @@ func BiasGELU(x, b *Tensor) *Tensor {
 	res := resultGPU(out, x.Shape, []*Tensor{x, b}, func(g *cuda.Buffer) {
 		gp := ptr(g)
 		dx, db := ptr(x.ensureGradGPU()), ptr(b.ensureGradGPU())
+		rows := int(n) / c
+		if rows > 0 && c > 0 {
+			r32 := int32(rows)
+			gy := min((rows+7)/8, 64)
+			timedGPU("bias_gelu_b", func() error {
+				return graphKernel("bias_gelu_b_2d").Launch([3]int{(c + 31) / 32, gy, 1}, [3]int{32, 8, 1}, 0, nil, []unsafe.Pointer{
+					unsafe.Pointer(&xp), unsafe.Pointer(&bp), unsafe.Pointer(&gp), unsafe.Pointer(&dx), unsafe.Pointer(&db), unsafe.Pointer(&r32), unsafe.Pointer(&channels),
+				})
+			})
+			return
+		}
 		launch("bias_gelu_b", int(n), unsafe.Pointer(&xp), unsafe.Pointer(&bp), unsafe.Pointer(&gp), unsafe.Pointer(&dx), unsafe.Pointer(&db), unsafe.Pointer(&n), unsafe.Pointer(&channels))
 	})
 	res.setBF16(shadow)
@@ -80,6 +91,17 @@ func BiasResidual(x, b, residual *Tensor) *Tensor {
 	res := resultGPU(out, x.Shape, []*Tensor{x, b, residual}, func(g *cuda.Buffer) {
 		gp := ptr(g)
 		dx, db, dr := ptr(x.ensureGradGPU()), ptr(b.ensureGradGPU()), ptr(residual.ensureGradGPU())
+		rows := int(n) / c
+		if rows > 0 && c > 0 {
+			r32 := int32(rows)
+			gy := min((rows+7)/8, 64)
+			timedGPU("bias_residual_b", func() error {
+				return graphKernel("bias_residual_b_2d").Launch([3]int{(c + 31) / 32, gy, 1}, [3]int{32, 8, 1}, 0, nil, []unsafe.Pointer{
+					unsafe.Pointer(&gp), unsafe.Pointer(&dx), unsafe.Pointer(&db), unsafe.Pointer(&dr), unsafe.Pointer(&r32), unsafe.Pointer(&channels),
+				})
+			})
+			return
+		}
 		launch("bias_residual_b", int(n), unsafe.Pointer(&gp), unsafe.Pointer(&dx), unsafe.Pointer(&db), unsafe.Pointer(&dr), unsafe.Pointer(&n), unsafe.Pointer(&channels))
 	})
 	res.setBF16(shadow)

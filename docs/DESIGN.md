@@ -29,9 +29,9 @@
 | 実行条件 | ステップ時間 |
 | --- | ---: |
 | CPU FP32 | 431.9–470.3 ms |
-| CUDA FP32 eager | 19.0 ms |
+| CUDA FP32 eager | 18.2 ms |
 | CUDA FP32 graph replay | 26.7 ms |
-| CUDA BF16 eager | 12.8–15.3 ms |
+| CUDA BF16 eager | 12.6–14.6 ms |
 | CUDA BF16 graph replay | 15.2 ms |
 
 ### CUDA Attention（`cmd/attention-bench`）

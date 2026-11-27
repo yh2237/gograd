@@ -156,8 +156,27 @@ extern "C" __global__ void merge_heads_b(const float* g,float* dx,int n,int t,in
 }
 extern "C" __global__ void softmax_f(const float* x,float* y,int rows,int dim,int inner,int logmode){int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;if(row>=rows)return;int o=row/inner,j=row%inner,base=o*dim*inner+j;float mx=-__int_as_float(0x7f800000);for(int k=lane;k<dim;k+=32){float v=x[base+k*inner];mx=isnan(v)?v:fmaxf(mx,v);}mx=warp_max(mx);float sum=0;for(int k=lane;k<dim;k+=32)sum+=expf(x[base+k*inner]-mx);sum=warp_sum(sum);float ls=logf(sum);for(int k=lane;k<dim;k+=32){int idx=base+k*inner;y[idx]=logmode?x[idx]-mx-ls:expf(x[idx]-mx)/sum;}}
 extern "C" __global__ void softmax_b(const float* y,const float* g,float* dx,int rows,int dim,int inner,int logmode){int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;if(row>=rows)return;int o=row/inner,j=row%inner,base=o*dim*inner+j;float dot=0;for(int k=lane;k<dim;k+=32){int idx=base+k*inner;dot+=g[idx]*(logmode?1.0f:y[idx]);}dot=warp_sum(dot);for(int k=lane;k<dim;k+=32){int idx=base+k*inner;dx[idx]+=logmode?g[idx]-expf(y[idx])*dot:y[idx]*(g[idx]-dot);}}
-extern "C" __global__ void attn_softmax_f(const float* scores,const float* mask,float* probs,unsigned short* probs16,int rows,int dim,float scale,Axes6 shape,Axes6 ms){int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;if(row>=rows)return;int base=row*dim;float mx=-__int_as_float(0x7f800000);for(int k=lane;k<dim;k+=32){int i=base+k;float z=scores[i]*scale+(mask?mask[view_index(i,shape,ms,0)]:0.0f);mx=isnan(z)?z:fmaxf(mx,z);}mx=warp_max(mx);float sum=0;for(int k=lane;k<dim;k+=32){int i=base+k;float z=scores[i]*scale+(mask?mask[view_index(i,shape,ms,0)]:0.0f);sum+=expf(z-mx);}sum=warp_sum(sum);for(int k=lane;k<dim;k+=32){int i=base+k;float z=scores[i]*scale+(mask?mask[view_index(i,shape,ms,0)]:0.0f);float p=expf(z-mx)/sum;probs[i]=p;if(probs16)probs16[i]=round_bf16(p);}}
-extern "C" __global__ void attn_softmax_b(const float* probs,const float* dp,float* ds,unsigned short* ds16,float* dmask,int rows,int dim,float scale,Axes6 shape,Axes6 ms){int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;if(row>=rows)return;int base=row*dim;float dot=0;for(int k=lane;k<dim;k+=32){int i=base+k;dot+=probs[i]*dp[i];}dot=warp_sum(dot);for(int k=lane;k<dim;k+=32){int i=base+k;float z=probs[i]*(dp[i]-dot);float dsv=z*scale;ds[i]=dsv;if(ds16)ds16[i]=round_bf16(dsv);if(dmask)atomicAdd(&dmask[view_index(i,shape,ms,0)],z);}}
+extern "C" __global__ void attn_softmax_f(const float* scores,const float* mask,float* probs,unsigned short* probs16,int rows,int dim,float scale,Axes6 shape,Axes6 ms){
+  int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;
+  if(row>=rows)return;
+  int base=row*dim;
+  float mx=-__int_as_float(0x7f800000);
+  for(int k=lane;k<dim;k+=32){int i=base+k;float z=scores[i]*scale+(mask?mask[view_index(i,shape,ms,0)]:0.0f);mx=isnan(z)?z:fmaxf(mx,z);}
+  mx=warp_max(mx);
+  float sum=0;
+  for(int k=lane;k<dim;k+=32){int i=base+k;float z=scores[i]*scale+(mask?mask[view_index(i,shape,ms,0)]:0.0f);float e=expf(z-mx);probs[i]=e;sum+=e;}
+  float inv=1.0f/warp_sum(sum);
+  for(int k=lane;k<dim;k+=32){int i=base+k;float p=probs[i]*inv;probs[i]=p;if(probs16)probs16[i]=round_bf16(p);}
+}
+extern "C" __global__ void attn_softmax_b(const float* probs,const float* dp,float* ds,unsigned short* ds16,float* dmask,int rows,int dim,float scale,Axes6 shape,Axes6 ms){
+  int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;
+  if(row>=rows)return;
+  int base=row*dim;
+  float dot=0;
+  for(int k=lane;k<dim;k+=32){int i=base+k;dot+=probs[i]*dp[i];}
+  dot=warp_sum(dot);
+  for(int k=lane;k<dim;k+=32){int i=base+k;float z=probs[i]*(dp[i]-dot);float dsv=z*scale;ds[i]=dsv;if(ds16)ds16[i]=round_bf16(dsv);if(dmask)atomicAdd(&dmask[view_index(i,shape,ms,0)],z);}
+}
 template<int BR,int BC,int ECOLS>
 __device__ __forceinline__ void flash_fwd_impl(const float* q,const float* k,const float* v,const float* mask,float* out,float* stats,int nq,int nk,int d,int e,int qblocks,float scale,Axes6 shape,Axes6 ms){
   extern __shared__ float smem[];
@@ -552,9 +571,64 @@ __device__ __forceinline__ void flash_bwd_kv_impl(const float* q,const float* k,
 }
 extern "C" __global__ void flash_attention_tiled_b_kv(const float* q,const float* k,const float* v,const float* mask,const float* stats,const float* deltaBuf,const float* g,float* dk,float* dv,int nq,int nk,int d,int e,int kvblocks,float scale,Axes6 shape,Axes6 ms){flash_bwd_kv_impl<32,32,4,4>(q,k,v,mask,stats,deltaBuf,g,dk,dv,nq,nk,d,e,kvblocks,scale,shape,ms);}
 extern "C" __global__ void flash_attention_tiled_b_kv128(const float* q,const float* k,const float* v,const float* mask,const float* stats,const float* deltaBuf,const float* g,float* dk,float* dv,int nq,int nk,int d,int e,int kvblocks,float scale,Axes6 shape,Axes6 ms){flash_bwd_kv_impl<16,16,8,8>(q,k,v,mask,stats,deltaBuf,g,dk,dv,nq,nk,d,e,kvblocks,scale,shape,ms);}
-extern "C" __global__ void layernorm_f(const float* x,const float* w,const float* b,float* y,float* stats,int rows,int dim,float eps){int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;if(row>=rows)return;int base=row*dim;float sum=0;for(int j=lane;j<dim;j+=32)sum+=x[base+j];float mean=warp_sum(sum)/(float)dim;float ss=0;for(int j=lane;j<dim;j+=32){float z=x[base+j]-mean;ss+=z*z;}float inv=rsqrtf(warp_sum(ss)/(float)dim+eps);if(lane==0){stats[row*2]=mean;stats[row*2+1]=inv;}for(int j=lane;j<dim;j+=32)y[base+j]=(x[base+j]-mean)*inv*w[j]+b[j];}
-extern "C" __global__ void layernorm_bf16_f(const float* x,const float* w,const float* b,float* y,unsigned short* y16,float* stats,int rows,int dim,float eps){int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;if(row>=rows)return;int base=row*dim;float sum=0;for(int j=lane;j<dim;j+=32)sum+=x[base+j];float mean=warp_sum(sum)/(float)dim;float ss=0;for(int j=lane;j<dim;j+=32){float z=x[base+j]-mean;ss+=z*z;}float inv=rsqrtf(warp_sum(ss)/(float)dim+eps);if(lane==0){stats[row*2]=mean;stats[row*2+1]=inv;}for(int j=lane;j<dim;j+=32){float z=(x[base+j]-mean)*inv*w[j]+b[j];y[base+j]=z;y16[base+j]=round_bf16(z);}}
-extern "C" __global__ void layernorm_b(const float* x,const float* w,const float* g,const float* stats,float* dx,float* dw,float* db,int rows,int dim){int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;if(row>=rows)return;int base=row*dim;float mean=stats[row*2],inv=stats[row*2+1];float sg=0,sgn=0;for(int j=lane;j<dim;j+=32){int i=base+j;float norm=(x[i]-mean)*inv,z=g[i]*w[j];sg+=z;sgn+=z*norm;}sg=warp_sum(sg)/(float)dim;sgn=warp_sum(sgn)/(float)dim;for(int j=lane;j<dim;j+=32){int i=base+j;float norm=(x[i]-mean)*inv;if(dx)dx[i]+=inv*(g[i]*w[j]-sg-norm*sgn);if(dw)atomicAdd(&dw[j],g[i]*norm);if(db)atomicAdd(&db[j],g[i]);}}
+extern "C" __global__ void layernorm_f(const float* x,const float* w,const float* b,float* y,float* stats,int rows,int dim,float eps){
+  int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;
+  if(row>=rows)return;
+  int base=row*dim;
+  float sum=0;for(int j=lane;j<dim;j+=32)sum+=x[base+j];
+  float mean=warp_sum(sum)/(float)dim;
+  float ss=0;for(int j=lane;j<dim;j+=32){float z=x[base+j]-mean;ss+=z*z;}
+  float inv=rsqrtf(warp_sum(ss)/(float)dim+eps);
+  if(lane==0){stats[row*2]=mean;stats[row*2+1]=inv;}
+  for(int j=lane;j<dim;j+=32)y[base+j]=(x[base+j]-mean)*inv*w[j]+b[j];
+}
+extern "C" __global__ void layernorm_bf16_f(const float* x,const float* w,const float* b,float* y,unsigned short* y16,float* stats,int rows,int dim,float eps){
+  int row=blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5),lane=threadIdx.x&31;
+  if(row>=rows)return;
+  int base=row*dim;
+  float sum=0;for(int j=lane;j<dim;j+=32)sum+=x[base+j];
+  float mean=warp_sum(sum)/(float)dim;
+  float ss=0;for(int j=lane;j<dim;j+=32){float z=x[base+j]-mean;ss+=z*z;}
+  float inv=rsqrtf(warp_sum(ss)/(float)dim+eps);
+  if(lane==0){stats[row*2]=mean;stats[row*2+1]=inv;}
+  for(int j=lane;j<dim;j+=32){float z=(x[base+j]-mean)*inv*w[j]+b[j];y[base+j]=z;y16[base+j]=round_bf16(z);}
+}
+extern "C" __global__ void layernorm_b(const float* x,const float* w,const float* g,const float* stats,float* dx,float* dw,float* db,int rows,int dim){
+  int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+  int row=blockIdx.x*(blockDim.x>>5)+warp;
+  bool active=row<rows;
+  __shared__ float sdw[8][32],sdb[8][32];
+  int base=row*dim;
+  float mean=active?stats[row*2]:0.0f,inv=active?stats[row*2+1]:0.0f;
+  float sg=0,sgn=0;
+  if(active){
+    for(int j=lane;j<dim;j+=32){int i=base+j;float norm=(x[i]-mean)*inv,z=g[i]*w[j];sg+=z;sgn+=z*norm;}
+  }
+  sg=warp_sum(sg)/(float)dim;
+  sgn=warp_sum(sgn)/(float)dim;
+  int steps=(dim+31)>>5;
+  for(int c=0;c<steps;c++){
+    int j=lane+c*32;
+    float dwv=0.0f,dbv=0.0f;
+    if(active&&j<dim){
+      int i=base+j;
+      float norm=(x[i]-mean)*inv,gi=g[i];
+      if(dx)dx[i]+=inv*(gi*w[j]-sg-norm*sgn);
+      dwv=gi*norm;
+      dbv=gi;
+    }
+    if(dw||db){
+      sdw[warp][lane]=dwv;
+      sdb[warp][lane]=dbv;
+      __syncthreads();
+      if(warp==0&&j<dim){
+        if(dw){float sw=0;for(int r=0;r<8;r++)sw+=sdw[r][lane];atomicAdd(&dw[j],sw);}
+        if(db){float sb=0;for(int r=0;r<8;r++)sb+=sdb[r][lane];atomicAdd(&db[j],sb);}
+      }
+      __syncthreads();
+    }
+  }
+}
 __device__ unsigned int dropout_hash(unsigned int i,unsigned int seed){unsigned int x=i^seed;x^=x>>16;x*=0x7feb352du;x^=x>>15;x*=0x846ca68bu;x^=x>>16;return x;}
 extern "C" __global__ void dropout_f(const float* x,float* y,int n,float p,unsigned int seed,unsigned int cutoff){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)y[i]=dropout_hash(i,seed)<cutoff?0.0f:x[i]/(1.0f-p);}
 extern "C" __global__ void dropout_b(const float* g,float* dx,int n,float p,unsigned int seed,unsigned int cutoff){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)dx[i]+=dropout_hash(i,seed)<cutoff?0.0f:g[i]/(1.0f-p);}
@@ -638,9 +712,47 @@ __device__ float deriv(float x,int op){if(op==0)return expf(x);if(op==1)return 1
 extern "C" __global__ void bias_gelu_f(const float* x,const float* b,float* y,int n,int c){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)y[i]=fun(x[i]+b[i%c],5);}
 extern "C" __global__ void bias_gelu_bf16_f(const float* x,const float* b,float* y,unsigned short* y16,int n,int c){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=fun(x[i]+b[i%c],5);y[i]=z;y16[i]=round_bf16(z);}}
 extern "C" __global__ void bias_gelu_b(const float* x,const float* b,const float* g,float* dx,float* db,int n,int c){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=g[i]*deriv(x[i]+b[i%c],5);if(dx)dx[i]+=z;if(db)atomicAdd(&db[i%c],z);}}
+extern "C" __global__ void bias_gelu_b_2d(const float* x,const float* b,const float* g,float* dx,float* db,int rows,int c){
+  __shared__ float sdb[8][32];
+  int col=blockIdx.x*32+threadIdx.x;
+  float acc=0.0f;
+  if(col<c){
+    float bv=b[col];
+    for(int row=blockIdx.y*8+threadIdx.y;row<rows;row+=gridDim.y*8){
+      int i=row*c+col;
+      float z=g[i]*deriv(x[i]+bv,5);
+      if(dx)dx[i]+=z;
+      acc+=z;
+    }
+  }
+  if(db){
+    sdb[threadIdx.y][threadIdx.x]=acc;
+    __syncthreads();
+    if(threadIdx.y==0&&col<c){float sum=0.0f;for(int r=0;r<8;r++)sum+=sdb[r][threadIdx.x];atomicAdd(&db[col],sum);}
+  }
+}
 extern "C" __global__ void bias_residual_f(const float* x,const float* b,const float* r,float* y,int n,int c){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)y[i]=x[i]+b[i%c]+r[i];}
 extern "C" __global__ void bias_residual_bf16_f(const float* x,const float* b,const float* r,float* y,unsigned short* y16,int n,int c){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=x[i]+b[i%c]+r[i];y[i]=z;y16[i]=round_bf16(z);}}
 extern "C" __global__ void bias_residual_b(const float* g,float* dx,float* db,float* dr,int n,int c){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float z=g[i];if(dx)dx[i]+=z;if(db)atomicAdd(&db[i%c],z);if(dr)dr[i]+=z;}}
+extern "C" __global__ void bias_residual_b_2d(const float* g,float* dx,float* db,float* dr,int rows,int c){
+  __shared__ float sdb[8][32];
+  int col=blockIdx.x*32+threadIdx.x;
+  float acc=0.0f;
+  if(col<c){
+    for(int row=blockIdx.y*8+threadIdx.y;row<rows;row+=gridDim.y*8){
+      int i=row*c+col;
+      float z=g[i];
+      if(dx)dx[i]+=z;
+      if(dr)dr[i]+=z;
+      acc+=z;
+    }
+  }
+  if(db){
+    sdb[threadIdx.y][threadIdx.x]=acc;
+    __syncthreads();
+    if(threadIdx.y==0&&col<c){float sum=0.0f;for(int r=0;r<8;r++)sum+=sdb[r][threadIdx.x];atomicAdd(&db[col],sum);}
+  }
+}
 extern "C" __global__ void unary_f(const float* a,float* out,int n,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=fun(a[i],op);}
 extern "C" __global__ void unary_b(const float* a,const float* g,float* da,int n,int op){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)da[i]+=g[i]*deriv(a[i],op);}
 extern "C" __global__ void permute_f(const float* a,float* out,int n,int d0,int d1,int d2,int s0,int s1,int s2){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){int j=(i/(d1*d2))*s0+((i/d2)%d1)*s1+(i%d2)*s2;out[i]=a[j];}}
@@ -679,7 +791,7 @@ extern "C" __global__ void scale_all_grads(const unsigned long long* ptrs,const 
 var graphCache cuda.KernelCache
 
 func graphKernel(name string) *cuda.Kernel {
-	functions, err := graphCache.Get(graphSource, "reduce_scalar_f", "reduce_last_f", "copy_values", "f32_to_bf16", "set_one", "seed_grad", "write_clip_entry", "view_gather", "view_gather_bf16", "view_scatter", "binary_nd_f", "binary_nd_bf16_f", "binary_nd_b", "reduce_nd_f", "reduce_nd_b", "split_heads_f", "split_heads_bf16_f", "split_heads_b", "merge_heads_f", "merge_heads_bf16_f", "merge_heads_b", "softmax_f", "softmax_b", "attn_softmax_f", "attn_softmax_b", "flash_attention_tiled_f", "flash_attention_tiled_f128", "flash_attention_delta", "flash_attention_tiled_b", "flash_attention_tiled_b128", "flash_attention_tiled_b_kv", "flash_attention_tiled_b_kv128", "layernorm_f", "layernorm_b", "layernorm_bf16_f", "bias_gelu_f", "bias_gelu_bf16_f", "bias_gelu_b", "bias_residual_f", "bias_residual_bf16_f", "bias_residual_b", "dropout_f", "dropout_b", "ce_f", "ce_finish", "ce_b", "bce_logits_f", "bce_logits_b", "smooth_l1_f", "smooth_l1_b", "graph_adam_inc", "graph_adamw", "add_values", "scalar_f", "scalar_b", "clamp_f", "clamp_b", "pow_scalar_f", "pow_scalar_b", "binary_same_f", "binary_same_bf16_f", "binary_same_b", "bias_add_f", "bias_add_bf16_f", "bias_add_b", "binary_f", "binary_b", "binary_bf16_f", "unary_f", "unary_b", "permute_f", "permute_b", "concat_f", "concat_b", "slice_f", "slice_b", "embedding_f", "embedding_b", "reduce_f", "reduce_b", "group_stats", "group_f", "group_backstats", "group_b", "masked_f", "masked_finish", "masked_b", "scale_grad", "global_norm_parts", "scale_all_grads")
+	functions, err := graphCache.Get(graphSource, "reduce_scalar_f", "reduce_last_f", "copy_values", "f32_to_bf16", "set_one", "seed_grad", "write_clip_entry", "view_gather", "view_gather_bf16", "view_scatter", "binary_nd_f", "binary_nd_bf16_f", "binary_nd_b", "reduce_nd_f", "reduce_nd_b", "split_heads_f", "split_heads_bf16_f", "split_heads_b", "merge_heads_f", "merge_heads_bf16_f", "merge_heads_b", "softmax_f", "softmax_b", "attn_softmax_f", "attn_softmax_b", "flash_attention_tiled_f", "flash_attention_tiled_f128", "flash_attention_delta", "flash_attention_tiled_b", "flash_attention_tiled_b128", "flash_attention_tiled_b_kv", "flash_attention_tiled_b_kv128", "layernorm_f", "layernorm_b", "layernorm_bf16_f", "bias_gelu_f", "bias_gelu_bf16_f", "bias_gelu_b", "bias_gelu_b_2d", "bias_residual_f", "bias_residual_bf16_f", "bias_residual_b", "bias_residual_b_2d", "dropout_f", "dropout_b", "ce_f", "ce_finish", "ce_b", "bce_logits_f", "bce_logits_b", "smooth_l1_f", "smooth_l1_b", "graph_adam_inc", "graph_adamw", "add_values", "scalar_f", "scalar_b", "clamp_f", "clamp_b", "pow_scalar_f", "pow_scalar_b", "binary_same_f", "binary_same_bf16_f", "binary_same_b", "bias_add_f", "bias_add_bf16_f", "bias_add_b", "binary_f", "binary_b", "binary_bf16_f", "unary_f", "unary_b", "permute_f", "permute_b", "concat_f", "concat_b", "slice_f", "slice_b", "embedding_f", "embedding_b", "reduce_f", "reduce_b", "group_stats", "group_f", "group_backstats", "group_b", "masked_f", "masked_finish", "masked_b", "scale_grad", "global_norm_parts", "scale_all_grads")
 	if err != nil {
 		panic(err)
 	}
