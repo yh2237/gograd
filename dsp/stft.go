@@ -51,11 +51,8 @@ func NewSTFT(filterLength, hopLength int) (*STFT, error) {
 	return &STFT{fft: f, window: window, windowSq: windowSq, hop: hopLength, center: filterLength / 2}, nil
 }
 
-// Bins reports the number of frequency bins in one frame.
 func (s *STFT) Bins() int { return s.fft.Bins() }
 
-// FramesFor reports how many frames Transform produces for a block of length
-// samples, including the reflect centring torch.stft adds.
 func (s *STFT) FramesFor(length int) int {
 	padded := padLength(length, len(s.window)) + 2*s.center
 	return 1 + (padded-len(s.window))/s.hop

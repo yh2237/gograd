@@ -42,11 +42,8 @@ func NewFFT(n int) (*FFT, error) {
 	return f, nil
 }
 
-// Len reports the transform length.
 func (f *FFT) Len() int { return f.n }
 
-// Transform replaces x, stored as interleaved real/imaginary pairs, with its
-// discrete transform. The inverse divides by n, as a discrete inverse must.
 func (f *FFT) Transform(x []float64, inverse bool) {
 	if len(x) != 2*f.n {
 		panic("dsp: FFT block length mismatch")
@@ -96,7 +93,6 @@ func (f *FFT) bitReverse(x []float64) {
 	}
 }
 
-// Bins reports the number of one-sided bins, n/2+1.
 func (f *FFT) Bins() int { return f.n/2 + 1 }
 
 func (f *FFT) RealForward(block []float32) (re, im []float32) {
