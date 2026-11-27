@@ -44,20 +44,75 @@ void main() {
     if (row >= p.rows) return;
     uint lane = gl_LocalInvocationID.x;
     if (p.kind == 0u || p.kind == 3u) {
+        uint base = row * p.cols;
+        if (p.cols <= 1024u) {
+            float vals[8];
+            uint count = 0u;
+            float mx = uintBitsToFloat(0xff800000u);
+            for (uint j = lane; j < p.cols; j += 128u) {
+                float v = x[base + j];
+                vals[count++] = v;
+                mx = max(mx, v);
+            }
+            mx = maxReduce(mx);
+            float sum = 0.0;
+            if (p.kind == 3u) {
+                for (uint k = 0u; k < count; ++k) sum += exp(vals[k] - mx);
+                float lse = log(sumReduce(sum));
+                for (uint k = 0u; k < count; ++k) {
+                    precise float value = (vals[k] - mx) - lse;
+                    y[base + lane + k*128u] = value;
+                }
+            } else {
+                for (uint k = 0u; k < count; ++k) {
+                    float e = exp(vals[k] - mx);
+                    vals[k] = e;
+                    sum += e;
+                }
+                float inv = 1.0 / sumReduce(sum);
+                for (uint k = 0u; k < count; ++k) {
+                    y[base + lane + k*128u] = vals[k] * inv;
+                }
+            }
+            return;
+        }
         float mx = uintBitsToFloat(0xff800000u);
-        for (uint j = lane; j < p.cols; j += 128u) mx = max(mx, x[row*p.cols+j]);
+        for (uint j = lane; j < p.cols; j += 128u) mx = max(mx, x[base+j]);
         mx = maxReduce(mx);
         float sum = 0.0;
-        for (uint j = lane; j < p.cols; j += 128u) sum += exp(x[row*p.cols+j]-mx);
+        for (uint j = lane; j < p.cols; j += 128u) sum += exp(x[base+j]-mx);
         sum = sumReduce(sum);
         if (p.kind == 3u) {
             float lse = log(sum);
             for (uint j = lane; j < p.cols; j += 128u) {
-                precise float value = (x[row*p.cols+j] - mx) - lse;
-                y[row*p.cols+j] = value;
+                precise float value = (x[base+j] - mx) - lse;
+                y[base+j] = value;
             }
         } else {
-            for (uint j = lane; j < p.cols; j += 128u) y[row*p.cols+j] = exp(x[row*p.cols+j]-mx)/sum;
+            float inv = 1.0 / sum;
+            for (uint j = lane; j < p.cols; j += 128u) y[base+j] = exp(x[base+j]-mx)*inv;
+        }
+    } else if (p.kind == 1u && p.cols <= 1024u) {
+        uint base = row * p.cols;
+        float vals[8];
+        uint count = 0u;
+        float sum = 0.0;
+        for (uint j = lane; j < p.cols; j += 128u) {
+            float v = x[base + j];
+            vals[count++] = v;
+            sum += v;
+        }
+        float mean = sumReduce(sum) / float(p.cols);
+        float variance = 0.0;
+        for (uint k = 0u; k < count; ++k) {
+            float z = vals[k] - mean;
+            vals[k] = z;
+            variance += z * z;
+        }
+        float inv = inversesqrt(sumReduce(variance) / float(p.cols) + p.eps);
+        for (uint k = 0u; k < count; ++k) {
+            uint j = lane + k*128u;
+            y[base + j] = vals[k] * inv * w[j] + b[j];
         }
     } else {
         float sum = 0.0;
