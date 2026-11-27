@@ -285,9 +285,11 @@ func (d *nativeDriver) submit(record func() error) error {
 	// If Signal fails, retry until the queue can be fenced or device removal
 	// permits destruction. A host event-allocation error falls back to polling.
 	var signalError error
-	for {
+	signaled := false
+	for attempts := 0; attempts < 1024; attempts++ {
 		err := hresult("Signal", call(d.queue, 14, uintptr(unsafe.Pointer(d.fence)), uintptr(d.serial)))
 		if err == nil {
+			signaled = true
 			break
 		}
 		signalError = err
@@ -295,6 +297,9 @@ func (d *nativeDriver) submit(record func() error) error {
 			return err
 		}
 		runtime.Gosched()
+	}
+	if !signaled {
+		return signalError
 	}
 	waitError := hresult("SetEventOnCompletion", call(d.fence, 9, uintptr(d.serial), 0))
 	for {

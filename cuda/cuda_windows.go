@@ -502,18 +502,22 @@ func freeCachedPointers(victims []cachedPointer) error {
 	if err != nil {
 		return err
 	}
+	var firstErr error
 	for _, victim := range victims {
 		if err := withDevice(victim.device, func() error {
 			code, _, _ := a.free.Call(victim.pointer)
 			return runtimeError("cudaFree", code)
 		}); err != nil {
-			return err
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
 		}
 		poolMu.Lock()
 		reservedBytes -= victim.size
 		poolMu.Unlock()
 	}
-	return nil
+	return firstErr
 }
 
 // SetPoolCacheLimit changes the maximum bytes held in the reusable cache.

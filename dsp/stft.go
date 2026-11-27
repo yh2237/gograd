@@ -71,12 +71,14 @@ func (s *STFT) Transform(x []float32) (magnitude, phase []float32, frames int) {
 	magnitude = make([]float32, bins*frames)
 	phase = make([]float32, bins*frames)
 	frame := make([]float32, len(s.window))
+	fftBuf := make([]float64, 2*len(s.window))
+	re, im := make([]float32, bins), make([]float32, bins)
 	for f := 0; f < frames; f++ {
 		copy(frame, padded[f*s.hop:f*s.hop+len(s.window)])
 		for i, v := range frame {
 			frame[i] = v * s.window[i]
 		}
-		re, im := s.fft.RealForward(frame)
+		s.fft.realForwardInto(fftBuf, frame, re, im)
 		for k := range re {
 			squared := re[k]*re[k] + im[k]*im[k]
 			at := k*frames + f
@@ -103,13 +105,15 @@ func (s *STFT) Inverse(magnitude, phase []float32, numSamples int) []float32 {
 	istft := hop * (frames - 1)
 	accumulated, envelope := make([]float32, n+hop*(frames-1)), make([]float32, n+hop*(frames-1))
 	re, im := make([]float32, bins), make([]float32, bins)
+	fftBuf := make([]float64, 2*n)
+	block := make([]float32, n)
 	for f := 0; f < frames; f++ {
 		for k := 0; k < bins; k++ {
 			at := k*frames + f
 			angle := float64(phase[at])
 			re[k], im[k] = magnitude[at]*float32(math.Cos(angle)), magnitude[at]*float32(math.Sin(angle))
 		}
-		block := s.fft.RealInverse(re, im)
+		s.fft.realInverseInto(fftBuf, re, im, block)
 		start := f * hop
 		for i := 0; i < width; i++ {
 			accumulated[start+i] += block[i] * s.window[i]

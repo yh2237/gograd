@@ -237,20 +237,37 @@ func WriteWAV(w io.Writer, samples []float32, encoding WAVEncoding) error {
 	binary.LittleEndian.PutUint16(header[34:], uint16(encoding.Bits))
 	copy(header[36:40], "data")
 	binary.LittleEndian.PutUint32(header[40:], uint32(dataBytes))
-	if _, err := w.Write(header[:]); err != nil {
+	if err := writeFull(w, header[:]); err != nil {
 		return err
 	}
-	raw := make([]byte, width)
-	for _, value := range samples {
-		encodeWAVSample(raw, value, encoding.Bits, encoding.Float)
-		if _, err := w.Write(raw); err != nil {
+	chunkSamples := max(1, 4096/width)
+	buf := make([]byte, chunkSamples*width)
+	for i := 0; i < len(samples); i += chunkSamples {
+		end := min(i+chunkSamples, len(samples))
+		pos := 0
+		for _, value := range samples[i:end] {
+			encodeWAVSample(buf[pos:pos+width], value, encoding.Bits, encoding.Float)
+			pos += width
+		}
+		if err := writeFull(w, buf[:pos]); err != nil {
 			return err
 		}
 	}
 	if padding != 0 {
-		if _, err := w.Write([]byte{0}); err != nil {
+		if err := writeFull(w, []byte{0}); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func writeFull(w io.Writer, p []byte) error {
+	n, err := w.Write(p)
+	if err != nil {
+		return err
+	}
+	if n != len(p) {
+		return io.ErrShortWrite
 	}
 	return nil
 }

@@ -3,6 +3,8 @@ package data
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -194,5 +196,21 @@ func TestAuditWAVAcceptsEmptyDataChunk(t *testing.T) {
 	}
 	if len(wav.Samples) != 0 || wav.SampleRate != 8000 {
 		t.Fatalf("empty WAV = %+v", wav)
+	}
+}
+
+type shortWriter struct{ limit int }
+
+func (w shortWriter) Write(p []byte) (int, error) {
+	if len(p) > w.limit {
+		return w.limit, nil
+	}
+	return len(p), nil
+}
+
+func TestWriteWAVShortWrite(t *testing.T) {
+	err := WriteWAV(shortWriter{limit: 4}, monoSamples(8), WAVEncoding{Channels: 1, SampleRate: 16000, Bits: 16})
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("err=%v want %v", err, io.ErrShortWrite)
 	}
 }

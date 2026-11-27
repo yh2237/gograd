@@ -99,32 +99,39 @@ func (f *FFT) bitReverse(x []float64) {
 // Bins reports the number of one-sided bins, n/2+1.
 func (f *FFT) Bins() int { return f.n/2 + 1 }
 
-// RealForward transforms a real block of n samples and returns the one-sided
-// spectrum as float32 pairs, matching torch.stft's onesided output.
 func (f *FFT) RealForward(block []float32) (re, im []float32) {
 	if len(block) != f.n {
 		panic("dsp: FFT block length mismatch")
 	}
 	buf := make([]float64, 2*f.n)
-	for i, v := range block {
-		buf[2*i] = float64(v)
-	}
-	f.bitReverse(buf)
-	f.butterflies(buf, -1)
 	re, im = make([]float32, f.n/2+1), make([]float32, f.n/2+1)
-	for k := range re {
-		re[k], im[k] = float32(buf[2*k]), float32(buf[2*k+1])
-	}
+	f.realForwardInto(buf, block, re, im)
 	return re, im
 }
 
-// RealInverse rebuilds a real block of n samples from the one-sided spectrum,
-// mirroring it into the missing half before transforming.
+func (f *FFT) realForwardInto(buf []float64, block, re, im []float32) {
+	for i, v := range block {
+		buf[2*i] = float64(v)
+		buf[2*i+1] = 0
+	}
+	f.bitReverse(buf)
+	f.butterflies(buf, -1)
+	for k := range re {
+		re[k], im[k] = float32(buf[2*k]), float32(buf[2*k+1])
+	}
+}
+
 func (f *FFT) RealInverse(re, im []float32) []float32 {
 	if len(re) != f.n/2+1 || len(im) != f.n/2+1 {
 		panic("dsp: FFT bin count mismatch")
 	}
 	buf := make([]float64, 2*f.n)
+	out := make([]float32, f.n)
+	f.realInverseInto(buf, re, im, out)
+	return out
+}
+
+func (f *FFT) realInverseInto(buf []float64, re, im, out []float32) {
 	for k := range re {
 		buf[2*k], buf[2*k+1] = float64(re[k]), float64(im[k])
 	}
@@ -133,9 +140,7 @@ func (f *FFT) RealInverse(re, im []float32) []float32 {
 		buf[2*(f.n-k)+1] = -float64(im[k])
 	}
 	f.Transform(buf, true)
-	out := make([]float32, f.n)
 	for i := range out {
 		out[i] = float32(buf[2*i])
 	}
-	return out
 }
