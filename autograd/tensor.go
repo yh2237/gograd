@@ -499,16 +499,18 @@ func (t *Tensor) addGrad(g []float32) {
 	if !t.RequiresGrad {
 		return
 	}
-	// The first contribution is a plain copy, which is a memmove instead of a
-	// read-modify-write pass.
 	if t.Grad == nil {
 		t.Grad = make([]float32, t.Numel())
 		copy(t.Grad, g)
 		return
 	}
-	for i, v := range g {
-		t.Grad[i] += v
-	}
+	grad := t.Grad
+	parallelFor(len(g), func(start, end int) {
+		ds, gs := grad[start:end], g[start:end]
+		for i, v := range gs {
+			ds[i] += v
+		}
+	})
 }
 func (t *Tensor) Backward() error {
 	return t.BackwardWithOptions(BackwardOptions{})
@@ -635,11 +637,12 @@ func parallelForWork(n, elementsPerItem int, fn func(int, int)) {
 		return
 	}
 	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
+	for w := 1; w < workers; w++ {
 		start, end := n*w/workers, n*(w+1)/workers
 		wg.Add(1)
 		go func() { defer wg.Done(); fn(start, end) }()
 	}
+	fn(0, n/workers)
 	wg.Wait()
 }
 func Add(a, b *Tensor) *Tensor {
@@ -998,7 +1001,7 @@ func ReLU(a *Tensor) *Tensor {
 	})
 }
 func erfApprox32(x float32) float32 {
-	if math.IsNaN(float64(x)) {
+	if x != x {
 		return x
 	}
 	ax := x

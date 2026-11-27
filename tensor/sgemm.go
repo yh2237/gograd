@@ -32,7 +32,7 @@ func sgemmTile() (mr, nr int) {
 		return 4, 4
 	}
 	if use4x16 {
-		return 4, 16
+		return 6, 16
 	}
 	return 4, 8
 }
@@ -156,9 +156,15 @@ func sgemmOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 	}
 	// A short row block keeps enough tiles to spread over the workers when m is
 	// small; tall matrices already have plenty.
-	mc := 32
+	mc := 36
 	if m <= 512 {
-		mc = 16
+		mc = 18
+	}
+	if !use4x16 {
+		mc = 32
+		if m <= 512 {
+			mc = 16
+		}
 	}
 	const kc = 256
 	mr, nr := sgemmTile()
@@ -211,7 +217,7 @@ func sgemmOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 		ap := sgemmBuffer(mc * kc)
 		defer releaseSGEMMBuffer(ap)
 		// 端の小さなブロックも、一時領域でAVXのカーネルを使う。余った行と列の結果は捨てる。
-		var edge [64]float32
+		var edge [96]float32
 		process := func(row int) {
 			end := min(row+mc, m)
 			for depth := 0; depth < k; depth += kc {
@@ -241,7 +247,7 @@ func sgemmOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 						aa := ap[(i-row)*kc:]
 						if height == mr && width == nr {
 							if use4x16 {
-								kernel4x16AVX(&c[i*n+j], &aa[0], &bb[0], n, nk, depth != 0)
+								kernel6x16AVX(&c[i*n+j], &aa[0], &bb[0], n, nk, depth != 0)
 							} else if useAVX2FMA {
 								kernel4x8AVX(&c[i*n+j], &aa[0], &bb[0], n, nk, depth != 0)
 							} else {
@@ -253,7 +259,7 @@ func sgemmOpWorkers(c, a, b []float32, m, n, k int, transA, transB bool, maxWork
 									copy(edge[r*nr:r*nr+width], c[(i+r)*n+j:(i+r)*n+j+width])
 								}
 							}
-							kernel4x16AVX(&edge[0], &aa[0], &bb[0], nr, nk, depth != 0)
+							kernel6x16AVX(&edge[0], &aa[0], &bb[0], nr, nk, depth != 0)
 							for r := 0; r < height; r++ {
 								copy(c[(i+r)*n+j:(i+r)*n+j+width], edge[r*nr:r*nr+width])
 							}
